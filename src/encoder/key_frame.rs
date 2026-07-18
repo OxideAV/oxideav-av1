@@ -485,7 +485,7 @@ fn tu_bd_anchor(plane: usize, start_x: usize, start_y: usize) -> (i32, i32) {
 /// §7.11.2.1 `haveAboveRight` / `haveBelowLeft` for a `tx_w × tx_h`
 /// TU — the §5.11.35 `BlockDecoded[]` border reads.
 #[inline]
-fn tu_corner_avail(
+pub(crate) fn tu_corner_avail(
     bd: &BlockDecodedMirror,
     plane: usize,
     start_x: usize,
@@ -538,7 +538,7 @@ pub(crate) struct ReconState {
 }
 
 impl ReconState {
-    fn plane(&self, plane: usize) -> (&[u8], usize, usize) {
+    pub(crate) fn plane(&self, plane: usize) -> (&[u8], usize, usize) {
         match plane {
             0 => (&self.y, self.width, self.height),
             1 => (&self.u, self.chroma_w, self.chroma_h),

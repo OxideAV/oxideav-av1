@@ -16768,7 +16768,6 @@ impl PartitionWalker {
     /// past the right / bottom frame edge are clipped silently. Returns
     /// silently for `plane >= 3` or an out-of-range `mode`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn predict_intra_into_curr_frame(
         &mut self,
         plane: u8,
@@ -16807,8 +16806,6 @@ impl PartitionWalker {
         if w == 0 || h == 0 || w > 64 || h > 64 {
             return;
         }
-        let log2_w = w.trailing_zeros();
-        let log2_h = h.trailing_zeros();
 
         // Per-plane buffer extent — `(MiRows * MI_SIZE) >> subY` rows by
         // `(MiCols * MI_SIZE) >> subX` cols (§7.11.2.1 `maxX` / `maxY`
@@ -16825,6 +16822,185 @@ impl PartitionWalker {
         let max_x = buf_cols.saturating_sub(1);
         let max_y = buf_rows.saturating_sub(1);
 
+        let read = |yy: u32, xx: u32| -> u16 {
+            let idx = (yy as usize) * (buf_cols as usize) + (xx as usize);
+            buf.samples[idx] as u16
+        };
+        let Some(pred) = Self::intra_predict_block_samples(
+            &read,
+            max_x,
+            max_y,
+            start_x,
+            start_y,
+            tx_sz,
+            mode,
+            angle_delta,
+            bit_depth,
+            have_above,
+            have_left,
+            have_above_right,
+            have_below_left,
+            enable_intra_edge_filter,
+            filter_type,
+            // §7.11.2.1 first dispatch arm — `use_filter_intra` is
+            // luma-only; the chroma callers' `Some(_)` collapses to
+            // the normal mode dispatch exactly as before the r417
+            // core extraction.
+            filter_intra_mode.filter(|_| plane == 0),
+        ) else {
+            return;
+        };
+
+        let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
+            return;
+        };
+        let cols_buf = buf.cols;
+        let rows_buf = buf.rows;
+        // r408: a §5.11.35 TU legally overhangs the mi-padded grid;
+        // §7.11.5 CfL reads the overhung luma samples back (spec
+        // CurrFrame is unbounded), so plane-0 out-of-buffer cells go
+        // to the [`LumaOverhang`] side store instead of being dropped.
+        let mut overhang: Vec<(u32, u32, i32)> = Vec::new();
+        for i in 0..h as u32 {
+            let dst_y = start_y + i;
+            for j in 0..w as u32 {
+                let dst_x = start_x + j;
+                if dst_y >= rows_buf || dst_x >= cols_buf {
+                    if plane == 0 {
+                        overhang.push((dst_y, dst_x, pred[(i as usize) * w + (j as usize)] as i32));
+                    }
+                    continue;
+                }
+                let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
+                buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+            }
+        }
+        for (y, x, v) in overhang {
+            if let Some(slot) = self.luma_overhang_slot(y, x) {
+                *slot = v;
+            }
+        }
+    }
+
+    /// r417 — buffer-parameterised §7.11.2 intra prediction for the
+    /// encoder's search scratch: the §5.11.33 `IsInterIntra` arm runs
+    /// `predict_intra` into `CurrFrame[ plane ]` BEFORE
+    /// `predict_inter` reads it back as the §7.11.3.14 blend's
+    /// `pred1`, and the encoder-side search must realise the SAME
+    /// §7.11.2 prediction into its own scratch planes before invoking
+    /// the shared inter-intra leaf driver. Runs the exact
+    /// [`Self::predict_intra_into_curr_frame`] core
+    /// ([`Self::intra_predict_block_samples`] — one code path, no
+    /// re-derivation), reading neighbour samples through `neigh`
+    /// (absolute per-plane sample coordinates, pre-clamped by the core
+    /// to `(max_y, max_x)`) and writing the `w × h` prediction into
+    /// `out` (row-major at `out_stride`). Writes past `(max_y, max_x)`
+    /// are dropped silently — the encoder's leaves are §5.11.4
+    /// fully-inside blocks, so nothing overhangs (the walker's
+    /// [`LumaOverhang`] side store has no encoder-search counterpart).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_intra_into_u16_plane(
+        neigh: &dyn Fn(u32, u32) -> u16,
+        out: &mut [u16],
+        out_stride: usize,
+        max_x: u32,
+        max_y: u32,
+        start_x: u32,
+        start_y: u32,
+        tx_sz: usize,
+        mode: usize,
+        angle_delta: i32,
+        bit_depth: u8,
+        have_above: bool,
+        have_left: bool,
+        have_above_right: bool,
+        have_below_left: bool,
+        enable_intra_edge_filter: bool,
+        filter_type: u8,
+        filter_intra_mode: Option<usize>,
+    ) {
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        let Some(pred) = Self::intra_predict_block_samples(
+            neigh,
+            max_x,
+            max_y,
+            start_x,
+            start_y,
+            tx_sz,
+            mode,
+            angle_delta,
+            bit_depth,
+            have_above,
+            have_left,
+            have_above_right,
+            have_below_left,
+            enable_intra_edge_filter,
+            filter_type,
+            filter_intra_mode,
+        ) else {
+            return;
+        };
+        for i in 0..h as u32 {
+            let dst_y = start_y + i;
+            if dst_y > max_y {
+                continue;
+            }
+            for j in 0..w as u32 {
+                let dst_x = start_x + j;
+                if dst_x > max_x {
+                    continue;
+                }
+                let idx = (dst_y as usize) * out_stride + (dst_x as usize);
+                if let Some(slot) = out.get_mut(idx) {
+                    *slot = pred[(i as usize) * w + (j as usize)];
+                }
+            }
+        }
+    }
+
+    /// §7.11.2 block-prediction core shared by
+    /// [`Self::predict_intra_into_curr_frame`] (the §5.11.35 decode
+    /// walk, reading / writing the walker's own `CurrFrame[ plane ]`)
+    /// and [`Self::predict_intra_into_u16_plane`] (the r417
+    /// buffer-parameterised encoder-search variant): derive the
+    /// §7.11.2.1 `AboveRow[ ]` / `LeftCol[ ]` neighbour arrays through
+    /// `read` (absolute per-plane sample coordinates, clamped here to
+    /// `(max_y, max_x)`), run the §7.11.2.4 step-4 directional
+    /// pre-pass when it applies, and dispatch the §7.11.2.{2,3,4,5,6}
+    /// kernels. Returns the `w × h` row-major prediction, or `None`
+    /// on an out-of-domain configuration (the callers' silent-return
+    /// arm).
+    #[allow(clippy::too_many_arguments)]
+    fn intra_predict_block_samples(
+        read: &dyn Fn(u32, u32) -> u16,
+        max_x: u32,
+        max_y: u32,
+        start_x: u32,
+        start_y: u32,
+        tx_sz: usize,
+        mode: usize,
+        angle_delta: i32,
+        bit_depth: u8,
+        have_above: bool,
+        have_left: bool,
+        have_above_right: bool,
+        have_below_left: bool,
+        enable_intra_edge_filter: bool,
+        filter_type: u8,
+        filter_intra_mode: Option<usize>,
+    ) -> Option<Vec<u16>> {
+        if mode >= INTRA_MODES {
+            return None;
+        }
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        if w == 0 || h == 0 || w > 64 || h > 64 {
+            return None;
+        }
+        let log2_w = w.trailing_zeros();
+        let log2_h = h.trailing_zeros();
+
         // §7.11.2.1 availability (`haveAbove` / `haveLeft`) is supplied
         // by the §5.11.35 caller as `(AvailU/AvailUChroma) || y > 0` /
         // `(AvailL/AvailLChroma) || x > 0`; `haveAboveRight` /
@@ -16835,12 +17011,7 @@ impl PartitionWalker {
         let have_above = have_above && start_y > 0;
         let have_left = have_left && start_x > 0;
 
-        let read = |yy: u32, xx: u32| -> u16 {
-            let cy = yy.min(max_y);
-            let cx = xx.min(max_x);
-            let idx = (cy as usize) * (buf_cols as usize) + (cx as usize);
-            buf.samples[idx] as u16
-        };
+        let read = |yy: u32, xx: u32| -> u16 { read(yy.min(max_y), xx.min(max_x)) };
 
         let half = 1u16 << (bit_depth - 1);
         // §7.11.2.1 `AboveRow[ -1 ]` corner (offset `1` in the
@@ -16980,7 +17151,7 @@ impl PartitionWalker {
         // `Block_Width[MiSize] <= 32 && Block_Height[MiSize] <= 32`
         // reader constraint, so `w`/`h` are always within the
         // `[4, 32]` recursive-kernel domain (`w >= 4 && h >= 2`).
-        let ok = if let Some(fim) = filter_intra_mode.filter(|_| plane == 0) {
+        let ok = if let Some(fim) = filter_intra_mode {
             predict_intra_recursive(w, h, fim, bit_depth, &above_ext, &left_ext, &mut pred).is_ok()
         } else {
             match mode {
@@ -17036,38 +17207,9 @@ impl PartitionWalker {
             }
         };
         if !ok {
-            return;
+            return None;
         }
-
-        let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
-            return;
-        };
-        let cols_buf = buf.cols;
-        let rows_buf = buf.rows;
-        // r408: a §5.11.35 TU legally overhangs the mi-padded grid;
-        // §7.11.5 CfL reads the overhung luma samples back (spec
-        // CurrFrame is unbounded), so plane-0 out-of-buffer cells go
-        // to the [`LumaOverhang`] side store instead of being dropped.
-        let mut overhang: Vec<(u32, u32, i32)> = Vec::new();
-        for i in 0..h as u32 {
-            let dst_y = start_y + i;
-            for j in 0..w as u32 {
-                let dst_x = start_x + j;
-                if dst_y >= rows_buf || dst_x >= cols_buf {
-                    if plane == 0 {
-                        overhang.push((dst_y, dst_x, pred[(i as usize) * w + (j as usize)] as i32));
-                    }
-                    continue;
-                }
-                let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
-            }
-        }
-        for (y, x, v) in overhang {
-            if let Some(slot) = self.luma_overhang_slot(y, x) {
-                *slot = v;
-            }
-        }
+        Some(pred)
     }
 
     /// §7.11.5 predict-chroma-from-luma process (av1-spec p.287) — the
@@ -59985,6 +60127,84 @@ mod tests {
                     (10 * (i + 1)) as i32,
                     "H_PRED row copy at row {i} col {j}",
                 );
+            }
+        }
+    }
+
+    /// r417 — the buffer-parameterised §7.11.2 variant
+    /// ([`PartitionWalker::predict_intra_into_u16_plane`]) is
+    /// sample-exact against the walker's own
+    /// `predict_intra_into_curr_frame` on identical neighbour content
+    /// (the two share the `intra_predict_block_samples` core; this
+    /// pins the wrapper plumbing — neighbour reads, extent clamps,
+    /// output placement) across the non-CfL §6.10.x modes, the
+    /// §7.11.2.4 directional pre-pass (non-zero angle deltas), and
+    /// the §7.11.2.3 filter-intra arm, over square and both
+    /// rectangular TX orientations.
+    #[test]
+    fn r417_u16_plane_intra_variant_matches_walker() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        // 8x8 mi = 32x32 samples per plane; deterministic texture.
+        let fill = |y: usize, x: usize| -> u16 {
+            ((y * 37 + x * 11 + (y / 3) * (x / 5) + 7) % 251) as u16
+        };
+        let cases: [(usize, i32, Option<usize>); 16] = [
+            (DC_PRED, 0, None),
+            (V_PRED, 0, None),
+            (H_PRED, 0, None),
+            (V_PRED, 2, None),
+            (H_PRED, -1, None),
+            (D45_PRED, 0, None),
+            (D135_PRED, 1, None),
+            (D113_PRED, -2, None),
+            (D157_PRED, 0, None),
+            (D203_PRED, 3, None),
+            (D67_PRED, 0, None),
+            (SMOOTH_PRED, 0, None),
+            (SMOOTH_V_PRED, 0, None),
+            (SMOOTH_H_PRED, 0, None),
+            (PAETH_PRED, 0, None),
+            (DC_PRED, 0, Some(2)),
+        ];
+        for (mode, delta, fim) in cases {
+            for (tx_sz, sx, sy) in [(TX_8X8, 8u32, 8u32), (TX_16X8, 8, 16), (TX_4X16, 12, 4)] {
+                let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+                walker.ensure_curr_frame_plane(0, 32, 32);
+                {
+                    let buf = walker.curr_frame[0].as_mut().unwrap();
+                    for y in 0..32usize {
+                        for x in 0..32usize {
+                            buf.samples[y * 32 + x] = i32::from(fill(y, x));
+                        }
+                    }
+                }
+                walker.predict_intra_into_curr_frame(
+                    0, sx, sy, tx_sz, mode, delta, 8, 0, 0, true, true, true, false, true, 1, fim,
+                );
+                let walked: Vec<i32> = walker.curr_frame(0).unwrap().to_vec();
+
+                let mut out = vec![0u16; 32 * 32];
+                let neigh = |y: u32, x: u32| -> u16 { fill(y as usize, x as usize) };
+                PartitionWalker::predict_intra_into_u16_plane(
+                    &neigh, &mut out, 32, 31, 31, sx, sy, tx_sz, mode, delta, 8, true, true, true,
+                    false, true, 1, fim,
+                );
+                let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
+                for i in 0..h {
+                    for j in 0..w {
+                        let idx = (sy as usize + i) * 32 + sx as usize + j;
+                        assert_eq!(
+                            i64::from(out[idx]),
+                            i64::from(walked[idx]),
+                            "mode {mode} delta {delta} fim {fim:?} tx {tx_sz} at ({i}, {j})"
+                        );
+                    }
+                }
             }
         }
     }

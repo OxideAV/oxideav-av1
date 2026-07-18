@@ -181,6 +181,28 @@ impl CompoundSel {
     };
 }
 
+/// r417 — one §5.11.28 inter-intra selection for
+/// [`PSearchCtx::predict_leaf`]: the §7.11.5-translated intra half is
+/// predicted into the search scratch (reading reconstructed
+/// neighbours from `neigh` through the decode walker's own §7.11.2
+/// core), then the decoder's §7.11.3.14 mask blend combines it with
+/// the single-reference inter prediction.
+#[derive(Clone, Copy)]
+struct InterIntraTrial<'a> {
+    /// §6.10.27 `interintra_mode` ordinal
+    /// (`II_DC_PRED..=II_SMOOTH_PRED`).
+    mode: u8,
+    /// `Some(wedge_index)` selects the `wedge_interintra == 1` sub-arm
+    /// (§7.11.3.11 luma-grid wedge mask, sign fixed `0` per §5.11.28);
+    /// `None` the §7.11.3.13 smooth intra-variant mask.
+    wedge: Option<u8>,
+    /// The committed running reconstruction — the §7.11.2 neighbour
+    /// source (the decode walker's intra half reads its own
+    /// `CurrFrame[ plane ]`, whose encoder twin is this recon state,
+    /// sample-exact by the module's induction argument).
+    neigh: &'a ReconState,
+}
+
 /// Lossless (`base_q_idx = 0`) GOP encode — see
 /// [`encode_gop_yuv420_with_q`].
 pub fn encode_gop_yuv420(frames: &[Yuv420Frame]) -> Result<EncodedGop, Error> {
@@ -959,6 +981,15 @@ struct PSearchCtx {
     wedge_indices: Vec<u8>,
     wedge_signs: Vec<u8>,
     mask_types: Vec<u8>,
+    /// r417 — the §5.11.28 inter-intra side-data grids the decoder's
+    /// leaf driver reads at an inter-intra origin (`RefFrames[.. ][1]
+    /// == INTRA_FRAME`): decoded-twin `InterIntraModes[]` /
+    /// `WedgeInterIntras[]` / interintra `WedgeIndices[]` (all-zero
+    /// pre-fill; [`Self::predict_leaf`] stamps each trial's committed
+    /// selection over its footprint).
+    interintra_modes: Vec<u8>,
+    wedge_interintras: Vec<u8>,
+    interintra_wedge_indices: Vec<u8>,
     /// All-zero §7.11.3.8 per-cell warp-fit slice (never read on the
     /// all-SIMPLE configuration; sized per the [`crate::GridWarpContext`]
     /// contract).
@@ -1110,6 +1141,9 @@ impl PSearchCtx {
             wedge_indices: vec![0u8; cells],
             wedge_signs: vec![0u8; cells],
             mask_types: vec![0u8; cells],
+            interintra_modes: vec![0u8; cells],
+            wedge_interintras: vec![0u8; cells],
+            interintra_wedge_indices: vec![0u8; cells],
             local_warp: vec![0i32; cells * 6],
             scratch: [
                 vec![0u16; width * height],
@@ -1363,6 +1397,16 @@ impl PSearchCtx {
     /// Stamp the leaf's §5.11.5 grid footprint (the same values the
     /// write mirror / decode walker stamp), then run the decoder's
     /// §5.11.33 leaf driver into the scratch planes.
+    ///
+    /// r417 — `ii: Some(_)` selects the §5.11.28 inter-intra arm: the
+    /// stamps mirror the decode walker's §5.11.28 imperative override
+    /// (`RefFrame[ 1 ] = INTRA_FRAME`, the §5.11.29 bit-silent
+    /// `compound_type` derivation, the inter-intra side-data grids),
+    /// the §7.11.5-translated intra half is predicted into the
+    /// scratch planes FIRST (the §5.11.33 order: `predict_intra`
+    /// before `predict_inter`), and the leaf driver's §7.11.3.14
+    /// blend consumes it in place. `ref_frame[ 1 ]` must be `-1`
+    /// (the §5.11.28 gate requires a single-reference leaf).
     #[allow(clippy::too_many_arguments)]
     fn predict_leaf(
         &mut self,
@@ -1374,9 +1418,27 @@ impl PSearchCtx {
         mv: [[i32; 2]; 2],
         filter: u8,
         comp: CompoundSel,
+        ii: Option<InterIntraTrial<'_>>,
     ) -> Result<(), Error> {
+        if ii.is_some() && ref_frame[1] != -1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
         let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        // §5.11.28 imperative overrides the decode walker stamps on
+        // the `interintra == 1` arm: `RefFrame[ 1 ] = INTRA_FRAME`
+        // plus the §5.11.29 bit-silent `compound_type` derivation
+        // (`wedge_interintra ? COMPOUND_WEDGE : COMPOUND_INTRA`).
+        let stamp_rf1: i8 = if ii.is_some() {
+            crate::uncompressed_header_tail::INTRA_FRAME as i8
+        } else {
+            ref_frame[1]
+        };
+        let stamp_ctype: u8 = match &ii {
+            Some(t) if t.wedge.is_some() => crate::inter_pred::COMPOUND_WEDGE,
+            Some(_) => crate::inter_pred::COMPOUND_INTRA,
+            None => comp.ctype,
+        };
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -1391,7 +1453,7 @@ impl PSearchCtx {
                 self.mi_sizes[cell] = b_size;
                 self.is_inters[cell] = 1;
                 self.ref_frames[cell * 2] = ref_frame[0];
-                self.ref_frames[cell * 2 + 1] = ref_frame[1];
+                self.ref_frames[cell * 2 + 1] = stamp_rf1;
                 self.mvs[cell * 4] = mv[0][0] as i16;
                 self.mvs[cell * 4 + 1] = mv[0][1] as i16;
                 self.mvs[cell * 4 + 2] = mv[1][0] as i16;
@@ -1402,10 +1464,92 @@ impl PSearchCtx {
                 self.y_modes[cell] = y_mode;
                 // r415 — §5.11.29 side-data stamps (the decoder's leaf
                 // driver dispatches WEDGE / DIFFWTD masks from these).
-                self.compound_types[cell] = comp.ctype;
+                self.compound_types[cell] = stamp_ctype;
                 self.wedge_indices[cell] = comp.wedge_index;
                 self.wedge_signs[cell] = comp.wedge_sign;
                 self.mask_types[cell] = comp.mask_type;
+                // r417 — §5.11.28 inter-intra side-data stamps (the
+                // decode-walker grid-fill twins; all-zero outside the
+                // inter-intra arm).
+                self.interintra_modes[cell] = ii.as_ref().map_or(0, |t| t.mode);
+                self.wedge_interintras[cell] =
+                    u8::from(ii.as_ref().is_some_and(|t| t.wedge.is_some()));
+                self.interintra_wedge_indices[cell] =
+                    ii.as_ref().and_then(|t| t.wedge).unwrap_or(0);
+            }
+        }
+
+        // r417 — §5.11.33 `IsInterIntra` arm, intra half FIRST: run
+        // the §7.11.5-translated `predict_intra` into the scratch
+        // planes over the whole per-plane block region (av1-spec
+        // §5.11.33 line 5146: one call at `(baseX, baseY, log2W,
+        // log2H)`), reading reconstructed neighbours from the
+        // committed recon — the decode walker's `CurrFrame[ plane ]`
+        // twin. The §7.11.3.14 blend below reads it back as `pred1`.
+        if let Some(t) = &ii {
+            // §5.11.33 `interintra_mode → mode` translation
+            // (av1-spec p.82 lines 5142-5145).
+            let mode = match t.mode {
+                crate::cdf::II_V_PRED => crate::cdf::V_PRED,
+                crate::cdf::II_H_PRED => crate::cdf::H_PRED,
+                crate::cdf::II_DC_PRED => crate::cdf::DC_PRED,
+                _ => crate::cdf::SMOOTH_PRED,
+            };
+            // Single-tile §5.11.5 availability: `AvailU = MiRow >
+            // MiRowStart`, `AvailL = MiCol > MiColStart`; the chroma
+            // pair equals the luma pair on every §5.11.28-eligible
+            // block (`bw4 >= 2 && bh4 >= 2` skips the §5.11.5 sub-8
+            // chroma fix-ups).
+            let avail_u = mi_row > 0;
+            let avail_l = mi_col > 0;
+            for plane in 0..3usize {
+                let (sub_x, sub_y): (u8, u8) = if plane > 0 { (1, 1) } else { (0, 0) };
+                let plane_sz =
+                    crate::cdf::get_plane_residual_size(b_size, plane as u8, sub_x, sub_y)
+                        .ok_or(Error::PartitionWalkOutOfRange)?;
+                let w = NUM_4X4_BLOCKS_WIDE[plane_sz] * 4;
+                let h = NUM_4X4_BLOCKS_HIGH[plane_sz] * 4;
+                let tx_sz = crate::cdf::find_tx_size(w, h).ok_or(Error::PartitionWalkOutOfRange)?;
+                let base_x = ((mi_col >> sub_x) * 4) as usize;
+                let base_y = ((mi_row >> sub_y) * 4) as usize;
+                // §5.11.33 `BlockDecoded[ ]` above-right / below-left
+                // reads against the encoder's own §5.11.3 mirror.
+                // Provably inert for the four §6.10.27 II modes (DC /
+                // V@0 / H@0 / SMOOTH never read the extended
+                // neighbour segments), threaded for §7.11.2 fidelity.
+                let (have_ar, have_bl) =
+                    super::key_frame::tu_corner_avail(&t.neigh.bd, plane, base_x, base_y, w, h);
+                let (buf, pw, ph) = t.neigh.plane(plane);
+                let read = |yy: u32, xx: u32| -> u16 {
+                    u16::from(buf[(yy as usize) * pw + (xx as usize)])
+                };
+                let out = &mut self.scratch[plane];
+                // §7.11.2.4 step-4 pre-pass inputs: inert on the II
+                // mode set (no directional D-mode reachable — V/H ride
+                // the exact-90°/180° copies at `angle_delta == 0`), so
+                // the neutral pair matches the decode walker's output
+                // sample-for-sample regardless of the sequence's
+                // `enable_intra_edge_filter`.
+                PartitionWalker::predict_intra_into_u16_plane(
+                    &read,
+                    out,
+                    pw,
+                    (pw - 1) as u32,
+                    (ph - 1) as u32,
+                    base_x as u32,
+                    base_y as u32,
+                    tx_sz,
+                    mode,
+                    /* angle_delta = */ 0,
+                    /* bit_depth = */ 8,
+                    avail_u,
+                    avail_l,
+                    have_ar,
+                    have_bl,
+                    /* enable_intra_edge_filter = */ false,
+                    /* filter_type = */ 0,
+                    /* filter_intra_mode = */ None,
+                );
             }
         }
 
@@ -1422,6 +1566,9 @@ impl PSearchCtx {
             wedge_indices,
             wedge_signs,
             mask_types,
+            interintra_modes,
+            wedge_interintras,
+            interintra_wedge_indices,
             mi_sizes,
             is_inters,
             ref_frames,
@@ -1481,9 +1628,9 @@ impl PSearchCtx {
             wedge_indices,
             wedge_signs,
             mask_types,
-            interintra_modes: zeros,
-            wedge_interintras: zeros,
-            interintra_wedge_indices: zeros,
+            interintra_modes,
+            wedge_interintras,
+            interintra_wedge_indices,
             order_hint_bits: *hint_bits,
             current_order_hint: *current_hint,
             order_hints_by_ref: ref_hints,
@@ -1664,6 +1811,7 @@ fn refine_mv_subpel(
             [mv, [0, 0]],
             EIGHTTAP,
             CompoundSel::AVERAGE,
+            None,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -1752,6 +1900,7 @@ fn encode_inter_leaf(
         sm_mv,
         EIGHTTAP,
         CompoundSel::AVERAGE,
+        None,
     )?;
     let (bw, bh) = (bw4 * 4, bh4 * 4);
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
@@ -1820,6 +1969,7 @@ fn encode_inter_leaf(
                 wedge_sign: ib.wedge_sign,
                 mask_type: ib.mask_type,
             },
+            None,
         )?;
     }
     Ok(leaf)
@@ -2064,6 +2214,7 @@ fn encode_inter_leaf_modes(
             cand.mv,
             EIGHTTAP,
             CompoundSel::AVERAGE,
+            None,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -2124,7 +2275,7 @@ fn encode_inter_leaf_modes(
                 ));
             }
             for (sel, extra) in trials {
-                ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel)?;
+                ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel, None)?;
                 let mut ssd = 0u64;
                 for i in 0..bh {
                     for j in 0..bw {
@@ -2161,7 +2312,7 @@ fn encode_inter_leaf_modes(
                 wedge_sign: 0,
                 mask_type: 0,
             };
-            ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel)?;
+            ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel, None)?;
             let mut ssd = 0u64;
             for i in 0..bh {
                 for j in 0..bw {
@@ -2203,7 +2354,7 @@ fn encode_inter_leaf_modes(
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
         let mut best_f = (u64::MAX, EIGHTTAP);
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f, comp)?;
+            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f, comp, None)?;
             let mut ssd = 0u64;
             for i in 0..bh {
                 for j in 0..bw {
@@ -2218,7 +2369,9 @@ fn encode_inter_leaf_modes(
         }
         best_f.1
     };
-    ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter, comp)?;
+    ictx.predict_leaf(
+        mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter, comp, None,
+    )?;
 
     // r413 — per-leaf segment (deterministic activity policy) and its
     // quantiser; a leaf that quantises to all-zero commits `skip = 1`
@@ -3196,6 +3349,7 @@ mod tests {
                     [[0, 4], [0, 0]],
                     EIGHTTAP_SHARP,
                     CompoundSel::AVERAGE,
+                    None,
                 )
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
@@ -4055,6 +4209,7 @@ mod tests {
                 [[0, 4], [0, 0]],
                 f,
                 CompoundSel::AVERAGE,
+                None,
             )
             .unwrap();
             let mut v = Vec::new();
@@ -4073,6 +4228,148 @@ mod tests {
             outs[0], outs[2],
             "EIGHTTAP vs SHARP must differ at half-pel"
         );
+    }
+
+    /// r417 — `predict_leaf` with an [`InterIntraTrial`] realises the
+    /// §5.11.33 `IsInterIntra` arm in the search scratch: the
+    /// §7.11.5-translated intra half (predicted from the committed
+    /// recon's neighbours through the decode walker's §7.11.2 core)
+    /// blends with the inter prediction through the decoder's own
+    /// §7.11.3.14 driver, on luma AND chroma, and the §5.11.5 grid
+    /// stamps mirror the decode walker's §5.11.28 imperative
+    /// overrides (`RefFrame[ 1 ] = INTRA_FRAME`, the bit-silent
+    /// §5.11.29 `compound_type` derivation, the inter-intra side-data
+    /// grids).
+    #[test]
+    fn r417_predict_leaf_inter_intra_blends_intra_half() {
+        // Reference: flat luma 100, flat chroma 128 ⇒ the zero-MV
+        // inter half is flat.
+        let refr = GopFrameRecon {
+            y: vec![100u8; 64 * 64],
+            u: vec![128u8; 32 * 32],
+            v: vec![128u8; 32 * 32],
+        };
+        // Committed recon (the §7.11.2 neighbour source): flat luma
+        // 200, flat chroma 60 ⇒ the II_V_PRED intra half is flat 200
+        // (luma) / 60 (chroma) over the block.
+        let mut recon = fresh_recon(64, 64, 60);
+        recon.y.fill(200);
+        recon.u.fill(60);
+        recon.v.fill(60);
+        let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+        let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1, 60, &[]).unwrap();
+
+        // Smooth (non-wedge) inter-intra trial at mi (2, 2), 8x8.
+        ictx.predict_leaf(
+            2,
+            2,
+            BLOCK_8X8,
+            [1, -1],
+            MODE_NEWMV,
+            [[0, 0], [0, 0]],
+            EIGHTTAP,
+            CompoundSel::AVERAGE,
+            Some(InterIntraTrial {
+                mode: crate::cdf::II_V_PRED,
+                wedge: None,
+                neigh: &recon,
+            }),
+        )
+        .unwrap();
+        let mut smooth_luma = Vec::new();
+        for i in 8..16usize {
+            for j in 8..16usize {
+                let v = ictx.scratch[0][i * 64 + j];
+                assert!(
+                    (100..=200).contains(&v),
+                    "blend out of the [inter, intra] envelope at ({i}, {j}): {v}"
+                );
+                smooth_luma.push(v);
+            }
+        }
+        assert!(
+            smooth_luma.iter().any(|&v| v > 100),
+            "intra half must contribute to the luma blend"
+        );
+        assert_ne!(
+            &smooth_luma[0..8],
+            &smooth_luma[56..64],
+            "the §7.11.3.14 smooth II mask varies down the block"
+        );
+        // Chroma blends too (inter 128 vs intra 60).
+        let cu = ictx.scratch[1][4 * 32 + 4];
+        assert!(
+            (60..128).contains(&cu),
+            "chroma blend must pull toward the intra half: {cu}"
+        );
+        // §5.11.5 grid stamps at the origin cell.
+        let cell = 2 * 16 + 2;
+        assert_eq!(
+            ictx.ref_frames[cell * 2 + 1],
+            0,
+            "RefFrame[1] = INTRA_FRAME"
+        );
+        assert_eq!(ictx.interintra_modes[cell], crate::cdf::II_V_PRED);
+        assert_eq!(ictx.wedge_interintras[cell], 0);
+        assert_eq!(
+            ictx.compound_types[cell],
+            crate::inter_pred::COMPOUND_INTRA,
+            "§5.11.29 bit-silent derivation on the non-wedge arm"
+        );
+
+        // Wedge sub-arm: a different §7.11.3.11 mask ⇒ different blend.
+        ictx.predict_leaf(
+            2,
+            2,
+            BLOCK_8X8,
+            [1, -1],
+            MODE_NEWMV,
+            [[0, 0], [0, 0]],
+            EIGHTTAP,
+            CompoundSel::AVERAGE,
+            Some(InterIntraTrial {
+                mode: crate::cdf::II_V_PRED,
+                wedge: Some(7),
+                neigh: &recon,
+            }),
+        )
+        .unwrap();
+        let mut wedge_luma = Vec::new();
+        for i in 8..16usize {
+            for j in 8..16usize {
+                wedge_luma.push(ictx.scratch[0][i * 64 + j]);
+            }
+        }
+        assert_ne!(smooth_luma, wedge_luma, "wedge mask differs from smooth");
+        assert_eq!(ictx.wedge_interintras[cell], 1);
+        assert_eq!(ictx.interintra_wedge_indices[cell], 7);
+        assert_eq!(ictx.compound_types[cell], crate::inter_pred::COMPOUND_WEDGE);
+
+        // A subsequent plain trial restores the non-inter-intra stamps.
+        ictx.predict_leaf(
+            2,
+            2,
+            BLOCK_8X8,
+            [1, -1],
+            MODE_NEWMV,
+            [[0, 0], [0, 0]],
+            EIGHTTAP,
+            CompoundSel::AVERAGE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ictx.ref_frames[cell * 2 + 1], -1);
+        assert_eq!(ictx.wedge_interintras[cell], 0);
+        assert_eq!(ictx.interintra_modes[cell], 0);
+        for i in 8..16usize {
+            for j in 8..16usize {
+                assert_eq!(
+                    ictx.scratch[0][i * 64 + j],
+                    100,
+                    "plain zero-MV inter pred is the flat reference"
+                );
+            }
+        }
     }
 
     /// r412 — the driver mirror must agree with the WRITE mirror leaf
@@ -4332,6 +4629,7 @@ mod tests {
                         [[0, 0], [0, 0]],
                         EIGHTTAP,
                         sel,
+                        None,
                     )
                     .unwrap();
             }
@@ -4473,6 +4771,7 @@ mod tests {
                         [[0, 0], [0, 0]],
                         EIGHTTAP,
                         sel,
+                        None,
                     )
                     .unwrap();
             }
