@@ -234,6 +234,17 @@ fn pyramid_lossy_blend_round_trips() {
     assert_pyramid_round_trip(&frames, 60);
 }
 
+/// r417 — vertically-correlated fade over moving texture (the
+/// inter-intra-stressing sweep kind) round-trips at three quantisers
+/// through two full mini-GOPs.
+#[test]
+fn pyramid_iifade_content_round_trips() {
+    for q in [0u8, 60, 160] {
+        let frames = build_content("iifade", 64, 64, 5, 11);
+        assert_pyramid_round_trip(&frames, q);
+    }
+}
+
 /// Env-gated external-validation dump: when `OXIDEAV_AV1_SWEEP_DIR`
 /// is set, encode the full config matrix and write each stream's IVF
 /// plus the encoder reconstruction as concatenated yuv420p
@@ -251,8 +262,10 @@ fn pyramid_external_sweep_dump() {
     // r416: "fine" (per-4x4-cell checkerboard motion — drives the
     // sub-8x8 SPLIT leaves) and "bands" (4-row alternating shifts —
     // drives the 16x4 / 8x4 strip alphabet) join the rotation.
+    // r417: "iifade" (vertically-correlated fade over moving texture
+    // — drives the §5.11.28 inter-intra blends) joins the rotation.
     let contents = [
-        "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands",
+        "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands", "iifade",
     ];
     let lengths = [2usize, 3, 4, 5, 7, 9];
     let mut count = 0u32;
@@ -368,6 +381,38 @@ fn build_content(kind: &str, w: u32, h: u32, n: usize, seed: u32) -> Vec<Yuv420F
                         for j in 0..wu / 2 {
                             f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 64;
                             f.v[i * (wu / 2) + j] = tex(i + 3, j + 5, seed) / 2 + 32;
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+        "iifade" => {
+            // r417 — a strong vertical ramp (V_PRED-friendly intra
+            // structure) mixed over a horizontally-moving texture:
+            // the inter half tracks the texture, the §7.11.2 intra
+            // half continues the vertical ramp from the above
+            // neighbours, so §5.11.28 inter-intra blends are the
+            // natural winner near block tops.
+            let tex = |i: usize, j: usize, s: u32| -> u8 {
+                ((i * 3 + j * 13 + (i / 8) * (j / 16) + s as usize) % 256) as u8
+            };
+            (0..n)
+                .map(|k| {
+                    let (wu, hu) = (w as usize, h as usize);
+                    let mut f = Yuv420Frame::filled(w, h, 0);
+                    for i in 0..hu {
+                        for j in 0..wu {
+                            let ramp = (255 - ((i * 5 + (k * 2)) % 256)) as u32;
+                            let t = u32::from(tex(i, j + 3 * k, seed));
+                            f.y[i * wu + j] = ((3 * ramp + t) / 4) as u8;
+                        }
+                    }
+                    for i in 0..hu / 2 {
+                        for j in 0..wu / 2 {
+                            let ramp = (255 - ((i * 9) % 256)) as u32;
+                            f.u[i * (wu / 2) + j] = ((ramp + 128) / 2) as u8;
+                            f.v[i * (wu / 2) + j] = ((ramp / 2 + 64) / 2 + 32) as u8;
                         }
                     }
                     f
