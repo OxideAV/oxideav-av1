@@ -656,6 +656,11 @@ pub(crate) fn encode_inter_frame_generic(
     // COMPOUND_DIFFWTD (the RD ladder trials both against the
     // AVERAGE baseline).
     ip.enable_masked_compound = seq.enable_masked_compound;
+    // r417: §5.5.2 inter-intra compound — single-reference 8x8..32x32
+    // leaves code the §5.11.28 cascade and may commit smooth / wedge
+    // inter-intra blends (the RD ladder trials all four II modes and
+    // the 16 wedge masks against the plain leaf).
+    ip.enable_interintra_compound = seq.enable_interintra_compound;
     // r416: §5.5.2 jnt-comp — compound leaves code the §5.11.29
     // `compound_idx` S() and may commit COMPOUND_DISTANCE (the RD
     // ladder trials the §7.11.3.15 distance-weighted blend against
@@ -1983,6 +1988,24 @@ fn encode_inter_leaf(
     // the scratch planes, never the recon).
     restore_region(recon, mi_r, mi_c, &after_normal);
     if let Some(ib) = leaf.inter.as_ref() {
+        // r417 — an inter-intra winner re-predicts through the same
+        // arm (its committed compound_type is the §5.11.29 bit-silent
+        // derivation, not a §5.11.29 side-data selection).
+        let ii = ib.interintra_mode.map(|m| InterIntraTrial {
+            mode: m,
+            wedge: (ib.wedge_interintra == 1).then_some(ib.interintra_wedge_index),
+            neigh: &*recon,
+        });
+        let sel = if ib.interintra_mode.is_some() {
+            CompoundSel::AVERAGE
+        } else {
+            CompoundSel {
+                ctype: ib.compound_type,
+                wedge_index: ib.wedge_index,
+                wedge_sign: ib.wedge_sign,
+                mask_type: ib.mask_type,
+            }
+        };
         ictx.predict_leaf(
             mi_r,
             mi_c,
@@ -1991,13 +2014,8 @@ fn encode_inter_leaf(
             ib.y_mode,
             ib.mv,
             ib.interp_filter[0],
-            CompoundSel {
-                ctype: ib.compound_type,
-                wedge_index: ib.wedge_index,
-                wedge_sign: ib.wedge_sign,
-                mask_type: ib.mask_type,
-            },
-            None,
+            sel,
+            ii,
         )?;
     }
     Ok(leaf)
@@ -2232,6 +2250,9 @@ fn encode_inter_leaf_modes(
     let lambda = lambda_for(&recon.qp);
     let mut best: Option<(u64, usize)> = None;
     let mut best_compound: Option<(u64, usize)> = None;
+    // r417 — the best SINGLE-reference candidate (the §5.11.28
+    // inter-intra trials blend on top of it).
+    let mut best_single: Option<(u64, usize)> = None;
     for (ci, cand) in cands.iter().enumerate() {
         ictx.predict_leaf(
             mi_r,
@@ -2258,6 +2279,9 @@ fn encode_inter_leaf_modes(
         }
         if cand.ref_frame[1] > 0 && best_compound.map_or(true, |(s, _)| score < s) {
             best_compound = Some((score, ci));
+        }
+        if cand.ref_frame[1] < 0 && best_single.map_or(true, |(s, _)| score < s) {
+            best_single = Some((score, ci));
         }
     }
     let (mut best_score, mut best_ci) = best.ok_or(Error::PartitionWalkOutOfRange)?;
@@ -2357,6 +2381,99 @@ fn encode_inter_leaf_modes(
             }
         }
     }
+
+    // r417 — §5.11.28 inter-intra trials on the best single-reference
+    // candidate: each of the four §6.10.27 II modes through the
+    // §7.11.3.13 smooth intra-variant mask (the intra half predicted
+    // from the committed recon's neighbours), then — where
+    // `Wedge_Bits[ MiSize ] > 0` — the 16 §7.11.3.11 wedge masks at
+    // the best smooth mode, every trial through the decoder's own
+    // §7.11.3.14 blend driver and scored `D + λ·(rate + §5.11.28
+    // bits)` against the running best (which keeps the plain leaf
+    // when the blends lose).
+    let mut ii_sel: Option<(u8, Option<u8>)> = None;
+    if ictx.ip.enable_interintra_compound
+        && (crate::cdf::BLOCK_8X8..=crate::cdf::BLOCK_32X32).contains(&b_size)
+    {
+        if let Some((_, sci)) = best_single {
+            let (s_ref, s_mode, s_mv, s_rate) = {
+                let c = &cands[sci];
+                (c.ref_frame, c.y_mode, c.mv, c.rate)
+            };
+            let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
+                let mut ssd = 0u64;
+                for i in 0..bh {
+                    for j in 0..bw {
+                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                        ssd += (d * d) as u64;
+                    }
+                }
+                ssd
+            };
+            // Stage 1 — the four smooth-mask II modes
+            // (`interintra` S() + `interintra_mode` S() +
+            // `wedge_interintra` S() ≈ 4 rate-proxy bits).
+            let mut stage: Option<(u64, u8)> = None;
+            for m in 0..crate::cdf::INTERINTRA_MODES as u8 {
+                ictx.predict_leaf(
+                    mi_r,
+                    mi_c,
+                    b_size,
+                    s_ref,
+                    s_mode,
+                    s_mv,
+                    EIGHTTAP,
+                    CompoundSel::AVERAGE,
+                    Some(InterIntraTrial {
+                        mode: m,
+                        wedge: None,
+                        neigh: &*recon,
+                    }),
+                )?;
+                let ssd = leaf_ssd(ictx);
+                if stage.map_or(true, |(s, _)| ssd < s) {
+                    stage = Some((ssd, m));
+                }
+                let score = ssd + lambda * (s_rate + 4);
+                if score < best_score {
+                    best_score = score;
+                    best_ci = sci;
+                    comp = CompoundSel::AVERAGE;
+                    ii_sel = Some((m, None));
+                }
+            }
+            // Stage 2 — the 16 wedge masks at the stage-1 distortion
+            // winner (+ `wedge_index` S() ≈ 4 more bits).
+            if crate::cdf::wedge_bits(b_size) > 0 {
+                let (_, base_mode) = stage.expect("stage 1 ran");
+                for wi in 0..16u8 {
+                    ictx.predict_leaf(
+                        mi_r,
+                        mi_c,
+                        b_size,
+                        s_ref,
+                        s_mode,
+                        s_mv,
+                        EIGHTTAP,
+                        CompoundSel::AVERAGE,
+                        Some(InterIntraTrial {
+                            mode: base_mode,
+                            wedge: Some(wi),
+                            neigh: &*recon,
+                        }),
+                    )?;
+                    let score = leaf_ssd(ictx) + lambda * (s_rate + 8);
+                    if score < best_score {
+                        best_score = score;
+                        best_ci = sci;
+                        comp = CompoundSel::AVERAGE;
+                        ii_sel = Some((base_mode, Some(wi)));
+                    }
+                }
+            }
+        }
+    }
     let _ = best_score;
     let ModeCand {
         ref_frame,
@@ -2398,7 +2515,19 @@ fn encode_inter_leaf_modes(
         best_f.1
     };
     ictx.predict_leaf(
-        mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter, comp, None,
+        mi_r,
+        mi_c,
+        b_size,
+        ref_frame,
+        y_mode,
+        mv,
+        filter,
+        comp,
+        ii_sel.map(|(m, w)| InterIntraTrial {
+            mode: m,
+            wedge: w,
+            neigh: &*recon,
+        }),
     )?;
 
     // r413 — per-leaf segment (deterministic activity policy) and its
@@ -2412,7 +2541,7 @@ fn encode_inter_leaf_modes(
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            comp, 0, segment_id, &seg_qp,
+            comp, ii_sel, 0, segment_id, &seg_qp,
         );
     }
 
@@ -2448,7 +2577,7 @@ fn encode_inter_leaf_modes(
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            comp, depth, segment_id, &seg_qp,
+            comp, ii_sel, depth, segment_id, &seg_qp,
         )?;
         let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -2629,6 +2758,10 @@ fn encode_inter_leaf_residual(
     ref_mv_idx: u32,
     filter: u8,
     comp: CompoundSel,
+    // r417 — the committed §5.11.28 selection: `Some((mode, wedge))`
+    // rides a single-reference leaf whose scratch prediction the
+    // caller already ran through the inter-intra arm.
+    ii: Option<(u8, Option<u8>)>,
     depth: u32,
     segment_id: u8,
     seg_qp: &QuantizerParams,
@@ -2855,13 +2988,19 @@ fn encode_inter_leaf_residual(
         ref_mv_idx,
         interp_filter: [filter; 2],
         skip_mode: 0,
-        compound_type: comp.ctype,
+        // r417 — inter-intra leaves commit the §5.11.29 bit-silent
+        // derivation (the write pass validates the exact value).
+        compound_type: match ii {
+            Some((_, Some(_))) => crate::inter_pred::COMPOUND_WEDGE,
+            Some(_) => crate::inter_pred::COMPOUND_INTRA,
+            None => comp.ctype,
+        },
         wedge_index: comp.wedge_index,
         wedge_sign: comp.wedge_sign,
         mask_type: comp.mask_type,
-        interintra_mode: None,
-        wedge_interintra: 0,
-        interintra_wedge_index: 0,
+        interintra_mode: ii.map(|(m, _)| m),
+        wedge_interintra: u8::from(matches!(ii, Some((_, Some(_))))),
+        interintra_wedge_index: ii.and_then(|(_, w)| w).unwrap_or(0),
     });
     Ok(block)
 }
@@ -4748,6 +4887,159 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 format!("{dir}/self-gop-64x64-q60-wedge.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+        }
+    }
+
+    /// r417 — §5.11.28 inter-intra must actually be selected where
+    /// the §7.11.3.14 blend is the distortion winner: the target
+    /// frame is constructed QUADRANT BY QUADRANT as the encoder's
+    /// own smooth II_V_PRED inter-intra blend (zero-MV LAST inter
+    /// half, the intra half predicted from the running construction
+    /// recon — exactly the §5.11.33 ordering the search and the
+    /// decoder both realise), so an inter-intra leaf predicts each
+    /// quadrant near-exactly while any plain inter leaf misses the
+    /// intra-weighted region — the search tree must commit
+    /// inter-intra leaves, and a full GOP over the same construction
+    /// must round-trip byte-exact through the spec driver (proving
+    /// the coded §5.11.28 cascade + §7.11.3.14 blend end to end).
+    #[test]
+    fn r417_search_selects_inter_intra_on_blended_content() {
+        use crate::cdf::{BLOCK_32X32, II_V_PRED};
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+
+        // Target: per-32x32-quadrant smooth inter-intra blend of the
+        // LAST reconstruction and the §7.11.2 intra half, built
+        // through the real driver with the SAME incremental
+        // neighbour state the sequential search walk will hold.
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        {
+            let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+            let mut probe =
+                PSearchCtx::new(&pre.recon[1], &pre.recon[0], 16, 16, 64, 64, ip, 2, 0, &[])
+                    .unwrap();
+            let mut running = fresh_recon(64, 64, base_q_idx);
+            for (r, c) in [(0u32, 0u32), (0, 8), (8, 0), (8, 8)] {
+                probe
+                    .predict_leaf(
+                        r,
+                        c,
+                        BLOCK_32X32,
+                        [1, -1],
+                        MODE_NEARESTMV,
+                        [[0, 0], [0, 0]],
+                        EIGHTTAP,
+                        CompoundSel::AVERAGE,
+                        Some(InterIntraTrial {
+                            mode: II_V_PRED,
+                            wedge: None,
+                            neigh: &running,
+                        }),
+                    )
+                    .unwrap();
+                // Adopt the blended quadrant into the target AND the
+                // running neighbour recon (the next quadrant's intra
+                // half reads it, like the decode walk will).
+                let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+                for i in 0..32usize {
+                    for j in 0..32usize {
+                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j] as u8;
+                        target.y[(row0 + i) * 64 + col0 + j] = v;
+                        running.y[(row0 + i) * 64 + col0 + j] = v;
+                    }
+                }
+                let (cr0, cc0) = (row0 / 2, col0 / 2);
+                for i in 0..16usize {
+                    for j in 0..16usize {
+                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j] as u8;
+                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j] as u8;
+                        target.u[(cr0 + i) * 32 + cc0 + j] = u;
+                        target.v[(cr0 + i) * 32 + cc0 + j] = v;
+                        running.u[(cr0 + i) * 32 + cc0 + j] = u;
+                        running.v[(cr0 + i) * 32 + cc0 + j] = v;
+                    }
+                }
+            }
+        }
+
+        // Direct search drive (LAST = f1 recon, GOLDEN = f0 recon at
+        // p_index = 2), inter-intra compound enabled.
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_interintra_compound = true;
+        ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[1],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, ii: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, ii: &mut u32, other: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.interintra_mode.is_some() {
+                        *ii += 1;
+                    } else {
+                        *other += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, ii, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, ii, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, ii, other);
+                    }
+                }
+            }
+        }
+        let (mut ii, mut other) = (0u32, 0u32);
+        count(&tree, &mut ii, &mut other);
+        assert!(
+            ii > 0,
+            "inter-intra blend content must commit §5.11.28 leaves \
+             (got II={ii} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+        // Env-gated fixture dump for external black-box validation /
+        // corpus pinning (no-op in normal runs).
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_INTERINTRA_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                format!("{dir}/self-gop-64x64-q60-interintra.ivf"),
                 &enc.ivf_bytes,
             )
             .unwrap();

@@ -304,7 +304,11 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         use_128x128_superblock: false,
         enable_filter_intra: false,
         enable_intra_edge_filter: false,
-        enable_interintra_compound: false,
+        // r417: inter-intra compound rides every stream this builder
+        // seeds — single-reference 8x8..32x32 inter leaves code the
+        // §5.11.28 cascade and may select smooth / wedge inter-intra
+        // blends (intra-only frames are unaffected).
+        enable_interintra_compound: true,
         // r415: masked compound rides every stream this builder seeds
         // — inter GOP compound leaves code the §5.11.29
         // `comp_group_idx` cascade and may select COMPOUND_WEDGE /
