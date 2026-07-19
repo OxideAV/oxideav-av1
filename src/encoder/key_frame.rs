@@ -1423,29 +1423,51 @@ fn palette_candidate_y(
     if row0 + n > recon.height || col0 + n > recon.width {
         return None;
     }
-    let mut seen = [false; 256];
+    let mut hist = [0u32; 256];
     let mut distinct = 0usize;
     for i in 0..n {
         let row = &input.y[(row0 + i) * recon.width + col0..][..n];
         for &v in row {
-            if !seen[v as usize] {
-                seen[v as usize] = true;
+            if hist[v as usize] == 0 {
                 distinct += 1;
-                if distinct > PALETTE_COLORS {
-                    return None;
-                }
             }
+            hist[v as usize] += 1;
         }
     }
     if distinct < 2 {
         return None;
     }
-    let mut colors: Vec<u16> = Vec::with_capacity(distinct);
+    let colors: Vec<u16> = if distinct <= PALETTE_COLORS {
+        // Exact-representable block: the distinct values ARE the
+        // palette (zero-distortion prediction).
+        (0..256u16).filter(|&c| hist[c as usize] > 0).collect()
+    } else if !recon.lossless && distinct <= kmeans_distinct_bound(n * n) {
+        // r418 colour clustering: weighted 1-D k-means over the value
+        // histogram with a size-RD pick of `k` (§5.11.46
+        // `palette_size` election — each extra colour costs entry
+        // bits, each dropped colour costs clustering SSE).
+        kmeans_palette_1d(&hist, lambda_for(&recon.qp))?
+    } else {
+        return None;
+    };
+    if colors.len() < 2 {
+        return None;
+    }
+    // Nearest-colour LUT over the present values (identity on the
+    // exact arm).
     let mut lut = [0u8; 256];
-    for (c, &s) in seen.iter().enumerate() {
-        if s {
-            lut[c] = colors.len() as u8;
-            colors.push(c as u16);
+    for (c, &cnt) in hist.iter().enumerate() {
+        if cnt > 0 {
+            let mut best = 0usize;
+            let mut best_d = u32::MAX;
+            for (idx, &pc) in colors.iter().enumerate() {
+                let d = (c as i32 - i32::from(pc)).unsigned_abs();
+                if d < best_d {
+                    best_d = d;
+                    best = idx;
+                }
+            }
+            lut[c] = best as u8;
         }
     }
     let mut map = vec![0u8; n * n];
@@ -1456,6 +1478,99 @@ fn palette_candidate_y(
         }
     }
     Some(PaletteCandY { colors, map })
+}
+
+/// Distinct-value bound above which the k-means arm is not attempted
+/// (dense texture / noise blocks: a palette cannot win there and the
+/// trial would be wasted work).
+const KMEANS_MAX_DISTINCT: usize = 64;
+
+/// Density-aware clustering gate: a block only clusters when its
+/// distinct-value count is at most one eighth of its sample count
+/// (capped at [`KMEANS_MAX_DISTINCT`]) — 8×8 blocks stay on the exact
+/// arm, 16×16 admit up to 32 values, 32×32+ up to 64. Denser blocks
+/// are texture, not palette territory, and the trial would only slow
+/// the search / destabilise elections.
+fn kmeans_distinct_bound(samples: usize) -> usize {
+    (samples / 8).min(KMEANS_MAX_DISTINCT)
+}
+
+/// Weighted 1-D k-means (Lloyd) over a value histogram with a
+/// size-RD pick of `k ∈ 2..=PALETTE_COLORS`: for each `k`, quantile
+/// seeding + 8 Lloyd rounds, scored as `SSE + λ · (10 + 8k)` (the
+/// [`leaf_rate`] palette entry cost); the winner's rounded centroids
+/// are returned strictly ascending (merged duplicates may shrink the
+/// list — `None` when fewer than 2 survive).
+fn kmeans_palette_1d(hist: &[u32; 256], lambda: u64) -> Option<Vec<u16>> {
+    use crate::cdf::PALETTE_COLORS;
+    let values: Vec<(u32, u32)> = (0..256u32)
+        .filter(|&c| hist[c as usize] > 0)
+        .map(|c| (c, hist[c as usize]))
+        .collect();
+    let total: u64 = values.iter().map(|&(_, w)| u64::from(w)).sum();
+    let mut best: Option<(Vec<u16>, u64)> = None;
+    for k in 2..=PALETTE_COLORS {
+        // Quantile seeding over the cumulative distribution.
+        let mut centroids: Vec<f64> = Vec::with_capacity(k);
+        let mut acc = 0u64;
+        let mut vi = 0usize;
+        for c in 0..k {
+            let target = (total * (2 * c as u64 + 1)) / (2 * k as u64);
+            while vi + 1 < values.len() && acc + u64::from(values[vi].1) <= target {
+                acc += u64::from(values[vi].1);
+                vi += 1;
+            }
+            centroids.push(f64::from(values[vi].0));
+        }
+        for _ in 0..8 {
+            // Assign + recompute (1-D: nearest centroid).
+            let mut sum = vec![0f64; k];
+            let mut cnt = vec![0f64; k];
+            for &(v, w) in &values {
+                let mut bi = 0usize;
+                let mut bd = f64::MAX;
+                for (i, &c) in centroids.iter().enumerate() {
+                    let d = (f64::from(v) - c).abs();
+                    if d < bd {
+                        bd = d;
+                        bi = i;
+                    }
+                }
+                sum[bi] += f64::from(v) * f64::from(w);
+                cnt[bi] += f64::from(w);
+            }
+            for i in 0..k {
+                if cnt[i] > 0.0 {
+                    centroids[i] = sum[i] / cnt[i];
+                }
+            }
+        }
+        // Round, sort, dedupe.
+        let mut cols: Vec<u16> = centroids
+            .iter()
+            .map(|&c| c.round().clamp(0.0, 255.0) as u16)
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        if cols.len() < 2 {
+            continue;
+        }
+        // Weighted SSE at the rounded palette + entry-cost RD.
+        let mut sse = 0u64;
+        for &(v, w) in &values {
+            let d = cols
+                .iter()
+                .map(|&c| (i64::from(v) - i64::from(c)).unsigned_abs())
+                .min()
+                .unwrap_or(0);
+            sse += d * d * u64::from(w);
+        }
+        let score = sse + lambda * (10 + 8 * cols.len() as u64);
+        if best.as_ref().map_or(true, |&(_, s)| score < s) {
+            best = Some((cols, score));
+        }
+    }
+    best.map(|(cols, _)| cols)
 }
 
 /// §5.11.46 chroma palette commitment candidate for one square leaf —
@@ -1501,20 +1616,34 @@ fn palette_candidate_uv(
     let cn = n / 2;
     let (crow0, ccol0) = (row0 / 2, col0 / 2);
     let cw = recon.chroma_w;
-    // Distinct joint (U, V) pairs, capped at PALETTE_COLORS.
-    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    // Distinct joint (U, V) pairs with weights.
+    let mut weights: std::collections::BTreeMap<(u16, u16), u32> =
+        std::collections::BTreeMap::new();
     for i in 0..cn {
         for j in 0..cn {
             let off = (crow0 + i) * cw + (ccol0 + j);
             let p = (u16::from(input.u[off]), u16::from(input.v[off]));
-            if !pairs.contains(&p) {
-                if pairs.len() == PALETTE_COLORS {
-                    return None;
-                }
-                pairs.push(p);
+            *weights.entry(p).or_insert(0) += 1;
+            if weights.len() > kmeans_distinct_bound(cn * cn).max(PALETTE_COLORS) {
+                return None;
             }
         }
     }
+    if weights.len() < 2 {
+        return None;
+    }
+    let mut pairs: Vec<(u16, u16)> = if weights.len() <= PALETTE_COLORS {
+        // Exact-representable chroma block.
+        weights.keys().copied().collect()
+    } else if !recon.lossless {
+        // r418 colour clustering: weighted 2-D k-means over the joint
+        // (U, V) pairs with the size-RD pick of `k` (each pair codes
+        // BOTH a U and a V entry — double the entry cost of the luma
+        // arm).
+        kmeans_palette_2d(&weights, lambda_for(&recon.qp))?
+    } else {
+        return None;
+    };
     if pairs.len() < 2 {
         return None;
     }
@@ -1526,9 +1655,18 @@ fn palette_candidate_uv(
     for i in 0..cn {
         for j in 0..cn {
             let off = (crow0 + i) * cw + (ccol0 + j);
-            let p = (u16::from(input.u[off]), u16::from(input.v[off]));
-            let idx = pairs.iter().position(|&q| q == p).expect("pair present");
-            map[i * cn + j] = idx as u8;
+            let p = (i64::from(input.u[off]), i64::from(input.v[off]));
+            // Nearest pair (exact arm: the pair itself).
+            let mut bi = 0usize;
+            let mut bd = i64::MAX;
+            for (idx, &(pu, pv)) in pairs.iter().enumerate() {
+                let d = (p.0 - i64::from(pu)).pow(2) + (p.1 - i64::from(pv)).pow(2);
+                if d < bd {
+                    bd = d;
+                    bi = idx;
+                }
+            }
+            map[i * cn + j] = bi as u8;
         }
     }
     Some(PaletteCandUv {
@@ -1536,6 +1674,93 @@ fn palette_candidate_uv(
         colors_v: pairs.iter().map(|&(_, v)| v).collect(),
         map,
     })
+}
+
+/// Weighted 2-D k-means (Lloyd) over joint (U, V) pair weights with a
+/// size-RD pick of `k ∈ 2..=PALETTE_COLORS` — the chroma twin of
+/// [`kmeans_palette_1d`] (entry cost doubled: each §5.11.46 UV pair
+/// codes a U and a V entry). Returns the winner's rounded centroid
+/// pairs (deduped; `None` when fewer than 2 survive).
+fn kmeans_palette_2d(
+    weights: &std::collections::BTreeMap<(u16, u16), u32>,
+    lambda: u64,
+) -> Option<Vec<(u16, u16)>> {
+    use crate::cdf::PALETTE_COLORS;
+    let values: Vec<((f64, f64), u32)> = weights
+        .iter()
+        .map(|(&(u, v), &w)| ((f64::from(u), f64::from(v)), w))
+        .collect();
+    let total: u64 = values.iter().map(|&(_, w)| u64::from(w)).sum();
+    let mut best: Option<(Vec<(u16, u16)>, u64)> = None;
+    for k in 2..=PALETTE_COLORS {
+        // Seed along the weighted BTreeMap (U-major) order.
+        let mut centroids: Vec<(f64, f64)> = Vec::with_capacity(k);
+        let mut acc = 0u64;
+        let mut vi = 0usize;
+        for c in 0..k {
+            let target = (total * (2 * c as u64 + 1)) / (2 * k as u64);
+            while vi + 1 < values.len() && acc + u64::from(values[vi].1) <= target {
+                acc += u64::from(values[vi].1);
+                vi += 1;
+            }
+            centroids.push(values[vi].0);
+        }
+        for _ in 0..8 {
+            let mut sum = vec![(0f64, 0f64); k];
+            let mut cnt = vec![0f64; k];
+            for &((u, v), w) in &values {
+                let mut bi = 0usize;
+                let mut bd = f64::MAX;
+                for (i, &(cu, cv)) in centroids.iter().enumerate() {
+                    let d = (u - cu) * (u - cu) + (v - cv) * (v - cv);
+                    if d < bd {
+                        bd = d;
+                        bi = i;
+                    }
+                }
+                sum[bi].0 += u * f64::from(w);
+                sum[bi].1 += v * f64::from(w);
+                cnt[bi] += f64::from(w);
+            }
+            for i in 0..k {
+                if cnt[i] > 0.0 {
+                    centroids[i] = (sum[i].0 / cnt[i], sum[i].1 / cnt[i]);
+                }
+            }
+        }
+        let mut cols: Vec<(u16, u16)> = centroids
+            .iter()
+            .map(|&(u, v)| {
+                (
+                    u.round().clamp(0.0, 255.0) as u16,
+                    v.round().clamp(0.0, 255.0) as u16,
+                )
+            })
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        if cols.len() < 2 {
+            continue;
+        }
+        let mut sse = 0u64;
+        for &((u, v), w) in &values {
+            let d = cols
+                .iter()
+                .map(|&(cu, cv)| {
+                    let du = (u - f64::from(cu)).abs() as u64;
+                    let dv = (v - f64::from(cv)).abs() as u64;
+                    du * du + dv * dv
+                })
+                .min()
+                .unwrap_or(0);
+            sse += d * u64::from(w);
+        }
+        let score = sse + lambda * (10 + 16 * cols.len() as u64);
+        if best.as_ref().map_or(true, |&(_, s)| score < s) {
+            best = Some((cols, score));
+        }
+    }
+    best.map(|(cols, _)| cols)
 }
 
 // ---------------------------------------------------------------------
@@ -2717,6 +2942,71 @@ mod tests {
                 assert_eq!(enc.recon_v, input.v);
             }
         }
+    }
+
+    /// r418 — the k-means clustering arm must win where the block is
+    /// NOT exactly representable: 4 colour groups with ±1 jitter
+    /// (~12 distinct values per block) cluster to a `<= 8`-colour
+    /// §5.11.46 palette whose prediction is within ±1 everywhere,
+    /// beating every §7.11.2 mode at q=60; committed leaves stay in
+    /// canonical form and the stream round-trips byte-exact.
+    #[test]
+    fn r418_search_selects_kmeans_palette_on_jittered_dither() {
+        const COLORS: [u8; 4] = [16, 80, 160, 240];
+        let mut input = Yuv420Frame::filled(64, 64, 128);
+        let mut state = 0x0A11_CE55u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for p in input.y.iter_mut() {
+            let r = next();
+            let base = COLORS[(r & 3) as usize];
+            let jitter = ((r >> 2) % 3) as i32 - 1;
+            *p = (i32::from(base) + jitter).clamp(0, 255) as u8;
+        }
+        // Distinct count per 64x64 exceeds PALETTE_COLORS (4 groups x
+        // 3 jitter levels = 12).
+        let mut seen = [false; 256];
+        for &v in &input.y {
+            seen[v as usize] = true;
+        }
+        assert!(seen.iter().filter(|&&b| b).count() > PALETTE_COLORS);
+
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows: 16,
+            mi_cols: 16,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(60, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        recon.bd.clear_for_sb(0, 0, 16, 16);
+        let tree = build_search_tree(0, 0, BLOCK_64X64, &input, &mut recon);
+        let (mut pal, mut other) = (0u32, 0u32);
+        count_palette_leaves(&tree, &mut pal, &mut other);
+        assert!(
+            pal > 0,
+            "jittered dither must commit clustered PaletteSizeY > 0 leaves \
+             (got PALETTE={pal} OTHER={other})"
+        );
+
+        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].planes[0], enc.recon_y);
+        assert_eq!(frames[0].planes[1], enc.recon_u);
+        assert_eq!(frames[0].planes[2], enc.recon_v);
     }
 
     /// r418 conformance-fixture twins: deterministic screen-content
