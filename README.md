@@ -590,6 +590,31 @@ inter ones. The sweep matrix gains the `iifade` kind; the 30-config
 pyramid sweep and both r417 self-encoded streams decode byte-exact
 in THREE independent reference decoders (corpus 62 total).
 
+### Screen-content encoding: palette + intra-block-copy search (r418)
+
+r418 builds the SEARCH side of the screen-content tools (the write
+arms landed earlier). **§5.11.46 palette election**: every eligible
+square leaf (8×8..64×64, fully on-screen) builds palette candidates —
+exact colour lists where a block carries ≤ 8 distinct values, and
+(new) k-means-clustered quantised palettes beyond that (weighted 1-D
+luma / 2-D joint-(U,V) Lloyd with a size-RD pick of `k ∈ 2..=8` and a
+density gate `distinct ≤ samples/8`) — and RD-trials every available
+combination (luma / chroma / both) at every §5.11.15 TX shape against
+the plain intra leaf, on the lossy and the lossless arm, in KEY
+frames and (via the shared leaf encoder) intra leaves inside inter
+frames. **§5.11.7 intra-block-copy election** (KEY frames): the
+§5.9.20 gate opens content-adaptively (duplicate-64×64-tile scan,
+§6.10.24-reachability-checked), and eligible leaves RD-trial a
+bounded even-offset DV set filtered by a full §6.10.24 `is_mv_valid`
+transcription (raster delay + wavefront), coded on the
+`use_intrabc = 1` arm with the `is_inter = 1` residual layout.
+Selection witnesses prove palette (exact + clustered, luma + chroma,
+KEY + P-frame) and intrabc leaves are committed; the sweep matrix
+gains the `screen` kind; the 30-config pyramid sweep, 18 ad-hoc
+screen/palette/intrabc streams, and both r418 self-encoded pins
+decode byte-exact in THREE independent reference decoders (corpus 64
+total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -603,14 +628,13 @@ in THREE independent reference decoders (corpus 62 total).
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r417 scope (palette / intrabc leaves — the
-  §5.11.46/§5.11.49/§5.11.7 write arms exist, the encoder-side
-  colour-clustering / block-copy search is the missing piece —
-  §5.11.19 temporal segment-map update, deeper-than-two pyramid
-  levels / adaptive mini-GOP sizing, true bit-accounting rate
-  costs, per-segment lossless mixing, OBMC / warped-motion /
-  filter-intra / CfL-in-inter mode search) is the follow-up
-  ladder.
+  encoding beyond the r418 scope (§5.11.19 temporal segment-map
+  update, deeper-than-two pyramid levels / adaptive mini-GOP sizing,
+  true bit-accounting rate costs from the mirror CDFs, per-segment
+  lossless mixing, OBMC / warped-motion / filter-intra /
+  CfL-in-inter mode search, intrabc hash-match DV search + rect /
+  clipped palette leaves, the §5.11.46 signed-delta V-plane arm) is
+  the follow-up ladder.
 
 ## Module layout
 
