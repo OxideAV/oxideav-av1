@@ -4549,7 +4549,6 @@ fn self_encoded_max_q_noise_keyframe_decodes_byte_exact() {
     );
 }
 
-
 // ---------------------------------------------------------------------
 // r418 self-encoded screen-content KEY fixtures - streams produced by
 // this crate's conformance-grade KEY-frame encoder with the SS5.11.46
