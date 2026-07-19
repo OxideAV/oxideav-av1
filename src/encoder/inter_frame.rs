@@ -782,6 +782,7 @@ pub(crate) fn encode_inter_frame_generic(
         mi_rows,
         mi_cols,
         lossless,
+        allow_screen_content_tools: fh.allow_screen_content_tools,
         qp,
         bd: BlockDecodedMirror::new(),
     };
@@ -3535,6 +3536,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp,
             bd: BlockDecodedMirror::new(),
         };
@@ -3637,6 +3639,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3757,6 +3760,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3857,6 +3861,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3953,6 +3958,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4047,6 +4053,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4168,6 +4175,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: {
                 let mut q = QuantizerParams::neutral(base_q_idx, 8);
                 q.segmentation_enabled = true;
@@ -4287,6 +4295,7 @@ mod tests {
             mi_rows,
             mi_cols,
             lossless: false,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4714,6 +4723,7 @@ mod tests {
             mi_rows: (h / 4) as u32,
             mi_cols: (w / 4) as u32,
             lossless: q == 0,
+            allow_screen_content_tools: true,
             qp: QuantizerParams::neutral(q, 8),
             bd: BlockDecodedMirror::new(),
         }
