@@ -5005,6 +5005,105 @@ mod tests {
         }
     }
 
+    /// r418 — the §5.11.46 palette arm must reach INTRA leaves inside
+    /// INTER frames through the shared leaf encoder: a P-frame whose
+    /// centre region is freshly-pasted 4-colour dither (inter
+    /// prediction has nothing to track, every §7.11.2 mode misses the
+    /// per-pixel pattern) commits `PaletteSizeY > 0` intra leaves in
+    /// the P search tree, and the GOP round-trips byte-exact through
+    /// the spec driver.
+    #[test]
+    fn r418_p_search_selects_palette_on_pasted_screen_content() {
+        const COLORS: [u8; 4] = [16, 80, 160, 240];
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let mut f1 = moving_gradient(64, 64, 0, 0, 40);
+        // Paste a 32x32 dither block (chroma pair checker) at (16, 16).
+        let mut state = 0x0DDB_A115u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for i in 16..48usize {
+            for j in 16..48usize {
+                f1.y[i * 64 + j] = COLORS[(next() & 3) as usize];
+            }
+        }
+        for i in 8..24usize {
+            for j in 8..24usize {
+                let par = ((i / 2) + (j / 2)) & 1;
+                f1.u[i * 32 + j] = if par == 0 { 96 } else { 168 };
+                f1.v[i * 32 + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
+            }
+        }
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+
+        // Direct search drive over the same driver state (LAST = f0
+        // recon at p_index = 1).
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[0],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, pal: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, pal: &mut u32, other: &mut u32| {
+                if b.inter.is_none() && b.palette.size_y > 0 {
+                    *pal += 1;
+                } else {
+                    *other += 1;
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, pal, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, pal, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, pal, other);
+                    }
+                }
+            }
+        }
+        let (mut pal, mut other) = (0u32, 0u32);
+        count(&tree, &mut pal, &mut other);
+        assert!(
+            pal > 0,
+            "pasted dither content must commit PaletteSizeY > 0 intra leaves in the \
+             P-frame search (got PALETTE={pal} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let decoded = crate::decoder::decode_av1_spec(&pre.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], pre.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], pre.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], pre.recon[idx].v, "frame {idx} V");
+        }
+    }
+
     /// r417 — the §5.11.28 WEDGE sub-arm must actually be selected
     /// where a §7.11.3.11 wedge-masked inter-intra blend is the
     /// distortion winner: the target quadrants are constructed

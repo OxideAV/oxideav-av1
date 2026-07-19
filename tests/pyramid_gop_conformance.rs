@@ -245,6 +245,19 @@ fn pyramid_iifade_content_round_trips() {
     }
 }
 
+/// r418 — a 4-colour dither panel growing frame-over-frame across a
+/// moving gradient (the §5.11.46 palette-stressing sweep kind: the
+/// freshly-revealed panel columns have no inter source and no
+/// §7.11.2-predictable structure, so palette intra leaves win there)
+/// round-trips at three quantisers.
+#[test]
+fn pyramid_screen_content_round_trips() {
+    for q in [0u8, 60, 160] {
+        let frames = build_content("screen", 64, 64, 5, 23);
+        assert_pyramid_round_trip(&frames, q);
+    }
+}
+
 /// Env-gated external-validation dump: when `OXIDEAV_AV1_SWEEP_DIR`
 /// is set, encode the full config matrix and write each stream's IVF
 /// plus the encoder reconstruction as concatenated yuv420p
@@ -264,8 +277,11 @@ fn pyramid_external_sweep_dump() {
     // drives the 16x4 / 8x4 strip alphabet) join the rotation.
     // r417: "iifade" (vertically-correlated fade over moving texture
     // — drives the §5.11.28 inter-intra blends) joins the rotation.
+    // r418: "screen" (4-colour dither panel growing over a moving
+    // gradient — drives the §5.11.46 palette intra leaves inside
+    // inter frames) joins the rotation.
     let contents = [
-        "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands", "iifade",
+        "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands", "iifade", "screen",
     ];
     let lengths = [2usize, 3, 4, 5, 7, 9];
     let mut count = 0u32;
@@ -439,6 +455,41 @@ fn build_content(kind: &str, w: u32, h: u32, n: usize, seed: u32) -> Vec<Yuv420F
                         for j in 0..wu / 2 {
                             f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 70;
                             f.v[i * (wu / 2) + j] = tex(i + 9, j + 2, seed) / 2 + 40;
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+        "screen" => {
+            // r418 — moving gradient with a 4-colour dither panel that
+            // widens by 8 columns per frame from the left edge (fresh
+            // palette territory every frame; chroma rides a two-pair
+            // 2x2-cell checker under the panel).
+            const COLORS: [u8; 4] = [16, 80, 160, 240];
+            (0..n)
+                .map(|k| {
+                    let mut f = moving_gradient(w, h, 2 * k, 3 * k, seed);
+                    let (wu, hu) = (w as usize, h as usize);
+                    let panel_w = ((k + 1) * 8).min(wu);
+                    let mut state = 0x5C4E_E100u32 ^ seed;
+                    let mut next = move || {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        state
+                    };
+                    for i in 0..hu {
+                        for j in 0..panel_w {
+                            f.y[i * wu + j] = COLORS[(next() & 3) as usize];
+                        }
+                    }
+                    let (cw, cpw) = (wu / 2, panel_w / 2);
+                    for i in 0..hu / 2 {
+                        for j in 0..cpw {
+                            let par = ((i / 2) + (j / 2)) & 1;
+                            f.u[i * cw + j] = if par == 0 { 96 } else { 168 };
+                            f.v[i * cw + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
                         }
                     }
                     f
