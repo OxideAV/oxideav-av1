@@ -783,6 +783,8 @@ pub(crate) fn encode_inter_frame_generic(
         mi_cols,
         lossless,
         allow_screen_content_tools: fh.allow_screen_content_tools,
+        // §5.9.20: intra-block-copy is intra-frame-only.
+        allow_intrabc: false,
         qp,
         bd: BlockDecodedMirror::new(),
     };
@@ -2677,7 +2679,7 @@ fn transform_tree_tu_order(
 /// TU quantises to all-zero (the §5.11.39 `all_zero` arm reads no
 /// `inter_tx_type` symbol and the walker stamps `DCT_DCT`).
 #[allow(clippy::too_many_arguments)]
-fn residual_tx_search_luma_inter(
+pub(crate) fn residual_tx_search_luma_inter(
     input_plane: &[u8],
     recon_plane: &mut [u8],
     pw: usize,
@@ -2773,7 +2775,7 @@ fn residual_tx_search_luma_inter(
 /// `tx` (r412: rect-aware — the per-split child count is
 /// `(h4 / stepH) * (w4 / stepW)`, 4 for square ordinals and 2 for
 /// rectangular ones, matching [`VarTxSyntaxTree::Split`]'s contract).
-fn uniform_var_tx_tree(tx: usize, depth: u32) -> VarTxSyntaxTree {
+pub(crate) fn uniform_var_tx_tree(tx: usize, depth: u32) -> VarTxSyntaxTree {
     if depth == 0 {
         VarTxSyntaxTree::Leaf
     } else {
@@ -3537,6 +3539,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp,
             bd: BlockDecodedMirror::new(),
         };
@@ -3640,6 +3643,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3761,6 +3765,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3862,6 +3867,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -3959,6 +3965,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4054,6 +4061,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4176,6 +4184,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: {
                 let mut q = QuantizerParams::neutral(base_q_idx, 8);
                 q.segmentation_enabled = true;
@@ -4296,6 +4305,7 @@ mod tests {
             mi_cols,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
         };
@@ -4724,6 +4734,7 @@ mod tests {
             mi_cols: (w / 4) as u32,
             lossless: q == 0,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(q, 8),
             bd: BlockDecodedMirror::new(),
         }

@@ -227,6 +227,11 @@ pub fn encode_key_frame_yuv420_with_q(
     seq.enable_filter_intra = true;
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    // r418: open the §5.9.20 intra-block-copy gate only when the
+    // content-level scan finds at least one §6.10.24-reachable exact
+    // duplicate superblock — the per-leaf `use_intrabc` S() overhead
+    // is only worth coding when a copy source provably exists.
+    fh.allow_intrabc = fh.allow_screen_content_tools && intrabc_beneficial(input);
     // r410: the lossy arm codes §5.9.21 `TxMode = TX_MODE_SELECT` so
     // every leaf carries the §5.11.15 `tx_depth` choice the RD search
     // makes (lossless stays on the §5.9.2 CodedLossless ONLY_4X4 arm).
@@ -287,6 +292,7 @@ pub fn encode_key_frame_yuv420_with_q(
         mi_cols,
         lossless,
         allow_screen_content_tools: fh.allow_screen_content_tools,
+        allow_intrabc: fh.allow_intrabc,
         qp,
         bd: BlockDecodedMirror::new(),
     };
@@ -540,6 +546,10 @@ pub(crate) struct ReconState {
     /// when the frame-header gate is closed, so the search must not
     /// build them).
     pub(crate) allow_screen_content_tools: bool,
+    /// §5.9.20 `allow_intrabc` for the frame — gates the §5.11.7
+    /// intra-block-copy election in [`encode_leaf_sq`]. Only ever
+    /// `true` on intra frames (the §5.9.20 read is intra-only).
+    pub(crate) allow_intrabc: bool,
     pub(crate) qp: QuantizerParams,
     pub(crate) bd: BlockDecodedMirror,
 }
@@ -1317,7 +1327,19 @@ pub(crate) fn encode_leaf_sq(
     if let (Some(a), Some(b)) = (pal_y.as_ref(), pal_uv.as_ref()) {
         combos.push((Some(a), Some(b)));
     }
-    if single_shape && combos.len() == 1 {
+    // r418 §5.11.7 intra-block-copy candidate — ranked on the pristine
+    // pre-trial reconstruction (the ladder below restores it between
+    // trials).
+    let intrabc_dv = if recon.allow_intrabc
+        && matches!(
+            b_size,
+            BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
+        ) {
+        intrabc_best_dv(input, recon, mi_r, mi_c, b_size)
+    } else {
+        None
+    };
+    if single_shape && combos.len() == 1 && intrabc_dv.is_none() {
         return encode_leaf_with_tx(mi_r, mi_c, b_size, cands[0], input, recon, None, None);
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
@@ -1339,6 +1361,21 @@ pub(crate) fn encode_leaf_sq(
             }
             restore_region(recon, mi_r, mi_c, &before);
         }
+    }
+    // r418 §5.11.7 intra-block-copy trial — one fixed-shape candidate
+    // against the same starting state.
+    if let Some(dv) = intrabc_dv {
+        let leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon);
+        let d = region_distortion(recon, input, mi_r, mi_c, n4);
+        let score = d + lambda * leaf_rate(&leaf);
+        let improves = match best.as_ref() {
+            Some((_, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+        }
+        restore_region(recon, mi_r, mi_c, &before);
     }
     let (leaf, after, _) = best.expect("at least one tx candidate");
     restore_region(recon, mi_r, mi_c, &after);
@@ -1499,6 +1536,364 @@ fn palette_candidate_uv(
         colors_v: pairs.iter().map(|&(_, v)| v).collect(),
         map,
     })
+}
+
+// ---------------------------------------------------------------------
+// r418 §5.11.7 intra-block-copy search.
+// ---------------------------------------------------------------------
+
+/// §6.10.24 `is_mv_valid` with `use_intrabc = 1` — the DV validity
+/// predicate for this single-tile driver (`MiRowStart = MiColStart =
+/// 0`, `MiRowEnd = mi_rows`, `MiColEnd = mi_cols`, 64×64 superblocks).
+/// `dv_r` / `dv_c` are whole-pel; this driver additionally restricts
+/// them to EVEN values so the 4:2:0 chroma copy stays integer-aligned
+/// (candidate generation only emits even offsets).
+///
+/// Spec walk: integer alignment (`force_integer_mv = 1` on intra
+/// frames), source rectangle inside the tile, the
+/// `INTRABC_DELAY_SB64 = 4` raster-delay guard, and the wavefront
+/// guard with `gradient = 1 + INTRABC_DELAY_SB64 +
+/// use_128x128_superblock = 5`.
+pub(crate) fn intrabc_dv_valid(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    dv_r: i32,
+    dv_c: i32,
+    mi_rows: u32,
+    mi_cols: u32,
+) -> bool {
+    const INTRABC_DELAY_SB64: i64 = 4;
+    let bw = (NUM_4X4_BLOCKS_WIDE[b_size] * 4) as i64;
+    let bh = bw; // square driver shapes only
+                 // §6.10.24 magnitude bound: |Mv| < 1 << 14 in 1/8-pel units.
+    if (i64::from(dv_r) * 8).abs() >= (1 << 14) || (i64::from(dv_c) * 8).abs() >= (1 << 14) {
+        return false;
+    }
+    let src_top = i64::from(mi_r) * 4 + i64::from(dv_r);
+    let src_left = i64::from(mi_c) * 4 + i64::from(dv_c);
+    let src_bottom = src_top + bh;
+    let src_right = src_left + bw;
+    // HasChroma sub-8 adjustments never fire: bw, bh >= 8 here.
+    if src_top < 0
+        || src_left < 0
+        || src_bottom > i64::from(mi_rows) * 4
+        || src_right > i64::from(mi_cols) * 4
+    {
+        return false;
+    }
+    let active_sb_row = (i64::from(mi_r) * 4) / 64;
+    let active_sb64_col = (i64::from(mi_c) * 4) >> 6;
+    let src_sb_row = (src_bottom - 1) / 64;
+    let src_sb64_col = (src_right - 1) >> 6;
+    let total_sb64_per_row = ((i64::from(mi_cols) - 1) >> 4) + 1;
+    let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
+    let src_sb64 = src_sb_row * total_sb64_per_row + src_sb64_col;
+    if src_sb64 >= active_sb64 - INTRABC_DELAY_SB64 {
+        return false;
+    }
+    let gradient = 1 + INTRABC_DELAY_SB64; // + use_128x128_superblock = 0
+    let wf_offset = gradient * (active_sb_row - src_sb_row);
+    if src_sb_row > active_sb_row
+        || src_sb64_col >= active_sb64_col - INTRABC_DELAY_SB64 + wf_offset
+    {
+        return false;
+    }
+    true
+}
+
+/// Frame-level §5.9.20 gate heuristic: `true` iff some pair of exact
+/// duplicate 64×64 tiles (all three planes) exists where the later
+/// one can §6.10.24-validly copy the earlier one. Content without a
+/// provable copy source keeps the gate closed — the per-leaf
+/// `use_intrabc` S() is pure overhead there.
+fn intrabc_beneficial(input: &Yuv420Frame) -> bool {
+    let (w, h) = (input.width as usize, input.height as usize);
+    let (sb_rows, sb_cols) = (h / 64, w / 64);
+    if sb_rows * sb_cols < 2 {
+        return false;
+    }
+    let cw = w / 2;
+    let mut tiles: Vec<(usize, usize, u64)> = Vec::new();
+    for sbr in 0..sb_rows {
+        for sbc in 0..sb_cols {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            let mut mix = |v: u8| {
+                hash ^= u64::from(v);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+            };
+            for i in 0..64 {
+                for j in 0..64 {
+                    mix(input.y[(sbr * 64 + i) * w + sbc * 64 + j]);
+                }
+            }
+            for i in 0..32 {
+                for j in 0..32 {
+                    let off = (sbr * 32 + i) * cw + sbc * 32 + j;
+                    mix(input.u[off]);
+                    mix(input.v[off]);
+                }
+            }
+            tiles.push((sbr, sbc, hash));
+        }
+    }
+    let mi_rows = 2 * ((h as u32 + 7) >> 3);
+    let mi_cols = 2 * ((w as u32 + 7) >> 3);
+    for (i, &(r1, c1, h1)) in tiles.iter().enumerate() {
+        for &(r0, c0, h0) in &tiles[..i] {
+            if h0 == h1
+                && intrabc_dv_valid(
+                    (r1 * 16) as u32,
+                    (c1 * 16) as u32,
+                    BLOCK_64X64,
+                    (r0 as i32 - r1 as i32) * 64,
+                    (c0 as i32 - c1 as i32) * 64,
+                    mi_rows,
+                    mi_cols,
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pick the best §5.11.7 DV candidate for one square leaf by luma SSD
+/// of the reconstruction copy against the input block, over a bounded
+/// even-offset candidate set (multiples of the superblock stride and
+/// of the block extent, leftward / upward / diagonal). Returns `None`
+/// when no candidate passes §6.10.24 validity.
+fn intrabc_best_dv(
+    input: &Yuv420Frame,
+    recon: &ReconState,
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+) -> Option<(i32, i32)> {
+    let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
+    if row0 + n > recon.height || col0 + n > recon.width {
+        return None;
+    }
+    let mut cands: Vec<(i32, i32)> = Vec::new();
+    for k in 1..=3i32 {
+        for &(dr, dc) in &[(0, -64 * k), (-64 * k, 0), (-64 * k, -64 * k)] {
+            cands.push((dr, dc));
+        }
+        if n < 64 {
+            let s = (n as i32) * k;
+            for &(dr, dc) in &[(0, -s), (-s, 0), (-s, -s)] {
+                cands.push((dr, dc));
+            }
+        }
+    }
+    let mut best: Option<((i32, i32), u64)> = None;
+    for (dr, dc) in cands {
+        if !intrabc_dv_valid(mi_r, mi_c, b_size, dr, dc, recon.mi_rows, recon.mi_cols) {
+            continue;
+        }
+        let (sr, sc) = ((row0 as i32 + dr) as usize, (col0 as i32 + dc) as usize);
+        let mut ssd = 0u64;
+        for i in 0..n {
+            for j in 0..n {
+                let d = i64::from(input.y[(row0 + i) * recon.width + col0 + j])
+                    - i64::from(recon.y[(sr + i) * recon.width + sc + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        if best.as_ref().map_or(true, |&(_, s)| ssd < s) {
+            best = Some(((dr, dc), ssd));
+        }
+    }
+    best.map(|(dv, _)| dv)
+}
+
+/// Encode one square leaf on the §5.11.7 intra-block-copy arm at DV
+/// `(dv_r, dv_c)` (whole-pel, even): `is_inter = 1` residual layout —
+/// one `Max_Tx_Size_Rect` luma TU on the lossy arm (uniform §5.11.17
+/// depth 0, committed as one no-split [`VarTxSyntaxTree`]) or the
+/// row-major `TX_4X4` grid on the lossless arm, the §5.11.48 INTER
+/// tx-type sets, and the §5.11.40 chroma inheritance. Prediction is
+/// the §7.11.3 whole-pel copy from the running reconstruction (the
+/// §6.10.24 wavefront guarantee keeps the source strictly before the
+/// current superblock neighbourhood, so it cannot alias this leaf).
+fn encode_intrabc_leaf(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    dv: (i32, i32),
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+) -> SyntaxBlock {
+    use crate::cdf::inter_tx_type_set;
+    let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
+    let width = recon.width;
+    let lossless = recon.lossless;
+    let qp = recon.qp;
+    let (dv_r, dv_c) = dv;
+    let (src_row0, src_col0) = ((row0 as i32 + dv_r) as usize, (col0 as i32 + dv_c) as usize);
+
+    let luma_tx = if lossless {
+        TX_4X4
+    } else {
+        MAX_TX_SIZE_RECT[b_size]
+    };
+    let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
+    let mut residual_quant: Vec<Vec<i32>> = Vec::new();
+    let mut luma_tx_types: Vec<u8> = Vec::new();
+    let tu_cols = n / ltw;
+    let mut tu_type_grid = vec![DCT_DCT as u8; tu_cols * (n / lth)];
+    // §5.11.34 luma walk: row-major on the lossless arm; the lossy arm
+    // is a single `Max_Tx_Size_Rect` TU (depth 0) — row-major order is
+    // the §5.11.36 order for both.
+    let mut ty = 0usize;
+    while ty < n {
+        let mut tx = 0usize;
+        while tx < n {
+            let (tr, tc) = (row0 + ty, col0 + tx);
+            let mut pred = vec![0u8; ltw * lth];
+            for i in 0..lth {
+                for j in 0..ltw {
+                    pred[i * ltw + j] = recon.y[(src_row0 + ty + i) * width + src_col0 + tx + j];
+                }
+            }
+            let (q, tt) = if lossless {
+                (
+                    residual_tx(
+                        &input.y,
+                        &mut recon.y,
+                        width,
+                        tr,
+                        tc,
+                        luma_tx,
+                        &pred,
+                        0,
+                        lossless,
+                        DCT_DCT,
+                        &qp,
+                    ),
+                    DCT_DCT as u8,
+                )
+            } else {
+                crate::encoder::inter_frame::residual_tx_search_luma_inter(
+                    &input.y,
+                    &mut recon.y,
+                    width,
+                    tr,
+                    tc,
+                    luma_tx,
+                    &pred,
+                    &qp,
+                )
+            };
+            tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
+            residual_quant.push(q);
+            luma_tx_types.push(tt);
+            tu_type_grid[(ty / lth) * tu_cols + tx / ltw] = tt;
+            tx += ltw;
+        }
+        ty += lth;
+    }
+
+    // --- Chroma (always `HasChroma` at the square >= 8x8 shapes). ---
+    let cn = n / 2;
+    let (crow0, ccol0) = (row0 / 2, col0 / 2);
+    let (csrc_row0, csrc_col0) = (
+        ((row0 as i32 + dv_r) / 2) as usize,
+        ((col0 as i32 + dv_c) / 2) as usize,
+    );
+    let chroma_tx = if lossless {
+        TX_4X4
+    } else {
+        get_tx_size(1, luma_tx, b_size, 1, 1).unwrap_or(TX_4X4)
+    };
+    let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
+    let chroma_set = inter_tx_type_set(
+        tx_size_sqr_index(chroma_tx) as u32,
+        TX_SIZE_SQR_UP[chroma_tx] as u32,
+        false,
+    );
+    let cw = recon.chroma_w;
+    for plane in 1..=2usize {
+        let mut ty = 0usize;
+        while ty < cn {
+            let mut tx = 0usize;
+            while tx < cn {
+                let (tr, tc) = (crow0 + ty, ccol0 + tx);
+                // §5.11.40 inter-chroma TxType inheritance from the
+                // subsampling-lifted luma cell, filtered by the
+                // chroma-size inter set.
+                let chroma_tt = if lossless || TX_SIZE_SQR_UP[chroma_tx] > crate::cdf::TX_32X32 {
+                    DCT_DCT
+                } else {
+                    let lifted_x = ((tc >> 2) << 3).saturating_sub(col0);
+                    let lifted_y = ((tr >> 2) << 3).saturating_sub(row0);
+                    let luma_tt =
+                        tu_type_grid[(lifted_y / lth) * tu_cols + lifted_x / ltw] as usize;
+                    if is_tx_type_in_set(true, chroma_set, luma_tt) {
+                        luma_tt
+                    } else {
+                        DCT_DCT
+                    }
+                };
+                let src_plane: &[u8] = if plane == 1 { &recon.u } else { &recon.v };
+                let mut pred = vec![0u8; ctw * cth];
+                for i in 0..cth {
+                    for j in 0..ctw {
+                        pred[i * ctw + j] =
+                            src_plane[(csrc_row0 + ty + i) * cw + csrc_col0 + tx + j];
+                    }
+                }
+                let plane_buf = if plane == 1 {
+                    &mut recon.u
+                } else {
+                    &mut recon.v
+                };
+                let q = residual_tx(
+                    if plane == 1 { &input.u } else { &input.v },
+                    plane_buf,
+                    cw,
+                    tr,
+                    tc,
+                    chroma_tx,
+                    &pred,
+                    plane as u8,
+                    lossless,
+                    chroma_tt,
+                    &qp,
+                );
+                tu_bd_stamp(&mut recon.bd, plane, tc, tr, ctw, cth);
+                residual_quant.push(q);
+                tx += ctw;
+            }
+            ty += cth;
+        }
+    }
+
+    let all_zero = residual_quant.iter().all(|tu| tu.iter().all(|&q| q == 0));
+    let skip = u8::from(all_zero);
+    if all_zero {
+        residual_quant.clear();
+        luma_tx_types.clear();
+    }
+    if luma_tx_types.iter().all(|&t| t == DCT_DCT as u8) {
+        luma_tx_types.clear();
+    }
+
+    let mut block = SyntaxBlock::skip_leaf(0, None);
+    block.skip = skip;
+    block.intrabc_mv = Some([dv_r * 8, dv_c * 8]);
+    block.residual_quant = residual_quant;
+    block.residual_tx_type = luma_tx_types;
+    if !lossless && skip == 0 {
+        block.var_tx_trees = vec![crate::encoder::inter_frame::uniform_var_tx_tree(
+            MAX_TX_SIZE_RECT[b_size],
+            0,
+        )];
+    }
+    block
 }
 
 /// One-shape leaf encode at a fixed luma TX size — see
@@ -1944,6 +2339,12 @@ pub(crate) fn leaf_rate(block: &SyntaxBlock) -> u64 {
             }
         }
     }
+    // §5.11.7 intra-block-copy proxy (r418): the `use_intrabc` S()
+    // plus an MV-magnitude term for the §5.11.31 `read_mv` cost.
+    if let Some(mv) = block.intrabc_mv {
+        let mag = |v: i32| u64::from(32 - (v.unsigned_abs() / 8 + 1).leading_zeros());
+        rate += 6 + mag(mv[0]) + mag(mv[1]);
+    }
     // §5.11.46 / §5.11.49 palette proxy (r418): colour entries at
     // roughly a literal each, plus a transition-weighted map term —
     // the §5.11.49 context coding makes runs nearly free while index
@@ -2159,6 +2560,7 @@ mod tests {
                 mi_cols: 16,
                 lossless: q == 0,
                 allow_screen_content_tools: true,
+                allow_intrabc: false,
                 qp: QuantizerParams::neutral(q, 8),
                 bd: BlockDecodedMirror::new(),
             };
@@ -2224,6 +2626,125 @@ mod tests {
         }
     }
 
+    /// r418 — the §5.11.7 intra-block-copy arm must actually be
+    /// SELECTED where a whole-pel copy of already-reconstructed
+    /// content is the winner: a 192×192 frame tiled from one 64×64
+    /// noise tile (every superblock identical) opens the §5.9.20 gate
+    /// through the duplicate-tile scan, the search tree commits
+    /// `use_intrabc = 1` leaves at §6.10.24-valid DVs, and the
+    /// emitted stream round-trips byte-exact through the spec driver
+    /// — on the lossy AND the lossless arm.
+    #[test]
+    fn r418_search_selects_intrabc_on_tiled_content() {
+        // One 64x64 xorshift noise tile, repeated over 3x3 superblocks.
+        let mut tile_y = [0u8; 64 * 64];
+        let mut tile_u = [0u8; 32 * 32];
+        let mut tile_v = [0u8; 32 * 32];
+        let mut state = 0x00C0_FFEEu32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for p in tile_y.iter_mut() {
+            *p = (next() & 0xFF) as u8;
+        }
+        for p in tile_u.iter_mut() {
+            *p = (next() & 0xFF) as u8;
+        }
+        for p in tile_v.iter_mut() {
+            *p = (next() & 0xFF) as u8;
+        }
+        let (w, h) = (192u32, 192u32);
+        let mut input = Yuv420Frame::filled(w, h, 0);
+        for i in 0..192usize {
+            for j in 0..192usize {
+                input.y[i * 192 + j] = tile_y[(i % 64) * 64 + (j % 64)];
+            }
+        }
+        for i in 0..96usize {
+            for j in 0..96usize {
+                input.u[i * 96 + j] = tile_u[(i % 32) * 32 + (j % 32)];
+                input.v[i * 96 + j] = tile_v[(i % 32) * 32 + (j % 32)];
+            }
+        }
+
+        for q in [60u8, 0] {
+            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            assert!(
+                enc.fh.allow_intrabc,
+                "q={q}: duplicate-tile scan must open the §5.9.20 gate"
+            );
+            // Tree-level witness over the same driver state.
+            let mut recon = ReconState {
+                y: vec![0u8; 192 * 192],
+                u: vec![0u8; 96 * 96],
+                v: vec![0u8; 96 * 96],
+                width: 192,
+                height: 192,
+                chroma_w: 96,
+                chroma_h: 96,
+                mi_rows: 48,
+                mi_cols: 48,
+                lossless: q == 0,
+                allow_screen_content_tools: true,
+                allow_intrabc: true,
+                qp: QuantizerParams::neutral(q, 8),
+                bd: BlockDecodedMirror::new(),
+            };
+            let (mut ibc, mut other) = (0u32, 0u32);
+            for (sb_r, sb_c) in sb_grid_origins(48, 48) {
+                recon.bd.clear_for_sb(sb_r, sb_c, 48, 48);
+                let tree = build_search_tree(sb_r, sb_c, BLOCK_64X64, &input, &mut recon);
+                count_palette_leaves_by(&tree, &mut ibc, &mut other, |b| b.intrabc_mv.is_some());
+            }
+            assert!(
+                ibc > 0,
+                "q={q}: tiled content must commit use_intrabc = 1 leaves \
+                 (got INTRABC={ibc} OTHER={other})"
+            );
+
+            // Full-stream conformance through the spec driver.
+            let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
+            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
+            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            if q == 0 {
+                assert_eq!(enc.recon_y, input.y, "lossless intrabc arm must be exact");
+                assert_eq!(enc.recon_u, input.u);
+                assert_eq!(enc.recon_v, input.v);
+            }
+        }
+    }
+
+    /// §6.10.24 validity transcription checks: raster delay, wavefront
+    /// gradient, tile bounds, magnitude.
+    #[test]
+    fn r418_intrabc_dv_validity() {
+        // 192x192 frame: mi_rows = mi_cols = 48, totalSb64PerRow = 3.
+        let (mr, mc) = (48u32, 48u32);
+        // SB (1,1) copying SB (0,0): srcSb64 = 0, activeSb64 = 4 —
+        // fails the 4-SB64 raster delay.
+        assert!(!intrabc_dv_valid(16, 16, BLOCK_64X64, -64, -64, mr, mc));
+        // SB (2,2) copying SB (0,0): srcSb64 = 0 < 8 - 4, wavefront
+        // offset 10 admits column 0.
+        assert!(intrabc_dv_valid(32, 32, BLOCK_64X64, -128, -128, mr, mc));
+        // SB (1,2) copying SB (0,0): srcSb64 = 0 < 5 - 4 = 1 and
+        // 0 < 2 - 4 + 5 = 3.
+        assert!(intrabc_dv_valid(16, 32, BLOCK_64X64, -64, -128, mr, mc));
+        // Out of frame.
+        assert!(!intrabc_dv_valid(32, 32, BLOCK_64X64, -256, 0, mr, mc));
+        // Sources below or right of the wavefront are invalid.
+        assert!(!intrabc_dv_valid(32, 32, BLOCK_64X64, 64, -128, mr, mc));
+        // An 8x8 leaf inside SB (2,2) reaching into SB (1,1) content:
+        // src bottom edge lands in SB row 1 => srcSb64 = 1*3+1 = 4 <
+        // active 8 - 4... equals 4 => invalid; two rows up is fine.
+        assert!(!intrabc_dv_valid(32, 32, BLOCK_8X8, -64, -64, mr, mc));
+        assert!(intrabc_dv_valid(32, 32, BLOCK_8X8, -128, -64, mr, mc));
+    }
+
     /// Ineligible shapes stay palette-free: 1-colour (flat) blocks, >8
     /// distinct colours, and frames with the §5.9.2 gate closed all
     /// yield no candidate.
@@ -2242,6 +2763,7 @@ mod tests {
             mi_cols: 16,
             lossless: false,
             allow_screen_content_tools: true,
+            allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
             bd: BlockDecodedMirror::new(),
         };
