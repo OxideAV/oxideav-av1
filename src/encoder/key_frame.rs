@@ -2719,6 +2719,92 @@ mod tests {
         }
     }
 
+    /// r418 conformance-fixture twins: deterministic screen-content
+    /// (4-colour glyph tile repeated with period 64 — §5.11.46 palette
+    /// AND §5.11.7 intra-block-copy live in one stream) and a k=8
+    /// luma+UV palette frame. Each round-trips byte-exact through the
+    /// spec driver; when `OXIDEAV_AV1_SCREEN_FIXDIR` is set the exact
+    /// streams + reconstructions are written for external validation /
+    /// fixture staging.
+    #[test]
+    fn r418_screen_and_palette_fixture_streams() {
+        // --- self-kf-192x192-q60-screen ---
+        const COLORS: [u8; 4] = [12, 92, 172, 244];
+        let mut tile = vec![0u8; 64 * 64];
+        let mut state = 0x5EED_0001u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for p in tile.iter_mut() {
+            *p = COLORS[(next() & 3) as usize];
+        }
+        let mut screen = Yuv420Frame::filled(192, 192, 128);
+        for i in 0..192usize {
+            for j in 0..192usize {
+                screen.y[i * 192 + j] = tile[(i % 64) * 64 + (j % 64)];
+            }
+        }
+        for i in 0..96usize {
+            for j in 0..96usize {
+                let par = ((i / 2) + (j / 2)) & 1;
+                screen.u[i * 96 + j] = if par == 0 { 96 } else { 168 };
+                screen.v[i * 96 + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
+            }
+        }
+        let enc_screen = encode_key_frame_yuv420_with_q(&screen, 60).unwrap();
+        assert!(enc_screen.fh.allow_intrabc);
+        assert!(enc_screen.fh.allow_screen_content_tools);
+
+        // --- self-kf-96x80-q100-palette (k = 8 luma dither + chroma
+        // checker pairs) ---
+        const COLORS8: [u8; 8] = [8, 40, 80, 120, 160, 200, 230, 250];
+        let mut state8 = 0x1234_5678u32 ^ 0x2C9;
+        let mut next8 = move || {
+            state8 ^= state8 << 13;
+            state8 ^= state8 >> 17;
+            state8 ^= state8 << 5;
+            state8
+        };
+        let mut pal = Yuv420Frame::filled(96, 80, 128);
+        for i in 0..80usize {
+            for j in 0..96usize {
+                pal.y[i * 96 + j] = COLORS8[(next8() as usize) % 8];
+            }
+        }
+        for i in 0..40usize {
+            for j in 0..48usize {
+                let par = ((i / 2) + (j / 2)) & 1;
+                pal.u[i * 48 + j] = if par == 0 { 96 } else { 168 };
+                pal.v[i * 48 + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
+            }
+        }
+        let enc_pal = encode_key_frame_yuv420_with_q(&pal, 100).unwrap();
+        assert!(!enc_pal.fh.allow_intrabc, "no duplicate 64x64 tile pair");
+
+        for (name, enc) in [
+            ("self-kf-192x192-q60-screen", &enc_screen),
+            ("self-kf-96x80-q100-palette", &enc_pal),
+        ] {
+            let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(frames.len(), 1, "{name}");
+            assert_eq!(frames[0].planes[0], enc.recon_y, "{name}: luma");
+            assert_eq!(frames[0].planes[1], enc.recon_u, "{name}: U");
+            assert_eq!(frames[0].planes[2], enc.recon_v, "{name}: V");
+            if let Ok(dir) = std::env::var("OXIDEAV_AV1_SCREEN_FIXDIR") {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(format!("{dir}/{name}.ivf"), &enc.ivf_bytes).unwrap();
+                let mut yuv = Vec::new();
+                yuv.extend_from_slice(&enc.recon_y);
+                yuv.extend_from_slice(&enc.recon_u);
+                yuv.extend_from_slice(&enc.recon_v);
+                std::fs::write(format!("{dir}/{name}.yuv"), &yuv).unwrap();
+            }
+        }
+    }
+
     /// §6.10.24 validity transcription checks: raster delay, wavefront
     /// gradient, tile bounds, magnitude.
     #[test]
