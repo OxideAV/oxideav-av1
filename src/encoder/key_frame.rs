@@ -1272,63 +1272,61 @@ pub(crate) fn encode_leaf_sq(
     input: &Yuv420Frame,
     recon: &mut ReconState,
 ) -> SyntaxBlock {
-    // §5.11.46 luma palette candidate (r418) — only built when the
+    // §5.11.46 palette candidates (r418) — only built when the
     // frame-header gate is open and the block is an eligible square.
-    let pal = if recon.allow_screen_content_tools {
-        palette_candidate_y(input, recon, mi_r, mi_c, b_size)
+    let (pal_y, pal_uv) = if recon.allow_screen_content_tools {
+        (
+            palette_candidate_y(input, recon, mi_r, mi_c, b_size),
+            palette_candidate_uv(input, recon, mi_r, mi_c, b_size),
+        )
     } else {
-        None
+        (None, None)
     };
-    if recon.lossless || b_size == BLOCK_4X4 {
-        // §5.11.15: lossless forces TX_4X4; a BLOCK_4X4 block has no
-        // tx_depth choice. One TX shape — the only extra trial is the
-        // §5.11.46 palette arm when a candidate exists.
-        let luma_tx = if recon.lossless {
+    // §5.11.15: lossless forces TX_4X4; a BLOCK_4X4 block has no
+    // tx_depth choice. Otherwise step the luma TX down from
+    // `Max_Tx_Size_Rect[MiSize]` via `Split_Tx_Size` (one step for
+    // BLOCK_8X8 — its tx_depth alphabet is 2-valued — two for larger
+    // squares) and trial-encode the leaf at each size against the
+    // same starting state, keeping the lower `D + λ·R`.
+    let single_shape = recon.lossless || b_size == BLOCK_4X4;
+    let cands: Vec<usize> = if single_shape {
+        vec![if recon.lossless {
             TX_4X4
         } else {
             MAX_TX_SIZE_RECT[b_size]
-        };
-        let Some(pal) = pal else {
-            return encode_leaf_with_tx(mi_r, mi_c, b_size, luma_tx, input, recon, None);
-        };
-        let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
-        let lambda = lambda_for(&recon.qp);
-        let before = save_region(recon, mi_r, mi_c, n4);
-        let leaf_a = encode_leaf_with_tx(mi_r, mi_c, b_size, luma_tx, input, recon, None);
-        let d_a = region_distortion(recon, input, mi_r, mi_c, n4);
-        let score_a = d_a + lambda * leaf_rate(&leaf_a);
-        let after_a = save_region(recon, mi_r, mi_c, n4);
-        restore_region(recon, mi_r, mi_c, &before);
-        let leaf_b = encode_leaf_with_tx(mi_r, mi_c, b_size, luma_tx, input, recon, Some(&pal));
-        let d_b = region_distortion(recon, input, mi_r, mi_c, n4);
-        let score_b = d_b + lambda * leaf_rate(&leaf_b);
-        if score_a <= score_b {
-            restore_region(recon, mi_r, mi_c, &after_a);
-            return leaf_a;
+        }]
+    } else {
+        let max_steps = if b_size == BLOCK_8X8 { 1 } else { MAX_TX_DEPTH };
+        let mut v = vec![MAX_TX_SIZE_RECT[b_size]];
+        for _ in 0..max_steps {
+            let next = SPLIT_TX_SIZE[*v.last().expect("non-empty")];
+            v.push(next);
         }
-        return leaf_b;
+        v
+    };
+    // r418: per-TX-shape §5.11.46 palette combinations — every
+    // available candidate arm (luma / chroma / both) trials against
+    // the plain intra leaf over the same starting state.
+    let mut combos: Vec<(Option<&PaletteCandY>, Option<&PaletteCandUv>)> = vec![(None, None)];
+    if let Some(p) = pal_y.as_ref() {
+        combos.push((Some(p), None));
     }
-    // §5.11.15 tx_depth RD search (r410, TX_MODE_SELECT): step the
-    // luma TX down from `Max_Tx_Size_Rect[MiSize]` via `Split_Tx_Size`
-    // (one step for BLOCK_8X8 — its tx_depth alphabet is 2-valued —
-    // two for larger squares), trial-encode the leaf at each size
-    // against the same starting state, keep the lower `D + λ·R`.
-    // r418: when a §5.11.46 palette candidate exists, each TX shape
-    // additionally trials the palette arm (palette prediction +
-    // coded residual) against the same starting state.
+    if let Some(p) = pal_uv.as_ref() {
+        combos.push((None, Some(p)));
+    }
+    if let (Some(a), Some(b)) = (pal_y.as_ref(), pal_uv.as_ref()) {
+        combos.push((Some(a), Some(b)));
+    }
+    if single_shape && combos.len() == 1 {
+        return encode_leaf_with_tx(mi_r, mi_c, b_size, cands[0], input, recon, None, None);
+    }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let lambda = lambda_for(&recon.qp);
-    let max_steps = if b_size == BLOCK_8X8 { 1 } else { MAX_TX_DEPTH };
-    let mut cands = vec![MAX_TX_SIZE_RECT[b_size]];
-    for _ in 0..max_steps {
-        let next = SPLIT_TX_SIZE[*cands.last().expect("non-empty")];
-        cands.push(next);
-    }
     let before = save_region(recon, mi_r, mi_c, n4);
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
-        for pal_opt in [None, pal.as_ref()] {
-            let leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, pal_opt);
+        for &(py, puv) in combos.iter() {
+            let leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv);
             let d = region_distortion(recon, input, mi_r, mi_c, n4);
             let r = leaf_rate(&leaf) + 2 * depth as u64;
             let score = d + lambda * r;
@@ -1340,9 +1338,6 @@ pub(crate) fn encode_leaf_sq(
                 best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
             }
             restore_region(recon, mi_r, mi_c, &before);
-            if pal.is_none() {
-                break;
-            }
         }
     }
     let (leaf, after, _) = best.expect("at least one tx candidate");
@@ -1426,12 +1421,96 @@ fn palette_candidate_y(
     Some(PaletteCandY { colors, map })
 }
 
+/// §5.11.46 chroma palette commitment candidate for one square leaf —
+/// the joint (U, V) colour pairs (U non-strictly ascending — the
+/// §5.11.46 post-sort canonical order; V by pair index) plus the
+/// §5.11.49 `ColorMapUV` (row-major over the subsampled block).
+#[derive(Debug, Clone)]
+pub(crate) struct PaletteCandUv {
+    /// `2..=PALETTE_COLORS` U colours, non-strictly ascending.
+    pub(crate) colors_u: Vec<u16>,
+    /// Per-index V partner of each U colour (arbitrary order).
+    pub(crate) colors_v: Vec<u16>,
+    /// `(n/2) × (n/2)` row-major indices into the pair list.
+    pub(crate) map: Vec<u8>,
+}
+
+/// Build the §5.11.46 chroma palette candidate for one square leaf,
+/// or `None` when ineligible / not exactly representable. Same
+/// eligibility as [`palette_candidate_y`] with the distinct count
+/// taken over joint (U, V) sample PAIRS of the subsampled block —
+/// §5.11.49 codes ONE shared `ColorMapUV` for both chroma planes.
+fn palette_candidate_uv(
+    input: &Yuv420Frame,
+    recon: &ReconState,
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+) -> Option<PaletteCandUv> {
+    use crate::cdf::PALETTE_COLORS;
+    // §5.11.46 outer gate (square driver shapes only). Every square
+    // `>= BLOCK_8X8` leaf has chroma under 4:2:0.
+    if !matches!(
+        b_size,
+        BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
+    ) {
+        return None;
+    }
+    let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
+    if row0 + n > recon.height || col0 + n > recon.width {
+        return None;
+    }
+    let cn = n / 2;
+    let (crow0, ccol0) = (row0 / 2, col0 / 2);
+    let cw = recon.chroma_w;
+    // Distinct joint (U, V) pairs, capped at PALETTE_COLORS.
+    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    for i in 0..cn {
+        for j in 0..cn {
+            let off = (crow0 + i) * cw + (ccol0 + j);
+            let p = (u16::from(input.u[off]), u16::from(input.v[off]));
+            if !pairs.contains(&p) {
+                if pairs.len() == PALETTE_COLORS {
+                    return None;
+                }
+                pairs.push(p);
+            }
+        }
+    }
+    if pairs.len() < 2 {
+        return None;
+    }
+    // §5.11.46 canonical order: U non-strictly ascending (ties broken
+    // by V for determinism — pair order among equal U values is
+    // unconstrained by the entry coding).
+    pairs.sort_unstable();
+    let mut map = vec![0u8; cn * cn];
+    for i in 0..cn {
+        for j in 0..cn {
+            let off = (crow0 + i) * cw + (ccol0 + j);
+            let p = (u16::from(input.u[off]), u16::from(input.v[off]));
+            let idx = pairs.iter().position(|&q| q == p).expect("pair present");
+            map[i * cn + j] = idx as u8;
+        }
+    }
+    Some(PaletteCandUv {
+        colors_u: pairs.iter().map(|&(u, _)| u).collect(),
+        colors_v: pairs.iter().map(|&(_, v)| v).collect(),
+        map,
+    })
+}
+
 /// One-shape leaf encode at a fixed luma TX size — see
 /// [`encode_leaf_sq`] for the §5.11.15 TX search wrapper. When
 /// `palette_y` is `Some`, the luma plane rides the §5.11.46 palette
 /// arm: `y_mode = DC_PRED`, no filter-intra (the §5.11.24 gate closes
 /// on `PaletteSizeY > 0`), and every luma TU predicts from the
-/// §7.11.4 palette-mapped samples before the coded residual.
+/// §7.11.4 palette-mapped samples before the coded residual. When
+/// `palette_uv` is `Some`, the chroma planes ride the same arm:
+/// `uv_mode = DC_PRED` (the §5.11.46 UV gate), no CFL, and every
+/// chroma TU predicts from its plane's palette colours through the
+/// shared §5.11.49 `ColorMapUV`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_leaf_with_tx(
     mi_r: u32,
@@ -1441,6 +1520,7 @@ pub(crate) fn encode_leaf_with_tx(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     palette_y: Option<&PaletteCandY>,
+    palette_uv: Option<&PaletteCandUv>,
 ) -> SyntaxBlock {
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let n = n4 * 4;
@@ -1552,17 +1632,23 @@ pub(crate) fn encode_leaf_with_tx(
         // Chroma extent of this leaf's residual grid (§5.11.38
         // subsampled plane size; BLOCK_4X4 leaves keep the full 4×4).
         let cn = if b_size >= BLOCK_8X8 { n / 2 } else { 4 };
-        let (m, delta_uv, alpha) = pick_uv_mode(
-            recon,
-            input,
-            crow0,
-            ccol0,
-            cn,
-            cfl_allowed,
-            n,
-            max_luma_w,
-            max_luma_h,
-        );
+        // §5.11.46 UV palette arm (r418): the coded `uv_mode` is
+        // DC_PRED (the UV palette gate) and CFL is off; each chroma
+        // TU predicts from the §7.11.4 palette map instead.
+        let (m, delta_uv, alpha) = match palette_uv {
+            Some(_) => (DC_PRED as u8, 0i8, None),
+            None => pick_uv_mode(
+                recon,
+                input,
+                crow0,
+                ccol0,
+                cn,
+                cfl_allowed,
+                n,
+                max_luma_w,
+                max_luma_h,
+            ),
+        };
         uv_mode = Some(m);
         angle_delta_uv = delta_uv;
         cfl_alpha = alpha;
@@ -1582,7 +1668,19 @@ pub(crate) fn encode_leaf_with_tx(
                     let (tr, tc) = (crow0 + ty, ccol0 + tx);
                     // §5.11.35: a CFL chroma TU writes the DC_PRED
                     // base, then §7.11.5 layers the luma AC on top.
-                    let pred = if is_cfl {
+                    let pred = if let Some(p) = palette_uv {
+                        // §7.11.4 `predict_palette` over this TU's
+                        // footprint on the shared `ColorMapUV`.
+                        let colors = if plane == 1 { &p.colors_u } else { &p.colors_v };
+                        let mut buf = vec![0u8; ctw * cth];
+                        for i in 0..cth {
+                            for j in 0..ctw {
+                                let idx = p.map[(ty + i) * cn + (tx + j)] as usize;
+                                buf[i * ctw + j] = colors[idx] as u8;
+                            }
+                        }
+                        buf
+                    } else if is_cfl {
                         let dc = predict_tu(recon, plane, tc, tr, ctw, cth, DC_PRED, 0, None);
                         cfl_layer(
                             &dc,
@@ -1658,20 +1756,22 @@ pub(crate) fn encode_leaf_with_tx(
         Some((au, av)) => (Some(au), Some(av)),
         None => (None, None),
     };
-    // §5.11.46 / §5.11.49 palette commitments (r418, luma plane).
-    let palette = match palette_y {
-        Some(p) => {
-            let mut colors_y = [0u16; crate::cdf::PALETTE_COLORS];
-            colors_y[..p.colors.len()].copy_from_slice(&p.colors);
-            crate::encoder::partition_tree::SyntaxPalette {
-                size_y: p.colors.len() as u8,
-                colors_y,
-                color_map_y: p.map.clone(),
-                ..Default::default()
-            }
-        }
-        None => Default::default(),
-    };
+    // §5.11.46 / §5.11.49 palette commitments (r418).
+    let mut palette = crate::encoder::partition_tree::SyntaxPalette::default();
+    if let Some(p) = palette_y {
+        palette.size_y = p.colors.len() as u8;
+        palette.colors_y[..p.colors.len()].copy_from_slice(&p.colors);
+        palette.color_map_y = p.map.clone();
+    }
+    if let Some(p) = palette_uv {
+        palette.size_uv = p.colors_u.len() as u8;
+        palette.colors_u[..p.colors_u.len()].copy_from_slice(&p.colors_u);
+        palette.colors_v[..p.colors_v.len()].copy_from_slice(&p.colors_v);
+        // §5.11.46 V-plane arm: direct literals (r418 scope; the
+        // signed-delta arm is an encoder-choice follow-up).
+        palette.delta_encode_v = false;
+        palette.color_map_uv = p.map.clone();
+    }
 
     SyntaxBlock {
         skip,
@@ -1986,12 +2086,36 @@ mod tests {
                 f.y[i * wu + j] = COLORS[(next() & 3) as usize];
             }
         }
+        // Chroma: per-2x2-cell checker over two (U, V) pairs — at most
+        // four distinct joint pairs per chroma block, sharp cell edges
+        // no §7.11.2 mode predicts.
+        let (cw, ch) = (wu / 2, hu / 2);
+        for i in 0..ch {
+            for j in 0..cw {
+                let par = ((i / 2) + (j / 2)) & 1;
+                f.u[i * cw + j] = if par == 0 { 96 } else { 168 };
+                f.v[i * cw + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
+            }
+        }
         f
     }
 
     fn count_palette_leaves(node: &SyntaxNode, pal: &mut u32, other: &mut u32) {
+        count_palette_leaves_by(node, pal, other, |b| b.palette.size_y > 0)
+    }
+
+    fn count_palette_uv_leaves(node: &SyntaxNode, pal: &mut u32, other: &mut u32) {
+        count_palette_leaves_by(node, pal, other, |b| b.palette.size_uv > 0)
+    }
+
+    fn count_palette_leaves_by(
+        node: &SyntaxNode,
+        pal: &mut u32,
+        other: &mut u32,
+        pred: fn(&SyntaxBlock) -> bool,
+    ) {
         let leafc = |b: &SyntaxBlock, pal: &mut u32, other: &mut u32| {
-            if b.palette.size_y > 0 {
+            if pred(b) {
                 *pal += 1;
             } else {
                 *other += 1;
@@ -2001,7 +2125,7 @@ mod tests {
             SyntaxNode::Leaf(b) => leafc(b, pal, other),
             SyntaxNode::Split(children) => {
                 for ch in children.iter() {
-                    count_palette_leaves(ch, pal, other);
+                    count_palette_leaves_by(ch, pal, other, pred);
                 }
             }
             rest => {
@@ -2047,6 +2171,13 @@ mod tests {
                 "q={q}: 4-colour dither content must commit PaletteSizeY > 0 leaves \
                  (got PALETTE={pal} OTHER={other})"
             );
+            let (mut pal_uv, mut other_uv) = (0u32, 0u32);
+            count_palette_uv_leaves(&tree, &mut pal_uv, &mut other_uv);
+            assert!(
+                pal_uv > 0,
+                "q={q}: 2x2-cell chroma checker content must commit PaletteSizeUV > 0 \
+                 leaves (got PALETTE_UV={pal_uv} OTHER={other_uv})"
+            );
             fn check_sorted(node: &SyntaxNode) {
                 let leafc = |b: &SyntaxBlock| {
                     let k = b.palette.size_y as usize;
@@ -2059,6 +2190,17 @@ mod tests {
                             );
                         }
                         assert!(b.palette.color_map_y.iter().all(|&m| (m as usize) < k));
+                    }
+                    let kuv = b.palette.size_uv as usize;
+                    if kuv > 0 {
+                        assert!((2..=PALETTE_COLORS).contains(&kuv));
+                        for i in 1..kuv {
+                            assert!(
+                                b.palette.colors_u[i] >= b.palette.colors_u[i - 1],
+                                "§5.11.46 canonical form: U colours non-strictly ascending"
+                            );
+                        }
+                        assert!(b.palette.color_map_uv.iter().all(|&m| (m as usize) < kuv));
                     }
                 };
                 match node {
