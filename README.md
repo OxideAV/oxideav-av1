@@ -615,6 +615,42 @@ screen/palette/intrabc streams, and both r418 self-encoded pins
 decode byte-exact in THREE independent reference decoders (corpus 64
 total).
 
+### Inter encoder: motion-mode election + intra tools in inter frames (r419)
+
+r419 closes the remaining inter-tool ELECTION axes. **§5.11.27
+motion-mode election**: every inter frame codes
+`is_motion_mode_switchable = 1` and `allow_warped_motion = 1` (the
+§5.5.2 `enable_warped_motion` sequence gate opens), so every eligible
+single-reference leaf codes the `use_obmc` / 3-way `motion_mode` S();
+the leaf search trials — after the mode/MV/filter selection — the
+§7.11.3.9-10 **OBMC** overlap blend (per codable filter, through the
+decoder's own neighbour-scan dispatch over the committed grids) and,
+where the arm-B gates open (`NumSamples > 0` on the §7.10.4 scan,
+unscaled reference), the §7.11.3.5 **WARPED_CAUSAL** warp with the
+§7.11.3.8 least-squares fit (committed only when `setup_shear`-valid;
+committed filters collapse to the reader's bit-silent EIGHTTAP per
+`needs_interp_filter( )`). The write arm re-derives the reader's full
+§5.11.27 cascade from the write mirror
+(`has_overlappable_candidates( )`, `find_warp_samples( )` at the
+committed post-`assign_mv` vector) and rejects uncodable commitments;
+search/write/decode stamp identical `MotionModes[]` grids, and the
+§5.11.5 driver grids join the search's snapshot/rollback discipline
+(the OBMC neighbour scan reads committed above/left cells through
+them). **Filter-intra + CfL inside inter frames**: the intra-leaf arm
+rides the shared leaf encoder, and two witnesses prove reachability
+end-to-end — a P-frame region constructed as the §7.11.2.3 prediction
+of its own decode-time neighbours commits `use_filter_intra = 1`
+leaves, and a fresh region whose chroma tracks the subsampled luma AC
+commits `UV_CFL_PRED` leaves. Selection witnesses pin sheared motion →
+OBMC leaves and zooming motion (a true affine field) → WARPED_CAUSAL
+leaves; measured on the witness contents, warp saves 1.4-3.0% bytes
+AND gains 0.3-0.4 dB luma PSNR on affine content, OBMC adds ~0.03 dB
+at ~equal rate on shear content, and the always-coded motion-mode
+S() costs ≈ 0.4% on translational content. The sweep matrix gains the
+`shear` / `zoom` kinds; the 30-config pyramid sweep and three r419
+self-encoded pins decode byte-exact in THREE independent reference
+decoders (corpus 67 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -628,13 +664,15 @@ total).
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r418 scope (§5.11.19 temporal segment-map
+  encoding beyond the r419 scope (§5.11.19 temporal segment-map
   update, deeper-than-two pyramid levels / adaptive mini-GOP sizing,
-  true bit-accounting rate costs from the mirror CDFs, per-segment
-  lossless mixing, OBMC / warped-motion / filter-intra /
-  CfL-in-inter mode search, intrabc hash-match DV search + rect /
-  clipped palette leaves, the §5.11.46 signed-delta V-plane arm) is
-  the follow-up ladder.
+  true bit-accounting rate costs from a search-side CDF/write-state
+  twin, GLOBAL warped-motion election — frame-level affine estimation
+  plus the §5.9.24 `read_global_param` signed-subexp write arm, the
+  identity short-circuit is all the writer emits today —, per-segment
+  lossless mixing, intrabc hash-match DV search + rect / clipped
+  palette leaves, the §5.11.46 signed-delta V-plane arm) is the
+  follow-up ladder.
 
 ## Module layout
 
