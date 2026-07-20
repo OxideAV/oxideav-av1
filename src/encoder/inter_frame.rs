@@ -6729,4 +6729,389 @@ mod tests {
             assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
         }
     }
+
+    /// Deterministic noise texture (xorshift over the seed).
+    fn noise_frame(w: u32, h: u32, seed: u32) -> Yuv420Frame {
+        let mut state = 0x1357_9BDFu32 ^ seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut f = Yuv420Frame::filled(w, h, 0);
+        for p in f.y.iter_mut() {
+            *p = (next() & 0xFF) as u8;
+        }
+        for p in f.u.iter_mut() {
+            *p = 96 + (next() & 0x3F) as u8;
+        }
+        for p in f.v.iter_mut() {
+            *p = 64 + (next() & 0x3F) as u8;
+        }
+        f
+    }
+
+    /// GOP census over committed INTRA leaves inside the P-frame
+    /// search tree: `(filter_intra, cfl)` counts.
+    fn count_intra_tools(node: &SyntaxNode, fi: &mut u32, cfl: &mut u32) {
+        let leafc = |b: &SyntaxBlock, fi: &mut u32, cfl: &mut u32| {
+            if b.inter.is_none() {
+                if b.use_filter_intra == 1 {
+                    *fi += 1;
+                }
+                if b.uv_mode == Some(crate::cdf::UV_CFL_PRED as u8) {
+                    *cfl += 1;
+                }
+            }
+        };
+        match node {
+            SyntaxNode::Leaf(b) => leafc(b, fi, cfl),
+            SyntaxNode::Split(children) => {
+                for ch in children.iter() {
+                    count_intra_tools(ch, fi, cfl);
+                }
+            }
+            rest => {
+                for b in rest.asymmetric_blocks().iter() {
+                    leafc(b, fi, cfl);
+                }
+            }
+        }
+    }
+
+    /// Shared driver for the two intra-tool witnesses: encode
+    /// `[f0, f1]` through the public GOP driver, re-run the P-frame
+    /// search tree with the same reference state, and return the
+    /// intra-tool census plus the stream round-trip check.
+    fn p_frame_intra_tool_census(f0: &Yuv420Frame, f1: &Yuv420Frame, base_q_idx: u8) -> (u32, u32) {
+        let enc = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+        }
+        // Search-tree census with the identical reference state.
+        let reference = enc.recon[0].clone();
+        let (w, h) = (f0.width, f0.height);
+        let key = encode_key_frame_yuv420_with_q(f0, base_q_idx).unwrap();
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, w, h, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; (w * h) as usize],
+            u: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            v: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            width: w as usize,
+            height: h as usize,
+            chroma_w: (w / 2) as usize,
+            chroma_h: (h / 2) as usize,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.is_motion_mode_switchable = true;
+        ip.allow_warped_motion = true;
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            w as usize,
+            h as usize,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, f1, &mut recon, &mut ictx).unwrap();
+        if std::env::var("OXIDEAV_AV1_DEBUG_CENSUS").is_ok() {
+            fn dump(node: &SyntaxNode, depth: usize) {
+                let leafd = |b: &SyntaxBlock, depth: usize| {
+                    eprintln!(
+                        "{:indent$}leaf inter={} y={} uv={:?} fi={} cfl=({:?},{:?})",
+                        "",
+                        b.inter.is_some(),
+                        b.y_mode,
+                        b.uv_mode,
+                        b.use_filter_intra,
+                        b.cfl_alpha_u,
+                        b.cfl_alpha_v,
+                        indent = depth * 2
+                    );
+                };
+                match node {
+                    SyntaxNode::Leaf(b) => leafd(b, depth),
+                    SyntaxNode::Split(children) => {
+                        for ch in children.iter() {
+                            dump(ch, depth + 1);
+                        }
+                    }
+                    rest => {
+                        for b in rest.asymmetric_blocks().iter() {
+                            leafd(b, depth);
+                        }
+                    }
+                }
+            }
+            dump(&tree, 0);
+        }
+        let (mut fi, mut cfl) = (0u32, 0u32);
+        count_intra_tools(&tree, &mut fi, &mut cfl);
+        (fi, cfl)
+    }
+
+    /// r419 — §5.11.24 FILTER-INTRA must be reachable on intra leaves
+    /// INSIDE inter frames: the SE 32×32 quadrant of the P-frame is
+    /// constructed as the §7.11.2.3 recursive prediction of its own
+    /// decode-time neighbours (derived from a first static-GOP pass —
+    /// blocks above/left of the region commit identically in both
+    /// passes, so the region predicts exactly and the FI pick beats
+    /// every §7.11.2 plain mode), fresh content the inter search has
+    /// no source for.
+    #[test]
+    fn r419_p_search_selects_filter_intra_inside_inter_frame() {
+        let base_q_idx = 60u8;
+        let f0 = noise_frame(64, 64, 40);
+        // Pass 1 — static GOP: the SE-quadrant neighbours' committed
+        // reconstruction.
+        let enc1 = encode_gop_yuv420_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
+        let rec1 = &enc1.recon[1];
+        // §7.11.2 neighbour arrays for the 32×32 TU at (32, 32) —
+        // the same derivation the leaf picker runs (frame corners
+        // off-screen: no above-right / below-left).
+        let (above_ext, left_ext, _, _) = super::super::key_frame::build_tu_neighbours(
+            &rec1.y, 64, 64, 32, 32, 32, 32, false, false,
+        );
+        let target = super::super::key_frame::predict_filter_intra_from_neighbours(
+            /* FILTER_D157_PRED-class ordinal = */ 2, 32, 32, &above_ext, &left_ext,
+        )
+        .expect("32x32 filter-intra prediction");
+        // Pass 2 — the region carries exactly that prediction.
+        let mut f1 = f0.clone();
+        for i in 0..32usize {
+            for j in 0..32usize {
+                f1.y[(32 + i) * 64 + 32 + j] = target[i * 32 + j];
+            }
+        }
+        let (fi, _) = p_frame_intra_tool_census(&f0, &f1, base_q_idx);
+        assert!(
+            fi > 0,
+            "the FI-constructed fresh region must commit at least one \
+             §5.11.24 use_filter_intra = 1 intra leaf inside the \
+             P-frame (got {fi})"
+        );
+    }
+
+    /// r419 — §5.11.45 CfL must be reachable on intra leaves INSIDE
+    /// inter frames: the SE 32×32 quadrant of the P-frame carries
+    /// fresh textured luma whose chroma tracks the subsampled luma AC
+    /// (`c = mid ± ac/2`) — the §7.11.5 luma-feedthrough model no
+    /// plain §7.11.2 chroma mode can express.
+    #[test]
+    fn r419_p_search_selects_cfl_inside_inter_frame() {
+        let base_q_idx = 60u8;
+        // Noise luma, FLAT mid chroma: every plain §7.11.2 chroma
+        // mode collapses to the flat field, so the §7.11.5
+        // luma-feedthrough is the only model that can track the
+        // region's chroma AC.
+        let mut f0 = noise_frame(64, 64, 41);
+        f0.u.fill(128);
+        f0.v.fill(128);
+        let mut f1 = f0.clone();
+        // Fresh smooth-textured luma in the SE quadrant.
+        let tex = |i: usize, j: usize| -> u8 {
+            let v = 128.0
+                + 70.0 * ((i as f64) * 0.35).sin() * ((j as f64) * 0.29).cos()
+                + 30.0 * (((i + j) as f64) * 0.11).sin();
+            v.clamp(0.0, 255.0) as u8
+        };
+        for i in 0..32usize {
+            for j in 0..32usize {
+                f1.y[(32 + i) * 64 + 32 + j] = tex(i, j);
+            }
+        }
+        // Chroma = mid ± (subsampled luma AC) / 4 over the region —
+        // the §7.11.5 model at the (αU, αV) = (2, −2) grid point
+        // (`chroma_ac = α · luma_ac / 8`).
+        let mut acc = 0i64;
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let s = i64::from(tex(2 * i, 2 * j))
+                    + i64::from(tex(2 * i + 1, 2 * j))
+                    + i64::from(tex(2 * i, 2 * j + 1))
+                    + i64::from(tex(2 * i + 1, 2 * j + 1));
+                acc += s;
+            }
+        }
+        let mean4 = acc / 256; // 4x-scaled subsampled mean
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let s = i64::from(tex(2 * i, 2 * j))
+                    + i64::from(tex(2 * i + 1, 2 * j))
+                    + i64::from(tex(2 * i, 2 * j + 1))
+                    + i64::from(tex(2 * i + 1, 2 * j + 1));
+                let ac = (s - mean4) / 16; // ± a quarter of the subsampled AC
+                let cell = (16 + i) * 32 + 16 + j;
+                f1.u[cell] = (128 + ac).clamp(0, 255) as u8;
+                f1.v[cell] = (128 - ac).clamp(0, 255) as u8;
+            }
+        }
+        let (_, cfl) = p_frame_intra_tool_census(&f0, &f1, base_q_idx);
+        assert!(
+            cfl > 0,
+            "luma-tracking chroma on a fresh region must commit at \
+             least one §5.11.22 UV_CFL_PRED intra leaf inside the \
+             P-frame (got {cfl})"
+        );
+    }
+
+    /// r419 conformance-fixture twins: the three self-encoded GOP
+    /// streams pinned in `tests/fixture_conformance.rs` regenerate
+    /// deterministically from the witness content families —
+    /// (1) sheared motion (§5.11.27 OBMC leaves, per the OBMC
+    /// selection witness), (2) zooming motion (§5.11.27 WARPED_CAUSAL
+    /// leaves, per the warp selection witness), (3) noise + FI-exact +
+    /// CfL-tracking regions (§5.11.24 filter-intra and §5.11.22
+    /// UV_CFL_PRED intra leaves INSIDE inter frames, per the two
+    /// intra-tool witnesses). Each round-trips byte-exact through the
+    /// spec driver; when `OXIDEAV_AV1_R419_FIXDIR` is set the exact
+    /// streams + display-order reconstructions are written for
+    /// external validation / fixture staging.
+    #[test]
+    fn r419_motion_mode_and_intra_tool_fixture_streams() {
+        let dump = |name: &str, enc: &EncodedGop| {
+            let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(decoded.len(), enc.recon.len(), "{name}");
+            for (idx, f) in decoded.iter().enumerate() {
+                assert_eq!(f.planes[0], enc.recon[idx].y, "{name} display {idx}: luma");
+                assert_eq!(f.planes[1], enc.recon[idx].u, "{name} display {idx}: U");
+                assert_eq!(f.planes[2], enc.recon[idx].v, "{name} display {idx}: V");
+            }
+            if let Ok(dir) = std::env::var("OXIDEAV_AV1_R419_FIXDIR") {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(format!("{dir}/{name}.ivf"), &enc.ivf_bytes).unwrap();
+                let mut yuv = Vec::new();
+                for rc in &enc.recon {
+                    yuv.extend_from_slice(&rc.y);
+                    yuv.extend_from_slice(&rc.u);
+                    yuv.extend_from_slice(&rc.v);
+                }
+                std::fs::write(format!("{dir}/{name}.yuv"), &yuv).unwrap();
+            }
+        };
+
+        // --- self-gop-64x64-q100-shear-obmc: 3-frame shear GOP (the
+        // OBMC witness content family — per-row shift ramp 24..48,
+        // dx_top = 4k). ---
+        {
+            let tex = |i: usize, j: usize| -> u8 {
+                ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u8
+            };
+            let frames: Vec<Yuv420Frame> = (0..3)
+                .map(|k| {
+                    let mut f = Yuv420Frame::filled(64, 64, 128);
+                    for i in 0..64usize {
+                        let (ramp0, ramp1, top) = (24usize, 48usize, 4 * k);
+                        let dx = if i < ramp0 {
+                            top
+                        } else if i >= ramp1 {
+                            0
+                        } else {
+                            top * (ramp1 - i) / (ramp1 - ramp0)
+                        };
+                        for j in 0..64usize {
+                            f.y[i * 64 + j] = tex(i, j + dx);
+                        }
+                    }
+                    f
+                })
+                .collect();
+            let enc = encode_gop_yuv420_with_q(&frames, 100).unwrap();
+            dump("self-gop-64x64-q100-shear-obmc", &enc);
+        }
+
+        // --- self-gop-96x80-q100-zoom-warp: 2-frame zoom GOP (the
+        // WARPED_CAUSAL witness content itself). ---
+        {
+            let [f0, f1] = zoom_pair(96, 80, 17, 16);
+            let enc = encode_gop_yuv420_with_q(&[f0, f1], 100).unwrap();
+            dump("self-gop-96x80-q100-zoom-warp", &enc);
+        }
+
+        // --- self-gop-64x64-q60-fi-cfl: KEY + FI P-frame + CfL
+        // P-frame (the two intra-tool witness constructions composed
+        // into one GOP over a noise-luma / flat-chroma anchor). ---
+        {
+            let base_q_idx = 60u8;
+            let mut f0 = noise_frame(64, 64, 41);
+            f0.u.fill(128);
+            f0.v.fill(128);
+            // FI frame: SE quadrant = the §7.11.2.3 prediction of its
+            // own decode-time neighbours (static pass 1).
+            let enc1 = encode_gop_yuv420_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
+            let rec1 = &enc1.recon[1];
+            let (above_ext, left_ext, _, _) = super::super::key_frame::build_tu_neighbours(
+                &rec1.y, 64, 64, 32, 32, 32, 32, false, false,
+            );
+            let target = super::super::key_frame::predict_filter_intra_from_neighbours(
+                2, 32, 32, &above_ext, &left_ext,
+            )
+            .expect("32x32 filter-intra prediction");
+            let mut f1 = f0.clone();
+            for i in 0..32usize {
+                for j in 0..32usize {
+                    f1.y[(32 + i) * 64 + 32 + j] = target[i * 32 + j];
+                }
+            }
+            // CfL frame: SE quadrant = smooth texture with
+            // luma-tracking chroma at the (2, −2) grid point.
+            let tex = |i: usize, j: usize| -> u8 {
+                let v = 128.0
+                    + 70.0 * ((i as f64) * 0.35).sin() * ((j as f64) * 0.29).cos()
+                    + 30.0 * (((i + j) as f64) * 0.11).sin();
+                v.clamp(0.0, 255.0) as u8
+            };
+            let mut f2 = f1.clone();
+            for i in 0..32usize {
+                for j in 0..32usize {
+                    f2.y[(32 + i) * 64 + 32 + j] = tex(i, j);
+                }
+            }
+            let mut acc = 0i64;
+            for i in 0..16usize {
+                for j in 0..16usize {
+                    acc += i64::from(tex(2 * i, 2 * j))
+                        + i64::from(tex(2 * i + 1, 2 * j))
+                        + i64::from(tex(2 * i, 2 * j + 1))
+                        + i64::from(tex(2 * i + 1, 2 * j + 1));
+                }
+            }
+            let mean4 = acc / 256;
+            for i in 0..16usize {
+                for j in 0..16usize {
+                    let s = i64::from(tex(2 * i, 2 * j))
+                        + i64::from(tex(2 * i + 1, 2 * j))
+                        + i64::from(tex(2 * i, 2 * j + 1))
+                        + i64::from(tex(2 * i + 1, 2 * j + 1));
+                    let ac = (s - mean4) / 16;
+                    let cell = (16 + i) * 32 + 16 + j;
+                    f2.u[cell] = (128 + ac).clamp(0, 255) as u8;
+                    f2.v[cell] = (128 - ac).clamp(0, 255) as u8;
+                }
+            }
+            let enc = encode_gop_yuv420_with_q(&[f0, f1, f2], base_q_idx).unwrap();
+            dump("self-gop-64x64-q60-fi-cfl", &enc);
+        }
+    }
 }

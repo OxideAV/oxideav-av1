@@ -576,7 +576,7 @@ impl ReconState {
 /// which for a single-tile whole-frame walk collapse to `start_y > 0`
 /// / `start_x > 0`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-fn build_tu_neighbours(
+pub(crate) fn build_tu_neighbours(
     plane_buf: &[u8],
     pw: usize,
     ph: usize,
@@ -727,7 +727,7 @@ fn predict_mode_from_neighbours(
 /// §7.11.2.3 recursive (filter-intra) prediction over pre-built
 /// head-extended neighbour arrays — the `use_filter_intra == 1` luma
 /// arm of the §7.11.2.1 dispatch (replaces the mode-driven kernels).
-fn predict_filter_intra_from_neighbours(
+pub(crate) fn predict_filter_intra_from_neighbours(
     fim: usize,
     w: usize,
     h: usize,
