@@ -314,7 +314,12 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         // `comp_group_idx` cascade and may select COMPOUND_WEDGE /
         // COMPOUND_DIFFWTD (intra-only frames are unaffected).
         enable_masked_compound: true,
-        enable_warped_motion: false,
+        // r419: warped motion rides every stream this builder seeds —
+        // inter frames code `allow_warped_motion = 1`, eligible
+        // single-reference leaves code the §5.11.27 arm-B 3-way
+        // `motion_mode` S(), and the RD ladder may commit
+        // WARPED_CAUSAL winners (intra-only frames are unaffected).
+        enable_warped_motion: true,
         enable_dual_filter: false,
         // r413: §5.5.1 order hints ride every stream this builder
         // seeds (KEY-only and GOP alike) — the §5.9.22

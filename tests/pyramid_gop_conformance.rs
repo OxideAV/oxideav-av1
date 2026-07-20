@@ -258,6 +258,29 @@ fn pyramid_screen_content_round_trips() {
     }
 }
 
+/// r419 — vertically-sheared motion (the §5.11.27 OBMC-stressing
+/// sweep kind: a per-row horizontal shift ramp misaligned with every
+/// partition boundary) round-trips at three quantisers through two
+/// full mini-GOPs.
+#[test]
+fn pyramid_shear_content_round_trips() {
+    for q in [0u8, 60, 160] {
+        let frames = build_content("shear", 64, 64, 5, 31);
+        assert_pyramid_round_trip(&frames, q);
+    }
+}
+
+/// r419 — progressive centre zoom (the §5.11.27 WARPED_CAUSAL
+/// -stressing sweep kind: a true affine motion field feeding the
+/// §7.10.4/§7.11.3.8 warp fit) round-trips at three quantisers.
+#[test]
+fn pyramid_zoom_content_round_trips() {
+    for q in [0u8, 60, 160] {
+        let frames = build_content("zoom", 64, 64, 5, 37);
+        assert_pyramid_round_trip(&frames, q);
+    }
+}
+
 /// Env-gated external-validation dump: when `OXIDEAV_AV1_SWEEP_DIR`
 /// is set, encode the full config matrix and write each stream's IVF
 /// plus the encoder reconstruction as concatenated yuv420p
@@ -280,8 +303,12 @@ fn pyramid_external_sweep_dump() {
     // r418: "screen" (4-colour dither panel growing over a moving
     // gradient — drives the §5.11.46 palette intra leaves inside
     // inter frames) joins the rotation.
+    // r419: "shear" (per-row horizontal shift ramp — drives the
+    // §5.11.27 OBMC election) and "zoom" (progressive centre zoom —
+    // drives the §5.11.27 WARPED_CAUSAL election) join the rotation.
     let contents = [
         "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands", "iifade", "screen",
+        "shear", "zoom",
     ];
     let lengths = [2usize, 3, 4, 5, 7, 9];
     let mut count = 0u32;
@@ -455,6 +482,79 @@ fn build_content(kind: &str, w: u32, h: u32, n: usize, seed: u32) -> Vec<Yuv420F
                         for j in 0..wu / 2 {
                             f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 70;
                             f.v[i * (wu / 2) + j] = tex(i + 9, j + 2, seed) / 2 + 40;
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+        "shear" => {
+            // r419 — vertically-sheared motion: a per-row horizontal
+            // shift that ramps from `4k` (top) to 0 (bottom) across
+            // rows [h/3, 2h/3), misaligned with every partition
+            // boundary — §5.11.27 OBMC election territory.
+            let tex = |i: usize, j: usize, s: u32| -> u8 {
+                ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13) + s as usize) % 256) as u8
+            };
+            (0..n)
+                .map(|k| {
+                    let (wu, hu) = (w as usize, h as usize);
+                    let (ramp0, ramp1) = (hu / 3, 2 * hu / 3);
+                    let mut f = Yuv420Frame::filled(w, h, 128);
+                    for i in 0..hu {
+                        let top = 4 * k;
+                        let dx = if i < ramp0 {
+                            top
+                        } else if i >= ramp1 {
+                            0
+                        } else {
+                            top * (ramp1 - i) / (ramp1 - ramp0)
+                        };
+                        for j in 0..wu {
+                            f.y[i * wu + j] = tex(i, j + dx, seed);
+                        }
+                    }
+                    for i in 0..hu / 2 {
+                        for j in 0..wu / 2 {
+                            f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 64;
+                            f.v[i * (wu / 2) + j] = tex(i + 5, j + 3, seed) / 2 + 32;
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+        "zoom" => {
+            // r419 — progressive zoom about the frame centre (a true
+            // affine motion field: per-block translational MVs vary
+            // linearly, feeding the §7.10.4/§7.11.3.8 warp fit) over
+            // a smooth sub-pel-interpolable texture.
+            let tex = |y: i64, x: i64, s: u32| -> u8 {
+                let (y, x) = (y as f64 / 8.0, x as f64 / 8.0);
+                let v = 96.0
+                    + 60.0 * ((y * 0.11).sin() * (x * 0.13).cos())
+                    + 40.0 * ((y * 0.05 + x * 0.07 + (s % 7) as f64).sin());
+                v.clamp(0.0, 255.0) as u8
+            };
+            (0..n)
+                .map(|k| {
+                    let (wu, hu) = (w as usize, h as usize);
+                    let (cy, cx) = ((hu / 2) as i64, (wu / 2) as i64);
+                    // Scale 16/16, 17/16, 18/16, ... per frame.
+                    let (num, den) = (16 + k as i64, 16i64);
+                    let mut f = Yuv420Frame::filled(w, h, 128);
+                    for i in 0..hu {
+                        for j in 0..wu {
+                            let sy = cy * 8 + ((i as i64) - cy) * 8 * num / den;
+                            let sx = cx * 8 + ((j as i64) - cx) * 8 * num / den;
+                            f.y[i * wu + j] = tex(sy, sx, seed);
+                        }
+                    }
+                    for i in 0..hu / 2 {
+                        for j in 0..wu / 2 {
+                            f.u[i * (wu / 2) + j] = tex(4 * i as i64, 4 * j as i64, seed) / 2 + 64;
+                            f.v[i * (wu / 2) + j] =
+                                tex(4 * i as i64 + 9, 4 * j as i64 + 5, seed) / 2 + 32;
                         }
                     }
                     f

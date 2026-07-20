@@ -837,6 +837,19 @@ pub struct SyntaxInterBlock {
     /// size must satisfy `Wedge_Bits[ MiSize ] > 0` — the encoder
     /// never commits a wedge on a wedge-ineligible size).
     pub interintra_wedge_index: u8,
+    /// r419 — §5.11.27 committed `motion_mode` ordinal
+    /// ([`crate::cdf::MOTION_MODE_SIMPLE`] / `MOTION_MODE_OBMC` /
+    /// `MOTION_MODE_WARPED_CAUSAL`). Non-SIMPLE values are codable
+    /// only where the §5.11.27 reader can produce them — the writer
+    /// re-derives every short-circuit arm (skip-mode, frame
+    /// switchability, sub-8×8, warping-global-motion GLOBALMV,
+    /// compound / inter-intra slot-1, §7.10.3
+    /// `has_overlappable_candidates( )`) plus the
+    /// post-`find_warp_samples` arm dispatch (`WARPED_CAUSAL`
+    /// additionally requires `allow_warped_motion`, `NumSamples > 0`,
+    /// `!force_integer_mv` and an unscaled `RefFrame[ 0 ]`) and
+    /// rejects any uncodable commitment.
+    pub motion_mode: u8,
 }
 
 /// Frame-scope inter state for a §5.11.18 write walk (r411) — the
@@ -2534,6 +2547,24 @@ fn write_block_syntax_inter_frame(
         tail.is_motion_mode_switchable = ip.is_motion_mode_switchable;
         tail.allow_warped_motion = ip.allow_warped_motion;
         tail.is_scaled_per_ref = ip.is_scaled_per_ref;
+        // r419 — §5.11.27 `read_motion_mode( )` inputs, derived from
+        // the mirror exactly as the decode walker derives them at its
+        // read site (the mirror holds only prior blocks' stamps here,
+        // identical to the reader's grid state): the §7.10.3
+        // `has_overlappable_candidates( )` scan and the §7.10.4
+        // `find_warp_samples( )` NumSamples over the committed
+        // post-`assign_mv` motion vector.
+        tail.motion_mode = ib.motion_mode;
+        tail.has_overlappable = state
+            .mirror
+            .has_overlappable_candidates(mi_row, mi_col, sub_size);
+        tail.num_samples = state.mirror.find_warp_samples(
+            mi_row,
+            mi_col,
+            sub_size,
+            i32::from(ib.ref_frame[0]),
+            ib.mv,
+        );
         tail.enable_interintra_compound = ip.enable_interintra_compound;
         tail.enable_masked_compound = ip.enable_masked_compound;
         tail.enable_jnt_comp = ip.enable_jnt_comp;
@@ -2717,10 +2748,12 @@ fn write_block_syntax_inter_frame(
                 NUM_4X4_BLOCKS_WIDE[sub_size] * MI_SIZE,
                 NUM_4X4_BLOCKS_HIGH[sub_size] * MI_SIZE,
             ) >= 8;
-            let needs = if skip_mode != 0 {
-                // §5.11.23 `needs_interp_filter( )`: `skip_mode` (and
-                // LOCALWARP, unreachable here) return 0 — the reader
-                // derives EIGHTTAP on both slots with no bits.
+            let needs = if skip_mode != 0 || ib.motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL
+            {
+                // §5.11.23 `needs_interp_filter( )`: `skip_mode` and
+                // LOCALWARP (r419 — a committed `WARPED_CAUSAL` leaf)
+                // return 0 — the reader derives EIGHTTAP on both
+                // slots with no bits.
                 false
             } else if large && ib.y_mode == MODE_GLOBALMV {
                 ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
@@ -2809,7 +2842,9 @@ fn write_block_syntax_inter_frame(
                 mv: ib.mv[0],
                 mv2: ib.mv[1],
                 interp_filter: committed_filters,
-                motion_mode: MOTION_MODE_SIMPLE,
+                // r419 — the committed §5.11.27 ordinal (mirrors the
+                // decode walker's per-footprint `MotionModes` stamp).
+                motion_mode: ib.motion_mode,
                 palette_size_y: 0,
                 palette_colors_y: &[],
                 palette_size_uv: 0,
@@ -6423,6 +6458,7 @@ mod tests {
             interintra_mode: None,
             wedge_interintra: 0,
             interintra_wedge_index: 0,
+            motion_mode: MOTION_MODE_SIMPLE,
         });
         b
     }
@@ -6647,6 +6683,7 @@ mod tests {
                 interintra_mode: None,
                 wedge_interintra: 0,
                 interintra_wedge_index: 0,
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             b
         };
@@ -6752,6 +6789,7 @@ mod tests {
                 interintra_mode: None,
                 wedge_interintra: 0,
                 interintra_wedge_index: 0,
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             b
         };
@@ -6816,6 +6854,7 @@ mod tests {
                 interintra_mode: None,
                 wedge_interintra: 0,
                 interintra_wedge_index: 0,
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             let node = SyntaxNode::Leaf(Box::new(b));
             let mut writer = SymbolWriter::new(false);
@@ -6896,6 +6935,7 @@ mod tests {
                     interintra_mode: None,
                     wedge_interintra: 0,
                     interintra_wedge_index: 0,
+                    motion_mode: MOTION_MODE_SIMPLE,
                 });
                 b
             };
@@ -6963,6 +7003,7 @@ mod tests {
                 interintra_mode: None,
                 wedge_interintra: 0,
                 interintra_wedge_index: 0,
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             let node = SyntaxNode::Leaf(Box::new(b));
             let mut writer = SymbolWriter::new(false);
@@ -7034,6 +7075,7 @@ mod tests {
                 interintra_mode: Some(mode),
                 wedge_interintra: u8::from(wedge.is_some()),
                 interintra_wedge_index: wedge.unwrap_or(0),
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             b
         };
@@ -7060,6 +7102,7 @@ mod tests {
             interintra_mode: None,
             wedge_interintra: 0,
             interintra_wedge_index: 0,
+            motion_mode: MOTION_MODE_SIMPLE,
         });
         let node = SyntaxNode::Split([
             Box::new(SyntaxNode::Leaf(Box::new(nw))),
@@ -7132,6 +7175,7 @@ mod tests {
                 interintra_mode: Some(II_V_PRED),
                 wedge_interintra: wedge_ii,
                 interintra_wedge_index: wedge_idx,
+                motion_mode: MOTION_MODE_SIMPLE,
             });
             let node = SyntaxNode::Leaf(Box::new(b));
             let mut writer = SymbolWriter::new(false);

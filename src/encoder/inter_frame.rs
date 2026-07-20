@@ -64,9 +64,9 @@ use crate::cdf::{
     QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
     EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
     MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
-    MODE_NEWMV, MODE_NEW_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
-    PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP,
-    TX_WIDTH,
+    MODE_NEWMV, MODE_NEW_NEWMV, MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE,
+    SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
 use crate::encoder::frame_obu::encode_uncompressed_header;
@@ -179,6 +179,68 @@ impl CompoundSel {
         wedge_sign: 0,
         mask_type: 0,
     };
+}
+
+/// r419 — one leaf's committed §5.11.27 motion-mode selection for the
+/// prediction driver ([`PSearchCtx::predict_leaf`] stamps the ordinal
+/// into the `MotionModes[]` grid and — on the warp arm — the
+/// §7.11.3.8 fit into the per-cell `LocalWarpParams` slice the
+/// decoder's leaf driver reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionSel {
+    /// §5.11.27 `SIMPLE` — the translational §7.11.3.1 path.
+    Simple,
+    /// §5.11.27 `OBMC` — the leaf's own prediction plus the
+    /// §7.11.3.9-10 above/left overlap blend, resolved by the leaf
+    /// driver from the committed neighbour grids.
+    Obmc,
+    /// §5.11.27 `WARPED_CAUSAL` — the §7.11.3.5 warp with the carried
+    /// §7.11.3.8 least-squares fit (already `setup_shear`-validated
+    /// by the caller; an invalid fit is never committed).
+    Warp([i32; 6]),
+}
+
+impl MotionSel {
+    /// The committed §5.11.27 ordinal.
+    fn ordinal(self) -> u8 {
+        match self {
+            MotionSel::Simple => MOTION_MODE_SIMPLE,
+            MotionSel::Obmc => MOTION_MODE_OBMC,
+            MotionSel::Warp(_) => MOTION_MODE_WARPED_CAUSAL,
+        }
+    }
+}
+
+/// r419 — one driver-grid cell's saved state (see
+/// [`PSearchCtx::snapshot_grids_rect`]).
+#[derive(Debug, Clone, Copy)]
+struct DriverGridCell {
+    mi_size: usize,
+    is_inter: u8,
+    ref_frames: [i8; 2],
+    mvs: [i16; 4],
+    interp_filters: [u8; 2],
+    motion_mode: u8,
+    y_mode: u8,
+    compound_type: u8,
+    wedge_index: u8,
+    wedge_sign: u8,
+    mask_type: u8,
+    interintra_mode: u8,
+    wedge_interintra: u8,
+    interintra_wedge_index: u8,
+    local_warp: [i32; 6],
+    local_warp_valid: u8,
+}
+
+/// r419 — a rect snapshot of the §5.11.5 driver grids (row-major
+/// cells over `[mi_row, r1) × [mi_col, c1)`).
+struct DriverGridSnapshot {
+    mi_row: u32,
+    mi_col: u32,
+    r1: u32,
+    c1: u32,
+    cells: Vec<DriverGridCell>,
 }
 
 /// r417 — one §5.11.28 inter-intra selection for
@@ -465,7 +527,11 @@ fn build_inter_frame_fh(
         seq.order_hint_bits,
     );
     fh.skip_mode_present = Some(skip_allowed && reference_select && seq.enable_order_hint);
-    fh.allow_warped_motion = Some(false);
+    // r419: `allow_warped_motion = 1` whenever the sequence gate is
+    // open (the f(1) is coded under `!error_resilient_mode &&
+    // enable_warped_motion`) — §5.11.27 arm B becomes reachable and
+    // the RD ladder may commit WARPED_CAUSAL leaves.
+    fh.allow_warped_motion = Some(seq.enable_warped_motion);
     fh.inter_refs = Some(InterFrameRefs {
         frame_refs_short_signaling: false,
         last_frame_idx: None,
@@ -473,7 +539,11 @@ fn build_inter_frame_fh(
         ref_frame_idx: cfg.ref_frame_idx,
         allow_high_precision_mv: false,
         interpolation_filter: InterpolationFilter::Switchable,
-        is_motion_mode_switchable: false,
+        // r419: §5.9.2 `is_motion_mode_switchable = 1` — every
+        // §5.11.27-eligible leaf codes the `use_obmc` /
+        // `motion_mode` S(), and the RD ladder may commit OBMC /
+        // WARPED_CAUSAL winners.
+        is_motion_mode_switchable: true,
         // r413: §7.9 temporal MV prediction on every inter frame (the
         // first P-frame's projections are empty — every slot still
         // holds the intra KEY — which both sides derive identically).
@@ -666,6 +736,14 @@ pub(crate) fn encode_inter_frame_generic(
     // ladder trials the §7.11.3.15 distance-weighted blend against
     // the AVERAGE baseline).
     ip.enable_jnt_comp = seq.enable_jnt_comp;
+    // r419: §5.9.2 motion-mode switchability + warped motion — the
+    // write pass codes §5.11.27 `motion_mode` on eligible leaves and
+    // the RD ladder trials OBMC (and, with the warp gates open,
+    // WARPED_CAUSAL) against SIMPLE. `allow_warped_motion` mirrors
+    // the header derivation: coded only when the sequence gate is
+    // open (the header writer emits the f(1) under the same gate).
+    ip.is_motion_mode_switchable = true;
+    ip.allow_warped_motion = seq.enable_warped_motion;
     // §5.9.2 order hints — `OrderHints[ ref ]` =
     // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` over the
     // config's slot state.
@@ -975,9 +1053,11 @@ struct PSearchCtx {
     interp_filters: Vec<u8>,
     motion_modes: Vec<u8>,
     y_modes: Vec<u8>,
-    /// Shared all-zero grid for the compound / inter-intra side-data
-    /// slices (never read at a single-reference SIMPLE leaf's origin).
-    zeros: Vec<u8>,
+    /// r419 — §5.11.18 per-cell `AvailU` / `AvailL` grids for the
+    /// §7.11.3.9 OBMC pass gates (single full-frame tile: `AvailU =
+    /// MiRow > 0`, `AvailL = MiCol > 0`), precomputed once.
+    avail_us: Vec<u8>,
+    avail_ls: Vec<u8>,
     /// r415 — the §5.11.5 `CompoundTypes[ .. ]` grid (COMPOUND_AVERAGE
     /// initial fill; [`Self::predict_leaf`] stamps each trial's
     /// committed §5.11.29 selection over its footprint); read at
@@ -998,10 +1078,14 @@ struct PSearchCtx {
     interintra_modes: Vec<u8>,
     wedge_interintras: Vec<u8>,
     interintra_wedge_indices: Vec<u8>,
-    /// All-zero §7.11.3.8 per-cell warp-fit slice (never read on the
-    /// all-SIMPLE configuration; sized per the [`crate::GridWarpContext`]
-    /// contract).
+    /// §7.11.3.8 per-cell `LocalWarpParams[ 0..6 ]` slice
+    /// ([`crate::GridWarpContext`] contract; r419 —
+    /// [`Self::predict_leaf`] stamps a `Warp` trial's fit at the leaf
+    /// origin, the only cell the leaf driver reads).
     local_warp: Vec<i32>,
+    /// r419 — §7.11.3.8 `LocalValid` bit per cell (twin of the decode
+    /// walker's grid; stamped alongside [`Self::local_warp`]).
+    local_warp_valid: Vec<u8>,
     /// Full-plane prediction scratch (`reconstruct_inter_leaf_at`
     /// writes at absolute plane coordinates).
     scratch: [Vec<u16>; 3],
@@ -1144,7 +1228,18 @@ impl PSearchCtx {
             interp_filters: vec![EIGHTTAP; cells * 2],
             motion_modes: vec![MOTION_MODE_SIMPLE; cells],
             y_modes: vec![0u8; cells],
-            zeros: vec![0u8; cells],
+            avail_us: {
+                let mut v = vec![1u8; cells];
+                v[..mi_cols as usize].fill(0);
+                v
+            },
+            avail_ls: {
+                let mut v = vec![1u8; cells];
+                for r in 0..mi_rows as usize {
+                    v[r * mi_cols as usize] = 0;
+                }
+                v
+            },
             compound_types: vec![crate::cdf::COMPOUND_AVERAGE; cells],
             wedge_indices: vec![0u8; cells],
             wedge_signs: vec![0u8; cells],
@@ -1153,6 +1248,7 @@ impl PSearchCtx {
             wedge_interintras: vec![0u8; cells],
             interintra_wedge_indices: vec![0u8; cells],
             local_warp: vec![0i32; cells * 6],
+            local_warp_valid: vec![0u8; cells],
             scratch: [
                 vec![0u16; width * height],
                 vec![0u16; (width / 2) * (height / 2)],
@@ -1298,6 +1394,137 @@ impl PSearchCtx {
         )
     }
 
+    /// r419 — rect snapshot of every §5.11.5 driver grid (the slices
+    /// [`Self::predict_leaf`] / [`Self::stamp_intra_leaf_grids`]
+    /// stamp and the decoder's leaf driver reads). The r419 OBMC
+    /// neighbour scan reads committed ABOVE/LEFT cells through these
+    /// grids, so — like the mirror — losing trials must roll back:
+    /// [`build_p_search_tree`] pairs every mirror snapshot/restore
+    /// with a driver-grid one.
+    fn snapshot_grids_rect(&self, mi_row: u32, mi_col: u32, n4: u32) -> DriverGridSnapshot {
+        let r1 = (mi_row + n4).min(self.mi_rows);
+        let c1 = (mi_col + n4).min(self.mi_cols);
+        let mut cells = Vec::with_capacity(((r1 - mi_row) * (c1 - mi_col)) as usize);
+        for rr in mi_row..r1 {
+            for cc in mi_col..c1 {
+                let cell = (rr * self.mi_cols + cc) as usize;
+                cells.push(DriverGridCell {
+                    mi_size: self.mi_sizes[cell],
+                    is_inter: self.is_inters[cell],
+                    ref_frames: [self.ref_frames[cell * 2], self.ref_frames[cell * 2 + 1]],
+                    mvs: [
+                        self.mvs[cell * 4],
+                        self.mvs[cell * 4 + 1],
+                        self.mvs[cell * 4 + 2],
+                        self.mvs[cell * 4 + 3],
+                    ],
+                    interp_filters: [
+                        self.interp_filters[cell * 2],
+                        self.interp_filters[cell * 2 + 1],
+                    ],
+                    motion_mode: self.motion_modes[cell],
+                    y_mode: self.y_modes[cell],
+                    compound_type: self.compound_types[cell],
+                    wedge_index: self.wedge_indices[cell],
+                    wedge_sign: self.wedge_signs[cell],
+                    mask_type: self.mask_types[cell],
+                    interintra_mode: self.interintra_modes[cell],
+                    wedge_interintra: self.wedge_interintras[cell],
+                    interintra_wedge_index: self.interintra_wedge_indices[cell],
+                    local_warp: {
+                        let mut w = [0i32; 6];
+                        w.copy_from_slice(&self.local_warp[cell * 6..cell * 6 + 6]);
+                        w
+                    },
+                    local_warp_valid: self.local_warp_valid[cell],
+                });
+            }
+        }
+        DriverGridSnapshot {
+            mi_row,
+            mi_col,
+            r1,
+            c1,
+            cells,
+        }
+    }
+
+    /// Restore a [`Self::snapshot_grids_rect`] snapshot.
+    fn restore_grids_rect(&mut self, snap: &DriverGridSnapshot) {
+        let mut it = snap.cells.iter();
+        for rr in snap.mi_row..snap.r1 {
+            for cc in snap.mi_col..snap.c1 {
+                let cell = (rr * self.mi_cols + cc) as usize;
+                let s = it.next().expect("snapshot covers the rect");
+                self.mi_sizes[cell] = s.mi_size;
+                self.is_inters[cell] = s.is_inter;
+                self.ref_frames[cell * 2] = s.ref_frames[0];
+                self.ref_frames[cell * 2 + 1] = s.ref_frames[1];
+                self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&s.mvs);
+                self.interp_filters[cell * 2] = s.interp_filters[0];
+                self.interp_filters[cell * 2 + 1] = s.interp_filters[1];
+                self.motion_modes[cell] = s.motion_mode;
+                self.y_modes[cell] = s.y_mode;
+                self.compound_types[cell] = s.compound_type;
+                self.wedge_indices[cell] = s.wedge_index;
+                self.wedge_signs[cell] = s.wedge_sign;
+                self.mask_types[cell] = s.mask_type;
+                self.interintra_modes[cell] = s.interintra_mode;
+                self.wedge_interintras[cell] = s.wedge_interintra;
+                self.interintra_wedge_indices[cell] = s.interintra_wedge_index;
+                self.local_warp[cell * 6..cell * 6 + 6].copy_from_slice(&s.local_warp);
+                self.local_warp_valid[cell] = s.local_warp_valid;
+            }
+        }
+    }
+
+    /// r419 — the §5.11.27 WARPED_CAUSAL fit for one leaf: the
+    /// §7.10.4 `find_warp_samples` scan against the driver mirror
+    /// (the identical scan the write pass validates `NumSamples`
+    /// with and the decode walker re-runs at its in-walk
+    /// `compute_prediction( )` position), the §7.11.3.8
+    /// `warp_estimation` least squares, and the §7.11.3.6
+    /// `setup_shear` validity check. `Some(params)` iff the scan
+    /// found samples AND the fit is shear-valid — the only
+    /// configuration where committing `WARPED_CAUSAL` changes the
+    /// §7.11.3.1 step-7 prediction.
+    fn warp_fit(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+        ref0: i8,
+        mv: [[i32; 2]; 2],
+    ) -> Option<[i32; 6]> {
+        let mut cands: Vec<crate::inter_pred::WarpSampleCand> = Vec::new();
+        let ns = self.mirror.find_warp_samples_list(
+            mi_row,
+            mi_col,
+            b_size,
+            i32::from(ref0),
+            mv,
+            &mut cands,
+        );
+        if ns == 0 {
+            return None;
+        }
+        let lw = crate::inter_pred::warp_estimation(
+            &cands,
+            mi_row as i32,
+            mi_col as i32,
+            NUM_4X4_BLOCKS_WIDE[b_size] as i32,
+            NUM_4X4_BLOCKS_HIGH[b_size] as i32,
+            [mv[0][0] as i16, mv[0][1] as i16],
+        );
+        if !lw.local_valid {
+            return None;
+        }
+        match crate::inter_pred::setup_shear(lw.local_warp_params) {
+            Some(s) if s.warp_valid => Some(lw.local_warp_params),
+            _ => None,
+        }
+    }
+
     /// Stamp a COMMITTED leaf into the driver mirror with the same
     /// `stamp_encoder_block_syntax` values the write pass stamps for
     /// this leaf (`cdef: None` per the
@@ -1342,7 +1569,9 @@ impl PSearchCtx {
                 mv: ib.mv[0],
                 mv2: ib.mv[1],
                 interp_filter: ib.interp_filter,
-                motion_mode: MOTION_MODE_SIMPLE,
+                // r419 — the committed §5.11.27 ordinal (the write
+                // pass stamps the identical value).
+                motion_mode: ib.motion_mode,
                 palette_size_y: 0,
                 palette_colors_y: &[],
                 palette_size_uv: 0,
@@ -1498,8 +1727,14 @@ impl PSearchCtx {
         filter: u8,
         comp: CompoundSel,
         ii: Option<InterIntraTrial<'_>>,
+        motion: MotionSel,
     ) -> Result<(), Error> {
         if ii.is_some() && ref_frame[1] != -1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // r419 — §5.11.27: a non-SIMPLE motion mode exists only on a
+        // single-reference non-inter-intra leaf.
+        if motion != MotionSel::Simple && (ref_frame[1] != -1 || ii.is_some()) {
             return Err(Error::PartitionWalkOutOfRange);
         }
         let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
@@ -1539,7 +1774,9 @@ impl PSearchCtx {
                 self.mvs[cell * 4 + 3] = mv[1][1] as i16;
                 self.interp_filters[cell * 2] = filter;
                 self.interp_filters[cell * 2 + 1] = filter;
-                self.motion_modes[cell] = MOTION_MODE_SIMPLE;
+                // r419 — the committed §5.11.27 ordinal over the
+                // footprint (the decode walker's grid-fill twin).
+                self.motion_modes[cell] = motion.ordinal();
                 self.y_modes[cell] = y_mode;
                 // r415 — §5.11.29 side-data stamps (the decoder's leaf
                 // driver dispatches WEDGE / DIFFWTD masks from these).
@@ -1555,6 +1792,21 @@ impl PSearchCtx {
                     u8::from(ii.as_ref().is_some_and(|t| t.wedge.is_some()));
                 self.interintra_wedge_indices[cell] =
                     ii.as_ref().and_then(|t| t.wedge).unwrap_or(0);
+            }
+        }
+
+        // r419 — §7.11.3.8 per-cell warp-fit stamps at the leaf
+        // origin (the only cell the leaf driver's warp context
+        // reads), mirroring the decode walker's in-walk
+        // `compute_prediction( )` stamp.
+        {
+            let origin = (mi_row * self.mi_cols + mi_col) as usize;
+            if let MotionSel::Warp(p) = motion {
+                self.local_warp[origin * 6..origin * 6 + 6].copy_from_slice(&p);
+                self.local_warp_valid[origin] = 1;
+            } else {
+                self.local_warp[origin * 6..origin * 6 + 6].fill(0);
+                self.local_warp_valid[origin] = 0;
             }
         }
 
@@ -1655,8 +1907,10 @@ impl PSearchCtx {
             interp_filters,
             motion_modes,
             y_modes,
-            zeros,
+            avail_us,
+            avail_ls,
             local_warp,
+            local_warp_valid,
             scratch,
             gm_types,
             gm_flat,
@@ -1716,20 +1970,29 @@ impl PSearchCtx {
             mi_rows,
             mi_cols,
             bit_depth: 8,
-            // §7.11.3.1 step-7 warp context — identity global motion +
-            // SIMPLE motion modes keep `useWarp = 0` on every leaf
-            // (the decode walker threads the same tables).
+            // §7.11.3.1 step-7 warp context — identity global motion;
+            // r419: a `WARPED_CAUSAL` trial carries its §7.11.3.8 fit
+            // in the per-cell slices stamped above (SIMPLE / OBMC
+            // leaves keep `useWarp = 0`).
             warp: Some(crate::GridWarpContext {
                 motion_modes,
                 local_warp_params: local_warp,
-                local_warp_valid: zeros,
+                local_warp_valid,
                 y_modes,
                 gm_types,
                 gm_params: gm_flat,
                 force_integer_mv: false,
                 is_scaled: no_scaled,
             }),
-            obmc: None,
+            // r419 — §7.11.3.9 OBMC context: an `OBMC` trial routes
+            // through the decoder's own neighbour-scan dispatch over
+            // the committed grids (the decode frame walk threads the
+            // identical trio).
+            obmc: Some(crate::GridObmcContext {
+                motion_modes,
+                avail_u: avail_us,
+                avail_l: avail_ls,
+            }),
         };
         let [s0, s1, s2] = scratch;
         let mut planes = [
@@ -1891,6 +2154,7 @@ fn refine_mv_subpel(
             EIGHTTAP,
             CompoundSel::AVERAGE,
             None,
+            MotionSel::Simple,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -1980,6 +2244,7 @@ fn encode_inter_leaf(
         EIGHTTAP,
         CompoundSel::AVERAGE,
         None,
+        MotionSel::Simple,
     )?;
     let (bw, bh) = (bw4 * 4, bh4 * 4);
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
@@ -2022,6 +2287,8 @@ fn encode_inter_leaf(
         interintra_mode: None,
         wedge_interintra: 0,
         interintra_wedge_index: 0,
+        // §5.11.27 line 1: skip-mode forces SIMPLE with no bits.
+        motion_mode: MOTION_MODE_SIMPLE,
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
     let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
@@ -2055,6 +2322,18 @@ fn encode_inter_leaf(
                 mask_type: ib.mask_type,
             }
         };
+        // r419 — a WARPED_CAUSAL winner re-predicts through the same
+        // arm: the §7.11.3.8 fit is a pure function of the mirror
+        // state (unchanged since the trial — `stamp_leaf` runs at the
+        // caller), so the recomputation is bit-identical.
+        let motion = match ib.motion_mode {
+            MOTION_MODE_OBMC => MotionSel::Obmc,
+            MOTION_MODE_WARPED_CAUSAL => MotionSel::Warp(
+                ictx.warp_fit(mi_r, mi_c, b_size, ib.ref_frame[0], ib.mv)
+                    .ok_or(Error::PartitionWalkOutOfRange)?,
+            ),
+            _ => MotionSel::Simple,
+        };
         ictx.predict_leaf(
             mi_r,
             mi_c,
@@ -2065,6 +2344,7 @@ fn encode_inter_leaf(
             ib.interp_filter[0],
             sel,
             ii,
+            motion,
         )?;
     }
     Ok(leaf)
@@ -2313,6 +2593,7 @@ fn encode_inter_leaf_modes(
             EIGHTTAP,
             CompoundSel::AVERAGE,
             None,
+            MotionSel::Simple,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -2376,7 +2657,18 @@ fn encode_inter_leaf_modes(
                 ));
             }
             for (sel, extra) in trials {
-                ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel, None)?;
+                ictx.predict_leaf(
+                    mi_r,
+                    mi_c,
+                    b_size,
+                    c_ref,
+                    c_mode,
+                    c_mv,
+                    EIGHTTAP,
+                    sel,
+                    None,
+                    MotionSel::Simple,
+                )?;
                 let mut ssd = 0u64;
                 for i in 0..bh {
                     for j in 0..bw {
@@ -2413,7 +2705,18 @@ fn encode_inter_leaf_modes(
                 wedge_sign: 0,
                 mask_type: 0,
             };
-            ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel, None)?;
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                c_ref,
+                c_mode,
+                c_mv,
+                EIGHTTAP,
+                sel,
+                None,
+                MotionSel::Simple,
+            )?;
             let mut ssd = 0u64;
             for i in 0..bh {
                 for j in 0..bw {
@@ -2479,6 +2782,7 @@ fn encode_inter_leaf_modes(
                         wedge: None,
                         neigh: &*recon,
                     }),
+                    MotionSel::Simple,
                 )?;
                 let ssd = leaf_ssd(ictx);
                 if stage.map_or(true, |(s, _)| ssd < s) {
@@ -2511,6 +2815,7 @@ fn encode_inter_leaf_modes(
                             wedge: Some(wi),
                             neigh: &*recon,
                         }),
+                        MotionSel::Simple,
                     )?;
                     let score = leaf_ssd(ictx) + lambda * (s_rate + 8);
                     if score < best_score {
@@ -2542,27 +2847,143 @@ fn encode_inter_leaf_modes(
     // identity-warp frame configuration — the reader derives EIGHTTAP
     // with no bits, so no search happens and the committed pair must
     // be EIGHTTAP.
-    let filter = if y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV {
-        EIGHTTAP
+    let leaf_luma_ssd = |ictx: &PSearchCtx| -> u64 {
+        let mut ssd = 0u64;
+        for i in 0..bh {
+            for j in 0..bw {
+                let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                    - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        ssd
+    };
+    let (mut filter, simple_ssd) = if y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV {
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            ref_frame,
+            y_mode,
+            mv,
+            EIGHTTAP,
+            comp,
+            None,
+            MotionSel::Simple,
+        )?;
+        (EIGHTTAP, leaf_luma_ssd(ictx))
     } else {
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
         let mut best_f = (u64::MAX, EIGHTTAP);
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f, comp, None)?;
-            let mut ssd = 0u64;
-            for i in 0..bh {
-                for j in 0..bw {
-                    let d = i64::from(input.y[(row0 + i) * width + col0 + j])
-                        - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
-                    ssd += (d * d) as u64;
-                }
-            }
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                ref_frame,
+                y_mode,
+                mv,
+                f,
+                comp,
+                None,
+                MotionSel::Simple,
+            )?;
+            let ssd = leaf_luma_ssd(ictx);
             if ssd < best_f.0 {
                 best_f = (ssd, f);
             }
         }
-        best_f.1
+        (best_f.1, best_f.0)
     };
+
+    // r419 — §5.11.27 motion-mode trials on the winning
+    // single-reference (mode, MV): OBMC (the §7.11.3.9-10 overlap
+    // blend, trialled per codable filter) and — where the §5.11.27
+    // arm-B gates open — WARPED_CAUSAL (the §7.10.4 sample scan +
+    // §7.11.3.8 least-squares fit + §7.11.3.5 warp, filter-silent
+    // `EIGHTTAP` per `needs_interp_filter( )`). Every arm codes one
+    // roughly-equal-rate S() whichever value it selects, so luma
+    // distortion decides; ties keep the earlier arm (SIMPLE, then
+    // OBMC). The eligibility derivation tracks the §5.11.27 reader's
+    // short-circuit cascade exactly — an ineligible leaf never trials
+    // (and the write pass re-derives the same cascade and would
+    // reject an uncodable commitment).
+    let mut motion = MotionSel::Simple;
+    if ictx.ip.is_motion_mode_switchable
+        && ii_sel.is_none()
+        && ref_frame[1] == -1
+        && bw.min(bh) >= 8
+        && !(!ictx.ip.force_integer_mv
+            && y_mode == MODE_GLOBALMV
+            && ictx.ip.gm_type[ref_frame[0] as usize] > crate::cdf::GM_TYPE_TRANSLATION)
+        && ictx.mirror.has_overlappable_candidates(mi_r, mi_c, b_size)
+    {
+        let mut best_ssd = simple_ssd;
+        // OBMC trial — the leaf's own prediction rides its own
+        // §7.11.3.4 filter (GLOBALMV leaves stay filter-silent on
+        // EIGHTTAP), the overlap bands the committed neighbours'.
+        {
+            use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
+            let obmc_filters: &[u8] = if y_mode == MODE_GLOBALMV {
+                &[EIGHTTAP]
+            } else {
+                &[EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP]
+            };
+            for &f in obmc_filters {
+                ictx.predict_leaf(
+                    mi_r,
+                    mi_c,
+                    b_size,
+                    ref_frame,
+                    y_mode,
+                    mv,
+                    f,
+                    comp,
+                    None,
+                    MotionSel::Obmc,
+                )?;
+                let ssd = leaf_luma_ssd(ictx);
+                if ssd < best_ssd {
+                    best_ssd = ssd;
+                    motion = MotionSel::Obmc;
+                    filter = f;
+                }
+            }
+        }
+        // WARPED_CAUSAL trial — §5.11.27 arm B only (`NumSamples > 0`
+        // over the same §7.10.4 scan the write pass and the decoder
+        // re-run at this leaf, `allow_warped_motion`, unscaled
+        // reference), and only when the §7.11.3.8 fit is
+        // `setup_shear`-valid (an invalid fit decodes translationally
+        // — never worth the commitment).
+        if ictx.ip.allow_warped_motion
+            && !ictx.ip.force_integer_mv
+            && !ictx.ip.is_scaled_per_ref[(ref_frame[0] - 1) as usize]
+        {
+            if let Some(params) = ictx.warp_fit(mi_r, mi_c, b_size, ref_frame[0], mv) {
+                ictx.predict_leaf(
+                    mi_r,
+                    mi_c,
+                    b_size,
+                    ref_frame,
+                    y_mode,
+                    mv,
+                    EIGHTTAP,
+                    comp,
+                    None,
+                    MotionSel::Warp(params),
+                )?;
+                let ssd = leaf_luma_ssd(ictx);
+                if ssd < best_ssd {
+                    motion = MotionSel::Warp(params);
+                    // `needs_interp_filter( ) == 0` on LOCALWARP —
+                    // the committed pair must be the reader's
+                    // bit-silent EIGHTTAP derivation.
+                    filter = EIGHTTAP;
+                }
+            }
+        }
+    }
     ictx.predict_leaf(
         mi_r,
         mi_c,
@@ -2577,6 +2998,7 @@ fn encode_inter_leaf_modes(
             wedge: w,
             neigh: &*recon,
         }),
+        motion,
     )?;
 
     // r413 — per-leaf segment (deterministic activity policy) and its
@@ -2589,8 +3011,23 @@ fn encode_inter_leaf_modes(
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            comp, ii_sel, 0, segment_id, &seg_qp,
+            mi_r,
+            mi_c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            filter,
+            comp,
+            ii_sel,
+            motion.ordinal(),
+            0,
+            segment_id,
+            &seg_qp,
         );
     }
 
@@ -2625,8 +3062,23 @@ fn encode_inter_leaf_modes(
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            comp, ii_sel, depth, segment_id, &seg_qp,
+            mi_r,
+            mi_c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            filter,
+            comp,
+            ii_sel,
+            motion.ordinal(),
+            depth,
+            segment_id,
+            &seg_qp,
         )?;
         let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -2811,6 +3263,9 @@ fn encode_inter_leaf_residual(
     // rides a single-reference leaf whose scratch prediction the
     // caller already ran through the inter-intra arm.
     ii: Option<(u8, Option<u8>)>,
+    // r419 — the committed §5.11.27 ordinal (the caller's final
+    // `predict_leaf` already ran the matching prediction arm).
+    motion_mode: u8,
     depth: u32,
     segment_id: u8,
     seg_qp: &QuantizerParams,
@@ -3050,6 +3505,7 @@ fn encode_inter_leaf_residual(
         interintra_mode: ii.map(|(m, _)| m),
         wedge_interintra: u8::from(matches!(ii, Some((_, Some(_))))),
         interintra_wedge_index: ii.and_then(|(_, w)| w).unwrap_or(0),
+        motion_mode,
     });
     Ok(block)
 }
@@ -3236,7 +3692,11 @@ fn build_p_search_tree(
     // discipline as the pixel planes — every candidate leaves the
     // mirror holding ITS committed stamps, and the loser's stamps are
     // rolled back so subsequent §7.10.2 scans see only the winner.
+    // r419: the §5.11.5 driver grids join the discipline — the OBMC
+    // neighbour scan reads committed above/left cells through them,
+    // so a losing trial's stamps must not survive the node.
     let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
+    let g_before = ictx.snapshot_grids_rect(r, c, n4);
 
     // Candidate A: one INTER leaf.
     let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
@@ -3246,8 +3706,10 @@ fn build_p_search_tree(
     let score_inter = d_inter + lambda * r_inter;
     let after_inter = save_region(recon, r, c, n4 as usize);
     let m_after_inter = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
+    let g_after_inter = ictx.snapshot_grids_rect(r, c, n4);
     restore_region(recon, r, c, &before);
     ictx.mirror.restore_encoder_stamp_rect(&m_before);
+    ictx.restore_grids_rect(&g_before);
 
     // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
     // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
@@ -3260,26 +3722,46 @@ fn build_p_search_tree(
         intra_leaf.segment_id = ictx.segment_pred(r, c);
     }
     ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
+    // r419 — driver-grid intra stamps (the decode walker's grid-fill
+    // twins): a later leaf's OBMC neighbour scan must see
+    // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` on a committed intra
+    // region, exactly as the decoder will.
+    ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
     let d_intra = region_distortion(recon, input, r, c, n4 as usize);
     let r_intra = p_leaf_rate(&intra_leaf);
     let score_intra = d_intra + lambda * r_intra;
     let after_intra = save_region(recon, r, c, n4 as usize);
     let m_after_intra = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
+    let g_after_intra = ictx.snapshot_grids_rect(r, c, n4);
     restore_region(recon, r, c, &before);
     ictx.mirror.restore_encoder_stamp_rect(&m_before);
+    ictx.restore_grids_rect(&g_before);
 
-    let (leaf, after_leaf, m_after_leaf, score_leaf) = if score_inter <= score_intra {
-        (inter_leaf, after_inter, m_after_inter, score_inter)
+    let (leaf, after_leaf, m_after_leaf, g_after_leaf, score_leaf) = if score_inter <= score_intra {
+        (
+            inter_leaf,
+            after_inter,
+            m_after_inter,
+            g_after_inter,
+            score_inter,
+        )
     } else {
-        (intra_leaf, after_intra, m_after_intra, score_intra)
+        (
+            intra_leaf,
+            after_intra,
+            m_after_intra,
+            g_after_intra,
+            score_intra,
+        )
     };
 
     // Running best over the non-split candidates: NONE-leaf first,
     // then the r412 HORZ / VERT rectangular trials.
-    let mut best_node: (SyntaxNode, RegionSnapshot, _, u64) = (
+    let mut best_node: (SyntaxNode, RegionSnapshot, _, DriverGridSnapshot, u64) = (
         SyntaxNode::Leaf(Box::new(leaf)),
         after_leaf,
         m_after_leaf,
+        g_after_leaf,
         score_leaf,
     );
 
@@ -3354,7 +3836,7 @@ fn build_p_search_tree(
         }
         let d = region_distortion(recon, input, r, c, n4 as usize);
         let score = d + lambda * rate;
-        if score < best_node.3 {
+        if score < best_node.4 {
             let bx = |b: SyntaxBlock| Box::new(b);
             let node = match part {
                 PARTITION_HORZ | PARTITION_VERT => {
@@ -3402,13 +3884,15 @@ fn build_p_search_tree(
                 node,
                 save_region(recon, r, c, n4 as usize),
                 ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4),
+                ictx.snapshot_grids_rect(r, c, n4),
                 score,
             );
         }
         restore_region(recon, r, c, &before);
         ictx.mirror.restore_encoder_stamp_rect(&m_before);
+        ictx.restore_grids_rect(&g_before);
     }
-    let (node_leafish, after_leafish, m_after_leafish, score_leafish) = best_node;
+    let (node_leafish, after_leafish, m_after_leafish, g_after_leafish, score_leafish) = best_node;
 
     // Candidate C: PARTITION_SPLIT into four recursively-searched
     // quadrants (NW/NE/SW/SE dispatch order — the mirror currently
@@ -3435,6 +3919,7 @@ fn build_p_search_tree(
     if score_leafish <= score_split {
         restore_region(recon, r, c, &after_leafish);
         ictx.mirror.restore_encoder_stamp_rect(&m_after_leafish);
+        ictx.restore_grids_rect(&g_after_leafish);
         Ok(node_leafish)
     } else {
         Ok(SyntaxNode::Split(children))
@@ -3616,6 +4101,7 @@ mod tests {
                     EIGHTTAP_SHARP,
                     CompoundSel::AVERAGE,
                     None,
+                    MotionSel::Simple,
                 )
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
@@ -4490,6 +4976,7 @@ mod tests {
                 f,
                 CompoundSel::AVERAGE,
                 None,
+                MotionSel::Simple,
             )
             .unwrap();
             let mut v = Vec::new();
@@ -4554,6 +5041,7 @@ mod tests {
                 wedge: None,
                 neigh: &recon,
             }),
+            MotionSel::Simple,
         )
         .unwrap();
         let mut smooth_luma = Vec::new();
@@ -4612,6 +5100,7 @@ mod tests {
                 wedge: Some(7),
                 neigh: &recon,
             }),
+            MotionSel::Simple,
         )
         .unwrap();
         let mut wedge_luma = Vec::new();
@@ -4636,6 +5125,7 @@ mod tests {
             EIGHTTAP,
             CompoundSel::AVERAGE,
             None,
+            MotionSel::Simple,
         )
         .unwrap();
         assert_eq!(ictx.ref_frames[cell * 2 + 1], -1);
@@ -4912,6 +5402,7 @@ mod tests {
                         EIGHTTAP,
                         sel,
                         None,
+                        MotionSel::Simple,
                     )
                     .unwrap();
             }
@@ -5145,6 +5636,7 @@ mod tests {
                             wedge: Some(7),
                             neigh: &running,
                         }),
+                        MotionSel::Simple,
                     )
                     .unwrap();
                 let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
@@ -5416,6 +5908,7 @@ mod tests {
                             wedge: None,
                             neigh: &running,
                         }),
+                        MotionSel::Simple,
                     )
                     .unwrap();
                 // Adopt the blended quadrant into the target AND the
@@ -5571,6 +6064,7 @@ mod tests {
                         EIGHTTAP,
                         sel,
                         None,
+                        MotionSel::Simple,
                     )
                     .unwrap();
             }
@@ -5980,5 +6474,259 @@ mod tests {
             "converged references on a skip-mode B frame must select \
              skip_mode leaves (got SKIP_MODE={sm} OTHER={other})"
         );
+    }
+
+    /// Per-leaf §5.11.27 motion-mode census over a search tree.
+    fn count_motion_modes(node: &SyntaxNode, counts: &mut [u32; 3]) {
+        let leafc = |b: &SyntaxBlock, counts: &mut [u32; 3]| {
+            if let Some(ib) = b.inter.as_ref() {
+                counts[(ib.motion_mode as usize).min(2)] += 1;
+            }
+        };
+        match node {
+            SyntaxNode::Leaf(b) => leafc(b, counts),
+            SyntaxNode::Split(children) => {
+                for ch in children.iter() {
+                    count_motion_modes(ch, counts);
+                }
+            }
+            rest => {
+                for b in rest.asymmetric_blocks().iter() {
+                    leafc(b, counts);
+                }
+            }
+        }
+    }
+
+    /// Vertically-sheared motion content: `f0` a dense texture, `f1`
+    /// the same texture with a per-ROW horizontal shift that ramps
+    /// from `dx_top` (rows above `ramp0`) down to 0 (rows below
+    /// `ramp1`). No block-constant MV fits a ramp row band, and no
+    /// §5.11.4 partition boundary aligns with it — the §7.11.3.9-10
+    /// OBMC blend of the above neighbour's larger shift over a
+    /// block's top band is the best model the syntax offers.
+    fn shear_pair(w: u32, h: u32, dx_top: usize, ramp0: usize, ramp1: usize) -> [Yuv420Frame; 2] {
+        let (wu, hu) = (w as usize, h as usize);
+        let tex = |i: usize, j: usize| -> u8 {
+            ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u8
+        };
+        let mut f0 = Yuv420Frame::filled(w, h, 128);
+        for i in 0..hu {
+            for j in 0..wu {
+                f0.y[i * wu + j] = tex(i, j);
+            }
+        }
+        let dx_of = |i: usize| -> usize {
+            if i < ramp0 {
+                dx_top
+            } else if i >= ramp1 {
+                0
+            } else {
+                dx_top * (ramp1 - i) / (ramp1 - ramp0)
+            }
+        };
+        let mut f1 = Yuv420Frame::filled(w, h, 128);
+        for i in 0..hu {
+            let dx = dx_of(i);
+            for j in 0..wu {
+                f1.y[i * wu + j] = tex(i, j + dx);
+            }
+        }
+        [f0, f1]
+    }
+
+    /// r419 — the §5.11.27 OBMC selection must actually be REACHED:
+    /// on vertically-sheared motion (per-row shift ramp misaligned
+    /// with every partition boundary) at least one committed leaf
+    /// carries `motion_mode = OBMC`, and the emitted GOP stream
+    /// round-trips byte-exact through the spec decoder.
+    #[test]
+    fn r419_p_search_selects_obmc_on_sheared_motion() {
+        let [f0, f1] = shear_pair(64, 64, 8, 24, 48);
+        let base_q_idx = 100u8;
+        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameRecon {
+            y: key.recon_y,
+            u: key.recon_u,
+            v: key.recon_v,
+        };
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        // r419 — the frame configuration the GOP driver codes.
+        ip.is_motion_mode_switchable = true;
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let mut counts = [0u32; 3];
+        count_motion_modes(&tree, &mut counts);
+        assert!(
+            counts[MOTION_MODE_OBMC as usize] > 0,
+            "sheared motion must commit at least one §5.11.27 OBMC leaf \
+             (got SIMPLE={} OBMC={} WARP={})",
+            counts[0],
+            counts[1],
+            counts[2]
+        );
+
+        // Stream-level: the same content through the public GOP
+        // driver decodes byte-exact in the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+        }
+    }
+
+    /// Smoothly zooming texture pair: `f1` samples `f0`'s texture
+    /// field scaled about the frame centre by `num/den` (a true
+    /// affine motion field — per-block translational MVs vary
+    /// linearly across the frame, the §7.10.4 neighbour samples fit
+    /// the §7.11.3.8 least squares exactly).
+    fn zoom_pair(w: u32, h: u32, num: i64, den: i64) -> [Yuv420Frame; 2] {
+        let (wu, hu) = (w as usize, h as usize);
+        // Smooth wide-scale texture (sub-pel interpolable).
+        let tex = |y: i64, x: i64| -> u8 {
+            let (y, x) = (y as f64 / 8.0, x as f64 / 8.0);
+            let v = 96.0
+                + 60.0 * ((y * 0.11).sin() * (x * 0.13).cos())
+                + 40.0 * ((y * 0.05 + x * 0.07).sin());
+            v.clamp(0.0, 255.0) as u8
+        };
+        let mut f0 = Yuv420Frame::filled(w, h, 128);
+        let mut f1 = Yuv420Frame::filled(w, h, 128);
+        let (cy, cx) = ((hu / 2) as i64, (wu / 2) as i64);
+        for i in 0..hu {
+            for j in 0..wu {
+                // f0 at identity, f1 zoomed about the centre in
+                // 1/8-pel units.
+                f0.y[i * wu + j] = tex((i as i64) * 8, (j as i64) * 8);
+                let sy = cy * 8 + ((i as i64) - cy) * 8 * num / den;
+                let sx = cx * 8 + ((j as i64) - cx) * 8 * num / den;
+                f1.y[i * wu + j] = tex(sy, sx);
+            }
+        }
+        [f0, f1]
+    }
+
+    /// r419 — the §5.11.27 WARPED_CAUSAL selection must actually be
+    /// REACHED: on zooming content (a true affine motion field, so
+    /// the §7.10.4 neighbour MVs fit the §7.11.3.8 least squares)
+    /// at least one committed leaf carries
+    /// `motion_mode = WARPED_CAUSAL`, and the emitted GOP stream
+    /// round-trips byte-exact through the spec decoder.
+    #[test]
+    fn r419_p_search_selects_warped_causal_on_zooming_motion() {
+        let [f0, f1] = zoom_pair(96, 80, 17, 16);
+        let base_q_idx = 100u8;
+        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        assert!(
+            key.seq.enable_warped_motion,
+            "r419: the sequence gate must be open for §5.11.27 arm B"
+        );
+        let reference = GopFrameRecon {
+            y: key.recon_y,
+            u: key.recon_u,
+            v: key.recon_v,
+        };
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 96, 80, base_q_idx, 1, &[]);
+        assert_eq!(fh.allow_warped_motion, Some(true));
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 96 * 80],
+            u: vec![0u8; 48 * 40],
+            v: vec![0u8; 48 * 40],
+            width: 96,
+            height: 80,
+            chroma_w: 48,
+            chroma_h: 40,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.is_motion_mode_switchable = true;
+        ip.allow_warped_motion = true;
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            96,
+            80,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        let mut counts = [0u32; 3];
+        for (sb_r, sb_c) in [(0u32, 0u32), (0, 16), (16, 0), (16, 16)] {
+            if sb_r >= mi_rows || sb_c >= mi_cols {
+                continue;
+            }
+            recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            let tree =
+                build_p_search_tree(sb_r, sb_c, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+            count_motion_modes(&tree, &mut counts);
+        }
+        assert!(
+            counts[MOTION_MODE_WARPED_CAUSAL as usize] > 0,
+            "zooming motion must commit at least one §5.11.27 \
+             WARPED_CAUSAL leaf (got SIMPLE={} OBMC={} WARP={})",
+            counts[0],
+            counts[1],
+            counts[2]
+        );
+
+        // Stream-level: the same content through the public GOP
+        // driver decodes byte-exact in the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+        }
     }
 }

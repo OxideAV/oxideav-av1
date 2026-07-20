@@ -168,6 +168,41 @@ fn gop_lossy_halfpel_motion_round_trips() {
     assert_gop_round_trip(&frames, 0);
 }
 
+/// r419 — vertically-sheared motion (per-row horizontal shift ramp
+/// misaligned with every partition boundary): the §5.11.27 OBMC
+/// election territory. Round-trips at three quantisers including
+/// lossless.
+#[test]
+fn gop_shear_motion_round_trips() {
+    let tex = |i: usize, j: usize| -> u8 {
+        ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u8
+    };
+    let dx_of = |i: usize, k: usize| -> usize {
+        let (ramp0, ramp1, top) = (24usize, 48usize, 4 * k);
+        if i < ramp0 {
+            top
+        } else if i >= ramp1 {
+            0
+        } else {
+            top * (ramp1 - i) / (ramp1 - ramp0)
+        }
+    };
+    let frames: Vec<Yuv420Frame> = (0..3)
+        .map(|k| {
+            let mut f = Yuv420Frame::filled(64, 64, 128);
+            for i in 0..64 {
+                for j in 0..64 {
+                    f.y[i * 64 + j] = tex(i, j + dx_of(i, k));
+                }
+            }
+            f
+        })
+        .collect();
+    for q in [0u8, 100, 200] {
+        assert_gop_round_trip(&frames, q);
+    }
+}
+
 /// Noise content at a mid quantiser: dense coefficients on the inter
 /// TUs and deep splits.
 #[test]
