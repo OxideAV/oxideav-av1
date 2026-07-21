@@ -72,9 +72,9 @@ use crate::encoder::block_mode_info::assign_mv_pred_mv;
 use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
-    encode_key_frame_yuv420_with_q, encode_leaf_sq, lambda_for, leaf_rate, region_distortion,
-    region_distortion_wh, residual_tx, restore_region, save_region, save_region_wh, tu_bd_stamp,
-    BlockDecodedMirror, ReconState, RegionSnapshot, KEY_FRAME_MAX_DIM,
+    encode_leaf_sq, lambda_for, leaf_rate, region_distortion, region_distortion_wh, residual_tx,
+    restore_region, save_region, save_region_wh, tu_bd_stamp, BlockDecodedMirror, ReconState,
+    RegionSnapshot, KEY_FRAME_MAX_DIM,
 };
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
@@ -84,6 +84,7 @@ use crate::encoder::partition_tree::{
 use crate::encoder::pixel_driver_dyn::{
     build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
 };
+use crate::encoder::rate_twin::{score256, RateModel, RateTwin};
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
 use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
@@ -315,6 +316,19 @@ pub fn encode_gop_yuv420_with_q_seg(
     base_q_idx: u8,
     alt_q: &[i16],
 ) -> Result<EncodedGop, Error> {
+    encode_gop_yuv420_with_q_seg_rate_model(frames, base_q_idx, alt_q, RateModel::Twin)
+}
+
+/// r421 — [`encode_gop_yuv420_with_q_seg`] with an explicit
+/// [`RateModel`], kept public (hidden) so the sweep harnesses can A/B
+/// the twin-priced elections against the pre-r421 heuristic baseline.
+#[doc(hidden)]
+pub fn encode_gop_yuv420_with_q_seg_rate_model(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    model: RateModel,
+) -> Result<EncodedGop, Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -342,7 +356,9 @@ pub fn encode_gop_yuv420_with_q_seg(
 
     // Frame 0: the r410 conformance-grade KEY-frame encoder (which
     // also validates the dimension rules).
-    let key = encode_key_frame_yuv420_with_q(&frames[0], base_q_idx)?;
+    let key = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_rate_model(
+        &frames[0], base_q_idx, model,
+    )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
     let mut recon = vec![GopFrameRecon {
@@ -368,7 +384,7 @@ pub fn encode_gop_yuv420_with_q_seg(
         let prev = recon.last().expect("at least the KEY recon");
         let prevprev = &recon[recon.len().saturating_sub(2)];
         let (tu, rc, saved_mf) = encode_p_frame_yuv420(
-            input, prev, prevprev, &seq, base_q_idx, p_index, alt_q, &mf_store,
+            input, prev, prevprev, &seq, base_q_idx, p_index, alt_q, &mf_store, model,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -638,10 +654,11 @@ fn encode_p_frame_yuv420(
     p_index: u32,
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
+    model: RateModel,
 ) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField), Error> {
     let cfg = p_frame_config(prev, prevprev, p_index);
     let (obu, recon, saved) =
-        encode_inter_frame_generic(input, seq, base_q_idx, &cfg, alt_q, mf_store)?;
+        encode_inter_frame_generic(input, seq, base_q_idx, &cfg, alt_q, mf_store, model)?;
     // §7.5 temporal unit: TD + OBU_FRAME (the SH rode the KEY frame's
     // unit; §7.5 requires it once per coded video sequence). Every
     // P-frame is shown, so the one-OBU unit satisfies the "exactly
@@ -659,6 +676,7 @@ fn encode_p_frame_yuv420(
 /// caller packs OBUs into §7.5 temporal units (each unit must carry
 /// exactly ONE shown frame, so pyramid drivers bundle
 /// decoded-not-shown frames with the next shown one).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_inter_frame_generic(
     input: &Yuv420Frame,
     seq: &SequenceHeader,
@@ -666,6 +684,7 @@ pub(crate) fn encode_inter_frame_generic(
     cfg: &InterFrameConfig<'_>,
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
+    model: RateModel,
 ) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
     if input.width < 8
         || input.height < 8
@@ -898,8 +917,22 @@ pub(crate) fn encode_inter_frame_generic(
 
     for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
         recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
-        let tree = build_p_search_tree(sb_r, sb_c, BLOCK_64X64, input, &mut recon, &mut ictx)?;
+        // r421 — arm the §5.11.2 delta lifecycle on the live state AND
+        // the rate twin's fork, so both enter the superblock identically.
         state.arm_read_deltas();
+        let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+        twin.arm_read_deltas();
+        let (tree, _cost) = build_p_search_tree(
+            sb_r,
+            sb_c,
+            BLOCK_64X64,
+            input,
+            &mut recon,
+            &mut ictx,
+            &mut twin,
+            &params,
+            model,
+        )?;
         write_partition_tree_syntax(
             &mut writer,
             &mut cdfs,
@@ -910,6 +943,12 @@ pub(crate) fn encode_inter_frame_generic(
             BLOCK_64X64,
             &params,
         )?;
+        // r421 anti-desync invariant: the search committed EXACTLY the
+        // symbols the writer just emitted.
+        debug_assert!(
+            twin.matches(&cdfs, &writer),
+            "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+        );
     }
     let tile_bytes = writer.finish();
 
@@ -1523,6 +1562,24 @@ impl PSearchCtx {
             Some(s) if s.warp_valid => Some(lw.local_warp_params),
             _ => None,
         }
+    }
+
+    /// r421 — `NumSamples` from the same §7.10.4 `find_warp_samples`
+    /// scan [`Self::warp_fit`] runs, without the fit: the §5.11.27
+    /// arm-A/arm-B dispatch operand (`num_samples == 0` selects the
+    /// `use_obmc` arm even when warp is enabled), needed to price the
+    /// motion-mode symbol through the writer's own arm derivation.
+    fn warp_num_samples(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+        ref0: i8,
+        mv: [[i32; 2]; 2],
+    ) -> u32 {
+        let mut cands: Vec<crate::inter_pred::WarpSampleCand> = Vec::new();
+        self.mirror
+            .find_warp_samples_list(mi_row, mi_col, b_size, i32::from(ref0), mv, &mut cands)
     }
 
     /// Stamp a COMMITTED leaf into the driver mirror with the same
@@ -2192,6 +2249,7 @@ fn refine_mv_subpel(
 /// `Max_Tx_Size_Rect` luma TU on the lossy arm / the `TX_4X4` grid on
 /// the lossless arm; chroma at the §5.11.38 size), `skip = 1` when
 /// every TU quantises to zero.
+#[allow(clippy::too_many_arguments)]
 fn encode_inter_leaf(
     mi_r: u32,
     mi_c: u32,
@@ -2199,8 +2257,12 @@ fn encode_inter_leaf(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
+    // r421 — `Some((twin, params))` prices the leaf-level elections
+    // (tx-depth ladder, §5.11.10 skip-mode trial) with exact twin
+    // bits; `None` keeps the pre-r421 heuristics.
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
-    let leaf = encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx)?;
+    let leaf = encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx, pricing)?;
 
     // r413 — §5.11.10 skip-mode trial: on a skip-mode frame, every
     // >= 8×8 leaf additionally trials the pure-derivation skip-mode
@@ -2228,8 +2290,17 @@ fn encode_inter_leaf(
     let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
     let lambda = lambda_for(&recon.qp);
+    // r421 — twin-priced or heuristic, one scale per call (heuristic
+    // rates scaled by 256 so both run the same comparison with
+    // decisions identical to the pre-r421 integer scores).
+    let rate_of = |blk: &SyntaxBlock| -> Result<u64, Error> {
+        match pricing {
+            Some((twin, params)) => twin.price_block(blk, mi_r, mi_c, b_size, params),
+            None => Ok(p_leaf_rate(blk) * 256),
+        }
+    };
     let d_normal = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
-    let score_normal = d_normal + lambda * p_leaf_rate(&leaf);
+    let score_normal = score256(d_normal, lambda, rate_of(&leaf)?);
     let after_normal = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
 
     // Predict the skip-mode leaf (re-stamps the grid footprint) and
@@ -2291,7 +2362,7 @@ fn encode_inter_leaf(
         motion_mode: MOTION_MODE_SIMPLE,
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
-    let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
+    let score_sm = score256(d_sm, lambda, rate_of(&sm_leaf)?);
     // On the CodedLossless configuration a skip-mode leaf (which can
     // never code a residual) is only admissible when its bare
     // prediction is already exact — the q = 0 contract is
@@ -2361,6 +2432,7 @@ fn encode_inter_leaf_modes(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
     let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
@@ -2412,8 +2484,13 @@ fn encode_inter_leaf_modes(
     let single_refs = ictx.single_refs.clone();
     // r416 — §5.11.25 `Min( bw4, bh4 ) >= 2`: sub-8×8 blocks cannot
     // code `comp_mode` (SINGLE_REFERENCE forced with no bit), so the
-    // compound ladder is empty there.
-    let compound_pairs = if bw4.min(bh4) >= 2 {
+    // compound ladder is empty there. r421 — the §5.11.25
+    // `reference_select` frame gate joins: with `reference_select ==
+    // 0` the reader never codes `comp_mode` (SINGLE_REFERENCE forced),
+    // so a compound candidate would be uncodable — the rate twin's
+    // write-path validation surfaced configurations offering pairs the
+    // header cannot express.
+    let compound_pairs = if bw4.min(bh4) >= 2 && ictx.ip.reference_select {
         ictx.compound_pairs.clone()
     } else {
         Vec::new()
@@ -2858,7 +2935,26 @@ fn encode_inter_leaf_modes(
         }
         ssd
     };
-    let (mut filter, simple_ssd) = if y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV {
+    let (mut filter, simple_ssd) = if ictx.ip.interpolation_filter != SWITCHABLE {
+        // §5.11.26 else-arm: a non-SWITCHABLE frame filter is read
+        // with no bits — every leaf must carry exactly it (r421: the
+        // rate twin's write-path validation surfaced searches trialling
+        // filters the header cannot express).
+        let f = ictx.ip.interpolation_filter;
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            ref_frame,
+            y_mode,
+            mv,
+            f,
+            comp,
+            None,
+            MotionSel::Simple,
+        )?;
+        (f, leaf_luma_ssd(ictx))
+    } else if y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV {
         ictx.predict_leaf(
             mi_r,
             mi_c,
@@ -2918,13 +3014,56 @@ fn encode_inter_leaf_modes(
             && ictx.ip.gm_type[ref_frame[0] as usize] > crate::cdf::GM_TYPE_TRANSLATION)
         && ictx.mirror.has_overlappable_candidates(mi_r, mi_c, b_size)
     {
-        let mut best_ssd = simple_ssd;
+        // r421 — the §5.11.27 arm is no longer priced as "roughly
+        // equal-rate": under the twin model each candidate ordinal is
+        // priced through the writer's own arm derivation against the
+        // CURRENT adaptive CDFs (`use_obmc` and `motion_mode` rows
+        // adapt away from uniform quickly, so SIMPLE vs OBMC vs
+        // WARPED_CAUSAL can differ by whole bits), and the election
+        // scores `D·256 + λ·bits256`. The heuristic model keeps the
+        // pre-r421 pure-distortion pick.
+        let num_samples = ictx.warp_num_samples(mi_r, mi_c, b_size, ref_frame[0], mv);
+        // Copies of the gating scalars, so the pricing closure holds
+        // no borrow of `ictx` across the `predict_leaf` trials.
+        let (mm_switchable, mm_warp, mm_fimv, mm_gm_type, mm_scaled) = (
+            ictx.ip.is_motion_mode_switchable,
+            ictx.ip.allow_warped_motion,
+            ictx.ip.force_integer_mv,
+            ictx.ip.gm_type,
+            ictx.ip.is_scaled_per_ref,
+        );
+        let mm_bits = move |mm: u8| -> Result<u64, Error> {
+            match pricing {
+                Some((twin, _)) => twin.price_motion_mode(
+                    mm,
+                    b_size,
+                    false,
+                    [i32::from(ref_frame[0]), i32::from(ref_frame[1])],
+                    y_mode,
+                    num_samples,
+                    mm_switchable,
+                    mm_warp,
+                    mm_fimv,
+                    mm_gm_type,
+                    mm_scaled,
+                    true,
+                ),
+                None => Ok(0),
+            }
+        };
+        let mut best_score = score256(simple_ssd, lambda, mm_bits(MOTION_MODE_SIMPLE)?);
         // OBMC trial — the leaf's own prediction rides its own
         // §7.11.3.4 filter (GLOBALMV leaves stay filter-silent on
         // EIGHTTAP), the overlap bands the committed neighbours'.
         {
             use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
-            let obmc_filters: &[u8] = if y_mode == MODE_GLOBALMV {
+            let obmc_bits = mm_bits(MOTION_MODE_OBMC)?;
+            let fixed = [ictx.ip.interpolation_filter];
+            let obmc_filters: &[u8] = if ictx.ip.interpolation_filter != SWITCHABLE {
+                // §5.11.26 else-arm: the frame filter is the only
+                // codable pair.
+                &fixed
+            } else if y_mode == MODE_GLOBALMV {
                 &[EIGHTTAP]
             } else {
                 &[EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP]
@@ -2942,9 +3081,9 @@ fn encode_inter_leaf_modes(
                     None,
                     MotionSel::Obmc,
                 )?;
-                let ssd = leaf_luma_ssd(ictx);
-                if ssd < best_ssd {
-                    best_ssd = ssd;
+                let score = score256(leaf_luma_ssd(ictx), lambda, obmc_bits);
+                if score < best_score {
+                    best_score = score;
                     motion = MotionSel::Obmc;
                     filter = f;
                 }
@@ -2973,13 +3112,22 @@ fn encode_inter_leaf_modes(
                     None,
                     MotionSel::Warp(params),
                 )?;
-                let ssd = leaf_luma_ssd(ictx);
-                if ssd < best_ssd {
+                let score = score256(
+                    leaf_luma_ssd(ictx),
+                    lambda,
+                    mm_bits(MOTION_MODE_WARPED_CAUSAL)?,
+                );
+                if score < best_score {
                     motion = MotionSel::Warp(params);
                     // `needs_interp_filter( ) == 0` on LOCALWARP —
-                    // the committed pair must be the reader's
-                    // bit-silent EIGHTTAP derivation.
-                    filter = EIGHTTAP;
+                    // the committed pair is the reader's bit-silent
+                    // derivation: EIGHTTAP on the SWITCHABLE arm, the
+                    // frame filter otherwise.
+                    filter = if ictx.ip.interpolation_filter != SWITCHABLE {
+                        ictx.ip.interpolation_filter
+                    } else {
+                        EIGHTTAP
+                    };
                 }
             }
         }
@@ -3081,7 +3229,14 @@ fn encode_inter_leaf_modes(
             &seg_qp,
         )?;
         let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
-        let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
+        // r421 — exact twin bits (the §5.11.17 depth symbols are part
+        // of the block syntax, so no depth surcharge) or the pre-r421
+        // proxy, one scale per call.
+        let rate256 = match pricing {
+            Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
+            None => (p_leaf_rate(&leaf) + 2 * u64::from(depth)) * 256,
+        };
+        let score = score256(d, lambda, rate256);
         let improves = match best.as_ref() {
             Some((_, _, s)) => score < *s,
             None => true,
@@ -3593,6 +3748,7 @@ fn p_tree_rate(node: &SyntaxNode) -> u64 {
 /// `PARTITION_SPLIT` of four recursively-searched quadrants, keeping
 /// the lowest `D + λ·R`. `BLOCK_8X8` is the P-frame leaf floor (see
 /// the module docs). Frame-edge nodes take the §5.11.4 forced split.
+#[allow(clippy::too_many_arguments)]
 fn build_p_search_tree(
     r: u32,
     c: u32,
@@ -3600,9 +3756,12 @@ fn build_p_search_tree(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
-) -> Result<SyntaxNode, Error> {
+    twin: &mut RateTwin,
+    params: &SyntaxFrameParams,
+    model: RateModel,
+) -> Result<(SyntaxNode, u64), Error> {
     if r >= recon.mi_rows || c >= recon.mi_cols {
-        return Ok(SyntaxNode::dummy_oob());
+        return Ok((SyntaxNode::dummy_oob(), 0));
     }
     // r416 — sub-8×8 floor: a BLOCK_4X4 node (reachable only through
     // PARTITION_SPLIT at BLOCK_8X8, and always fully inside — dims
@@ -3625,10 +3784,25 @@ fn build_p_search_tree(
         let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, 1);
 
         // Candidate A: the fully-searched INTER leaf.
-        let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
+        let inter_leaf = encode_inter_leaf(
+            r,
+            c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            (model == RateModel::Twin).then_some((&*twin, params)),
+        )?;
         ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
         let d_inter = region_distortion_wh(recon, input, sr, sc, 2, 2);
-        let score_inter = d_inter + lambda * p_leaf_rate(&inter_leaf);
+        let h_rate_inter = p_leaf_rate(&inter_leaf);
+        let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
+        let mut twin_inter = twin.clone();
+        let cost_inter = twin_inter.commit_subtree(&node_inter, r, c, b_size, params)?;
+        let score_inter = match model {
+            RateModel::Twin => score256(d_inter, lambda, cost_inter),
+            RateModel::Heuristic => score256(d_inter, lambda, h_rate_inter * 256),
+        };
         let after_inter = save_region_wh(recon, sr, sc, 2, 2);
         let m_after_inter = ictx.mirror.snapshot_encoder_stamp_rect(r, c, 1);
         restore_region(recon, sr, sc, &before);
@@ -3636,30 +3810,52 @@ fn build_p_search_tree(
 
         // Candidate B: the §5.11.22 INTRA leaf (the KEY driver's 4×4
         // arm — group-chroma coding on the `HasChroma` SE cell).
-        let mut intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+        let mut intra_leaf = encode_leaf_sq(
+            r,
+            c,
+            b_size,
+            input,
+            recon,
+            (model == RateModel::Twin).then_some((&*twin, params)),
+        )?;
         if !ictx.seg_alt_q.is_empty() && intra_leaf.skip == 1 {
             intra_leaf.segment_id = ictx.segment_pred(r, c);
         }
         ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
         let d_intra = region_distortion_wh(recon, input, sr, sc, 2, 2);
-        let score_intra = d_intra + lambda * p_leaf_rate(&intra_leaf);
+        let h_rate_intra = p_leaf_rate(&intra_leaf);
+        let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
+        let mut twin_intra = twin.clone();
+        let cost_intra = twin_intra.commit_subtree(&node_intra, r, c, b_size, params)?;
+        let score_intra = match model {
+            RateModel::Twin => score256(d_intra, lambda, cost_intra),
+            RateModel::Heuristic => score256(d_intra, lambda, h_rate_intra * 256),
+        };
 
         if score_inter <= score_intra {
             restore_region(recon, sr, sc, &after_inter);
             ictx.mirror.restore_encoder_stamp_rect(&m_after_inter);
+            let SyntaxNode::Leaf(inter_leaf) = &node_inter else {
+                unreachable!("candidate A is a leaf");
+            };
             // Re-stamp the inter winner's mirror footprint (the intra
             // trial overwrote the mi cell); the driver grids already
             // hold the winner's stamps ([`encode_inter_leaf`]'s
             // final-predict guarantee — candidate B never touches
             // them).
-            ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
-            return Ok(SyntaxNode::Leaf(Box::new(inter_leaf)));
+            ictx.stamp_leaf(inter_leaf, r, c, b_size, recon.lossless);
+            *twin = twin_inter;
+            return Ok((node_inter, cost_inter));
         }
         // Driver-grid intra stamps for the committed winner: a later
         // group cell's §5.11.33 `someUseIntra` scan must see
         // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` here.
+        let SyntaxNode::Leaf(intra_leaf) = &node_intra else {
+            unreachable!("candidate B is a leaf");
+        };
         ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
-        return Ok(SyntaxNode::Leaf(Box::new(intra_leaf)));
+        *twin = twin_intra;
+        return Ok((node_intra, cost_intra));
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
     let half = n4 >> 1;
@@ -3669,21 +3865,29 @@ fn build_p_search_tree(
 
     if !fully_inside {
         // §5.11.4 forced arms (dims are multiples of 8, so BLOCK_8X8
-        // nodes are always fully inside and the recursion terminates).
-        let children = [
-            Box::new(build_p_search_tree(r, c, sub, input, recon, ictx)?),
-            Box::new(build_p_search_tree(r, c + half, sub, input, recon, ictx)?),
-            Box::new(build_p_search_tree(r + half, c, sub, input, recon, ictx)?),
-            Box::new(build_p_search_tree(
-                r + half,
-                c + half,
-                sub,
-                input,
-                recon,
-                ictx,
-            )?),
-        ];
-        return Ok(SyntaxNode::Split(children));
+        // nodes are always fully inside and the recursion terminates;
+        // the partition arm may still cost bits — the `split_or_*`
+        // half-straddle bools).
+        let mut cost = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let (nw, c0) = build_p_search_tree(r, c, sub, input, recon, ictx, twin, params, model)?;
+        let (ne, c1) =
+            build_p_search_tree(r, c + half, sub, input, recon, ictx, twin, params, model)?;
+        let (sw, c2) =
+            build_p_search_tree(r + half, c, sub, input, recon, ictx, twin, params, model)?;
+        let (se, c3) = build_p_search_tree(
+            r + half,
+            c + half,
+            sub,
+            input,
+            recon,
+            ictx,
+            twin,
+            params,
+            model,
+        )?;
+        cost += c0 + c1 + c2 + c3;
+        let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
+        return Ok((SyntaxNode::Split(children), cost));
     }
 
     let lambda = lambda_for(&recon.qp);
@@ -3698,12 +3902,34 @@ fn build_p_search_tree(
     let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
     let g_before = ictx.snapshot_grids_rect(r, c, n4);
 
+    // Per-candidate scoring: exact twin bits (the candidate node's
+    // full symbol sequence committed to a twin fork) under the twin
+    // model, the pre-r421 proxies (scaled by 256 — identical
+    // decisions) under the heuristic model.
+    let score_of = |d: u64, cost256: u64, h_rate: u64| -> u64 {
+        match model {
+            RateModel::Twin => score256(d, lambda, cost256),
+            RateModel::Heuristic => score256(d, lambda, h_rate * 256),
+        }
+    };
+
     // Candidate A: one INTER leaf.
-    let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
+    let inter_leaf = encode_inter_leaf(
+        r,
+        c,
+        b_size,
+        input,
+        recon,
+        ictx,
+        (model == RateModel::Twin).then_some((&*twin, params)),
+    )?;
     ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
     let d_inter = region_distortion(recon, input, r, c, n4 as usize);
-    let r_inter = p_leaf_rate(&inter_leaf);
-    let score_inter = d_inter + lambda * r_inter;
+    let h_rate_inter = p_leaf_rate(&inter_leaf);
+    let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
+    let mut twin_inter = twin.clone();
+    let cost_inter = twin_inter.commit_subtree(&node_inter, r, c, b_size, params)?;
+    let score_inter = score_of(d_inter, cost_inter, h_rate_inter);
     let after_inter = save_region(recon, r, c, n4 as usize);
     let m_after_inter = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
     let g_after_inter = ictx.snapshot_grids_rect(r, c, n4);
@@ -3714,7 +3940,14 @@ fn build_p_search_tree(
     // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
     // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
     // lossy arm; the lossless arm stays on the TX_4X4 grid).
-    let mut intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+    let mut intra_leaf = encode_leaf_sq(
+        r,
+        c,
+        b_size,
+        input,
+        recon,
+        (model == RateModel::Twin).then_some((&*twin, params)),
+    )?;
     // r413 — segmentation: a skip intra leaf inherits the §5.11.20
     // `pred` (bit-silent); a coded intra leaf keeps segment 0 (its
     // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
@@ -3728,8 +3961,11 @@ fn build_p_search_tree(
     // region, exactly as the decoder will.
     ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
     let d_intra = region_distortion(recon, input, r, c, n4 as usize);
-    let r_intra = p_leaf_rate(&intra_leaf);
-    let score_intra = d_intra + lambda * r_intra;
+    let h_rate_intra = p_leaf_rate(&intra_leaf);
+    let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
+    let mut twin_intra = twin.clone();
+    let cost_intra = twin_intra.commit_subtree(&node_intra, r, c, b_size, params)?;
+    let score_intra = score_of(d_intra, cost_intra, h_rate_intra);
     let after_intra = save_region(recon, r, c, n4 as usize);
     let m_after_intra = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
     let g_after_intra = ictx.snapshot_grids_rect(r, c, n4);
@@ -3737,33 +3973,38 @@ fn build_p_search_tree(
     ictx.mirror.restore_encoder_stamp_rect(&m_before);
     ictx.restore_grids_rect(&g_before);
 
-    let (leaf, after_leaf, m_after_leaf, g_after_leaf, score_leaf) = if score_inter <= score_intra {
+    // Running best over the non-split candidates: NONE-leaf first,
+    // then the r412 HORZ / VERT rectangular trials. Each entry
+    // carries its committed twin fork + exact cost.
+    let mut best_node: (
+        SyntaxNode,
+        RegionSnapshot,
+        _,
+        DriverGridSnapshot,
+        u64,
+        RateTwin,
+        u64,
+    ) = if score_inter <= score_intra {
         (
-            inter_leaf,
+            node_inter,
             after_inter,
             m_after_inter,
             g_after_inter,
             score_inter,
+            twin_inter,
+            cost_inter,
         )
     } else {
         (
-            intra_leaf,
+            node_intra,
             after_intra,
             m_after_intra,
             g_after_intra,
             score_intra,
+            twin_intra,
+            cost_intra,
         )
     };
-
-    // Running best over the non-split candidates: NONE-leaf first,
-    // then the r412 HORZ / VERT rectangular trials.
-    let mut best_node: (SyntaxNode, RegionSnapshot, _, DriverGridSnapshot, u64) = (
-        SyntaxNode::Leaf(Box::new(leaf)),
-        after_leaf,
-        m_after_leaf,
-        g_after_leaf,
-        score_leaf,
-    );
 
     // Candidates D..K: every asymmetric §5.11.4 partition — r412
     // PARTITION_HORZ / PARTITION_VERT (two rectangular INTER halves)
@@ -3826,109 +4067,298 @@ fn build_p_search_tree(
             crate::cdf::PARTITION_HORZ_4 => (0..4u32).map(|i| (r + quarter * i, c, psub)).collect(),
             _ => (0..4u32).map(|i| (r, c + quarter * i, psub)).collect(),
         };
+        // r421 — a RUNNING twin fork threads the shape's blocks in
+        // §5.11.4 dispatch order: each later block's leaf-internal
+        // pricing AND the writer's own commitment validation (the
+        // §5.11.27 cascade in particular) see the earlier siblings'
+        // committed mirror stamps, exactly like the emitting pass.
+        let mut twin_shape = twin.clone();
+        let mut cost_shape = twin_shape.commit_partition_symbol(part, r, c, b_size)?;
         let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(cells.len());
-        let mut rate = if cells.len() == 2 { 4 } else { 5 };
+        let mut h_rate = if cells.len() == 2 { 4 } else { 5 };
         for &(rr, cc, sz) in &cells {
-            let blk = encode_inter_leaf(rr, cc, sz, input, recon, ictx)?;
+            let blk = encode_inter_leaf(
+                rr,
+                cc,
+                sz,
+                input,
+                recon,
+                ictx,
+                (model == RateModel::Twin).then_some((&twin_shape, params)),
+            )?;
             ictx.stamp_leaf(&blk, rr, cc, sz, recon.lossless);
-            rate += p_leaf_rate(&blk);
+            h_rate += p_leaf_rate(&blk);
+            cost_shape += twin_shape.commit_block(&blk, rr, cc, sz, params)?;
             blocks.push(blk);
         }
         let d = region_distortion(recon, input, r, c, n4 as usize);
-        let score = d + lambda * rate;
+        let bx = |b: SyntaxBlock| Box::new(b);
+        let node = match part {
+            PARTITION_HORZ | PARTITION_VERT => {
+                let mut it = blocks.into_iter();
+                let pair = [bx(it.next().unwrap()), bx(it.next().unwrap())];
+                if part == PARTITION_HORZ {
+                    SyntaxNode::Horz(pair)
+                } else {
+                    SyntaxNode::Vert(pair)
+                }
+            }
+            crate::cdf::PARTITION_HORZ_A
+            | crate::cdf::PARTITION_HORZ_B
+            | crate::cdf::PARTITION_VERT_A
+            | crate::cdf::PARTITION_VERT_B => {
+                let mut it = blocks.into_iter();
+                let trio = [
+                    bx(it.next().unwrap()),
+                    bx(it.next().unwrap()),
+                    bx(it.next().unwrap()),
+                ];
+                match part {
+                    crate::cdf::PARTITION_HORZ_A => SyntaxNode::HorzA(trio),
+                    crate::cdf::PARTITION_HORZ_B => SyntaxNode::HorzB(trio),
+                    crate::cdf::PARTITION_VERT_A => SyntaxNode::VertA(trio),
+                    _ => SyntaxNode::VertB(trio),
+                }
+            }
+            _ => {
+                let mut it = blocks.into_iter();
+                let four = [
+                    bx(it.next().unwrap()),
+                    bx(it.next().unwrap()),
+                    bx(it.next().unwrap()),
+                    bx(it.next().unwrap()),
+                ];
+                if part == crate::cdf::PARTITION_HORZ_4 {
+                    SyntaxNode::Horz4(four)
+                } else {
+                    SyntaxNode::Vert4(four)
+                }
+            }
+        };
+        let score = score_of(d, cost_shape, h_rate);
         if score < best_node.4 {
-            let bx = |b: SyntaxBlock| Box::new(b);
-            let node = match part {
-                PARTITION_HORZ | PARTITION_VERT => {
-                    let mut it = blocks.into_iter();
-                    let pair = [bx(it.next().unwrap()), bx(it.next().unwrap())];
-                    if part == PARTITION_HORZ {
-                        SyntaxNode::Horz(pair)
-                    } else {
-                        SyntaxNode::Vert(pair)
-                    }
-                }
-                crate::cdf::PARTITION_HORZ_A
-                | crate::cdf::PARTITION_HORZ_B
-                | crate::cdf::PARTITION_VERT_A
-                | crate::cdf::PARTITION_VERT_B => {
-                    let mut it = blocks.into_iter();
-                    let trio = [
-                        bx(it.next().unwrap()),
-                        bx(it.next().unwrap()),
-                        bx(it.next().unwrap()),
-                    ];
-                    match part {
-                        crate::cdf::PARTITION_HORZ_A => SyntaxNode::HorzA(trio),
-                        crate::cdf::PARTITION_HORZ_B => SyntaxNode::HorzB(trio),
-                        crate::cdf::PARTITION_VERT_A => SyntaxNode::VertA(trio),
-                        _ => SyntaxNode::VertB(trio),
-                    }
-                }
-                _ => {
-                    let mut it = blocks.into_iter();
-                    let four = [
-                        bx(it.next().unwrap()),
-                        bx(it.next().unwrap()),
-                        bx(it.next().unwrap()),
-                        bx(it.next().unwrap()),
-                    ];
-                    if part == crate::cdf::PARTITION_HORZ_4 {
-                        SyntaxNode::Horz4(four)
-                    } else {
-                        SyntaxNode::Vert4(four)
-                    }
-                }
-            };
             best_node = (
                 node,
                 save_region(recon, r, c, n4 as usize),
                 ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4),
                 ictx.snapshot_grids_rect(r, c, n4),
                 score,
+                twin_shape,
+                cost_shape,
             );
         }
         restore_region(recon, r, c, &before);
         ictx.mirror.restore_encoder_stamp_rect(&m_before);
         ictx.restore_grids_rect(&g_before);
     }
-    let (node_leafish, after_leafish, m_after_leafish, g_after_leafish, score_leafish) = best_node;
+    let (
+        node_leafish,
+        after_leafish,
+        m_after_leafish,
+        g_after_leafish,
+        score_leafish,
+        twin_leafish,
+        cost_leafish,
+    ) = best_node;
 
     // Candidate C: PARTITION_SPLIT into four recursively-searched
     // quadrants (NW/NE/SW/SE dispatch order — the mirror currently
     // holds the pre-node state, so each child's §7.10.2 scan sees its
     // earlier siblings' committed stamps exactly as the write pass
-    // will).
-    let children = [
-        Box::new(build_p_search_tree(r, c, sub, input, recon, ictx)?),
-        Box::new(build_p_search_tree(r, c + half, sub, input, recon, ictx)?),
-        Box::new(build_p_search_tree(r + half, c, sub, input, recon, ictx)?),
-        Box::new(build_p_search_tree(
-            r + half,
-            c + half,
-            sub,
-            input,
-            recon,
-            ictx,
-        )?),
-    ];
+    // will; the twin fork enters each child holding the SPLIT arm +
+    // earlier siblings' symbols, exactly like the writer).
+    let mut twin_split = twin.clone();
+    let mut cost_split =
+        twin_split.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+    let (nw, c0) = build_p_search_tree(
+        r,
+        c,
+        sub,
+        input,
+        recon,
+        ictx,
+        &mut twin_split,
+        params,
+        model,
+    )?;
+    let (ne, c1) = build_p_search_tree(
+        r,
+        c + half,
+        sub,
+        input,
+        recon,
+        ictx,
+        &mut twin_split,
+        params,
+        model,
+    )?;
+    let (sw, c2) = build_p_search_tree(
+        r + half,
+        c,
+        sub,
+        input,
+        recon,
+        ictx,
+        &mut twin_split,
+        params,
+        model,
+    )?;
+    let (se, c3) = build_p_search_tree(
+        r + half,
+        c + half,
+        sub,
+        input,
+        recon,
+        ictx,
+        &mut twin_split,
+        params,
+        model,
+    )?;
+    cost_split += c0 + c1 + c2 + c3;
+    let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
     let d_split = region_distortion(recon, input, r, c, n4 as usize);
-    let r_split = children.iter().map(|ch| p_tree_rate(ch)).sum::<u64>() + 4;
-    let score_split = d_split + lambda * r_split;
+    let h_rate_split = children.iter().map(|ch| p_tree_rate(ch)).sum::<u64>() + 4;
+    let score_split = score_of(d_split, cost_split, h_rate_split);
 
     if score_leafish <= score_split {
         restore_region(recon, r, c, &after_leafish);
         ictx.mirror.restore_encoder_stamp_rect(&m_after_leafish);
         ictx.restore_grids_rect(&g_after_leafish);
-        Ok(node_leafish)
+        *twin = twin_leafish;
+        Ok((node_leafish, cost_leafish))
     } else {
-        Ok(SyntaxNode::Split(children))
+        *twin = twin_split;
+        Ok((SyntaxNode::Split(children), cost_split))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::key_frame::encode_key_frame_yuv420_with_q;
+
+    /// r421 — persistent per-tile search state for the module tests: a
+    /// fresh rate-twin source (§8.3.1 default CDFs at the recon's
+    /// quantiser, whole-frame single-tile write state, live emitting
+    /// writer) plus the frame-scope parameter bundle from the search
+    /// context's own inter params. Multi-superblock tests MUST reuse
+    /// one of these across superblocks — the twin's mirror carries the
+    /// earlier superblocks' committed stamps exactly like the real
+    /// driver's.
+    struct TestTileState {
+        cdfs: TileCdfContext,
+        state: PartitionSyntaxWriter,
+        writer: SymbolWriter,
+        params: SyntaxFrameParams,
+    }
+
+    fn test_tile_state(recon: &ReconState, ictx: &PSearchCtx) -> TestTileState {
+        let writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.init_coeff_cdfs(recon.qp.base_q_idx);
+        let state = PartitionSyntaxWriter::new(
+            recon.mi_rows,
+            recon.mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: recon.mi_rows,
+                mi_col_start: 0,
+                mi_col_end: recon.mi_cols,
+            },
+        )
+        .expect("test geometry is valid");
+        let params = SyntaxFrameParams {
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            seg_id_pre_skip: false,
+            segmentation_enabled: !ictx.seg_alt_q.is_empty(),
+            seg_skip_active: false,
+            last_active_seg_id: ictx.seg_alt_q.len().saturating_sub(1) as u8,
+            lossless_array: [recon.lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            coded_lossless: recon.lossless,
+            enable_cdef: false,
+            allow_intrabc: false,
+            cdef_bits: 0,
+            read_deltas: false,
+            use_128x128_superblock: false,
+            delta_q_res: 0,
+            delta_lf_present: false,
+            delta_lf_multi: false,
+            mono_chrome: false,
+            delta_lf_res: 0,
+            allow_screen_content_tools: recon.allow_screen_content_tools,
+            enable_filter_intra: true,
+            bit_depth: 8,
+            tx_mode_select: !recon.lossless,
+            quant: recon.qp,
+            reduced_tx_set: false,
+            inter: Some(ictx.ip.clone()),
+        };
+        TestTileState {
+            cdfs,
+            state,
+            writer,
+            params,
+        }
+    }
+
+    /// Search one superblock under the twin model, then COMMIT it to
+    /// the persistent tile state through the real write pass and
+    /// assert the anti-desync invariant — the driver loop's exact
+    /// shape.
+    fn search_and_commit_sb(
+        ts: &mut TestTileState,
+        r: u32,
+        c: u32,
+        input: &Yuv420Frame,
+        recon: &mut ReconState,
+        ictx: &mut PSearchCtx,
+    ) -> Result<SyntaxNode, Error> {
+        ts.state.arm_read_deltas();
+        let mut twin = RateTwin::snapshot(&ts.cdfs, &ts.state, &ts.writer);
+        twin.arm_read_deltas();
+        let (node, _) = build_p_search_tree(
+            r,
+            c,
+            BLOCK_64X64,
+            input,
+            recon,
+            ictx,
+            &mut twin,
+            &ts.params,
+            RateModel::Twin,
+        )?;
+        write_partition_tree_syntax(
+            &mut ts.writer,
+            &mut ts.cdfs,
+            &mut ts.state,
+            &node,
+            r,
+            c,
+            BLOCK_64X64,
+            &ts.params,
+        )?;
+        assert!(
+            twin.matches(&ts.cdfs, &ts.writer),
+            "rate twin desynced from the test tile writer after superblock ({r},{c})"
+        );
+        Ok(node)
+    }
+
+    /// Single-superblock convenience wrapper (the pre-r421 call shape).
+    fn build_p_search_tree_for_tests(
+        r: u32,
+        c: u32,
+        b_size: usize,
+        input: &Yuv420Frame,
+        recon: &mut ReconState,
+        ictx: &mut PSearchCtx,
+    ) -> Result<SyntaxNode, Error> {
+        assert_eq!(b_size, BLOCK_64X64, "tests search whole superblocks");
+        let mut ts = test_tile_state(recon, ictx);
+        search_and_commit_sb(&mut ts, r, c, input, recon, ictx)
+    }
 
     /// Deterministic textured frame with translation `(sy, sx)` — the
     /// `gop_inter_conformance.rs` generator, duplicated here so the
@@ -4043,7 +4473,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         let mut counts = [0u32; 4];
         count_modes(&tree, &mut counts);
         let total: u32 = counts.iter().sum();
@@ -4149,7 +4580,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         fn count_filters(node: &SyntaxNode, counts: &mut [u32; 3]) {
             match node {
                 SyntaxNode::Leaf(b) => {
@@ -4272,7 +4704,8 @@ mod tests {
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
-            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx)
+                .unwrap();
         fn count_rect(node: &SyntaxNode, horz: &mut u32, vert: &mut u32) {
             match node {
                 SyntaxNode::Leaf(_) => {}
@@ -4363,7 +4796,8 @@ mod tests {
             PSearchCtx::new(&prev, &prevprev, mi_rows, mi_cols, 64, 64, ip, 2, 0, &[]).unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
-            build_p_search_tree(0, 0, BLOCK_64X64, &frames[2], &mut recon, &mut ictx).unwrap();
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &frames[2], &mut recon, &mut ictx)
+                .unwrap();
         fn count_refs(node: &SyntaxNode, golden: &mut u32, last: &mut u32) {
             let leafs = |b: &SyntaxBlock, golden: &mut u32, last: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -4472,7 +4906,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
         fn count_compound(node: &SyntaxNode, compound: &mut u32, single: &mut u32) {
             let leafc = |b: &SyntaxBlock, compound: &mut u32, single: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -4571,7 +5006,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
         fn count_skip_mode(node: &SyntaxNode, sm: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, sm: &mut u32, other: &mut u32| {
                 if b.inter.as_ref().is_some_and(|ib| ib.skip_mode != 0) {
@@ -4702,7 +5138,8 @@ mod tests {
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
-            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx)
+                .unwrap();
         fn collect_segments(node: &SyntaxNode, seen: &mut [u32; 8]) {
             match node {
                 SyntaxNode::Leaf(b) => seen[b.segment_id as usize] += 1,
@@ -4814,7 +5251,8 @@ mod tests {
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
-            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx)
+                .unwrap();
         fn count_ext(node: &SyntaxNode, ext: &mut u32) {
             match node {
                 SyntaxNode::HorzA(_)
@@ -4892,6 +5330,7 @@ mod tests {
             1,
             &[],
             &mf_store,
+            RateModel::Twin,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
@@ -5266,7 +5705,8 @@ mod tests {
         let mut recon = fresh_recon(64, 64, base_q_idx);
         let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, false);
         recon.bd.clear_for_sb(0, 0, 16, 16);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         fn count(node: &SyntaxNode, compound: &mut u32, single: &mut u32) {
             let leafc = |b: &SyntaxBlock, compound: &mut u32, single: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -5323,7 +5763,8 @@ mod tests {
         let mut recon = fresh_recon(64, 64, base_q_idx);
         let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, false);
         recon.bd.clear_for_sb(0, 0, 16, 16);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
         fn count(node: &SyntaxNode, bwd: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, bwd: &mut u32, other: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -5442,7 +5883,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         fn count(node: &SyntaxNode, wedge: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, wedge: &mut u32, other: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -5554,7 +5996,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         fn count(node: &SyntaxNode, pal: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, pal: &mut u32, other: &mut u32| {
                 if b.inter.is_none() && b.palette.size_y > 0 {
@@ -5684,7 +6127,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         fn count(node: &SyntaxNode, wedge_ii: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, wedge_ii: &mut u32, other: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -5798,7 +6242,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
 
         // Walk the committed tree: collect BLOCK_4X4 leaves with
         // §5.11.4 SPLIT geometry.
@@ -5961,7 +6406,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         fn count(node: &SyntaxNode, ii: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, ii: &mut u32, other: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -6105,7 +6551,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         fn count(node: &SyntaxNode, dist: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, dist: &mut u32, other: &mut u32| {
                 if let Some(ib) = b.inter.as_ref() {
@@ -6292,7 +6739,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         let (mut n_sub8, mut n_4x4) = (0u32, 0u32);
         count_sub8(&tree, BLOCK_64X64, &mut n_sub8, &mut n_4x4);
         assert!(
@@ -6378,7 +6826,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let tree = build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx)
+            .unwrap();
         let (mut n_sub8, mut n_4x4) = (0u32, 0u32);
         count_sub8(&tree, BLOCK_64X64, &mut n_sub8, &mut n_4x4);
         assert!(
@@ -6444,7 +6893,8 @@ mod tests {
         let mut recon = fresh_recon(64, 64, base_q_idx);
         let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, true);
         recon.bd.clear_for_sb(0, 0, 16, 16);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
         fn count(node: &SyntaxNode, sm: &mut u32, other: &mut u32) {
             let leafc = |b: &SyntaxBlock, sm: &mut u32, other: &mut u32| {
                 if b.inter.as_ref().is_some_and(|ib| ib.skip_mode != 0) {
@@ -6587,7 +7037,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         let mut counts = [0u32; 3];
         count_motion_modes(&tree, &mut counts);
         assert!(
@@ -6700,13 +7151,16 @@ mod tests {
         )
         .unwrap();
         let mut counts = [0u32; 3];
+        // r421 — one persistent tile state across the superblocks (the
+        // twin's mirror must carry the earlier superblocks' stamps).
+        let mut ts = test_tile_state(&recon, &ictx);
         for (sb_r, sb_c) in [(0u32, 0u32), (0, 16), (16, 0), (16, 16)] {
             if sb_r >= mi_rows || sb_c >= mi_cols {
                 continue;
             }
             recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
             let tree =
-                build_p_search_tree(sb_r, sb_c, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+                search_and_commit_sb(&mut ts, sb_r, sb_c, &f1, &mut recon, &mut ictx).unwrap();
             count_motion_modes(&tree, &mut counts);
         }
         assert!(
@@ -6834,7 +7288,8 @@ mod tests {
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
-        let tree = build_p_search_tree(0, 0, BLOCK_64X64, f1, &mut recon, &mut ictx).unwrap();
+        let tree =
+            build_p_search_tree_for_tests(0, 0, BLOCK_64X64, f1, &mut recon, &mut ictx).unwrap();
         if std::env::var("OXIDEAV_AV1_DEBUG_CENSUS").is_ok() {
             fn dump(node: &SyntaxNode, depth: usize) {
                 let leafd = |b: &SyntaxBlock, depth: usize| {

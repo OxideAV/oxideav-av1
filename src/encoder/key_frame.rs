@@ -115,6 +115,7 @@ use crate::encoder::pixel_driver_dyn::{
     build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq, sb_grid_origins,
     Yuv420Frame,
 };
+use crate::encoder::rate_twin::{score256, RateModel, RateTwin};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
@@ -197,6 +198,19 @@ pub fn encode_key_frame_yuv420(input: &Yuv420Frame) -> Result<EncodedKeyFrame, E
 pub fn encode_key_frame_yuv420_with_q(
     input: &Yuv420Frame,
     base_q_idx: u8,
+) -> Result<EncodedKeyFrame, Error> {
+    encode_key_frame_yuv420_with_q_rate_model(input, base_q_idx, RateModel::Twin)
+}
+
+/// r421 — [`encode_key_frame_yuv420_with_q`] with an explicit
+/// [`RateModel`], kept public (hidden) so the sweep harnesses can A/B
+/// the twin-priced elections against the pre-r421 heuristic baseline
+/// on identical inputs.
+#[doc(hidden)]
+pub fn encode_key_frame_yuv420_with_q_rate_model(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    model: RateModel,
 ) -> Result<EncodedKeyFrame, Error> {
     // Own dimension gate (wider than `Yuv420Frame::validate`'s
     // single-superblock bound): multiples of 8, [8, MAX] per axis.
@@ -319,8 +333,21 @@ pub fn encode_key_frame_yuv420_with_q(
 
     for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
         recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
-        let tree = build_search_tree(sb_r, sb_c, BLOCK_64X64, input, &mut recon);
+        // r421 — arm the §5.11.2 delta lifecycle on the live state AND
+        // the rate twin's fork, so both enter the superblock identically.
         state.arm_read_deltas();
+        let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+        twin.arm_read_deltas();
+        let (tree, _cost) = build_search_tree(
+            sb_r,
+            sb_c,
+            BLOCK_64X64,
+            input,
+            &mut recon,
+            &mut twin,
+            &params,
+            model,
+        )?;
         write_partition_tree_syntax(
             &mut writer,
             &mut cdfs,
@@ -331,6 +358,14 @@ pub fn encode_key_frame_yuv420_with_q(
             BLOCK_64X64,
             &params,
         )?;
+        // r421 anti-desync invariant: the search committed EXACTLY the
+        // symbols the writer just emitted, so the twin's CDFs and
+        // coder range must equal the live state — always, in both
+        // rate models (commits are model-independent).
+        debug_assert!(
+            twin.matches(&cdfs, &writer),
+            "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+        );
     }
     let tile_bytes = writer.finish();
 
@@ -1281,7 +1316,11 @@ pub(crate) fn encode_leaf_sq(
     b_size: usize,
     input: &Yuv420Frame,
     recon: &mut ReconState,
-) -> SyntaxBlock {
+    // r421 — `Some((twin, params))` prices the leaf-level elections
+    // (tx-depth ladder, §5.11.46 palette combos, §5.11.7 intra-bc)
+    // with exact twin bits; `None` keeps the pre-r421 heuristics.
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
     // §5.11.46 palette candidates (r418) — only built when the
     // frame-header gate is open and the block is an eligible square.
     let (pal_y, pal_uv) = if recon.allow_screen_content_tools {
@@ -1340,18 +1379,35 @@ pub(crate) fn encode_leaf_sq(
         None
     };
     if single_shape && combos.len() == 1 && intrabc_dv.is_none() {
-        return encode_leaf_with_tx(mi_r, mi_c, b_size, cands[0], input, recon, None, None);
+        return Ok(encode_leaf_with_tx(
+            mi_r, mi_c, b_size, cands[0], input, recon, None, None,
+        ));
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let lambda = lambda_for(&recon.qp);
+    // r421 — one election, one rate scale: exact twin bits (1/256-bit
+    // units, block syntax only — the partition symbol is constant
+    // across every candidate here and cancels) or the pre-r421
+    // heuristic. The two scales never mix within a call.
+    let rate_of = |leaf: &SyntaxBlock, depth: u64| -> Result<u64, Error> {
+        match pricing {
+            Some((twin, params)) => twin.price_block(leaf, mi_r, mi_c, b_size, params),
+            None => Ok(leaf_rate(leaf) + 2 * depth),
+        }
+    };
+    let score_of = |d: u64, rate: u64| -> u64 {
+        match pricing {
+            Some(_) => score256(d, lambda, rate),
+            None => d + lambda * rate,
+        }
+    };
     let before = save_region(recon, mi_r, mi_c, n4);
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
         for &(py, puv) in combos.iter() {
             let leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv);
             let d = region_distortion(recon, input, mi_r, mi_c, n4);
-            let r = leaf_rate(&leaf) + 2 * depth as u64;
-            let score = d + lambda * r;
+            let score = score_of(d, rate_of(&leaf, depth as u64)?);
             let improves = match best.as_ref() {
                 Some((_, _, s)) => score < *s,
                 None => true,
@@ -1367,7 +1423,7 @@ pub(crate) fn encode_leaf_sq(
     if let Some(dv) = intrabc_dv {
         let leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon);
         let d = region_distortion(recon, input, mi_r, mi_c, n4);
-        let score = d + lambda * leaf_rate(&leaf);
+        let score = score_of(d, rate_of(&leaf, 0)?);
         let improves = match best.as_ref() {
             Some((_, _, s)) => score < *s,
             None => true,
@@ -1379,7 +1435,7 @@ pub(crate) fn encode_leaf_sq(
     }
     let (leaf, after, _) = best.expect("at least one tx candidate");
     restore_region(recon, mi_r, mi_c, &after);
-    leaf
+    Ok(leaf)
 }
 
 /// §5.11.46 luma palette commitment candidate for one square leaf —
@@ -2622,19 +2678,39 @@ pub(crate) fn tree_rate(node: &SyntaxNode) -> u64 {
 /// symbols). Nodes straddling the frame edge take the §5.11.4 forced
 /// split; out-of-frame quadrants get the short-circuited dummy node.
 /// The running reconstruction ends in the winning shape's state.
+///
+/// r421 — rate is priced by the search-side rate twin: `twin` enters
+/// holding the live write state at this node's stream position, every
+/// candidate is priced by count-writing its exact symbol sequence
+/// through the real write path, and the twin leaves committed to the
+/// WINNING shape's symbols (so later nodes price against the adapted
+/// CDFs the writer will actually hold). Under
+/// [`RateModel::Heuristic`] the twin is still threaded (commits are
+/// how the state stays consistent) but scores use the pre-r421
+/// proxies — the sweep harnesses A/B the two models. Returns the
+/// chosen node plus its exact cost in 1/256-bit units.
+#[allow(clippy::too_many_arguments)]
 fn build_search_tree(
     r: u32,
     c: u32,
     b_size: usize,
     input: &Yuv420Frame,
     recon: &mut ReconState,
-) -> SyntaxNode {
+    twin: &mut RateTwin,
+    params: &SyntaxFrameParams,
+    model: RateModel,
+) -> Result<(SyntaxNode, u64), Error> {
     if r >= recon.mi_rows || c >= recon.mi_cols {
-        // §5.11.4 line 1 — never inspected by the writer.
-        return SyntaxNode::dummy_oob();
+        // §5.11.4 line 1 — never inspected by the writer (and never
+        // costed: the write pass short-circuits before any symbol).
+        return Ok((SyntaxNode::dummy_oob(), 0));
     }
     if b_size == BLOCK_4X4 {
-        return SyntaxNode::Leaf(Box::new(encode_leaf_sq(r, c, b_size, input, recon)));
+        let pricing = (model == RateModel::Twin).then_some((&*twin, params));
+        let leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let cost = twin.commit_subtree(&node, r, c, b_size, params)?;
+        return Ok((node, cost));
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
     let half = n4 >> 1;
@@ -2642,44 +2718,82 @@ fn build_search_tree(
         .expect("PARTITION_SPLIT subsize exists for every b_size >= BLOCK_8X8");
     let fully_inside = r + n4 <= recon.mi_rows && c + n4 <= recon.mi_cols;
 
-    let split_children = |input: &Yuv420Frame, recon: &mut ReconState| -> [Box<SyntaxNode>; 4] {
-        [
-            Box::new(build_search_tree(r, c, sub, input, recon)),
-            Box::new(build_search_tree(r, c + half, sub, input, recon)),
-            Box::new(build_search_tree(r + half, c, sub, input, recon)),
-            Box::new(build_search_tree(r + half, c + half, sub, input, recon)),
-        ]
-    };
-
     if !fully_inside {
         // §5.11.4 forced arms: a node straddling the frame edge cannot
-        // code PARTITION_NONE at this driver's leaf shapes — split.
-        return SyntaxNode::Split(split_children(input, recon));
+        // code PARTITION_NONE at this driver's leaf shapes — split
+        // (the partition arm may still cost bits: the `split_or_*`
+        // half-straddle bools).
+        let mut cost = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let (nw, c0) = build_search_tree(r, c, sub, input, recon, twin, params, model)?;
+        let (ne, c1) = build_search_tree(r, c + half, sub, input, recon, twin, params, model)?;
+        let (sw, c2) = build_search_tree(r + half, c, sub, input, recon, twin, params, model)?;
+        let (se, c3) =
+            build_search_tree(r + half, c + half, sub, input, recon, twin, params, model)?;
+        cost += c0 + c1 + c2 + c3;
+        let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
+        return Ok((SyntaxNode::Split(children), cost));
     }
 
     let lambda = lambda_for(&recon.qp);
     let before = save_region(recon, r, c, n4 as usize);
 
-    // Candidate A: one PARTITION_NONE leaf.
-    let leaf = encode_leaf_sq(r, c, b_size, input, recon);
+    // Candidate A: one PARTITION_NONE leaf (partition symbol + block
+    // syntax committed to a twin fork).
+    let pricing = (model == RateModel::Twin).then_some((&*twin, params));
+    let leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+    let node_a = SyntaxNode::Leaf(Box::new(leaf));
     let d_a = region_distortion(recon, input, r, c, n4 as usize);
-    let r_a = leaf_rate(&leaf);
+    let mut twin_a = twin.clone();
+    let cost_a = twin_a.commit_subtree(&node_a, r, c, b_size, params)?;
     let after_a = save_region(recon, r, c, n4 as usize);
     restore_region(recon, r, c, &before);
 
     // Candidate B: PARTITION_SPLIT into four recursively-searched
-    // quadrants (NW/NE/SW/SE dispatch order — the writer's order).
-    let children = split_children(input, recon);
+    // quadrants (NW/NE/SW/SE dispatch order — the writer's order),
+    // each child searched against the twin state its symbols will
+    // actually be written under (SPLIT arm + earlier siblings).
+    let mut twin_b = twin.clone();
+    let mut cost_b = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+    let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model)?;
+    let (ne, c1) = build_search_tree(r, c + half, sub, input, recon, &mut twin_b, params, model)?;
+    let (sw, c2) = build_search_tree(r + half, c, sub, input, recon, &mut twin_b, params, model)?;
+    let (se, c3) = build_search_tree(
+        r + half,
+        c + half,
+        sub,
+        input,
+        recon,
+        &mut twin_b,
+        params,
+        model,
+    )?;
+    cost_b += c0 + c1 + c2 + c3;
+    let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
     let d_b = region_distortion(recon, input, r, c, n4 as usize);
-    let r_b = children.iter().map(|ch| tree_rate(ch)).sum::<u64>() + 4;
 
-    let score_a = d_a + lambda * r_a;
-    let score_b = d_b + lambda * r_b;
+    let (r_a, r_b) = match model {
+        RateModel::Twin => (cost_a, cost_b),
+        // Heuristic scores scaled by 256 so both models run through
+        // the same `score256` comparison with identical decisions to
+        // the pre-r421 integer scores.
+        RateModel::Heuristic => {
+            let lr = match &node_a {
+                SyntaxNode::Leaf(b) => leaf_rate(b),
+                _ => unreachable!("candidate A is always a leaf"),
+            };
+            let tr = children.iter().map(|ch| tree_rate(ch)).sum::<u64>() + 4;
+            (lr * 256, tr * 256)
+        }
+    };
+    let score_a = score256(d_a, lambda, r_a);
+    let score_b = score256(d_b, lambda, r_b);
     if score_a <= score_b {
         restore_region(recon, r, c, &after_a);
-        SyntaxNode::Leaf(Box::new(leaf))
+        *twin = twin_a;
+        Ok((node_a, cost_a))
     } else {
-        SyntaxNode::Split(children)
+        *twin = twin_b;
+        Ok((SyntaxNode::Split(children), cost_b))
     }
 }
 
@@ -2691,6 +2805,56 @@ fn build_search_tree(
 mod tests {
     use super::*;
     use crate::cdf::PALETTE_COLORS;
+
+    /// r421 — fresh-frame search context (rate twin + frame params)
+    /// for driving [`build_search_tree`] directly: §8.3.1 default
+    /// CDFs at the recon's quantiser, a whole-frame single-tile write
+    /// state, and the KEY driver's frame-scope parameter bundle.
+    fn search_ctx_for_tests(recon: &ReconState) -> (RateTwin, SyntaxFrameParams) {
+        let writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.init_coeff_cdfs(recon.qp.base_q_idx);
+        let state = PartitionSyntaxWriter::new(
+            recon.mi_rows,
+            recon.mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: recon.mi_rows,
+                mi_col_start: 0,
+                mi_col_end: recon.mi_cols,
+            },
+        )
+        .expect("test geometry is valid");
+        let params = SyntaxFrameParams {
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            seg_id_pre_skip: false,
+            segmentation_enabled: false,
+            seg_skip_active: false,
+            last_active_seg_id: 0,
+            lossless_array: [recon.lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            coded_lossless: recon.lossless,
+            enable_cdef: false,
+            allow_intrabc: recon.allow_intrabc,
+            cdef_bits: 0,
+            read_deltas: false,
+            use_128x128_superblock: false,
+            delta_q_res: 0,
+            delta_lf_present: false,
+            delta_lf_multi: false,
+            mono_chrome: false,
+            delta_lf_res: 0,
+            allow_screen_content_tools: recon.allow_screen_content_tools,
+            enable_filter_intra: true,
+            bit_depth: 8,
+            tx_mode_select: !recon.lossless,
+            quant: recon.qp,
+            reduced_tx_set: false,
+            inter: None,
+        };
+        (RateTwin::snapshot(&cdfs, &state, &writer), params)
+    }
 
     /// Deterministic 4-colour dither over the luma plane (xorshift cell
     /// noise) with flat chroma — exactly representable by a §5.11.46
@@ -2724,6 +2888,98 @@ mod tests {
             }
         }
         f
+    }
+
+    /// r421 — end-to-end rate-twin witness: replicate the driver loop
+    /// over a multi-superblock textured frame, sum the per-superblock
+    /// committed twin costs, and (a) assert the twin state matches the
+    /// live writer state after every superblock (the anti-desync
+    /// invariant, here as a hard assert), (b) assert the summed exact
+    /// cost predicts the emitted tile payload to within the §8.2.4
+    /// termination slack (15 seed bits − 14 dropped trailing zeros ±
+    /// byte padding ± 1 fractional bit).
+    #[test]
+    fn r421_twin_costs_sum_to_writer_emission() {
+        let input = dither4(128, 64, 77);
+        let (mi_rows, mi_cols) = (16u32, 32u32);
+        let mut recon = ReconState {
+            y: vec![0u8; 128 * 64],
+            u: vec![0u8; 64 * 32],
+            v: vec![0u8; 64 * 32],
+            width: 128,
+            height: 64,
+            chroma_w: 64,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(60, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.init_coeff_cdfs(60);
+        let mut state = PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .unwrap();
+        // Params must mirror the twin's exactly (same object).
+        let (_, params) = search_ctx_for_tests(&recon);
+        let mut total_cost256 = 0u64;
+        for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+            recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            state.arm_read_deltas();
+            let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+            twin.arm_read_deltas();
+            let (tree, cost) = build_search_tree(
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &input,
+                &mut recon,
+                &mut twin,
+                &params,
+                RateModel::Twin,
+            )
+            .unwrap();
+            total_cost256 += cost;
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &tree,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &params,
+            )
+            .unwrap();
+            assert!(
+                twin.matches(&cdfs, &writer),
+                "rate twin desynced after superblock ({sb_r},{sb_c})"
+            );
+        }
+        let tile_bits = writer.finish().len() as u64 * 8;
+        let predicted_bits = total_cost256 / 256;
+        // Emission = 15 seed bits + renorm bits − 14 dropped trailing
+        // zeros, padded up to a byte: |emitted − predicted| ≤ 1 + 7 +
+        // 1 (fractional accumulation) bits — use 16 for slack.
+        assert!(
+            tile_bits.abs_diff(predicted_bits) <= 16,
+            "twin predicted {predicted_bits} bits, tile payload is {tile_bits} bits"
+        );
+        // The prediction is meaningful (a real multi-superblock lossy
+        // payload, thousands of bits).
+        assert!(predicted_bits > 2000, "payload unexpectedly trivial");
     }
 
     fn count_palette_leaves(node: &SyntaxNode, pal: &mut u32, other: &mut u32) {
@@ -2790,7 +3046,18 @@ mod tests {
                 bd: BlockDecodedMirror::new(),
             };
             recon.bd.clear_for_sb(0, 0, 16, 16);
-            let tree = build_search_tree(0, 0, BLOCK_64X64, &input, &mut recon);
+            let (mut twin, params) = search_ctx_for_tests(&recon);
+            let (tree, _) = build_search_tree(
+                0,
+                0,
+                BLOCK_64X64,
+                &input,
+                &mut recon,
+                &mut twin,
+                &params,
+                RateModel::Twin,
+            )
+            .unwrap();
             let (mut pal, mut other) = (0u32, 0u32);
             count_palette_leaves(&tree, &mut pal, &mut other);
             assert!(
@@ -2919,9 +3186,21 @@ mod tests {
                 bd: BlockDecodedMirror::new(),
             };
             let (mut ibc, mut other) = (0u32, 0u32);
+            let (mut twin, params) = search_ctx_for_tests(&recon);
             for (sb_r, sb_c) in sb_grid_origins(48, 48) {
                 recon.bd.clear_for_sb(sb_r, sb_c, 48, 48);
-                let tree = build_search_tree(sb_r, sb_c, BLOCK_64X64, &input, &mut recon);
+                twin.arm_read_deltas();
+                let (tree, _) = build_search_tree(
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &input,
+                    &mut recon,
+                    &mut twin,
+                    &params,
+                    RateModel::Twin,
+                )
+                .unwrap();
                 count_palette_leaves_by(&tree, &mut ibc, &mut other, |b| b.intrabc_mv.is_some());
             }
             assert!(
@@ -2992,7 +3271,18 @@ mod tests {
             bd: BlockDecodedMirror::new(),
         };
         recon.bd.clear_for_sb(0, 0, 16, 16);
-        let tree = build_search_tree(0, 0, BLOCK_64X64, &input, &mut recon);
+        let (mut twin, params) = search_ctx_for_tests(&recon);
+        let (tree, _) = build_search_tree(
+            0,
+            0,
+            BLOCK_64X64,
+            &input,
+            &mut recon,
+            &mut twin,
+            &params,
+            RateModel::Twin,
+        )
+        .unwrap();
         let (mut pal, mut other) = (0u32, 0u32);
         count_palette_leaves(&tree, &mut pal, &mut other);
         assert!(

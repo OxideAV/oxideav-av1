@@ -285,6 +285,7 @@ pub mod pixel_driver;
 pub mod pixel_driver_dyn;
 #[doc(hidden)]
 pub mod pyramid_gop;
+pub(crate) mod rate_twin;
 #[doc(hidden)]
 pub mod sequence_obu;
 #[doc(hidden)]
@@ -334,6 +335,8 @@ pub use forward_transform_2d::forward_transform_2d;
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 #[doc(hidden)]
 pub use frame_obu::write_frame_header_obu;
+#[doc(hidden)]
+pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model;
 pub use inter_frame::{
     encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg, EncodedGop,
     GopFrameRecon, GOP_MAX_FRAMES,
@@ -347,6 +350,8 @@ pub use inter_predict::{
 };
 #[doc(hidden)]
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
+#[doc(hidden)]
+pub use key_frame::encode_key_frame_yuv420_with_q_rate_model;
 pub use key_frame::{
     encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
 };
@@ -385,7 +390,13 @@ pub use pixel_driver_dyn::{
     EncodedFrameDynYuvMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420FrameMultiSb, MAX_DIM,
     MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
 };
+// r421 — rate-model selector, exposed (hidden) so the sweep harnesses
+// can A/B the twin-priced elections against the heuristic baseline.
+#[doc(hidden)]
+pub use pyramid_gop::encode_pyramid_gop_yuv420_with_q_rate_model;
 pub use pyramid_gop::{encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q};
+#[doc(hidden)]
+pub use rate_twin::RateModel;
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 #[doc(hidden)]

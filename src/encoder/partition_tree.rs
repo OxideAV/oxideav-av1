@@ -1201,7 +1201,9 @@ impl SyntaxFrameParams {
 /// [`PartitionWalker`] neighbour-grid mirror every §8.3.2 context is
 /// derived from. One driver per tile, mirroring the decode side's
 /// one-walker-per-tile shape.
-#[derive(Debug)]
+// r421: `Clone` so the search-side rate twin ([`super::rate_twin`])
+// can price candidate subtrees on a snapshot of the live write state.
+#[derive(Debug, Clone)]
 pub struct PartitionSyntaxWriter {
     mi_rows: u32,
     mi_cols: u32,
@@ -1407,13 +1409,7 @@ pub fn write_partition_tree_syntax(
         }
     };
 
-    let pctx = if b_size >= BLOCK_8X8 {
-        let bsl = MI_WIDTH_LOG2[b_size] as u32;
-        state.partition_ctx_for(r, c, bsl)
-    } else {
-        0
-    };
-    write_partition(writer, cdfs, partition, b_size, has_rows, has_cols, pctx)?;
+    write_partition_symbol(writer, cdfs, state, partition, r, c, b_size)?;
 
     let sub_size = partition_subsize(partition, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
 
@@ -1619,6 +1615,35 @@ pub fn write_partition_tree_syntax(
         _ => return Err(Error::PartitionWalkOutOfRange),
     }
     Ok(())
+}
+
+/// §5.11.4 partition-symbol emission for the node at `(r, c, b_size)`
+/// — the `pctx` derivation plus [`write_partition`]'s S() / forced /
+/// `split_or_*` arm dispatch, pulled out of
+/// [`write_partition_tree_syntax`] so the search-side rate twin
+/// ([`super::rate_twin::RateTwin`]) prices and commits partition arms
+/// through the SAME code the emitting pass runs (single source of
+/// truth — the twin can never drift from the writer's arm selection).
+pub(crate) fn write_partition_symbol(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &PartitionSyntaxWriter,
+    partition: usize,
+    r: u32,
+    c: u32,
+    b_size: usize,
+) -> Result<(), Error> {
+    let num4x4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let half_block4x4 = num4x4 >> 1;
+    let has_rows = (r + half_block4x4) < state.mi_rows;
+    let has_cols = (c + half_block4x4) < state.mi_cols;
+    let pctx = if b_size >= BLOCK_8X8 {
+        let bsl = MI_WIDTH_LOG2[b_size] as u32;
+        state.partition_ctx_for(r, c, bsl)
+    } else {
+        0
+    };
+    write_partition(writer, cdfs, partition, b_size, has_rows, has_cols, pctx)
 }
 
 /// Full §5.11.5 / §5.11.7 leaf emission — the write twin of

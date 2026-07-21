@@ -56,9 +56,9 @@ use crate::encoder::inter_frame::{
     GOP_MAX_FRAMES,
 };
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
-use crate::encoder::key_frame::encode_key_frame_yuv420_with_q;
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::pixel_driver_dyn::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Frame};
+use crate::encoder::rate_twin::RateModel;
 use crate::frame_header::{FrameHeader, FrameType, PRIMARY_REF_NONE};
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
@@ -123,6 +123,18 @@ pub fn encode_pyramid_gop_yuv420_with_q(
     frames: &[Yuv420Frame],
     base_q_idx: u8,
 ) -> Result<EncodedGop, Error> {
+    encode_pyramid_gop_yuv420_with_q_rate_model(frames, base_q_idx, RateModel::Twin)
+}
+
+/// r421 — [`encode_pyramid_gop_yuv420_with_q`] with an explicit
+/// [`RateModel`], kept public (hidden) so the sweep harnesses can A/B
+/// the twin-priced elections against the pre-r421 heuristic baseline.
+#[doc(hidden)]
+pub fn encode_pyramid_gop_yuv420_with_q_rate_model(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    model: RateModel,
+) -> Result<EncodedGop, Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -139,7 +151,9 @@ pub fn encode_pyramid_gop_yuv420_with_q(
     // also validates the dimension rules). Its `allFrames` refresh
     // fills every §7.20 slot with the KEY (hint 0, intra motion
     // field).
-    let key = encode_key_frame_yuv420_with_q(&frames[0], base_q_idx)?;
+    let key = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_rate_model(
+        &frames[0], base_q_idx, model,
+    )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
     let mut recons: Vec<Option<GopFrameRecon>> = (0..n).map(|_| None).collect();
@@ -223,6 +237,7 @@ pub fn encode_pyramid_gop_yuv420_with_q(
                         &cfg,
                         &[],
                         &mf_store,
+                        model,
                     )?;
                     pending.push(obu);
                     if role.show {

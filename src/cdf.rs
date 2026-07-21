@@ -15385,7 +15385,9 @@ impl FrameInterOrderHints {
 const MAX_SB4: usize = 32;
 const BD_STRIDE: usize = MAX_SB4 + 2;
 
-#[derive(Debug)]
+// r421: `Clone` so the encoder's search-side rate twin can price
+// candidate symbol sequences on a snapshot of the write-side mirror.
+#[derive(Debug, Clone)]
 pub struct PartitionWalker {
     mi_rows: u32,
     mi_cols: u32,
@@ -15932,7 +15934,7 @@ struct CurrFramePlane {
 /// `x ∈ [cols, cols + LUMA_OH)`, `bottom` covers `y ∈ [rows, rows +
 /// LUMA_OH)`, `corner` both. `LUMA_OH = 64` bounds the largest
 /// possible overhang (`Tx_Width ≤ 64`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LumaOverhang {
     rows: u32,
     cols: u32,
