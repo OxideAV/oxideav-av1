@@ -848,7 +848,6 @@ fn global_param_bits(
 /// election quantizes every estimated model through this before
 /// pricing or committing it, so the encoder-side `gm_params` are
 /// identical to the parsed ones by construction.
-#[allow(dead_code)] // r422: the frame-level global-motion election (this arc) consumes it.
 pub(crate) fn quantize_global_param(
     gm_type: WarpModelType,
     allow_high_precision_mv: bool,

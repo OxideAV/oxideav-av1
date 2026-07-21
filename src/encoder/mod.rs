@@ -263,6 +263,7 @@ pub mod forward_transform_2d;
 pub mod forward_wht;
 #[doc(hidden)]
 pub mod frame_obu;
+pub(crate) mod global_motion;
 #[doc(hidden)]
 pub mod inter_frame;
 #[doc(hidden)]

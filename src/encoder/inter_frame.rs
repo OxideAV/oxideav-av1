@@ -708,7 +708,7 @@ pub(crate) fn encode_inter_frame_generic(
         }
     }
 
-    let fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
+    let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
     let fs = fh
         .frame_size
         .as_ref()
@@ -837,6 +837,60 @@ pub(crate) fn encode_inter_frame_generic(
             mi_rows,
             mi_cols,
         );
+    }
+
+    // r422 — frame-level global-motion election (§5.9.24): one coarse
+    // motion pre-pass per DISTINCT reference reconstruction, then the
+    // least-squares model fits + §5.9.25 grid quantization +
+    // §7.11.3.6 validation of [`crate::encoder::global_motion`]. The
+    // elected `(GmType, gm_params)` pairs are stamped into the shared
+    // inter bundle (feeding the §7.10.2.1 `GlobalMvs` derivation and
+    // the §7.11.3 global-warp arm of BOTH the search mirror and the
+    // write pass) and into the frame header (feeding the §5.9.24
+    // write arm) — one source of truth on every side, so the stream
+    // and the search can never disagree about the model.
+    {
+        let hp = fh
+            .inter_refs
+            .as_ref()
+            .map(|ir| ir.allow_high_precision_mv)
+            .unwrap_or(false);
+        // Estimate once per distinct reference plane, then fan the
+        // result out to every RefFrame ordinal mapped onto it.
+        let mut per_plane: Vec<Option<(crate::uncompressed_header_tail::WarpModelType, [i32; 6])>> =
+            vec![None; cfg.refs.len()];
+        for &rf in &cfg.single_refs {
+            let plane = cfg.slot_to_plane[cfg.ref_frame_idx[(rf - 1) as usize] as usize];
+            let (t, p) = match per_plane[plane] {
+                Some(tp) => tp,
+                None => {
+                    let samples = crate::encoder::global_motion::collect_motion_samples(
+                        &input.y,
+                        &cfg.refs[plane].y,
+                        width,
+                        height,
+                    );
+                    let tp = crate::encoder::global_motion::estimate_global_motion(&samples, hp);
+                    per_plane[plane] = Some(tp);
+                    tp
+                }
+            };
+            ip.gm_type[rf as usize] = i32::from(t.as_u8());
+            ip.gm_params[rf as usize] = p;
+        }
+        // Header twin of the elected models.
+        let mut gmp = crate::uncompressed_header_tail::GlobalMotionParams::identity();
+        gmp.short_circuited = false;
+        for r in 1..=7usize {
+            gmp.gm_type[r] = match ip.gm_type[r] {
+                1 => crate::uncompressed_header_tail::WarpModelType::Translation,
+                2 => crate::uncompressed_header_tail::WarpModelType::RotZoom,
+                3 => crate::uncompressed_header_tail::WarpModelType::Affine,
+                _ => crate::uncompressed_header_tail::WarpModelType::Identity,
+            };
+            gmp.gm_params[r] = ip.gm_params[r];
+        }
+        fh.global_motion_params = Some(gmp);
     }
 
     let params = SyntaxFrameParams {
@@ -1226,10 +1280,15 @@ impl PSearchCtx {
         }
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
+        // r422 — the §5.9.24 model state comes from the shared inter
+        // bundle (identity unless the frame-level election committed
+        // a model), so the §7.11.3 warp context of `predict_leaf`
+        // sees EXACTLY what the write pass and the decoder see.
         let mut gm_flat = [0i32; 48];
+        let mut gm_types_u8 = [GM_TYPE_IDENTITY as u8; 8];
         for r in 0..8 {
-            gm_flat[r * 6 + 2] = 1 << crate::cdf::WARPEDMODEL_PREC_BITS;
-            gm_flat[r * 6 + 5] = 1 << crate::cdf::WARPEDMODEL_PREC_BITS;
+            gm_flat[r * 6..r * 6 + 6].copy_from_slice(&ip.gm_params[r]);
+            gm_types_u8[r] = ip.gm_type[r] as u8;
         }
         let mut ref_frames = vec![0i8; cells * 2];
         for cell in 0..cells {
@@ -1293,7 +1352,7 @@ impl PSearchCtx {
                 vec![0u16; (width / 2) * (height / 2)],
                 vec![0u16; (width / 2) * (height / 2)],
             ],
-            gm_types: [GM_TYPE_IDENTITY as u8; 8],
+            gm_types: gm_types_u8,
             gm_flat,
             ref_hints: {
                 let mut h = [0i32; 8];
