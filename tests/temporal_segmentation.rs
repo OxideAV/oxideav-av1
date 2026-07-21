@@ -26,8 +26,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg, encode_gop_yuv420_with_q_seg_tuned, EncodedGop, GopTuning,
-    Yuv420Frame,
+    encode_gop_yuv420_with_q_seg_tuned, EncodedGop, GopTuning, TunedGop, Yuv420Frame,
 };
 
 // ---------------------------------------------------------------------
@@ -108,7 +107,7 @@ fn total_bytes(enc: &EncodedGop) -> usize {
     enc.temporal_units.iter().map(Vec::len).sum()
 }
 
-fn tuned(frames: &[Yuv420Frame], q: u8, alt_q: &[i16], tuning: GopTuning) -> EncodedGop {
+fn tuned(frames: &[Yuv420Frame], q: u8, alt_q: &[i16], tuning: GopTuning) -> TunedGop {
     encode_gop_yuv420_with_q_seg_tuned(frames, q, alt_q, tuning).expect("tuned encode")
 }
 
@@ -123,8 +122,8 @@ fn tuned(frames: &[Yuv420Frame], q: u8, alt_q: &[i16], tuning: GopTuning) -> Enc
 #[test]
 fn static_segments_elect_temporal_and_round_trip() {
     let frames = static_region_gop(5, 96, 64);
-    let enc = encode_gop_yuv420_with_q_seg(&frames, 72, &ALT_Q).unwrap();
-    assert_round_trip(&enc, frames.len(), "static-region default");
+    let enc = tuned(&frames, 72, &ALT_Q, GopTuning::default());
+    assert_round_trip(&enc.gop, frames.len(), "static-region default");
     assert_eq!(enc.seg_temporal_updates.len(), frames.len() - 1);
     assert!(
         enc.seg_temporal_updates.iter().any(|&b| b),
@@ -140,8 +139,8 @@ fn static_segments_elect_temporal_and_round_trip() {
 #[test]
 fn moving_segments_round_trip_under_temporal_coding() {
     let frames = moving_region_gop(5, 96, 64);
-    let enc = encode_gop_yuv420_with_q_seg(&frames, 72, &ALT_Q).unwrap();
-    assert_round_trip(&enc, frames.len(), "moving-region default");
+    let enc = tuned(&frames, 72, &ALT_Q, GopTuning::default());
+    assert_round_trip(&enc.gop, frames.len(), "moving-region default");
     assert_eq!(enc.seg_temporal_updates.len(), frames.len() - 1);
 }
 
@@ -176,9 +175,9 @@ fn tuning_variants_round_trip_with_aggregate_tripwires() {
                 ..GopTuning::default()
             },
         );
-        assert_round_trip(&on, frames.len(), &format!("{name} temporal-elected"));
-        assert_round_trip(&spatial, frames.len(), &format!("{name} spatial-only"));
-        assert_round_trip(&none, frames.len(), &format!("{name} primary-ref-none"));
+        assert_round_trip(&on.gop, frames.len(), &format!("{name} temporal-elected"));
+        assert_round_trip(&spatial.gop, frames.len(), &format!("{name} spatial-only"));
+        assert_round_trip(&none.gop, frames.len(), &format!("{name} primary-ref-none"));
         assert!(
             spatial.seg_temporal_updates.iter().all(|&b| !b),
             "{name}: temporal_seg = false must force spatial maps"
@@ -187,14 +186,14 @@ fn tuning_variants_round_trip_with_aggregate_tripwires() {
             none.seg_temporal_updates.iter().all(|&b| !b),
             "{name}: PRIMARY_REF_NONE frames cannot elect temporal maps"
         );
-        on_total += total_bytes(&on);
-        spatial_total += total_bytes(&spatial);
-        none_total += total_bytes(&none);
+        on_total += total_bytes(&on.gop);
+        spatial_total += total_bytes(&spatial.gop);
+        none_total += total_bytes(&none.gop);
         eprintln!(
             "seg-ab {name}: temporal-elected {} B, spatial-only {} B, primary-none {} B",
-            total_bytes(&on),
-            total_bytes(&spatial),
-            total_bytes(&none)
+            total_bytes(&on.gop),
+            total_bytes(&spatial.gop),
+            total_bytes(&none.gop)
         );
     }
     // Aggregate tripwires (per-frame the election is exact-bits over
@@ -226,9 +225,9 @@ fn unsegmented_primary_ref_carry_round_trips_and_saves() {
             ..GopTuning::default()
         },
     );
-    assert_round_trip(&on, frames.len(), "unsegmented primary-ref");
-    assert_round_trip(&off, frames.len(), "unsegmented primary-none");
-    let (a, b) = (total_bytes(&on), total_bytes(&off));
+    assert_round_trip(&on.gop, frames.len(), "unsegmented primary-ref");
+    assert_round_trip(&off.gop, frames.len(), "unsegmented primary-none");
+    let (a, b) = (total_bytes(&on.gop), total_bytes(&off.gop));
     eprintln!("cdf-inheritance ab: primary-ref {a} B vs none {b} B");
     assert!(a <= b, "CDF inheritance cost bytes in aggregate: {a} > {b}");
 }
@@ -240,11 +239,20 @@ fn unsegmented_primary_ref_carry_round_trips_and_saves() {
 fn lossless_primary_ref_carry_round_trips() {
     let frames = static_region_gop(4, 64, 64);
     let enc = tuned(&frames, 0, &[], GopTuning::default());
-    assert_round_trip(&enc, frames.len(), "lossless primary-ref");
+    assert_round_trip(&enc.gop, frames.len(), "lossless primary-ref");
     for (idx, f) in frames.iter().enumerate() {
-        assert_eq!(enc.recon[idx].y, f.y, "lossless frame {idx}: luma != input");
-        assert_eq!(enc.recon[idx].u, f.u, "lossless frame {idx}: U != input");
-        assert_eq!(enc.recon[idx].v, f.v, "lossless frame {idx}: V != input");
+        assert_eq!(
+            enc.gop.recon[idx].y, f.y,
+            "lossless frame {idx}: luma != input"
+        );
+        assert_eq!(
+            enc.gop.recon[idx].u, f.u,
+            "lossless frame {idx}: U != input"
+        );
+        assert_eq!(
+            enc.gop.recon[idx].v, f.v,
+            "lossless frame {idx}: V != input"
+        );
     }
 }
 
@@ -293,16 +301,21 @@ fn seg_ab_measurement_matrix() {
                     ..GopTuning::default()
                 },
             );
-            assert_round_trip(&on, frames.len(), &format!("{name} q{q} temporal"));
-            assert_round_trip(&spatial, frames.len(), &format!("{name} q{q} spatial"));
-            assert_round_trip(&none, frames.len(), &format!("{name} q{q} none"));
-            let (a, b, c) = (total_bytes(&on), total_bytes(&spatial), total_bytes(&none));
+            assert_round_trip(&on.gop, frames.len(), &format!("{name} q{q} temporal"));
+            assert_round_trip(&spatial.gop, frames.len(), &format!("{name} q{q} spatial"));
+            assert_round_trip(&none.gop, frames.len(), &format!("{name} q{q} none"));
+            let (a, b, c) = (
+                total_bytes(&on.gop),
+                total_bytes(&spatial.gop),
+                total_bytes(&none.gop),
+            );
             let elected = on.seg_temporal_updates.iter().filter(|&&x| x).count();
             agg[0] += a;
             agg[1] += b;
             agg[2] += c;
             csv.push_str(&format!("{name},{q},{a},{b},{c},{elected}\n"));
-            std::fs::write(dir.join(format!("{name}-q{q}.ivf")), &on.ivf_bytes).expect("write ivf");
+            std::fs::write(dir.join(format!("{name}-q{q}.ivf")), &on.gop.ivf_bytes)
+                .expect("write ivf");
         }
     }
     std::fs::write(dir.join("seg_ab.csv"), &csv).expect("write csv");

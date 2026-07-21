@@ -121,11 +121,17 @@ pub struct EncodedGop {
     pub recon: Vec<GopFrameRecon>,
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
-    /// r423 (hidden) — per-P-frame §5.9.14
-    /// `segmentation_temporal_update` election outcome (index 0 is
-    /// the first P-frame; empty on unsegmented GOPs and on the
-    /// pyramid driver). Measurement/observability surface only.
-    #[doc(hidden)]
+}
+
+/// r423 (hidden) — [`EncodedGop`] plus the per-P-frame §5.9.14
+/// `segmentation_temporal_update` election outcomes (index 0 is the
+/// first P-frame; empty on unsegmented GOPs). Returned by the
+/// tuned measurement entry point only — [`EncodedGop`] itself stays
+/// field-stable for the public constructors.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TunedGop {
+    pub gop: EncodedGop,
     pub seg_temporal_updates: Vec<bool>,
 }
 
@@ -386,6 +392,7 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
             ..GopTuning::default()
         },
     )
+    .map(|t| t.gop)
 }
 
 /// r423 — the P-GOP encoder's tuning switches, kept public (hidden)
@@ -432,7 +439,7 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
     base_q_idx: u8,
     alt_q: &[i16],
     tuning: GopTuning,
-) -> Result<EncodedGop, Error> {
+) -> Result<TunedGop, Error> {
     let model = tuning.model;
     let global_motion = tuning.global_motion;
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
@@ -542,11 +549,13 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
             .map_err(|_| Error::PartitionWalkOutOfRange)?;
     }
 
-    Ok(EncodedGop {
-        ivf_bytes,
-        temporal_units,
-        recon,
-        seq,
+    Ok(TunedGop {
+        gop: EncodedGop {
+            ivf_bytes,
+            temporal_units,
+            recon,
+            seq,
+        },
         seg_temporal_updates,
     })
 }

@@ -345,7 +345,7 @@ pub use inter_frame::{
     GopFrameRecon, GOP_MAX_FRAMES,
 };
 #[doc(hidden)]
-pub use inter_frame::{encode_gop_yuv420_with_q_seg_tuned, GopTuning};
+pub use inter_frame::{encode_gop_yuv420_with_q_seg_tuned, GopTuning, TunedGop};
 #[doc(hidden)]
 pub use inter_predict::{
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,

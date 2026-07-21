@@ -296,7 +296,6 @@ pub fn encode_pyramid_gop_yuv420_with_q_rate_model(
             .map(|r| r.expect("every display position coded"))
             .collect(),
         seq,
-        seg_temporal_updates: Vec::new(),
     })
 }
 
