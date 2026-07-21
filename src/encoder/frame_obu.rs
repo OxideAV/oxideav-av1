@@ -95,6 +95,22 @@ pub(crate) fn encode_uncompressed_header(
     fh: &FrameHeader,
     seq: &SequenceHeader,
 ) {
+    encode_uncompressed_header_with_prev_gm(bw, fh, seq, None);
+}
+
+/// r423 — [`encode_uncompressed_header`] with the §7.21
+/// `load_previous()` global-motion reference state: when
+/// `fh.primary_ref_frame != PRIMARY_REF_NONE`, the §5.9.24
+/// `read_global_param` subexp recentering runs against
+/// `PrevGmParams = SavedGmParams[ ref_frame_idx[ primary_ref_frame ] ]`
+/// (the caller-carried per-slot state) instead of the §7.13.1
+/// setup_past_independence defaults.
+pub(crate) fn encode_uncompressed_header_with_prev_gm(
+    bw: &mut BitWriter,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    prev_gm_params: Option<&[[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME]>,
+) {
     // §5.9.2 idLen derivation (only meaningful when frame_id_numbers_present_flag).
     let id_len: u32 = if seq.frame_id_numbers_present_flag {
         u32::from(seq.additional_frame_id_length_minus_1)
@@ -363,7 +379,7 @@ pub(crate) fn encode_uncompressed_header(
             bw.write_bits(1, u64::from(fh.disable_frame_end_update_cdf));
         }
         encode_tile_info(bw, fh.tile_info.as_ref().expect("inter has tile_info"));
-        encode_inter_tail(bw, fh, seq, fs);
+        encode_inter_tail(bw, fh, seq, fs, prev_gm_params);
     }
 }
 
@@ -486,7 +502,13 @@ fn encode_intra_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
     );
 }
 
-fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader, fs: &FrameSize) {
+fn encode_inter_tail(
+    bw: &mut BitWriter,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    fs: &FrameSize,
+    prev_gm_params: Option<&[[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME]>,
+) {
     let qp = fh
         .quantization_params
         .as_ref()
@@ -580,18 +602,14 @@ fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
     // §5.9.24 global_motion_params — inter path (r422: the full
     // read_global_param signed-subexp inverse; TRANSLATION / ROTZOOM /
     // AFFINE refs emit their coefficients through the §5.9.26–§5.9.29
-    // chain). `PrevGmParams` is the §7.13.1 setup_past_independence
-    // default — the only configuration this encoder emits
-    // (`primary_ref_frame == PRIMARY_REF_NONE`); a non-identity model
-    // under a primary reference would need the saved per-slot params.
+    // chain). r423: `PrevGmParams` per §5.9.2 — the §7.13.1
+    // setup_past_independence defaults under `primary_ref_frame ==
+    // PRIMARY_REF_NONE`, else the §7.21 load_previous() state
+    // (`SavedGmParams[ ref_frame_idx[ primary_ref_frame ] ]`, supplied
+    // by the caller as `prev_gm_params`).
     debug_assert!(
-        fh.primary_ref_frame == PRIMARY_REF_NONE
-            || fh
-                .global_motion_params
-                .as_ref()
-                .map(|g| g.gm_type.iter().all(|t| *t == WarpModelType::Identity))
-                .unwrap_or(true),
-        "non-identity global motion with a primary reference needs SavedGmParams plumbing"
+        fh.primary_ref_frame == PRIMARY_REF_NONE || prev_gm_params.is_some(),
+        "a primary reference requires the caller-carried SavedGmParams (load_previous())"
     );
     let gm = fh
         .global_motion_params
@@ -602,12 +620,13 @@ fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
         .as_ref()
         .map(|ir| ir.allow_high_precision_mv)
         .unwrap_or(false);
-    encode_inter_global_motion(
-        bw,
-        gm,
-        allow_high_precision_mv,
-        &crate::uncompressed_header_tail::prev_gm_params_default(),
-    );
+    let default_prev = crate::uncompressed_header_tail::prev_gm_params_default();
+    let prev = if fh.primary_ref_frame == PRIMARY_REF_NONE {
+        &default_prev
+    } else {
+        prev_gm_params.unwrap_or(&default_prev)
+    };
+    encode_inter_global_motion(bw, gm, allow_high_precision_mv, prev);
     encode_film_grain_params(
         bw,
         fh.film_grain_params

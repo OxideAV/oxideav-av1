@@ -229,8 +229,15 @@ pub fn encode_pyramid_gop_yuv420_with_q_rate_model(
                         compound_pairs: role.pairs.clone(),
                         refs,
                         slot_to_plane,
+                        // r423 — the pyramid roles keep per-frame
+                        // default state (primary-reference carry
+                        // across the B-pyramid's refresh graph is the
+                        // ladder-item-4 arc).
+                        primary_ref_frame: PRIMARY_REF_NONE,
+                        primary_carry: None,
+                        allow_temporal_seg: false,
                     };
-                    let (obu, rc, saved) = encode_inter_frame_generic(
+                    let (obu, rc, saved, _carry, _seg_temporal) = encode_inter_frame_generic(
                         &frames[role.display],
                         &seq,
                         base_q_idx,
@@ -289,6 +296,7 @@ pub fn encode_pyramid_gop_yuv420_with_q_rate_model(
             .map(|r| r.expect("every display position coded"))
             .collect(),
         seq,
+        seg_temporal_updates: Vec::new(),
     })
 }
 

@@ -212,6 +212,24 @@ pub fn encode_key_frame_yuv420_with_q_rate_model(
     base_q_idx: u8,
     model: RateModel,
 ) -> Result<EncodedKeyFrame, Error> {
+    encode_key_frame_yuv420_with_q_carry(input, base_q_idx, model).map(|(k, _)| k)
+}
+
+/// r423 — [`encode_key_frame_yuv420_with_q_rate_model`] plus the §7.20
+/// per-slot reference state the KEY frame's `allFrames` refresh
+/// deposits: the §8.4 frame-end CDF table (`save_cdfs`, the adapted
+/// state of the single tile — `context_update_tile_id = 0`,
+/// `disable_frame_end_update_cdf = 0`), the `SavedSegmentIds` grid
+/// (all-zero — `segmentation_enabled = 0` stamps the literal `0` per
+/// block), and the `SavedGmParams` identity table. A following INTER
+/// frame electing `primary_ref_frame != PRIMARY_REF_NONE` against a
+/// KEY-refreshed slot loads exactly this state (§5.9.2 `load_cdfs` +
+/// `load_previous` + `load_previous_segment_ids`).
+pub(crate) fn encode_key_frame_yuv420_with_q_carry(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    model: RateModel,
+) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
     // Own dimension gate (wider than `Yuv420Frame::validate`'s
     // single-superblock bound): multiples of 8, [8, MAX] per axis.
     if input.width < 8
@@ -417,15 +435,32 @@ pub fn encode_key_frame_yuv420_with_q_rate_model(
             .map_err(|_| Error::PartitionWalkOutOfRange)?;
     }
 
-    Ok(EncodedKeyFrame {
-        ivf_bytes,
-        temporal_unit_bytes,
-        recon_y: recon.y,
-        recon_u: recon.u,
-        recon_v: recon.v,
-        seq,
-        fh,
-    })
+    // r423 — §7.20 slot payload for the KEY frame's `allFrames`
+    // refresh: `save_cdfs` takes the tile's adapted frame-end CDFs
+    // (single tile ⇒ `context_update_tile_id = 0` donated them;
+    // `disable_frame_end_update_cdf = 0` on this header), and
+    // `SavedSegmentIds` is the walker mirror's fully-stamped grid
+    // (all-zero — §5.11.8 disabled-branch stamps).
+    let carry = crate::encoder::inter_frame::RefSlotCarry {
+        cdfs: Box::new(cdfs),
+        segment_ids: state.mirror().segment_ids().to_vec(),
+        mi_rows,
+        mi_cols,
+        gm_params: crate::uncompressed_header_tail::prev_gm_params_default(),
+    };
+
+    Ok((
+        EncodedKeyFrame {
+            ivf_bytes,
+            temporal_unit_bytes,
+            recon_y: recon.y,
+            recon_u: recon.u,
+            recon_v: recon.v,
+            seq,
+            fh,
+        },
+        carry,
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -1379,9 +1414,16 @@ pub(crate) fn encode_leaf_sq(
         None
     };
     if single_shape && combos.len() == 1 && intrabc_dv.is_none() {
-        return Ok(encode_leaf_with_tx(
-            mi_r, mi_c, b_size, cands[0], input, recon, None, None,
-        ));
+        let mut leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cands[0], input, recon, None, None);
+        // r423 — same §5.11.19 skip-leaf invariant as the ladder
+        // below (see `fix_skip_segment`): a segmented-inter-frame
+        // caller prices this leaf through the write path next.
+        if let Some((twin, params)) = pricing {
+            if params.segmentation_enabled && params.inter.is_some() && leaf.skip == 1 {
+                leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
+            }
+        }
+        return Ok(leaf);
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let lambda = lambda_for(&recon.qp);
@@ -1402,10 +1444,25 @@ pub(crate) fn encode_leaf_sq(
         }
     };
     let before = save_region(recon, mi_r, mi_c, n4);
+    // r423 — §5.11.19: on a segmented INTER frame a `skip == 1` leaf's
+    // segment id is the bit-silent spatial `pred` cascade, and the
+    // write path (which prices these candidates through its own
+    // emission body) validates the invariant. Trial candidates carry
+    // the twin-derived pred BEFORE pricing; the plain-KEY and
+    // heuristic paths (no twin, or segmentation off) are untouched —
+    // their callers apply the same rule before any pricing runs.
+    let fix_skip_segment = |leaf: &mut SyntaxBlock| {
+        if let Some((twin, params)) = pricing {
+            if params.segmentation_enabled && params.inter.is_some() && leaf.skip == 1 {
+                leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
+            }
+        }
+    };
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
         for &(py, puv) in combos.iter() {
-            let leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv);
+            let mut leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv);
+            fix_skip_segment(&mut leaf);
             let d = region_distortion(recon, input, mi_r, mi_c, n4);
             let score = score_of(d, rate_of(&leaf, depth as u64)?);
             let improves = match best.as_ref() {
@@ -1421,7 +1478,8 @@ pub(crate) fn encode_leaf_sq(
     // r418 §5.11.7 intra-block-copy trial — one fixed-shape candidate
     // against the same starting state.
     if let Some(dv) = intrabc_dv {
-        let leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon);
+        let mut leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon);
+        fix_skip_segment(&mut leaf);
         let d = region_distortion(recon, input, mi_r, mi_c, n4);
         let score = score_of(d, rate_of(&leaf, 0)?);
         let improves = match best.as_ref() {

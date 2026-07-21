@@ -69,7 +69,6 @@ use crate::cdf::{
     SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
-use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
     encode_leaf_sq, lambda_for, leaf_rate, region_distortion, region_distortion_wh, residual_tx,
@@ -122,6 +121,12 @@ pub struct EncodedGop {
     pub recon: Vec<GopFrameRecon>,
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
+    /// r423 (hidden) — per-P-frame §5.9.14
+    /// `segmentation_temporal_update` election outcome (index 0 is
+    /// the first P-frame; empty on unsegmented GOPs and on the
+    /// pyramid driver). Measurement/observability surface only.
+    #[doc(hidden)]
+    pub seg_temporal_updates: Vec<bool>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -154,6 +159,32 @@ impl SavedMotionField {
             frame_is_intra: true,
         }
     }
+}
+
+/// r423 — one §7.20 slot's stored cross-frame decode state on the
+/// encode side, mirroring the §5.9.2 primary-reference loads field by
+/// field:
+///
+/// * `cdfs` — the §8.4 frame-end CDF table `save_cdfs( i )` deposits
+///   (the `context_update_tile_id` tile's adapted state;
+///   `disable_frame_end_update_cdf = 0` on every header this encoder
+///   emits). A frame electing this slot as its primary reference
+///   starts from a clone with the per-row symbol counts zeroed
+///   (§6.8.21 `load_cdfs`).
+/// * `segment_ids` — `SavedSegmentIds[ i ][ row ][ col ]` (row-major
+///   over `mi_rows × mi_cols`), the §5.9.2
+///   `load_previous_segment_ids()` source feeding the §5.11.21
+///   `get_segment_id()` prediction.
+/// * `gm_params` — `SavedGmParams[ i ]`, the §7.21 `load_previous()`
+///   `PrevGmParams` source the §5.9.24 subexp recentering codes
+///   against.
+#[derive(Debug, Clone)]
+pub(crate) struct RefSlotCarry {
+    pub(crate) cdfs: Box<TileCdfContext>,
+    pub(crate) segment_ids: Vec<i32>,
+    pub(crate) mi_rows: u32,
+    pub(crate) mi_cols: u32,
+    pub(crate) gm_params: [[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME],
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -345,6 +376,65 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
     model: RateModel,
     global_motion: bool,
 ) -> Result<EncodedGop, Error> {
+    encode_gop_yuv420_with_q_seg_tuned(
+        frames,
+        base_q_idx,
+        alt_q,
+        GopTuning {
+            model,
+            global_motion,
+            ..GopTuning::default()
+        },
+    )
+}
+
+/// r423 — the P-GOP encoder's tuning switches, kept public (hidden)
+/// so the measurement harnesses can A/B each cross-frame feature
+/// against its baseline on identical inputs. Production entry points
+/// always use [`GopTuning::default`] (everything on).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct GopTuning {
+    /// RD-election rate model (r421).
+    pub model: RateModel,
+    /// §5.9.24 global-motion election (r422).
+    pub global_motion: bool,
+    /// r423 — §5.9.2 `primary_ref_frame` election: P-frames inherit
+    /// the previous frame's frame-end CDFs (§6.8.21 `load_cdfs`),
+    /// segment map (`load_previous_segment_ids`) and gm reference
+    /// state (`load_previous`) instead of per-frame defaults.
+    pub primary_ref: bool,
+    /// r423 — §5.9.14 / §5.11.19 temporal segment-map coding: allow
+    /// the per-frame exact-bits election between the temporal
+    /// (`seg_id_predicted`) and spatial segment-id arms. `false`
+    /// forces spatial coding on every frame (the A/B baseline).
+    /// Inert while `primary_ref` is off (the temporal arm requires
+    /// real `PrevSegmentIds` state).
+    pub temporal_seg: bool,
+}
+
+impl Default for GopTuning {
+    fn default() -> Self {
+        GopTuning {
+            model: RateModel::Twin,
+            global_motion: true,
+            primary_ref: true,
+            temporal_seg: true,
+        }
+    }
+}
+
+/// r423 — [`encode_gop_yuv420_with_q_seg`] with explicit
+/// [`GopTuning`] switches (the measurement-harness entry point).
+#[doc(hidden)]
+pub fn encode_gop_yuv420_with_q_seg_tuned(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    tuning: GopTuning,
+) -> Result<EncodedGop, Error> {
+    let model = tuning.model;
+    let global_motion = tuning.global_motion;
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -371,8 +461,10 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
     }
 
     // Frame 0: the r410 conformance-grade KEY-frame encoder (which
-    // also validates the dimension rules).
-    let key = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_rate_model(
+    // also validates the dimension rules). r423: also take the KEY
+    // frame's §7.20 slot payload — its `allFrames` refresh seeds
+    // every slot of the carry store below.
+    let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_carry(
         &frames[0], base_q_idx, model,
     )?;
     let seq = key.seq.clone();
@@ -394,12 +486,27 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
     };
     let mut mf_store: [SavedMotionField; 8] =
         core::array::from_fn(|_| SavedMotionField::intra(key_mi.0, key_mi.1));
+    // r423 — encoder-side §7.20 cross-frame carry store (CDFs /
+    // segment map / gm params per slot). The KEY frame's `allFrames`
+    // refresh fills every slot with its payload; each P-frame then
+    // refreshes its rotation slot, exactly like `mf_store`.
+    let key_carry = std::rc::Rc::new(key_carry);
+    let mut carry_store: [std::rc::Rc<RefSlotCarry>; 8] =
+        core::array::from_fn(|_| key_carry.clone());
+    let mut seg_temporal_updates: Vec<bool> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
         let prev = recon.last().expect("at least the KEY recon");
         let prevprev = &recon[recon.len().saturating_sub(2)];
-        let (tu, rc, saved_mf) = encode_p_frame_yuv420(
+        // r423 — the primary reference is LAST (ordinal 0): slot
+        // `p_index & 1`, holding frame `p_index - 1`.
+        let primary = if tuning.primary_ref {
+            Some(carry_store[(p_index & 1) as usize].clone())
+        } else {
+            None
+        };
+        let (tu, rc, saved_mf, carry, seg_temporal) = encode_p_frame_yuv420(
             input,
             prev,
             prevprev,
@@ -410,11 +517,15 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
             &mf_store,
             model,
             global_motion,
+            primary.as_deref(),
+            tuning.temporal_seg,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
+        seg_temporal_updates.push(seg_temporal);
         // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
         mf_store[((p_index - 1) & 1) as usize] = saved_mf;
+        carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
     }
 
     // IVF v0 wrap.
@@ -436,6 +547,7 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
         temporal_units,
         recon,
         seq,
+        seg_temporal_updates,
     })
 }
 
@@ -505,6 +617,19 @@ pub(crate) struct InterFrameConfig<'a> {
     /// onto them — see [`PSearchCtx::slot_to_plane`].
     pub refs: Vec<&'a GopFrameRecon>,
     pub slot_to_plane: [usize; 8],
+    /// r423 — §5.9.2 `primary_ref_frame`: the ordinal into
+    /// `ref_frame_idx[]` whose slot's saved state (CDFs, segment map,
+    /// gm params) this frame inherits, or [`PRIMARY_REF_NONE`] for
+    /// per-frame default state.
+    pub primary_ref_frame: u8,
+    /// r423 — the §7.20 stored state of
+    /// `ref_frame_idx[ primary_ref_frame ]`. MUST be `Some` whenever
+    /// `primary_ref_frame != PRIMARY_REF_NONE`.
+    pub primary_carry: Option<&'a RefSlotCarry>,
+    /// r423 — allow the §5.9.14 `temporal_update` election on this
+    /// frame (see [`GopTuning::temporal_seg`]). Only consulted on
+    /// segmented frames with a primary reference.
+    pub allow_temporal_seg: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -531,12 +656,15 @@ fn build_inter_frame_fh(
     // its later `show_existing_frame` display.
     fh.show_frame = cfg.show_frame;
     fh.showable_frame = true;
-    // r413: error resilience OFF — §5.9.2 codes primary_ref_frame
-    // (kept at PRIMARY_REF_NONE: per-frame default CDFs, no
-    // load_previous()) and opens the use_ref_frame_mvs f(1).
+    // r413: error resilience OFF — §5.9.2 codes primary_ref_frame and
+    // opens the use_ref_frame_mvs f(1). r423: the config elects the
+    // primary reference (forward CDF inheritance via §6.8.21
+    // `load_cdfs` + the §7.21 `load_previous()` /
+    // `load_previous_segment_ids()` state) — PRIMARY_REF_NONE keeps
+    // the per-frame default state.
     fh.error_resilient_mode = false;
     fh.force_integer_mv = false;
-    fh.primary_ref_frame = PRIMARY_REF_NONE;
+    fh.primary_ref_frame = cfg.primary_ref_frame;
     fh.refresh_frame_flags = cfg.refresh_frame_flags;
     // §5.9.2 `order_hint` — the DISPLAY order (KEY = 0), `<
     // GOP_MAX_FRAMES = 64` so the 7-bit modulus never wraps in-GOP.
@@ -590,12 +718,17 @@ fn build_inter_frame_fh(
         // holds the intra KEY — which both sides derive identically).
         use_ref_frame_mvs: true,
     });
-    // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — `PRIMARY_REF_NONE`
-    // forces `update_map = 1`, `temporal_update = 0`,
-    // `update_data = 1` (no bits for the three flags); the feature
-    // table codes one active ALT_Q slot per segment (`su(1+8)` each).
-    // `SegIdPreSkip = 0` (no feature at `j >= SEG_LVL_REF_FRAME`);
-    // `LastActiveSegId = alt_q.len() - 1`.
+    // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — under
+    // `PRIMARY_REF_NONE` the parser forces `update_map = 1`,
+    // `temporal_update = 0`, `update_data = 1` (no bits for the three
+    // flags); under a primary reference (r423) the three flags are
+    // CODED and this builder emits the same configuration explicitly
+    // (`update_map = 1`, `update_data = 1` — the feature table is
+    // re-coded every frame; `temporal_update` starts at 0, the
+    // per-frame election may flip it after the tile is priced). The
+    // feature table codes one active ALT_Q slot per segment
+    // (`su(1+8)` each). `SegIdPreSkip = 0` (no feature at `j >=
+    // SEG_LVL_REF_FRAME`); `LastActiveSegId = alt_q.len() - 1`.
     if !alt_q.is_empty() {
         use crate::uncompressed_header_tail::{SegmentationParams, SEG_LVL_ALT_Q};
         let mut sp = SegmentationParams::disabled();
@@ -616,10 +749,26 @@ fn build_inter_frame_fh(
 
 /// The r412/r413 two-slot P-frame [`InterFrameConfig`] for P-frame
 /// `p_index` (see [`gop_ref_hints`] for the rotation).
+#[cfg(test)]
 fn p_frame_config<'a>(
     prev: &'a GopFrameRecon,
     prevprev: &'a GopFrameRecon,
     p_index: u32,
+) -> InterFrameConfig<'a> {
+    p_frame_config_primary(prev, prevprev, p_index, None)
+}
+
+/// r423 — [`p_frame_config`] with the primary-reference election:
+/// `primary_carry = Some` elects `primary_ref_frame = 0` (LAST — the
+/// ordinal reading slot `p_index & 1`, which holds frame
+/// `p_index - 1`, the §7.20 slot the caller's carry store tracks);
+/// `None` keeps `PRIMARY_REF_NONE` (the pre-r423 shape, and the A/B
+/// baseline).
+fn p_frame_config_primary<'a>(
+    prev: &'a GopFrameRecon,
+    prevprev: &'a GopFrameRecon,
+    p_index: u32,
+    primary_carry: Option<&'a RefSlotCarry>,
 ) -> InterFrameConfig<'a> {
     let last_slot = (p_index & 1) as usize;
     let golden_slot = ((p_index - 1) & 1) as usize;
@@ -642,6 +791,13 @@ fn p_frame_config<'a>(
         compound_pairs: vec![[1, 4]],
         refs: vec![prev, prevprev],
         slot_to_plane,
+        primary_ref_frame: if primary_carry.is_some() {
+            0 // LAST_FRAME ordinal — ref_frame_idx[ 0 ] = last_slot.
+        } else {
+            PRIMARY_REF_NONE
+        },
+        primary_carry,
+        allow_temporal_seg: true,
     }
 }
 
@@ -681,9 +837,12 @@ fn encode_p_frame_yuv420(
     mf_store: &[SavedMotionField; 8],
     model: RateModel,
     global_motion: bool,
-) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField), Error> {
-    let cfg = p_frame_config(prev, prevprev, p_index);
-    let (obu, recon, saved) = encode_inter_frame_generic_gm(
+    primary_carry: Option<&RefSlotCarry>,
+    allow_temporal_seg: bool,
+) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField, RefSlotCarry, bool), Error> {
+    let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry);
+    cfg.allow_temporal_seg = allow_temporal_seg;
+    let (obu, recon, saved, carry, seg_temporal) = encode_inter_frame_generic_gm(
         input,
         seq,
         base_q_idx,
@@ -697,7 +856,13 @@ fn encode_p_frame_yuv420(
     // unit; §7.5 requires it once per coded video sequence). Every
     // P-frame is shown, so the one-OBU unit satisfies the "exactly
     // one shown frame per temporal unit" bitstream conformance rule.
-    Ok((build_temporal_unit(None, &[obu]), recon, saved))
+    Ok((
+        build_temporal_unit(None, &[obu]),
+        recon,
+        saved,
+        carry,
+        seg_temporal,
+    ))
 }
 
 /// r415 — the shared INTER frame encoder every pyramid role (P / ALT /
@@ -719,7 +884,16 @@ pub(crate) fn encode_inter_frame_generic(
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
     model: RateModel,
-) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
+) -> Result<
+    (
+        ObuFrame,
+        GopFrameRecon,
+        SavedMotionField,
+        RefSlotCarry,
+        bool,
+    ),
+    Error,
+> {
     encode_inter_frame_generic_gm(input, seq, base_q_idx, cfg, alt_q, mf_store, model, true)
 }
 
@@ -736,13 +910,29 @@ pub(crate) fn encode_inter_frame_generic_gm(
     mf_store: &[SavedMotionField; 8],
     model: RateModel,
     global_motion: bool,
-) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
+) -> Result<
+    (
+        ObuFrame,
+        GopFrameRecon,
+        SavedMotionField,
+        RefSlotCarry,
+        bool,
+    ),
+    Error,
+> {
     if input.width < 8
         || input.height < 8
         || input.width > KEY_FRAME_MAX_DIM
         || input.height > KEY_FRAME_MAX_DIM
         || input.width % 8 != 0
         || input.height % 8 != 0
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // r423 — a primary-reference election requires the §7.20 carry of
+    // the elected slot and a valid ordinal (`0..7`).
+    if cfg.primary_ref_frame != PRIMARY_REF_NONE
+        && (usize::from(cfg.primary_ref_frame) >= REFS_PER_FRAME || cfg.primary_carry.is_none())
     {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -852,11 +1042,35 @@ pub(crate) fn encode_inter_frame_generic_gm(
         ip.skip_mode_present = fh.skip_mode_present == Some(true) && allowed;
         ip.skip_mode_frame = pair;
     }
-    // r413: spatial segmentation (PRIMARY_REF_NONE forces the map
-    // update; the temporal arm stays out of scope).
+    // r413: segmentation map update (spatial coding; the r423
+    // frame-level election may flip the temporal arm on after the
+    // tile is priced). r423: `load_previous_segment_ids()` — with a
+    // primary reference whose stored extent matches, `PrevSegmentIds`
+    // is that slot's §7.20 `SavedSegmentIds`; otherwise all-zero
+    // (also the setup_past_independence state for PRIMARY_REF_NONE),
+    // exactly mirroring the decode driver's derivation.
     if !alt_q.is_empty() {
         ip.segmentation_update_map = true;
-        ip.segmentation_temporal_update = false;
+        // r423 — main-pass arm: search and emit under the §5.11.19
+        // temporal arm whenever this frame CAN code it (a primary
+        // reference exists, so `PrevSegmentIds` is real state) and
+        // the config allows it; the exact-bits election after the
+        // tile write may fall back to the spatial replay.
+        ip.segmentation_temporal_update =
+            cfg.primary_ref_frame != PRIMARY_REF_NONE && cfg.allow_temporal_seg;
+        let cells = (mi_rows as usize) * (mi_cols as usize);
+        let prev_ids = match cfg.primary_carry {
+            Some(c)
+                if cfg.primary_ref_frame != PRIMARY_REF_NONE
+                    && c.mi_rows == mi_rows
+                    && c.mi_cols == mi_cols
+                    && c.segment_ids.len() == cells =>
+            {
+                c.segment_ids.clone()
+            }
+            _ => vec![0i32; cells],
+        };
+        ip.prev_segment_ids = Some(std::sync::Arc::new(prev_ids));
     }
     // r413: §7.9 motion-field estimation over the encoder-side §7.20
     // store — the SAME shared core the decode driver runs, so the
@@ -1006,8 +1220,25 @@ pub(crate) fn encode_inter_frame_generic_gm(
     )?;
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
-    let mut cdfs = TileCdfContext::new_from_defaults();
-    cdfs.init_coeff_cdfs(base_q_idx);
+    // §8.3.1 frame-start CDF state (mirroring the decode driver):
+    // with a primary reference, §6.8.21 `load_cdfs( ref_frame_idx[
+    // primary_ref_frame ] )` — the slot's §7.20-saved frame-end state
+    // (coefficient CDFs included) with the per-row symbol counts
+    // zeroed; otherwise `init_non_coeff_cdfs()` (the §9.4 defaults)
+    // plus the q-context-selected `init_coeff_cdfs( base_q_idx )`.
+    let frame_start_cdfs: Box<TileCdfContext> = match cfg.primary_carry {
+        Some(carry) if cfg.primary_ref_frame != PRIMARY_REF_NONE => {
+            let mut loaded = carry.cdfs.clone();
+            loaded.zero_counts();
+            loaded
+        }
+        _ => {
+            let mut c = TileCdfContext::new_from_defaults();
+            c.init_coeff_cdfs(base_q_idx);
+            Box::new(c)
+        }
+    };
+    let mut cdfs = frame_start_cdfs.as_ref().clone();
     let mut state = PartitionSyntaxWriter::new(
         mi_rows,
         mi_cols,
@@ -1020,6 +1251,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
     )
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
+    // r423 — the committed per-superblock syntax trees are retained:
+    // the §5.9.14 `temporal_update` election below replays them
+    // bit-exactly under the opposite segment-id coding arm.
+    let mut trees: Vec<SyntaxNode> = Vec::new();
     for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
         recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
         // r421 — arm the §5.11.2 delta lifecycle on the live state AND
@@ -1054,8 +1289,68 @@ pub(crate) fn encode_inter_frame_generic_gm(
             twin.matches(&cdfs, &writer),
             "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
         );
+        trees.push(tree);
     }
-    let tile_bytes = writer.finish();
+    let mut tile_bytes = writer.finish();
+
+    // r423 — §5.9.14 `segmentation_temporal_update` election by EXACT
+    // realized bits: the main pass searched and wrote under the
+    // temporal arm (when codable); replay the identical committed
+    // trees under the spatial arm from the same §8.3.1 frame-start
+    // CDF state and keep whichever tile is smaller. Both arms decode
+    // to the same reconstruction (the segment ids, modes and
+    // coefficients are the trees'; only the §5.11.19 id-coding bits
+    // differ), so the election is purely rate. Header cost is
+    // arm-invariant (each §5.9.14 flag is one f(1) either way).
+    let main_ip = params
+        .inter
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let mut seg_temporal_elected = main_ip.segmentation_temporal_update;
+    if seg_temporal_elected {
+        let mut alt_ip = main_ip.clone();
+        alt_ip.segmentation_temporal_update = false;
+        let mut alt_params = params.clone();
+        alt_params.inter = Some(alt_ip);
+        let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
+        let mut alt_cdfs = frame_start_cdfs.as_ref().clone();
+        let mut alt_state = PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
+            alt_state.arm_read_deltas();
+            write_partition_tree_syntax(
+                &mut alt_writer,
+                &mut alt_cdfs,
+                &mut alt_state,
+                tree,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &alt_params,
+            )?;
+        }
+        let alt_bytes = alt_writer.finish();
+        if alt_bytes.len() < tile_bytes.len() {
+            seg_temporal_elected = false;
+            tile_bytes = alt_bytes;
+            cdfs = alt_cdfs;
+            state = alt_state;
+        }
+    }
+    // The header codes the elected arm (`update_map`/`update_data`
+    // are already 1 on every segmented frame).
+    if let Some(sp) = fh.segmentation_params.as_mut() {
+        sp.temporal_update = seg_temporal_elected;
+    }
 
     let tile_group = TileGroupObu {
         num_tiles: 1,
@@ -1070,9 +1365,17 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let tile_group_body = write_tile_group_obu(&tile_group)?;
 
     // §5.10 `frame_obu()`: header + `byte_alignment()` + tile group.
+    // r423: with a primary reference the §5.9.24 subexp recentering
+    // codes against the carried `SavedGmParams` (§7.21
+    // `load_previous()`), not the setup_past_independence defaults.
     let frame_body = {
         let mut bw = crate::encoder::bitwriter::BitWriter::new();
-        encode_uncompressed_header(&mut bw, &fh, seq);
+        crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+            &mut bw,
+            &fh,
+            seq,
+            cfg.primary_carry.map(|c| &c.gm_params),
+        );
         bw.byte_align();
         let mut body = bw.finish();
         body.extend_from_slice(&tile_group_body);
@@ -1126,6 +1429,26 @@ pub(crate) fn encode_inter_frame_generic_gm(
         frame_is_intra: false,
     };
 
+    // r423 — this frame's own §7.20 slot payload for the caller's
+    // carry store: the tile's adapted frame-end CDFs (§8.4
+    // `save_cdfs` — single tile, `context_update_tile_id = 0`,
+    // `disable_frame_end_update_cdf = 0`), the committed
+    // `SavedSegmentIds` grid (the write mirror's stamps — identical
+    // to the decode walker's by the lockstep argument), and
+    // `SavedGmParams` (this frame's decoded GmParams table; identity
+    // rows where no model was coded).
+    let carry = RefSlotCarry {
+        cdfs: Box::new(cdfs),
+        segment_ids: state.mirror().segment_ids().to_vec(),
+        mi_rows,
+        mi_cols,
+        gm_params: fh
+            .global_motion_params
+            .as_ref()
+            .map(|g| g.gm_params)
+            .unwrap_or_else(crate::uncompressed_header_tail::prev_gm_params_default),
+    };
+
     Ok((
         frame_obu,
         GopFrameRecon {
@@ -1134,6 +1457,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
             v: recon.v,
         },
         saved_mf,
+        carry,
+        seg_temporal_elected,
     ))
 }
 
@@ -5527,7 +5852,7 @@ mod tests {
         };
         let mf_store: [SavedMotionField; 8] =
             core::array::from_fn(|_| SavedMotionField::intra(mi_rows, mi_cols));
-        let (_, _, saved1) = encode_p_frame_yuv420(
+        let (_, _, saved1, _, _) = encode_p_frame_yuv420(
             &frames[1],
             &key_recon,
             &key_recon,
@@ -5537,6 +5862,8 @@ mod tests {
             &[],
             &mf_store,
             RateModel::Twin,
+            true,
+            None,
             true,
         )
         .unwrap();
