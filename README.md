@@ -743,6 +743,39 @@ was −3.06% under the r421 proxy mode rates), 30-config pyramid
 byte-identical in THREE independent black-box reference decoders
 (1233/1233 decoder runs).
 
+### Cross-frame state carry: primary-reference election + temporal segment maps (r423)
+
+r423 ends the encoder's per-frame statelessness. P-frames elect
+§5.9.2 `primary_ref_frame = 0` (LAST): a §7.20 per-slot carry store
+tracks every refreshed frame's end state — the §8.4 `save_cdfs`
+frame-end CDF table, `SavedSegmentIds`, `SavedGmParams` — and each
+INTER frame starts from its primary slot per the spec loads (§6.8.21
+`load_cdfs` with symbol counts zeroed, §7.21 `load_previous()` — the
+§5.9.24 subexp coefficients now recenter against the CARRIED
+`PrevGmParams` — and `load_previous_segment_ids()`). The §5.9.14
+flag triple becomes real coded bits, and the §5.11.19
+`segmentation_temporal_update` write arm goes live end-to-end: per
+block, the §5.11.21 `get_segment_id()` prediction, the §8.3.2
+seg-pred ctx read before the block's own stamp, the
+`seg_id_predicted` S() with the §5.11.20 spatial fallback, and both
+spec-mandated `SegPredContext[]` stamp arms on the write mirror.
+`temporal_update` is elected per frame by EXACT realized bits: the
+main pass searches and emits under the spatial arm (trees
+bit-identical to the temporal-disabled baseline), the committed
+trees replay under the temporal arm from the same frame-start CDFs,
+and the smaller tile wins — so the elected stream is
+smaller-or-equal per frame by construction. Measured on the
+committed 12-config persistent-segment matrix: the carry is worth
+**−1.52%** total bytes (12/12 smaller), the temporal election a
+further −0.06% (12/12 smaller-or-equal, up to 4/5 P-frames elected).
+r423 also fixes a latent skip-leaf invariant bug in the shared
+intra-leaf ladder (trial candidates priced with the
+constructor-default segment instead of the §5.11.9 forced pred,
+hard-erroring segmented encodes). Witnesses + A/B harness in
+`tests/temporal_segmentation.rs`; two streams pinned:
+`self-gop-128x64-q72-seg-temporal-moving` and
+`self-gop-192x128-q72-seg-temporal-static` (corpus 73 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -756,13 +789,13 @@ byte-identical in THREE independent black-box reference decoders
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r422 scope (§5.11.19 temporal segment-map
-  update, deeper-than-two pyramid levels / adaptive mini-GOP sizing,
-  per-TU tx-type + palette-k-means elections on twin pricing — the
-  coefficient chain is still proxy-priced inside those two inner
-  ladders —, per-segment lossless mixing, intrabc hash-match DV
-  search + rect / clipped palette leaves, the §5.11.46 signed-delta
-  V-plane arm) is the follow-up ladder.
+  encoding beyond the r423 scope (primary-reference carry across the
+  B-pyramid refresh graph, deeper-than-two pyramid levels / adaptive
+  mini-GOP sizing, per-TU tx-type + palette-k-means elections on
+  twin pricing — the coefficient chain is still proxy-priced inside
+  those two inner ladders —, per-segment lossless mixing, intrabc
+  hash-match DV search + rect / clipped palette leaves, the §5.11.46
+  signed-delta V-plane arm) is the follow-up ladder.
 
 ## Module layout
 
