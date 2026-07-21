@@ -64,23 +64,20 @@ fn sample_frame(w: u32, h: u32, map: impl Fn(f64, f64) -> (f64, f64)) -> Yuv420F
     f
 }
 
-/// Parse the (single) frame header of temporal unit `tu_index` (the
-/// 1-based P-frame index of the two-slot GOP rotation) and return the
-/// per-ref `(GmType, gm_params)` global-motion state.
+/// Parse every P-frame header of the GOP IN SESSION ORDER and return
+/// each frame's per-ref `(GmType, gm_params)` global-motion state
+/// (index 0 = the first P-frame).
 ///
-/// The header must be parsed against the decoder session's TRUE
-/// per-slot state (the §5.9.22 `skipModeAllowed` derivation reads the
-/// stored `RefOrderHint[]`), so this rebuilds the GOP's slot rotation
-/// for P-frame `k`: slot `k & 1` holds frame `k - 1`, slot
-/// `(k - 1) & 1` holds frame `k - 2` (clamped at the KEY), every
-/// other slot still the KEY.
-fn frame_gm(
-    enc: &EncodedGop,
-    tu_index: usize,
-    w: u32,
-    h: u32,
-) -> (Vec<WarpModelType>, Vec<[i32; 6]>) {
-    let k = tu_index as u32;
+/// The headers must be parsed against the decoder session's TRUE
+/// per-slot state: the §5.9.22 `skipModeAllowed` derivation reads the
+/// stored `RefOrderHint[]`, and — since the r423 primary-reference
+/// election — the §5.9.24 coefficients recenter against the CARRIED
+/// `PrevGmParams` (§7.21 `load_previous()` over §7.20
+/// `SavedGmParams`), so this walks the GOP's two-slot rotation like a
+/// real decoder: P-frame `k` reads slot `k & 1` (frame `k - 1`) and
+/// slot `(k - 1) & 1` (frame `k - 2`, clamped at the KEY), then
+/// refreshes slot `(k - 1) & 1` with its own decoded gm table.
+fn gop_gm_headers(enc: &EncodedGop, w: u32, h: u32) -> Vec<(Vec<WarpModelType>, Vec<[i32; 6]>)> {
     let mut ref_info = RefInfo::default();
     for slot in 0..8usize {
         ref_info.valid[slot] = true;
@@ -90,22 +87,35 @@ fn frame_gm(
         ref_info.render_height[slot] = h;
         ref_info.frame_type_is_key[slot] = true;
     }
-    ref_info.order_hint[(k & 1) as usize] = k - 1;
-    ref_info.order_hint[((k - 1) & 1) as usize] = k.saturating_sub(2);
-    let tu = &enc.temporal_units[tu_index];
-    for obu in ObuIter::new(tu) {
-        let obu = obu.expect("own stream parses");
-        if obu.obu_type == ObuType::Frame {
-            let fh = parse_frame_header_with_refs(obu.payload, &enc.seq, &ref_info)
-                .expect("own frame header parses");
-            assert_eq!(fh.frame_type, FrameType::Inter, "P-frame TU expected");
-            let gm = fh
-                .global_motion_params
-                .expect("inter header carries §5.9.24 state");
-            return (gm.gm_type.to_vec(), gm.gm_params.to_vec());
+    let mut out = Vec::new();
+    for tu_index in 1..enc.temporal_units.len() {
+        let k = tu_index as u32;
+        ref_info.order_hint[(k & 1) as usize] = k - 1;
+        ref_info.order_hint[((k - 1) & 1) as usize] = k.saturating_sub(2);
+        let tu = &enc.temporal_units[tu_index];
+        let mut found = false;
+        for obu in ObuIter::new(tu) {
+            let obu = obu.expect("own stream parses");
+            if obu.obu_type == ObuType::Frame {
+                let fh = parse_frame_header_with_refs(obu.payload, &enc.seq, &ref_info)
+                    .expect("own frame header parses");
+                assert_eq!(fh.frame_type, FrameType::Inter, "P-frame TU expected");
+                let gm = fh
+                    .global_motion_params
+                    .expect("inter header carries §5.9.24 state");
+                // §7.20: this frame refreshes slot `(k - 1) & 1` —
+                // store its decoded gm table as `SavedGmParams`.
+                let refresh = ((k - 1) & 1) as usize;
+                ref_info.saved_gm_params[refresh] = gm.gm_params;
+                ref_info.frame_type_is_key[refresh] = false;
+                out.push((gm.gm_type.to_vec(), gm.gm_params.to_vec()));
+                found = true;
+                break;
+            }
         }
+        assert!(found, "temporal unit {tu_index} has no OBU_FRAME");
     }
-    panic!("temporal unit {tu_index} has no OBU_FRAME");
+    out
 }
 
 /// Encode, then decode through the spec driver and require byte-exact
@@ -159,8 +169,7 @@ fn pan_content_elects_translation_and_round_trips() {
     let enc = assert_round_trip(&frames, 60);
     maybe_dump("self-gop-64x64-q60-gm-pan", &enc);
     let mut elected = 0usize;
-    for tu in 1..enc.temporal_units.len() {
-        let (types, params) = frame_gm(&enc, tu, w, h);
+    for (types, params) in gop_gm_headers(&enc, w, h) {
         if types[LAST] == WarpModelType::Translation {
             elected += 1;
             assert!(
@@ -193,8 +202,7 @@ fn zoom_content_elects_rotzoom_and_round_trips() {
     let enc = assert_round_trip(&frames, 60);
     maybe_dump("self-gop-64x64-q60-gm-zoom-warp", &enc);
     let mut elected = 0usize;
-    for tu in 1..enc.temporal_units.len() {
-        let (types, params) = frame_gm(&enc, tu, w, h);
+    for (types, params) in gop_gm_headers(&enc, w, h) {
         if types[LAST] == WarpModelType::RotZoom {
             elected += 1;
             let p = params[LAST];
@@ -234,8 +242,7 @@ fn rotation_content_elects_rotzoom_and_round_trips() {
     let enc = assert_round_trip(&frames, 60);
     maybe_dump("self-gop-64x64-q60-gm-rotation", &enc);
     let mut elected = 0usize;
-    for tu in 1..enc.temporal_units.len() {
-        let (types, params) = frame_gm(&enc, tu, w, h);
+    for (types, params) in gop_gm_headers(&enc, w, h) {
         if types[LAST] == WarpModelType::RotZoom {
             elected += 1;
             let p = params[LAST];
@@ -257,8 +264,7 @@ fn static_content_keeps_identity_headers() {
     let (w, h) = (64u32, 64u32);
     let frames: Vec<Yuv420Frame> = (0..3).map(|_| sample_frame(w, h, |x, y| (x, y))).collect();
     let enc = assert_round_trip(&frames, 60);
-    for tu in 1..enc.temporal_units.len() {
-        let (types, _) = frame_gm(&enc, tu, w, h);
+    for (types, _) in gop_gm_headers(&enc, w, h) {
         assert!(
             types.iter().all(|t| *t == WarpModelType::Identity),
             "static content must not elect a model"
