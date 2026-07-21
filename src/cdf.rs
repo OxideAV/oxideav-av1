@@ -23165,9 +23165,18 @@ impl PartitionWalker {
     /// block's `bw4` columns of `AboveSegPredContext[]` and `bh4` rows
     /// of `LeftSegPredContext[]` with the given binary `flag`.
     /// Frame-edge cells are skipped (mirroring the §5.11.5 grid-fill
-    /// edge-clip pattern).
+    /// edge-clip pattern). `pub(crate)` since r423: the encoder's
+    /// §5.11.19 write arm performs the same two spec-mandated stamps
+    /// on its mirror walker (the `!preSkip && skip` arm's forced `0`
+    /// and the `temporal_update == 1` arm's `seg_id_predicted`).
     #[inline]
-    fn stamp_seg_pred_context(&mut self, mi_row: u32, mi_col: u32, sub_size: usize, flag: u8) {
+    pub(crate) fn stamp_seg_pred_context(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        flag: u8,
+    ) {
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
         for i in 0..bw4 {
@@ -23216,9 +23225,11 @@ impl PartitionWalker {
     /// `seg_id_predicted` ctx (`LeftSegPredContext[ MiRow ] +
     /// AboveSegPredContext[ MiCol ]`). Each contribution is in
     /// `0..=1`, so the sum is in `0..SEGMENT_ID_PREDICTED_CONTEXTS =
-    /// 0..3`.
+    /// 0..3`. `pub(crate)` since r423: the encoder's §5.11.19 write
+    /// arm derives the identical ctx from its mirror walker before
+    /// emitting the `seg_id_predicted` S().
     #[inline]
-    fn seg_pred_ctx(&self, mi_row: u32, mi_col: u32) -> usize {
+    pub(crate) fn seg_pred_ctx(&self, mi_row: u32, mi_col: u32) -> usize {
         let left = self.left_seg_pred_context[mi_row as usize] as usize;
         let above = self.above_seg_pred_context[mi_col as usize] as usize;
         left + above

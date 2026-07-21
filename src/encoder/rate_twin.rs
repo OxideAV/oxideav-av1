@@ -305,6 +305,17 @@ impl RateTwin {
         Ok(w.cost_bits256())
     }
 
+    /// r423 — the §5.11.9 spatial segment-id `pred` cascade at
+    /// `(mi_row, mi_col)` over THIS twin's write-state mirror — the
+    /// exact value the write path's own derivation will produce for
+    /// this block given the symbols committed so far. A `skip == 1`
+    /// leaf on a segmented inter frame MUST carry it as its
+    /// `segment_id` (§5.11.19 arm 4 / §5.11.9 skip short-circuit), so
+    /// candidate builders consult the twin BEFORE pricing.
+    pub fn spatial_segment_pred(&self, mi_row: u32, mi_col: u32) -> u8 {
+        self.state.segment_pred_ctx(mi_row, mi_col).0
+    }
+
     /// Anti-desync check: after the driver's REAL emission of the
     /// superblock the search committed, the twin must hold the
     /// identical CDF state and coder `range`. A mismatch means the

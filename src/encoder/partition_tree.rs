@@ -889,10 +889,22 @@ pub struct SyntaxInterFrameParams {
     /// `PRIMARY_REF_NONE` configuration forces it to 1); `false`
     /// adopts `predictedSegmentId` with no bits.
     pub segmentation_update_map: bool,
-    /// §5.9.14 `segmentation_temporal_update` (r413) — MUST be
-    /// `false` on the current scope (the §5.11.19 `seg_id_predicted`
-    /// S() + `PrevSegmentIds` threading is a follow-up arc).
+    /// §5.9.14 `segmentation_temporal_update` (r423) — with
+    /// [`Self::segmentation_update_map`] set, `true` codes the
+    /// per-block §5.11.19 `seg_id_predicted` S() against the three
+    /// §8.3.2 seg-pred contexts: a `1` adopts the §5.11.21
+    /// `get_segment_id()` prediction over [`Self::prev_segment_ids`]
+    /// with no further bits, a `0` falls back to the spatial
+    /// §5.11.20 `read_segment_id()` coding.
     pub segmentation_temporal_update: bool,
+    /// r423 — the §5.9.2 `load_previous_segment_ids()` surface: the
+    /// previous frame's `SegmentIds[][]` grid (row-major over the
+    /// CURRENT frame's `mi_rows × mi_cols` — the loader already
+    /// zero-filled on any extent mismatch, mirroring the decode
+    /// driver), feeding the §5.11.21 `get_segment_id()` prediction
+    /// per block. `None` is the all-zero `PrevSegmentIds` state
+    /// (setup_past_independence / segmentation disabled).
+    pub prev_segment_ids: Option<std::sync::Arc<Vec<i32>>>,
     /// §5.9.2 `allow_warped_motion`.
     pub allow_warped_motion: bool,
     /// §5.11.27 `is_scaled( LAST_FRAME + i )` per reference.
@@ -940,6 +952,7 @@ impl SyntaxInterFrameParams {
             is_motion_mode_switchable: false,
             segmentation_update_map: false,
             segmentation_temporal_update: false,
+            prev_segment_ids: None,
             allow_warped_motion: false,
             is_scaled_per_ref: [false; 7],
             enable_interintra_compound: false,
@@ -1275,7 +1288,7 @@ impl PartitionSyntaxWriter {
     /// [`crate::cdf::PartitionWalker::decode_segment_id`]'s
     /// derivation (out-of-grid / unvisited cells carry the `-1`
     /// sentinel).
-    fn segment_pred_ctx(&self, mi_row: u32, mi_col: u32) -> (u8, usize) {
+    pub(crate) fn segment_pred_ctx(&self, mi_row: u32, mi_col: u32) -> (u8, usize) {
         let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
         let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
         let at = |r: i32, c: i32| -> i32 {
@@ -2309,13 +2322,12 @@ fn write_block_syntax_inter_frame(
     if block.intrabc_mv.is_some() || params.allow_intrabc {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    // r413 scope reject: the §5.11.19 temporal-update arm
-    // (`seg_id_predicted` S() + `PrevSegmentIds`) is a follow-up arc;
-    // spatial segmentation (`segmentation_update_map == 1`,
-    // `segmentation_temporal_update == 0`) is fully threaded.
-    if params.segmentation_enabled
-        && (ip.segmentation_temporal_update || !ip.segmentation_update_map)
-    {
+    // r413 scope reject (still standing in r423): the
+    // `!segmentation_update_map` arm adopts `predictedSegmentId` with
+    // no bits — the drivers never emit it (the map is re-coded every
+    // segmented frame), so a caller requesting it is a bug. The
+    // §5.11.19 temporal-update arm is fully threaded since r423.
+    if params.segmentation_enabled && !ip.segmentation_update_map {
         return Err(Error::PartitionWalkOutOfRange);
     }
     // r413 — §5.11.10 skip-mode commitments. `skip_mode == 1` is a
@@ -2359,6 +2371,54 @@ fn write_block_syntax_inter_frame(
     // §5.11.19 neighbour cascade + §8.3.2 segment ctx (bit-silent with
     // segmentation off — derived for surface completeness).
     let (seg_pred, seg_ctx) = state.segment_pred_ctx(mi_row, mi_col);
+
+    // r423 — §5.11.21 `predictedSegmentId = get_segment_id()` over the
+    // frame-level `PrevSegmentIds` surface (all-zero under
+    // setup_past_independence — `None` here), plus the §8.3.2
+    // `seg_id_predicted` ctx (`LeftSegPredContext[ MiRow ] +
+    // AboveSegPredContext[ MiCol ]`) read from the mirror BEFORE this
+    // block's own stamp (spec order: the S() read precedes the
+    // context-array update).
+    let predicted_segment_id: u8 = if params.segmentation_enabled {
+        match ip.prev_segment_ids.as_deref() {
+            Some(prev) => {
+                let v = crate::cdf::get_segment_id(
+                    prev,
+                    state.mi_rows,
+                    state.mi_cols,
+                    state.mi_rows,
+                    state.mi_cols,
+                    mi_row,
+                    mi_col,
+                    sub_size,
+                )
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+                // A committed previous-frame grid is fully stamped in
+                // `0..=LastActiveSegId`; anything else (the `-1`
+                // sentinel, an id past the active set) is a driver
+                // bug, mirrored by the decode walker's guard.
+                if v < 0 || v > i32::from(params.last_active_seg_id) {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                v as u8
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+    let seg_pred_ctx_v = state.mirror.seg_pred_ctx(mi_row, mi_col);
+    // §5.11.19 temporal arm flag election: adopt the prediction
+    // whenever it matches the committed id (1 bit instead of the
+    // spatial S(); §6.10.9 allows a 0 flag on a matching id, but the
+    // drivers never profit from it), code spatially otherwise. The
+    // leaf writer validates the combination.
+    let seg_id_predicted_v: u8 = u8::from(
+        params.segmentation_enabled
+            && ip.segmentation_update_map
+            && ip.segmentation_temporal_update
+            && block.segment_id == predicted_segment_id,
+    );
 
     // §8.3.2 `skip` ctx from the mirror's `Skips[]` neighbours.
     let above_skip = if avail_u {
@@ -2443,11 +2503,11 @@ fn write_block_syntax_inter_frame(
         block.skip,
         is_inter_flag,
         seg_pred,
-        /* seg_id_predicted = */ 0,
+        seg_id_predicted_v,
         skip_mode_ctx_v,
         skip_ctx_v,
         /* seg_id_read_ctx = */ seg_ctx,
-        /* seg_pred_ctx = */ 0,
+        seg_pred_ctx_v,
         is_inter_ctx_v,
         /* seg_skip_mode_off = */ false,
         /* seg_skip_active = */ params.seg_skip_active,
@@ -2458,7 +2518,7 @@ fn write_block_syntax_inter_frame(
         ip.segmentation_update_map,
         ip.segmentation_temporal_update,
         params.seg_id_pre_skip,
-        /* predicted_segment_id = */ 0,
+        predicted_segment_id,
         params.last_active_seg_id,
         ip.skip_mode_present,
         &params.lossless_array,
@@ -2466,6 +2526,26 @@ fn write_block_syntax_inter_frame(
     )?;
     // §5.11.18 line 21: `ReadDeltas = 0`.
     state.write_deltas_pending = false;
+    // r423 — §5.11.19 segmentation-prediction context stamps, the
+    // write-side twin of the decode walker's two updating arms
+    // (executed inside the post-skip `inter_segment_id( 0 )` call when
+    // `SegIdPreSkip == 0`, inside the pre-skip call otherwise):
+    //   * `!preSkip && skip` — `seg_id_predicted = 0` forced, both
+    //     context arrays stamped to 0 over the footprint;
+    //   * `segmentation_temporal_update == 1` — both arrays stamped
+    //     with the just-coded `seg_id_predicted`.
+    // The remaining arms leave the arrays untouched per the spec body.
+    if params.segmentation_enabled && ip.segmentation_update_map {
+        if !params.seg_id_pre_skip && block.skip != 0 {
+            state
+                .mirror
+                .stamp_seg_pred_context(mi_row, mi_col, sub_size, 0);
+        } else if ip.segmentation_temporal_update {
+            state
+                .mirror
+                .stamp_seg_pred_context(mi_row, mi_col, sub_size, seg_id_predicted_v);
+        }
+    }
     let cdef_committed = prefix.cdef_idx;
     let lossless = prefix.lossless;
     let tx_pre = if lossless {
