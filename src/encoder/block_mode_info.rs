@@ -6188,8 +6188,18 @@ impl Default for InterBlockModeInfoTail {
 /// resulting `RefFrame` / `YMode` / `Mv` onto the block footprint
 /// through its own [`crate::cdf::PartitionWalker`] so subsequent blocks'
 /// §8.3.2 neighbour walks observe them.
+/// r422 — the §5.11.23 **mode + MV prefix**: `read_ref_frames( )`
+/// (§5.11.25 cascade), the four-arm `YMode` dispatch, the `RefMvIdx`
+/// `drl_mode` loop and the `assign_mv( )` NEWMV differences — i.e.
+/// everything [`write_inter_block_mode_info`] emits BEFORE the
+/// §5.11.28/§5.11.27/§5.11.29/interp-filter tail. Factored out so the
+/// search-side rate twin can price one `(RefFrame, YMode, Mv,
+/// RefMvIdx)` candidate through the writer's own emission path
+/// against a counting [`SymbolWriter`]; the emitting pass calls it
+/// through [`write_inter_block_mode_info`], so pricing and committing
+/// share one body by construction.
 #[allow(clippy::too_many_arguments)]
-pub fn write_inter_block_mode_info(
+pub fn write_inter_mode_mv_prefix(
     writer: &mut SymbolWriter,
     cdfs: &mut TileCdfContext,
     ref_frame: [i32; 2],
@@ -6215,13 +6225,7 @@ pub fn write_inter_block_mode_info(
     left_ref_frame: [i32; 2],
     force_integer_mv: bool,
     allow_high_precision_mv: bool,
-    tail: &InterBlockModeInfoTail,
 ) -> Result<(), Error> {
-    // §3 binary alphabet bound on `skip_mode` (mirrors the bootstrap).
-    if skip_mode > 1 {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-
     // §5.11.23 line 4618: `read_ref_frames( )`. Drives the §5.11.25
     // four-arm reference cascade (zero to six S() depending on arm /
     // leaf) and verifies the target pair is reachable.
@@ -6326,6 +6330,78 @@ pub fn write_inter_block_mode_info(
         }
         // Non-NEWMV lists: `Mv[ i ] = PredMv[ i ]`, no symbols.
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_inter_block_mode_info(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    ref_frame: [i32; 2],
+    y_mode: u8,
+    mv: [[i32; 2]; 2],
+    ref_mv_idx: u32,
+    mv_stack: &FindMvStackResult,
+    mi_size: usize,
+    skip_mode: u8,
+    skip_mode_frame: [i8; 2],
+    seg_ref_frame_active: bool,
+    seg_ref_frame_data: i8,
+    seg_skip_active: bool,
+    seg_globalmv_active: bool,
+    reference_select: bool,
+    avail_u: bool,
+    avail_l: bool,
+    above_single: bool,
+    left_single: bool,
+    above_intra: bool,
+    left_intra: bool,
+    above_ref_frame: [i32; 2],
+    left_ref_frame: [i32; 2],
+    force_integer_mv: bool,
+    allow_high_precision_mv: bool,
+    tail: &InterBlockModeInfoTail,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound on `skip_mode` (mirrors the bootstrap).
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.23 head — the reference cascade, the four-arm `YMode`
+    // dispatch, the `drl_mode` loop and the `assign_mv( )` MV
+    // differences, factored (r422) into [`write_inter_mode_mv_prefix`]
+    // so the search-side rate twin prices mode candidates through the
+    // EXACT emission path (single source of truth — the twin never
+    // re-implements the cascade).
+    write_inter_mode_mv_prefix(
+        writer,
+        cdfs,
+        ref_frame,
+        y_mode,
+        mv,
+        ref_mv_idx,
+        mv_stack,
+        mi_size,
+        skip_mode,
+        skip_mode_frame,
+        seg_ref_frame_active,
+        seg_ref_frame_data,
+        seg_skip_active,
+        seg_globalmv_active,
+        reference_select,
+        avail_u,
+        avail_l,
+        above_single,
+        left_single,
+        above_intra,
+        left_intra,
+        above_ref_frame,
+        left_ref_frame,
+        force_integer_mv,
+        allow_high_precision_mv,
+    )?;
+
+    let is_compound = ref_frame[1] > 0;
 
     // ------- §5.11.23 tail (folded r277) — spec order: §5.11.28 →
     // §5.11.27 → §5.11.29 → §5.11.x interpolation-filter loop. -------

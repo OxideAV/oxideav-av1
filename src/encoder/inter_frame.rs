@@ -2582,10 +2582,66 @@ fn encode_inter_leaf_modes(
         mv: [[i32; 2]; 2],
         ref_mv_idx: u32,
         rate: u64,
+        /// r422 — the EXACT §5.11.23 mode + MV prefix price
+        /// (1/256-bit units) through the writer's own emission path
+        /// against the twin's current adaptive CDFs; `None` under the
+        /// heuristic rate model.
+        bits256: Option<u64>,
     }
     let diff_bits = |mv: [i32; 2], pred: [i32; 2]| -> u64 {
         let b = |d: i32| u64::from(34 - d.unsigned_abs().leading_zeros());
         b(mv[0] - pred[0]) + b(mv[1] - pred[1])
+    };
+    // r422 — exact candidate pricing under the twin model: the
+    // §5.11.18 neighbour scalars the §5.11.25 cascade ctx walks read,
+    // derived from the search mirror exactly as the write pass
+    // derives them from ITS mirror at this leaf (both hold only prior
+    // committed blocks here).
+    let (nbr_avail_u, nbr_avail_l) = (mi_r > 0, mi_c > 0);
+    let nbr_ref = |r: u32, c: u32| -> [i32; 2] {
+        let cell = ((r * ictx.mi_cols + c) as usize) * 2;
+        let rfg = ictx.mirror.ref_frames();
+        [i32::from(rfg[cell]), i32::from(rfg[cell + 1])]
+    };
+    let above_ref_frame = if nbr_avail_u {
+        nbr_ref(mi_r - 1, mi_c)
+    } else {
+        [0, -1]
+    };
+    let left_ref_frame = if nbr_avail_l {
+        nbr_ref(mi_r, mi_c - 1)
+    } else {
+        [0, -1]
+    };
+    let (p_reference_select, p_fimv, p_hp) = (
+        ictx.ip.reference_select,
+        ictx.ip.force_integer_mv,
+        ictx.ip.allow_high_precision_mv,
+    );
+    let price_mode = |cand_ref: [i8; 2],
+                      y_mode: u8,
+                      mv: [[i32; 2]; 2],
+                      ref_mv_idx: u32,
+                      stack: &crate::cdf::FindMvStackResult|
+     -> Result<Option<u64>, Error> {
+        match pricing {
+            Some((twin, _)) => Ok(Some(twin.price_inter_mode(
+                [i32::from(cand_ref[0]), i32::from(cand_ref[1])],
+                y_mode,
+                mv,
+                ref_mv_idx,
+                stack,
+                b_size,
+                p_reference_select,
+                nbr_avail_u,
+                nbr_avail_l,
+                above_ref_frame,
+                left_ref_frame,
+                p_fimv,
+                p_hp,
+            )?)),
+            None => Ok(None),
+        }
     };
     let mut cands: Vec<ModeCand> = Vec::with_capacity(18);
     // r415 — per-reference searched vectors, keyed by the raw
@@ -2631,36 +2687,42 @@ fn encode_inter_leaf_modes(
         let nfound = stack.num_mv_found;
         {
             // NEWMV: pick the reachable drl slot with the cheapest
-            // §5.11.32 difference (each extra slot costs one
-            // drl_mode bit).
+            // §5.11.32 difference — exact twin bits when priced
+            // (drl_mode + read_mv against the current adaptive CDFs),
+            // else each extra slot costs one heuristic drl bit.
             let window: u32 = match nfound {
                 0 | 1 => 0,
                 2 => 1,
                 _ => 2,
             };
-            let mut best: Option<(u64, u32)> = None;
+            let mut best: Option<(u64, u32, u64, Option<u64>)> = None;
             for idx in 0..=window {
                 let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, idx)?;
                 let rate = 5 + ref_bias + u64::from(idx) + diff_bits(mv_new, pred);
-                if best.map_or(true, |(r, _)| rate < r) {
-                    best = Some((rate, idx));
+                let exact = price_mode([rf, -1], MODE_NEWMV, [mv_new, [0, 0]], idx, &stack)?;
+                let key = exact.unwrap_or(rate);
+                if best.map_or(true, |(k, _, _, _)| key < k) {
+                    best = Some((key, idx, rate, exact));
                 }
             }
-            let (rate, idx) = best.expect("slot 0 is always reachable");
+            let (_, idx, rate, bits256) = best.expect("slot 0 is always reachable");
             cands.push(ModeCand {
                 ref_frame: [rf, -1],
                 y_mode: MODE_NEWMV,
                 mv: [mv_new, [0, 0]],
                 ref_mv_idx: idx,
                 rate,
+                bits256,
             });
         }
+        let nearest_mv = [stack.ref_stack_mv[0][0], [0, 0]];
         cands.push(ModeCand {
             ref_frame: [rf, -1],
             y_mode: MODE_NEARESTMV,
-            mv: [stack.ref_stack_mv[0][0], [0, 0]],
+            mv: nearest_mv,
             ref_mv_idx: 0,
             rate: 3 + ref_bias,
+            bits256: price_mode([rf, -1], MODE_NEARESTMV, nearest_mv, 0, &stack)?,
         });
         let near_top: u32 = match nfound {
             0..=2 => 1,
@@ -2668,20 +2730,24 @@ fn encode_inter_leaf_modes(
             _ => 3,
         };
         for idx in 1..=near_top {
+            let near_mv = [stack.ref_stack_mv[idx as usize][0], [0, 0]];
             cands.push(ModeCand {
                 ref_frame: [rf, -1],
                 y_mode: MODE_NEARMV,
-                mv: [stack.ref_stack_mv[idx as usize][0], [0, 0]],
+                mv: near_mv,
                 ref_mv_idx: idx,
                 rate: 4 + ref_bias + u64::from(idx - 1),
+                bits256: price_mode([rf, -1], MODE_NEARMV, near_mv, idx, &stack)?,
             });
         }
+        let global_mv = [stack.global_mvs[0], [0, 0]];
         cands.push(ModeCand {
             ref_frame: [rf, -1],
             y_mode: MODE_GLOBALMV,
-            mv: [stack.global_mvs[0], [0, 0]],
+            mv: global_mv,
             ref_mv_idx: 0,
             rate: 4 + ref_bias,
+            bits256: price_mode([rf, -1], MODE_GLOBALMV, global_mv, 0, &stack)?,
         });
     }
 
@@ -2695,12 +2761,14 @@ fn encode_inter_leaf_modes(
     for &crf in &compound_pairs {
         let stack = ictx.find_stack(mi_r, mi_c, b_size, crf)?;
         let nfound = stack.num_mv_found;
+        let nn_mv = [stack.ref_stack_mv[0][0], stack.ref_stack_mv[0][1]];
         cands.push(ModeCand {
             ref_frame: crf,
             y_mode: MODE_NEAREST_NEARESTMV,
-            mv: [stack.ref_stack_mv[0][0], stack.ref_stack_mv[0][1]],
+            mv: nn_mv,
             ref_mv_idx: 0,
             rate: 6,
+            bits256: price_mode(crf, MODE_NEAREST_NEARESTMV, nn_mv, 0, &stack)?,
         });
         let near_top: u32 = match nfound {
             0..=2 => 1,
@@ -2708,23 +2776,27 @@ fn encode_inter_leaf_modes(
             _ => 3,
         };
         for idx in 1..=near_top {
+            let nn_mv = [
+                stack.ref_stack_mv[idx as usize][0],
+                stack.ref_stack_mv[idx as usize][1],
+            ];
             cands.push(ModeCand {
                 ref_frame: crf,
                 y_mode: MODE_NEAR_NEARMV,
-                mv: [
-                    stack.ref_stack_mv[idx as usize][0],
-                    stack.ref_stack_mv[idx as usize][1],
-                ],
+                mv: nn_mv,
                 ref_mv_idx: idx,
                 rate: 7 + u64::from(idx - 1),
+                bits256: price_mode(crf, MODE_NEAR_NEARMV, nn_mv, idx, &stack)?,
             });
         }
+        let gg_mv = [stack.global_mvs[0], stack.global_mvs[1]];
         cands.push(ModeCand {
             ref_frame: crf,
             y_mode: MODE_GLOBAL_GLOBALMV,
-            mv: [stack.global_mvs[0], stack.global_mvs[1]],
+            mv: gg_mv,
             ref_mv_idx: 0,
             rate: 7,
+            bits256: price_mode(crf, MODE_GLOBAL_GLOBALMV, gg_mv, 0, &stack)?,
         });
         {
             let window: u32 = match nfound {
@@ -2733,7 +2805,7 @@ fn encode_inter_leaf_modes(
                 _ => 2,
             };
             let pair_mv = [searched_mv[crf[0] as usize], searched_mv[crf[1] as usize]];
-            let mut best: Option<(u64, u32)> = None;
+            let mut best: Option<(u64, u32, u64, Option<u64>)> = None;
             for idx in 0..=window {
                 let pred0 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 0, idx)?;
                 let pred1 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 1, idx)?;
@@ -2741,17 +2813,20 @@ fn encode_inter_leaf_modes(
                     + u64::from(idx)
                     + diff_bits(pair_mv[0], pred0)
                     + diff_bits(pair_mv[1], pred1);
-                if best.map_or(true, |(r, _)| rate < r) {
-                    best = Some((rate, idx));
+                let exact = price_mode(crf, MODE_NEW_NEWMV, pair_mv, idx, &stack)?;
+                let key = exact.unwrap_or(rate);
+                if best.map_or(true, |(k, _, _, _)| key < k) {
+                    best = Some((key, idx, rate, exact));
                 }
             }
-            let (rate, idx) = best.expect("slot 0 is always reachable");
+            let (_, idx, rate, bits256) = best.expect("slot 0 is always reachable");
             cands.push(ModeCand {
                 ref_frame: crf,
                 y_mode: MODE_NEW_NEWMV,
                 mv: pair_mv,
                 ref_mv_idx: idx,
                 rate,
+                bits256,
             });
         }
     }
@@ -2790,7 +2865,14 @@ fn encode_inter_leaf_modes(
                 ssd += (d * d) as u64;
             }
         }
-        let score = ssd + lambda * cand.rate;
+        // r422 — twin model: `D·256 + λ·bits256` with the exact
+        // §5.11.23 mode-prefix price; heuristic model keeps the
+        // pre-r422 proxy scale. All candidates of one election carry
+        // the same scale, so the comparison is well-formed.
+        let score = match cand.bits256 {
+            Some(b) => score256(ssd, lambda, b),
+            None => ssd + lambda * cand.rate,
+        };
         if best.map_or(true, |(s, _)| score < s) {
             best = Some((score, ci));
         }
@@ -2812,9 +2894,9 @@ fn encode_inter_leaf_modes(
     let mut comp = CompoundSel::AVERAGE;
     if ictx.ip.enable_masked_compound {
         if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate) = {
+            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
                 let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate)
+                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
             };
             let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
             if crate::cdf::wedge_bits(b_size) > 0 {
@@ -2864,7 +2946,12 @@ fn encode_inter_leaf_modes(
                         ssd += (d * d) as u64;
                     }
                 }
-                let score = ssd + lambda * (c_rate + extra);
+                // r422 — twin scale: the exact mode-prefix bits plus
+                // the side-symbol proxy promoted to 1/256 units.
+                let score = match c_bits256 {
+                    Some(b) => score256(ssd, lambda, b + extra * 256),
+                    None => ssd + lambda * (c_rate + extra),
+                };
                 if score < best_score {
                     best_score = score;
                     best_ci = cci;
@@ -2882,9 +2969,9 @@ fn encode_inter_leaf_modes(
     // luma distortion alone decides; ties keep the running best.
     if ictx.ip.enable_jnt_comp {
         if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate) = {
+            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
                 let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate)
+                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
             };
             let sel = CompoundSel {
                 ctype: crate::inter_pred::COMPOUND_DISTANCE,
@@ -2912,7 +2999,10 @@ fn encode_inter_leaf_modes(
                     ssd += (d * d) as u64;
                 }
             }
-            let score = ssd + lambda * c_rate;
+            let score = match c_bits256 {
+                Some(b) => score256(ssd, lambda, b),
+                None => ssd + lambda * c_rate,
+            };
             if score < best_score {
                 best_score = score;
                 best_ci = cci;
@@ -2935,9 +3025,9 @@ fn encode_inter_leaf_modes(
         && (crate::cdf::BLOCK_8X8..=crate::cdf::BLOCK_32X32).contains(&b_size)
     {
         if let Some((_, sci)) = best_single {
-            let (s_ref, s_mode, s_mv, s_rate) = {
+            let (s_ref, s_mode, s_mv, s_rate, s_bits256) = {
                 let c = &cands[sci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate)
+                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
             };
             let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
                 let mut ssd = 0u64;
@@ -2975,7 +3065,10 @@ fn encode_inter_leaf_modes(
                 if stage.map_or(true, |(s, _)| ssd < s) {
                     stage = Some((ssd, m));
                 }
-                let score = ssd + lambda * (s_rate + 4);
+                let score = match s_bits256 {
+                    Some(b) => score256(ssd, lambda, b + 4 * 256),
+                    None => ssd + lambda * (s_rate + 4),
+                };
                 if score < best_score {
                     best_score = score;
                     best_ci = sci;
@@ -3004,7 +3097,10 @@ fn encode_inter_leaf_modes(
                         }),
                         MotionSel::Simple,
                     )?;
-                    let score = leaf_ssd(ictx) + lambda * (s_rate + 8);
+                    let score = match s_bits256 {
+                        Some(b) => score256(leaf_ssd(ictx), lambda, b + 8 * 256),
+                        None => leaf_ssd(ictx) + lambda * (s_rate + 8),
+                    };
                     if score < best_score {
                         best_score = score;
                         best_ci = sci;

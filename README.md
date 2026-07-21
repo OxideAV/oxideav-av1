@@ -698,6 +698,51 @@ two representative improved streams are pinned in the conformance
 corpus — the re-judged q60 shear GOP and the −27% q255 shear pyramid
 (corpus 69 total).
 
+### Global warped-motion election (r422)
+
+r422 lands the frame header's last identity-only stub: the §5.9.24
+`global_motion_params()` write arm now emits real models. The
+§5.9.25 `read_global_param` inverse (recenter forward, §5.9.28
+bucket-ladder subexp encoder, both §5.9.27 recenter arms, the
+per-type coefficient order with the derived ROTZOOM `[4]/[5]` pair)
+is byte-exact against the crate's own parser on synthetic ordinal
+sweeps, and a frame-level election feeds it: a coarse per-reference
+motion pre-pass (exhaustive half-resolution scan over 2×2-mean
+planes — fine-texture aliasing and reference coding blur wash out —
+then full-pel + 1/8-pel bilinear refinement), least-squares fits of
+TRANSLATION / ROTZOOM / AFFINE, §5.9.25 grid quantization BEFORE
+scoring, §7.11.3.6 `setup_shear` validation, and a residual-energy
+gate with ratio + absolute-margin class upgrades. The elected
+`(GmType, gm_params)` live in ONE shared bundle feeding the §7.10.2.1
+`GlobalMvs` derivation and the §7.11.3 global-warp prediction of
+search mirror, write pass and decoder alike — the model can only
+change which streams the RD ladder prefers, never desync one.
+Witnesses prove pan content elects TRANSLATION at the exact coded
+vector, zoom and rotation content elect ROTZOOM, and static content
+stays IDENTITY (bit-identical stream). Measured on the committed
+30-config A/B matrix (identity-only → elected, same inputs): +0.92%
+bytes for **+0.53 dB** mean PSNR, warp content decisive —
+rotation-64×64-q60 **+1.30 dB** at +6 B, zoom-64×64-q100 +1.42 dB;
+all 30 elected-model streams decode byte-identical in THREE
+independent black-box reference decoders
+(`tests/global_motion_ab.rs` joint-objective smoke + env-gated
+matrix). Two streams pinned: `self-gop-64x64-q60-gm-zoom-warp` and
+`self-gop-64x64-q60-gm-rotation` (corpus 71 total).
+
+r422 also converts the last big INTER-path heuristic to the twin:
+the §5.11.23 mode-cascade candidate rates. The mode + MV prefix
+(§5.11.25 reference cascade, four-arm `YMode` dispatch, `drl_mode`
+loop, NEWMV `read_mv` differences) is factored into ONE writer body
+(`write_inter_mode_mv_prefix`) that both the emitting pass and the
+twin's `price_inter_mode` run, so every leaf candidate — NEWMV drl
+slot choice included — is priced with exact fractional bits against
+the current adaptive CDFs. The refreshed twin-vs-heuristic matrices:
+66-config inter GOP **−3.49% bytes** at −0.07 dB (smaller on 63/66,
+was −3.06% under the r421 proxy mode rates), 30-config pyramid
+−5.02% at −0.17 dB; the full 411-stream twin sweep re-validates
+byte-identical in THREE independent black-box reference decoders
+(1233/1233 decoder runs).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -711,15 +756,13 @@ corpus — the re-judged q60 shear GOP and the −27% q255 shear pyramid
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r419 scope (§5.11.19 temporal segment-map
+  encoding beyond the r422 scope (§5.11.19 temporal segment-map
   update, deeper-than-two pyramid levels / adaptive mini-GOP sizing,
-  true bit-accounting rate costs from a search-side CDF/write-state
-  twin, GLOBAL warped-motion election — frame-level affine estimation
-  plus the §5.9.24 `read_global_param` signed-subexp write arm, the
-  identity short-circuit is all the writer emits today —, per-segment
-  lossless mixing, intrabc hash-match DV search + rect / clipped
-  palette leaves, the §5.11.46 signed-delta V-plane arm) is the
-  follow-up ladder.
+  per-TU tx-type + palette-k-means elections on twin pricing — the
+  coefficient chain is still proxy-priced inside those two inner
+  ladders —, per-segment lossless mixing, intrabc hash-match DV
+  search + rect / clipped palette leaves, the §5.11.46 signed-delta
+  V-plane arm) is the follow-up ladder.
 
 ## Module layout
 

@@ -247,6 +247,64 @@ impl RateTwin {
         Ok(w.cost_bits256())
     }
 
+    /// r422 — exact price (1/256-bit units) of the §5.11.23 mode + MV
+    /// prefix (the §5.11.25 reference cascade, the four-arm `YMode`
+    /// dispatch, the `drl_mode` loop and the NEWMV `read_mv`
+    /// differences) for one `(RefFrame, YMode, Mv, RefMvIdx)`
+    /// candidate — through the writer's own emission path
+    /// ([`crate::encoder::block_mode_info::write_inter_mode_mv_prefix`],
+    /// the single body the committing pass also runs), against this
+    /// twin's CURRENT adaptive CDFs. Replaces the pre-r422 constant
+    /// per-mode bit proxies in the leaf's candidate election.
+    #[allow(clippy::too_many_arguments)]
+    pub fn price_inter_mode(
+        &self,
+        ref_frame: [i32; 2],
+        y_mode: u8,
+        mv: [[i32; 2]; 2],
+        ref_mv_idx: u32,
+        mv_stack: &crate::cdf::FindMvStackResult,
+        mi_size: usize,
+        reference_select: bool,
+        avail_u: bool,
+        avail_l: bool,
+        above_ref_frame: [i32; 2],
+        left_ref_frame: [i32; 2],
+        force_integer_mv: bool,
+        allow_high_precision_mv: bool,
+    ) -> Result<u64, Error> {
+        let mut cdfs = self.cdfs.clone();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        crate::encoder::block_mode_info::write_inter_mode_mv_prefix(
+            &mut w,
+            &mut cdfs,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            mv_stack,
+            mi_size,
+            /* skip_mode = */ 0,
+            [0, 0],
+            /* seg_ref_frame_active = */ false,
+            0,
+            /* seg_skip_active = */ false,
+            /* seg_globalmv_active = */ false,
+            reference_select,
+            avail_u,
+            avail_l,
+            above_ref_frame[1] <= 0,
+            left_ref_frame[1] <= 0,
+            above_ref_frame[0] <= 0,
+            left_ref_frame[0] <= 0,
+            above_ref_frame,
+            left_ref_frame,
+            force_integer_mv,
+            allow_high_precision_mv,
+        )?;
+        Ok(w.cost_bits256())
+    }
+
     /// Anti-desync check: after the driver's REAL emission of the
     /// superblock the search committed, the twin must hold the
     /// identical CDF state and coder `range`. A mismatch means the
