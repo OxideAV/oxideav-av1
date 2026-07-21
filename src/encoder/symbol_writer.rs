@@ -87,6 +87,31 @@ fn floor_log2(x: u32) -> u32 {
     }
 }
 
+/// r421 — `round(256 · (log2(x) − 15))` for `x` in the §8.2.6
+/// post-renormalisation window `[1 << 15, (1 << 16) - 1]`, i.e. the
+/// fractional part of `log2(range)` in 1/256-bit units.
+///
+/// Deterministic integer fixed-point (no floating point): normalise
+/// `x / 2^15` into Q32 `[1, 2)`, then extract 8 fractional bits by the
+/// classic repeated-squaring recurrence — square the mantissa; if it
+/// reached `[2, 4)` the next log bit is 1 and the mantissa halves,
+/// else the bit is 0.
+fn log2_frac256(x: u32) -> u32 {
+    debug_assert!((1 << 15..1 << 16).contains(&x));
+    // Q32 mantissa in [1, 2): (x << 32) >> 15.
+    let mut v: u64 = u64::from(x) << 17;
+    let mut frac: u32 = 0;
+    for _ in 0..8 {
+        v = ((u128::from(v) * u128::from(v)) >> 32) as u64;
+        frac <<= 1;
+        if v >= 2u64 << 32 {
+            frac |= 1;
+            v >>= 1;
+        }
+    }
+    frac
+}
+
 /// `recenter( r, v )` — forward of §5.9.29 `inverse_recenter`. Given the
 /// actual value `v` and reference `r`, produce the recentred code the
 /// `decode_*_subexp_with_ref_bool` reader recovers via
@@ -124,7 +149,7 @@ pub(crate) fn recenter(r: i64, v: i64) -> i64 {
 /// decoder side already plumbs: when `true`, [`Self::write_symbol`]
 /// skips the §8.3 CDF adaptation. Boolean writes ([`Self::write_bool`])
 /// follow the §8.2.3 "fresh CDF per call" pattern and are unaffected.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SymbolWriter {
     /// Accumulated `low` value as MSB-first bits. The length of the
     /// vector grows by `15` at init and by `bits` per renorm step; the
@@ -140,6 +165,22 @@ pub struct SymbolWriter {
     /// (per the §8.2.3 note) because the CDF is reconstructed per
     /// call.
     disable_cdf_update: bool,
+    /// r421 — counting ("rate-twin") mode. When `true`, the writer
+    /// tracks the §8.2.6 `range` evolution and the renormalisation-bit
+    /// count exactly like the emitting writer, but keeps no `low`
+    /// accumulator and can never produce bytes. The search side uses
+    /// this to price candidate symbol sequences in exact fractional
+    /// bits ([`Self::cost_bits256`]) without emitting.
+    count_only: bool,
+    /// Total §8.2.6 renormalisation bits accumulated since
+    /// construction (`bits = 15 - FloorLog2(range)` summed over every
+    /// symbol write). In emit mode this equals
+    /// `low_bits.len() - 15`.
+    renorm_bits: u64,
+    /// `256·frac(log2(range))` at construction — the fractional-bit
+    /// anchor [`Self::cost_bits256`] subtracts the current value
+    /// against.
+    initial_log2_frac256: u32,
 }
 
 impl SymbolWriter {
@@ -154,7 +195,73 @@ impl SymbolWriter {
             low_bits: vec![false; 15],
             range: 1 << 15,
             disable_cdf_update,
+            count_only: false,
+            renorm_bits: 0,
+            initial_log2_frac256: 0,
         }
+    }
+
+    /// r421 — construct a **counting** writer (the search-side rate
+    /// twin's pricing engine). It applies the identical §8.2.6 interval
+    /// subdivision + renormalisation and §8.3 CDF adaptation as the
+    /// emitting writer, but keeps no `low` accumulator: only the
+    /// `range` trajectory and the renormalisation-bit count. Seed
+    /// `range` from the live emitting writer's [`Self::range`] so the
+    /// fractional bit state lines up exactly with the stream position
+    /// being priced; [`Self::finish`] must never be called on it.
+    ///
+    /// `range` must lie in the §8.2.6 post-renormalisation window
+    /// `[1 << 15, (1 << 16) - 1]`.
+    pub fn new_counting(disable_cdf_update: bool, range: u32) -> Self {
+        debug_assert!(
+            (1 << 15..1 << 16).contains(&range),
+            "counting writer seeded outside the §8.2.6 range window"
+        );
+        Self {
+            low_bits: Vec::new(),
+            range,
+            disable_cdf_update,
+            count_only: true,
+            renorm_bits: 0,
+            initial_log2_frac256: log2_frac256(range),
+        }
+    }
+
+    /// Current §8.2.6 sub-interval width (post-renormalisation window
+    /// `[1 << 15, (1 << 16) - 1]`). Exposed so a counting twin can be
+    /// seeded mid-stream ([`Self::new_counting`]).
+    #[must_use]
+    pub fn range(&self) -> u32 {
+        self.range
+    }
+
+    /// The §5.9.2 `disable_cdf_update` flag this writer was
+    /// constructed with — so a counting twin seeded from it applies
+    /// the identical §8.3 adaptation policy.
+    #[must_use]
+    pub fn disable_cdf_update(&self) -> bool {
+        self.disable_cdf_update
+    }
+
+    /// r421 — exact accumulated cost of every symbol written since
+    /// construction, in 1/256-bit units.
+    ///
+    /// Derivation: one §8.2.6 write shrinks `range_pre` to the
+    /// sub-interval width `w` (an information content of
+    /// `log2(range_pre / w)` bits) and then renormalises by `b` bits
+    /// so `range_post = w << b`. Telescoping over the sequence,
+    /// `Σ log2(range_pre/w) = Σ b + log2(range_start) −
+    /// log2(range_end)` — the renorm-bit count plus the fractional
+    /// `log2` drift of `range`, which is exactly what the emitting
+    /// writer adds to its bytestream (its emission length is
+    /// `15 + Σ b` bits before the §8.2.4 termination).
+    #[must_use]
+    pub fn cost_bits256(&self) -> u64 {
+        let cur = i64::from(log2_frac256(self.range));
+        let init = i64::from(self.initial_log2_frac256);
+        let total = self.renorm_bits as i64 * 256 + init - cur;
+        debug_assert!(total >= 0, "symbol-sequence cost cannot be negative");
+        total.max(0) as u64
     }
 
     /// `write_symbol( symbol, cdf )` — inverse of §8.2.6
@@ -188,7 +295,9 @@ impl SymbolWriter {
         let offset = self.range - prev;
         self.range = prev - cur;
         debug_assert!(self.range >= 1, "§8.2.6 produced a zero-width sub-interval");
-        self.add_to_low(offset);
+        if !self.count_only {
+            self.add_to_low(offset);
+        }
 
         // §8.2.6 renormalisation: shift `low` and `range` left by
         // `bits = 15 - FloorLog2(range)` so the new `range >= (1 <<
@@ -196,8 +305,11 @@ impl SymbolWriter {
         // bits.
         let bits = 15 - floor_log2(self.range);
         self.range <<= bits;
-        for _ in 0..bits {
-            self.low_bits.push(false);
+        self.renorm_bits += u64::from(bits);
+        if !self.count_only {
+            for _ in 0..bits {
+                self.low_bits.push(false);
+            }
         }
 
         // §8.2.6 post-renorm invariant — the encoder's `range` is in
@@ -482,6 +594,10 @@ impl SymbolWriter {
     /// zero-fill clamp), but the §8.2.4 conformance check in
     /// independent decoders rejects such tile data.
     pub fn finish(mut self) -> Vec<u8> {
+        debug_assert!(
+            !self.count_only,
+            "a counting (rate-twin) writer has no bytestream to flush"
+        );
         let n = self.low_bits.len();
         debug_assert!(n >= 15, "init seeds 15 bits; finish sees at least those");
         if n >= 15 {
@@ -1025,6 +1141,120 @@ mod tests {
             );
             assert!(v < r, "invariant #2: SymbolValue={v} SymbolRange={r}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // r421 — counting ("rate-twin") mode.
+    // -----------------------------------------------------------------
+
+    /// `log2_frac256` anchors: exact at the window edges and at the
+    /// half-bit point (`√2 · 2^15 ≈ 46341` ⇒ 128/256).
+    #[test]
+    fn log2_frac256_anchor_points() {
+        assert_eq!(log2_frac256(1 << 15), 0);
+        // log2(65535/32768) = 0.99997…, floor at 8 fractional bits.
+        assert_eq!(log2_frac256((1 << 16) - 1), 255);
+        // log2(46341/32768) = 0.500001…
+        assert_eq!(log2_frac256(46341), 128);
+        // Monotone non-decreasing across the whole window.
+        let mut prev = 0;
+        for x in (1u32 << 15)..(1 << 16) {
+            let f = log2_frac256(x);
+            assert!(f >= prev, "log2_frac256 not monotone at {x}");
+            prev = f;
+        }
+    }
+
+    /// A counting writer fed the same symbol sequence as an emitting
+    /// writer tracks the identical §8.2.6 `range` trajectory, applies
+    /// the identical §8.3 CDF adaptation, and its
+    /// [`SymbolWriter::cost_bits256`] agrees with the emitting
+    /// writer's renormalisation-bit count to within the sub-bit
+    /// fractional window (< 1 bit).
+    #[test]
+    fn counting_writer_tracks_emitting_writer() {
+        let start_cdf: [u16; 9] = [3000, 7000, 12000, 16000, 20000, 24000, 28000, 32768, 0];
+        let mut x: u32 = 0x1234_5678;
+        let mut emit = SymbolWriter::new(false);
+        let mut count = SymbolWriter::new_counting(false, emit.range());
+        let mut cdf_e = start_cdf;
+        let mut cdf_c = start_cdf;
+        for _ in 0..500 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let s = x % 8;
+            emit.write_symbol(s, &mut cdf_e).unwrap();
+            count.write_symbol(s, &mut cdf_c).unwrap();
+            assert_eq!(emit.range(), count.range(), "range trajectory diverged");
+        }
+        assert_eq!(cdf_e, cdf_c, "§8.3 adaptation diverged");
+        let cost = count.cost_bits256();
+        let renorm = emit.renorm_bits * 256;
+        let diff = cost.abs_diff(renorm);
+        assert!(
+            diff <= 256,
+            "cost {cost} vs renorm-bit count {renorm}: off by more than one bit"
+        );
+        // The emitting writer's bit accumulation is 15 seed bits plus
+        // one per renorm bit — the two books must agree exactly.
+        assert_eq!(emit.low_bits.len() as u64, 15 + emit.renorm_bits);
+    }
+
+    /// Seeding a counting twin from a mid-stream emitting writer's
+    /// `range` prices a suffix to the exact renorm-bit delta the
+    /// emitting writer accumulates for that same suffix (within the
+    /// fractional window).
+    #[test]
+    fn counting_writer_seeded_mid_stream_prices_suffix() {
+        let start_cdf: [u16; 5] = [6000, 14000, 22000, 32768, 0];
+        let mut emit = SymbolWriter::new(false);
+        let mut cdf_e = start_cdf;
+        for s in [0u32, 2, 1, 3, 0, 0, 1] {
+            emit.write_symbol(s, &mut cdf_e).unwrap();
+        }
+        let renorm_before = emit.renorm_bits;
+        let mut count = SymbolWriter::new_counting(false, emit.range());
+        let mut cdf_c = cdf_e;
+        for s in [3u32, 3, 2, 0, 1, 2, 3, 1, 0, 2] {
+            emit.write_symbol(s, &mut cdf_e).unwrap();
+            count.write_symbol(s, &mut cdf_c).unwrap();
+        }
+        assert_eq!(emit.range(), count.range());
+        assert_eq!(cdf_e, cdf_c);
+        let suffix_renorm = (emit.renorm_bits - renorm_before) * 256;
+        assert!(count.cost_bits256().abs_diff(suffix_renorm) <= 256);
+    }
+
+    /// A near-deterministic symbol (p ≈ 7/8 under CDF `[4096, 32768,
+    /// 0]`) must price well under one bit, and its complement well
+    /// over two bits — the counting mode resolves sub-bit costs the
+    /// whole-bit renorm count cannot.
+    #[test]
+    fn counting_writer_resolves_sub_bit_costs() {
+        // 64 likely symbols (symbol 1's §8.2.6 sub-interval is
+        // `[0, cur(0))` ≈ 28676/32768 wide): each ≈ 0.19 bit.
+        let mut w = SymbolWriter::new_counting(true, 1 << 15);
+        for _ in 0..64 {
+            let mut cdf: [u16; 3] = [4096, 32768, 0];
+            w.write_symbol(1, &mut cdf).unwrap();
+        }
+        let per_symbol = w.cost_bits256() as f64 / 64.0 / 256.0;
+        assert!(
+            per_symbol > 0.05 && per_symbol < 0.5,
+            "likely-symbol cost {per_symbol} bits: outside the sub-bit window"
+        );
+        // The rare complement (width ≈ 4092/32768) ≈ 3 bits each.
+        let mut w = SymbolWriter::new_counting(true, 1 << 15);
+        for _ in 0..64 {
+            let mut cdf: [u16; 3] = [4096, 32768, 0];
+            w.write_symbol(0, &mut cdf).unwrap();
+        }
+        let per_symbol = w.cost_bits256() as f64 / 64.0 / 256.0;
+        assert!(
+            per_symbol > 2.0 && per_symbol < 4.0,
+            "rare-symbol cost {per_symbol} bits: outside the expected window"
+        );
     }
 
     /// Direct unit test of [`SymbolWriter::check_range_invariant`] on
