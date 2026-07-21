@@ -1051,13 +1051,18 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // exactly mirroring the decode driver's derivation.
     if !alt_q.is_empty() {
         ip.segmentation_update_map = true;
-        // r423 — main-pass arm: search and emit under the §5.11.19
-        // temporal arm whenever this frame CAN code it (a primary
-        // reference exists, so `PrevSegmentIds` is real state) and
-        // the config allows it; the exact-bits election after the
-        // tile write may fall back to the spatial replay.
-        ip.segmentation_temporal_update =
-            cfg.primary_ref_frame != PRIMARY_REF_NONE && cfg.allow_temporal_seg;
+        // r423 — the main pass always searches and emits under the
+        // SPATIAL arm: the search (and therefore the committed trees)
+        // is bit-identical to the temporal-disabled baseline, and the
+        // exact-bits election below replays those trees under the
+        // §5.11.19 temporal arm — so the elected stream can only be
+        // smaller-or-equal, PER FRAME, than the spatial-only encode
+        // of the same input. (An early variant searched under the
+        // temporal arm and elected the spatial replay as fallback;
+        // measurement showed the temporal-biased trees sometimes lose
+        // to a spatial-native search outright, which the flipped
+        // election excludes by construction.)
+        ip.segmentation_temporal_update = false;
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let prev_ids = match cfg.primary_carry {
             Some(c)
@@ -1295,21 +1300,25 @@ pub(crate) fn encode_inter_frame_generic_gm(
 
     // r423 — §5.9.14 `segmentation_temporal_update` election by EXACT
     // realized bits: the main pass searched and wrote under the
-    // temporal arm (when codable); replay the identical committed
-    // trees under the spatial arm from the same §8.3.1 frame-start
-    // CDF state and keep whichever tile is smaller. Both arms decode
-    // to the same reconstruction (the segment ids, modes and
-    // coefficients are the trees'; only the §5.11.19 id-coding bits
-    // differ), so the election is purely rate. Header cost is
-    // arm-invariant (each §5.9.14 flag is one f(1) either way).
+    // spatial arm; when the frame can code the temporal arm (a
+    // primary reference exists and the config allows it), replay the
+    // identical committed trees under the §5.11.19 temporal arm from
+    // the same §8.3.1 frame-start CDF state and keep whichever tile
+    // is smaller. Both arms decode to the same reconstruction (the
+    // segment ids, modes and coefficients are the trees'; only the
+    // §5.11.19 id-coding bits differ), so the election is purely
+    // rate. Header cost is arm-invariant (each §5.9.14 flag is one
+    // f(1) either way).
     let main_ip = params
         .inter
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    let mut seg_temporal_elected = main_ip.segmentation_temporal_update;
-    if seg_temporal_elected {
+    let mut seg_temporal_elected = false;
+    let temporal_codable =
+        !alt_q.is_empty() && cfg.primary_ref_frame != PRIMARY_REF_NONE && cfg.allow_temporal_seg;
+    if temporal_codable {
         let mut alt_ip = main_ip.clone();
-        alt_ip.segmentation_temporal_update = false;
+        alt_ip.segmentation_temporal_update = true;
         let mut alt_params = params.clone();
         alt_params.inter = Some(alt_ip);
         let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
@@ -1340,7 +1349,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         }
         let alt_bytes = alt_writer.finish();
         if alt_bytes.len() < tile_bytes.len() {
-            seg_temporal_elected = false;
+            seg_temporal_elected = true;
             tile_bytes = alt_bytes;
             cdfs = alt_cdfs;
             state = alt_state;
