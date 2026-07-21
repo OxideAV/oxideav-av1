@@ -6532,3 +6532,75 @@ fn self_pyr_176x144_q255_shear_ratetwin_decodes_byte_exact() {
         9,
     );
 }
+
+const SELF_GOP_64X64_Q60_GM_ZOOM_WARP_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000400000000000000810100000000",
+    "00000000000012000a0a00000002afff977f000832f00216002780000040c3e4ae2de1004253",
+    "aa6ed6bd05ceeaa4198da41ef58966e48ec8a3ed5f39ab45541784d8cfc8ea888e5b7d11efe8",
+    "1906159a96392d635c2f7d10e3b8e689c9584e25c3850c27785a610b2ad88bad68edb4ed1861",
+    "904d617aa5661fc8c6e7ef4d4b319aa71e4835967a41713800769db69c6290c56c443cc3054a",
+    "b386c4b7195b3b65cf74dbb95a93b2c89031c24af8944601ad53dbdaa8c53b2b01c4ac61ac47",
+    "b83fd5e1b2b3fdb8807f72523fa8d71c4c7c39a69c924cf025a6ca9e54de9a576a394b1c7b06",
+    "702700e3b943c1dd464175b9ef9b586fe7da01e5a54ce78373b50dd62f190131fb33827049cf",
+    "8f6b4727214d0e1027ecbf113e5f203ae48201c036fc0eb40173a07b9f81292111d09e044dd6",
+    "a89f048be4ffe9cc3c759f18c96f259913aec55a330a8b26305a10890736b31bdea0dfe1bd6b",
+    "18e7df0e291eda5cafb4a03f5e4057d2f8a761d73cf43e18fdb480bfc3a7bb3f74ddf5bea927",
+    "cf08cbf552a9f1bcb9811c3000000001000000000000001200322c3201e02248249d3c000003",
+    "bff84d799f80fc34ffe135e67e03f0d0dc8b29eb01abc7947d8525c8da366f21274600000002",
+    "00000000000000120032423202e04001001d3c000003dffc3eb9df0ff859ffe301d4fc33f83c",
+    "00dec382a90ffd85b6240578793f32e3ccfb5702eb635d40285e834c698f8a7f3fa0245781d0",
+    "40650000000300000000000000120032613203e02248249d3c000003dffc43b8df0df859ffe3",
+    "0df3afc43f80c0dc7ad3e478a02fdf812f95dc6886aad8cbdaa204c9902c7985a50c8880e65c",
+    "da170bb74ff2f86d6f4043f37b731070bcf17aa12adb80ee2b4f2b02b757767cb1c0f73e9ce0",
+);
+
+/// r422: a 3.5%-per-frame centre zoom encoded with the frame-level
+/// §5.9.24 global-motion election live — the P-frame headers carry
+/// non-identity ROTZOOM models on LAST and GOLDEN written through the
+/// §5.9.25 signed-subexp arm, the §7.10.2.1 GlobalMvs derivation runs
+/// off them at every leaf, and >= 8x8 GLOBALMV leaves ride the
+/// §7.11.3 global-warp prediction path (+0.62 dB over the
+/// identity-only encode of the same input at fewer bytes).
+#[test]
+fn self_gop_64x64_q60_gm_zoom_warp_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-64x64-q60-gm-zoom-warp",
+        SELF_GOP_64X64_Q60_GM_ZOOM_WARP_IVF,
+        "86d28bb10cbfc7d49c9a641fe6d67860a13b755151a9bf58d362f99718db8d7c",
+        4,
+    );
+}
+
+const SELF_GOP_64X64_Q60_GM_ROTATION_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000400000000000000810100000000",
+    "00000000000012000a0a00000002afff977f000832f00216002780000040c3e4ae2de1004253",
+    "aa6ed6bd05ceeaa4198da41ef58966e48ec8a3ed5f39ab45541784d8cfc8ea888e5b7d11efe8",
+    "1906159a96392d635c2f7d10e3b8e689c9584e25c3850c27785a610b2ad88bad68edb4ed1861",
+    "904d617aa5661fc8c6e7ef4d4b319aa71e4835967a41713800769db69c6290c56c443cc3054a",
+    "b386c4b7195b3b65cf74dbb95a93b2c89031c24af8944601ad53dbdaa8c53b2b01c4ac61ac47",
+    "b83fd5e1b2b3fdb8807f72523fa8d71c4c7c39a69c924cf025a6ca9e54de9a576a394b1c7b06",
+    "702700e3b943c1dd464175b9ef9b586fe7da01e5a54ce78373b50dd62f190131fb33827049cf",
+    "8f6b4727214d0e1027ecbf113e5f203ae48201c036fc0eb40173a07b9f81292111d09e044dd6",
+    "a89f048be4ffe9cc3c759f18c96f259913aec55a330a8b26305a10890736b31bdea0dfe1bd6b",
+    "18e7df0e291eda5cafb4a03f5e4057d2f8a761d73cf43e18fdb480bfc3a7bb3f74ddf5bea927",
+    "cf08cbf552a9f1bcb9811c250000000100000000000000120032213201e02248249d3c000003",
+    "bc7fee83d9fb43c7fee83d9fb400dfdc63a718b3429a29000000020000000000000012003225",
+    "3202e04001001d3c000003d87fbb4f77ee0fb3ff714fb1fda000dfe2d7c354a94dc2851f8031",
+    "00000003000000000000001200322d3203e02248249d3c000003de9ff69debfda1f85ffb6a7d",
+    "9fedc0dcaf27bf27cc8964493758ecbf0ee4183f1f78",
+);
+
+/// r422: a ~1.7-degree-per-frame centre rotation under the same
+/// §5.9.24 election — non-identity ROTZOOM headers with a non-zero
+/// off-diagonal (the derived [4]/[5] pair), global-warp prediction on
+/// the rotating field (+1.30 dB over the identity-only encode of the
+/// same input).
+#[test]
+fn self_gop_64x64_q60_gm_rotation_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-64x64-q60-gm-rotation",
+        SELF_GOP_64X64_Q60_GM_ROTATION_IVF,
+        "6191e2f8b999155b37a25e3d5021579b7ad0609c7b7af9b3812cfb1c240027ef",
+        4,
+    );
+}
