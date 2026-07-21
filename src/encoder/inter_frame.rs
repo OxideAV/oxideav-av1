@@ -92,7 +92,9 @@ use crate::inter_pred::{
 };
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
-use crate::uncompressed_header_tail::{InterpolationFilter, TxMode, REFS_PER_FRAME};
+use crate::uncompressed_header_tail::{
+    InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
+};
 use crate::Error;
 
 /// One frame's reconstructed planes (row-major; U/V at
@@ -191,6 +193,18 @@ pub(crate) struct RefSlotCarry {
     pub(crate) mi_rows: u32,
     pub(crate) mi_cols: u32,
     pub(crate) gm_params: [[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME],
+}
+
+/// r424 — one INTER frame's auxiliary election outcomes, returned by
+/// [`encode_inter_frame_generic`] alongside the OBU: the §5.9.14
+/// `segmentation_temporal_update` arm the exact-bits election kept
+/// (r423) and the §5.9.2 `primary_ref_frame` ordinal the exact-bytes
+/// election committed (r424; equals the config's ordinal when no
+/// [`InterFrameConfig::alt_primaries`] were offered).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InterFrameAux {
+    pub(crate) seg_temporal: bool,
+    pub(crate) primary_ref: u8,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -513,7 +527,7 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
         } else {
             None
         };
-        let (tu, rc, saved_mf, carry, seg_temporal) = encode_p_frame_yuv420(
+        let (tu, rc, saved_mf, carry, aux) = encode_p_frame_yuv420(
             input,
             prev,
             prevprev,
@@ -529,7 +543,7 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
         )?;
         temporal_units.push(tu);
         recon.push(rc);
-        seg_temporal_updates.push(seg_temporal);
+        seg_temporal_updates.push(aux.seg_temporal);
         // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
         mf_store[((p_index - 1) & 1) as usize] = saved_mf;
         carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
@@ -639,6 +653,20 @@ pub(crate) struct InterFrameConfig<'a> {
     /// frame (see [`GopTuning::temporal_seg`]). Only consulted on
     /// segmented frames with a primary reference.
     pub allow_temporal_seg: bool,
+    /// r424 — alternative §5.9.2 `primary_ref_frame` candidates for
+    /// the exact-bytes election: after the main pass (searched and
+    /// written under `primary_ref_frame` / `primary_carry` above),
+    /// the committed trees are replayed bit-exactly from each
+    /// candidate's §8.3.1 frame-start CDF state and the smallest
+    /// total frame (header + tile) wins. `(PRIMARY_REF_NONE, None)`
+    /// is the per-frame-defaults candidate. All candidates decode to
+    /// the identical reconstruction (the trees carry every mode /
+    /// coefficient value; only the adaptive-coding bits and the
+    /// §5.9.24 gm recentering differ), so the election is purely
+    /// rate. Incompatible with the segmented temporal-update election
+    /// (caller bug — the pyramid drivers that use this never
+    /// segment).
+    pub alt_primaries: Vec<(u8, Option<&'a RefSlotCarry>)>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -807,6 +835,7 @@ fn p_frame_config_primary<'a>(
         },
         primary_carry,
         allow_temporal_seg: true,
+        alt_primaries: Vec::new(),
     }
 }
 
@@ -848,10 +877,19 @@ fn encode_p_frame_yuv420(
     global_motion: bool,
     primary_carry: Option<&RefSlotCarry>,
     allow_temporal_seg: bool,
-) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField, RefSlotCarry, bool), Error> {
+) -> Result<
+    (
+        Vec<u8>,
+        GopFrameRecon,
+        SavedMotionField,
+        RefSlotCarry,
+        InterFrameAux,
+    ),
+    Error,
+> {
     let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry);
     cfg.allow_temporal_seg = allow_temporal_seg;
-    let (obu, recon, saved, carry, seg_temporal) = encode_inter_frame_generic_gm(
+    let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
         base_q_idx,
@@ -865,13 +903,7 @@ fn encode_p_frame_yuv420(
     // unit; §7.5 requires it once per coded video sequence). Every
     // P-frame is shown, so the one-OBU unit satisfies the "exactly
     // one shown frame per temporal unit" bitstream conformance rule.
-    Ok((
-        build_temporal_unit(None, &[obu]),
-        recon,
-        saved,
-        carry,
-        seg_temporal,
-    ))
+    Ok((build_temporal_unit(None, &[obu]), recon, saved, carry, aux))
 }
 
 /// r415 — the shared INTER frame encoder every pyramid role (P / ALT /
@@ -899,7 +931,7 @@ pub(crate) fn encode_inter_frame_generic(
         GopFrameRecon,
         SavedMotionField,
         RefSlotCarry,
-        bool,
+        InterFrameAux,
     ),
     Error,
 > {
@@ -925,7 +957,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         GopFrameRecon,
         SavedMotionField,
         RefSlotCarry,
-        bool,
+        InterFrameAux,
     ),
     Error,
 > {
@@ -1370,6 +1402,116 @@ pub(crate) fn encode_inter_frame_generic_gm(
         sp.temporal_update = seg_temporal_elected;
     }
 
+    // r424 — §5.9.2 `primary_ref_frame` election by EXACT realized
+    // bytes: the main pass searched and wrote under the config's
+    // primary reference; each alternative candidate replays the
+    // identical committed trees from its own §8.3.1 frame-start CDF
+    // state (§6.8.21 `load_cdfs` of the candidate's carried slot, or
+    // the per-frame defaults for the `PRIMARY_REF_NONE` candidate)
+    // and re-prices the header (the 3-bit ordinal is constant; the
+    // §5.9.24 subexp recentering against the candidate's
+    // `PrevGmParams` is not). Every candidate decodes to the SAME
+    // reconstruction — the trees carry all modes and coefficients —
+    // so the election is purely rate, and the smallest header + tile
+    // total wins.
+    let mut prev_gm_for_header: Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]> =
+        if fh.primary_ref_frame != PRIMARY_REF_NONE {
+            cfg.primary_carry.map(|c| c.gm_params)
+        } else {
+            None
+        };
+    if !cfg.alt_primaries.is_empty() {
+        // The segmented temporal-update election above and this
+        // election both swap the tile — combining them would need a
+        // per-candidate seg replay matrix nobody codes yet (the
+        // pyramid drivers that offer alternatives never segment).
+        if temporal_codable {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let header_len = |ord: u8, prev: Option<&[[i32; 6]; TOTAL_REFS_PER_FRAME]>| -> usize {
+            let mut fh_c = fh.clone();
+            fh_c.primary_ref_frame = ord;
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw, &fh_c, seq, prev,
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let mut best_total =
+            header_len(fh.primary_ref_frame, prev_gm_for_header.as_ref()) + tile_bytes.len();
+        #[allow(clippy::type_complexity)]
+        let mut best: Option<(
+            u8,
+            Vec<u8>,
+            TileCdfContext,
+            PartitionSyntaxWriter,
+            Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]>,
+        )> = None;
+        for (ord, carry_opt) in &cfg.alt_primaries {
+            if *ord != PRIMARY_REF_NONE
+                && (usize::from(*ord) >= REFS_PER_FRAME || carry_opt.is_none())
+            {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let mut cand_cdfs: TileCdfContext = match carry_opt {
+                Some(carry) if *ord != PRIMARY_REF_NONE => {
+                    let mut loaded = carry.cdfs.as_ref().clone();
+                    loaded.zero_counts();
+                    loaded
+                }
+                _ => {
+                    let mut c = TileCdfContext::new_from_defaults();
+                    c.init_coeff_cdfs(base_q_idx);
+                    c
+                }
+            };
+            let mut cand_writer = SymbolWriter::new(fh.disable_cdf_update);
+            let mut cand_state = PartitionSyntaxWriter::new(
+                mi_rows,
+                mi_cols,
+                TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: mi_rows,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols,
+                },
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
+                cand_state.arm_read_deltas();
+                write_partition_tree_syntax(
+                    &mut cand_writer,
+                    &mut cand_cdfs,
+                    &mut cand_state,
+                    tree,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &params,
+                )?;
+            }
+            let cand_bytes = cand_writer.finish();
+            let cand_prev = if *ord != PRIMARY_REF_NONE {
+                carry_opt.map(|c| c.gm_params)
+            } else {
+                None
+            };
+            let total = header_len(*ord, cand_prev.as_ref()) + cand_bytes.len();
+            if total < best_total {
+                best_total = total;
+                best = Some((*ord, cand_bytes, cand_cdfs, cand_state, cand_prev));
+            }
+        }
+        if let Some((ord, bytes, e_cdfs, e_state, e_prev)) = best {
+            fh.primary_ref_frame = ord;
+            tile_bytes = bytes;
+            cdfs = e_cdfs;
+            state = e_state;
+            prev_gm_for_header = e_prev;
+        }
+    }
+
     let tile_group = TileGroupObu {
         num_tiles: 1,
         tile_cols_log2: 0,
@@ -1392,7 +1534,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             &mut bw,
             &fh,
             seq,
-            cfg.primary_carry.map(|c| &c.gm_params),
+            prev_gm_for_header.as_ref(),
         );
         bw.byte_align();
         let mut body = bw.finish();
@@ -1476,7 +1618,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
         },
         saved_mf,
         carry,
-        seg_temporal_elected,
+        InterFrameAux {
+            seg_temporal: seg_temporal_elected,
+            primary_ref: fh.primary_ref_frame,
+        },
     ))
 }
 

@@ -399,7 +399,16 @@ pub use pixel_driver_dyn::{
 // can A/B the twin-priced elections against the heuristic baseline.
 #[doc(hidden)]
 pub use pyramid_gop::encode_pyramid_gop_yuv420_with_q_rate_model;
-pub use pyramid_gop::{encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q};
+pub use pyramid_gop::{
+    encode_adaptive_gop_yuv420_with_q, encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q,
+};
+// r424 — deep-pyramid / adaptive-mini-GOP tuning surfaces, exposed
+// (hidden) for the measurement harnesses.
+#[doc(hidden)]
+pub use pyramid_gop::{
+    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
+    AdaptiveTuning, PyramidTuning, TunedAdaptiveGop, TunedPyramidGop,
+};
 #[doc(hidden)]
 pub use rate_twin::RateModel;
 #[doc(hidden)]
