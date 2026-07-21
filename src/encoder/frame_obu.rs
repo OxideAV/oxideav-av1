@@ -64,8 +64,10 @@ use crate::tile_info::{TileInfo, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH};
 use crate::uncompressed_header_tail::{
     CdefParams, DeltaLfParams, DeltaQParams, FilmGrainParams, GlobalMotionParams,
     InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams,
-    TxMode, WarpModelType, MAX_LOOP_FILTER, MAX_SEGMENTS, REFS_PER_FRAME,
-    SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
+    TxMode, WarpModelType, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
+    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, MAX_LOOP_FILTER, MAX_SEGMENTS,
+    REFS_PER_FRAME, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
+    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX, TOTAL_REFS_PER_FRAME, WARPEDMODEL_PREC_BITS,
 };
 
 /// Encode a `frame_header_obu()` payload per §5.9.1 / §5.9.2 from a
@@ -575,14 +577,37 @@ fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
     }
     let rts = fh.reduced_tx_set.expect("inter has reduced_tx_set");
     bw.write_bits(1, u64::from(rts));
-    // §5.9.24 global_motion_params — inter path. The full
-    // read_global_param signed-subexp emission lands next arc; we
-    // support the `gm_type == IDENTITY` short-circuit (1 bit per ref).
+    // §5.9.24 global_motion_params — inter path (r422: the full
+    // read_global_param signed-subexp inverse; TRANSLATION / ROTZOOM /
+    // AFFINE refs emit their coefficients through the §5.9.26–§5.9.29
+    // chain). `PrevGmParams` is the §7.13.1 setup_past_independence
+    // default — the only configuration this encoder emits
+    // (`primary_ref_frame == PRIMARY_REF_NONE`); a non-identity model
+    // under a primary reference would need the saved per-slot params.
+    debug_assert!(
+        fh.primary_ref_frame == PRIMARY_REF_NONE
+            || fh
+                .global_motion_params
+                .as_ref()
+                .map(|g| g.gm_type.iter().all(|t| *t == WarpModelType::Identity))
+                .unwrap_or(true),
+        "non-identity global motion with a primary reference needs SavedGmParams plumbing"
+    );
     let gm = fh
         .global_motion_params
         .as_ref()
         .expect("inter has global_motion_params");
-    encode_inter_global_motion_identity_only(bw, gm);
+    let allow_high_precision_mv = fh
+        .inter_refs
+        .as_ref()
+        .map(|ir| ir.allow_high_precision_mv)
+        .unwrap_or(false);
+    encode_inter_global_motion(
+        bw,
+        gm,
+        allow_high_precision_mv,
+        &crate::uncompressed_header_tail::prev_gm_params_default(),
+    );
     encode_film_grain_params(
         bw,
         fh.film_grain_params
@@ -684,16 +709,255 @@ pub(crate) fn skip_mode_params_twin(
     (true, [1 + lo, 1 + hi])
 }
 
-fn encode_inter_global_motion_identity_only(bw: &mut BitWriter, gm: &GlobalMotionParams) {
-    // §5.9.24 inter loop over LAST_FRAME..=ALTREF_FRAME. We only
-    // support `IDENTITY` (single `is_global = 0` bit per ref) until
-    // the next arc lands read_global_param's inverse.
+/// r422 — `recenter(r, v)`: the forward of the §5.9.29
+/// `inverse_recenter(r, v)` map. For every `v` in `0..mx` (with
+/// `0 <= r < mx`) this produces the unique code `x` with
+/// `inverse_recenter(r, x) == v`:
+///
+///   * `v > 2r`  ⇒ `x = v` (the pass-through arm);
+///   * `v >= r`  ⇒ `x = (v - r) << 1` (even arm, `x <= 2r`);
+///   * `v <  r`  ⇒ `x = ((r - v) << 1) - 1` (odd arm, `x < 2r`).
+fn recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        v
+    } else if v >= r {
+        (v - r) << 1
+    } else {
+        ((r - v) << 1) - 1
+    }
+}
+
+/// r422 — `encode_subexp(numSyms, v)`: the exact inverse of the
+/// §5.9.28 `decode_subexp(numSyms)` read loop. Walks the same
+/// bucket ladder (`k = 3`); the bucket holding `v` determines the
+/// unique bit pattern the reader maps back to `v`:
+///
+///   * final bucket (`numSyms <= mk + 3a`) ⇒ `ns(numSyms - mk)` of
+///     `v - mk`;
+///   * `v` inside the current bucket ⇒ `subexp_more_bits = 0` +
+///     `f(b2)` of `v - mk`;
+///   * otherwise ⇒ `subexp_more_bits = 1` and climb.
+fn encode_subexp(bw: &mut BitWriter, num_syms: u32, v: u32) {
+    debug_assert!(v < num_syms, "subexp symbol out of range");
+    let mut i: u32 = 0;
+    let mut mk: u32 = 0;
+    let k: u32 = 3;
+    loop {
+        let b2 = if i != 0 { k + i - 1 } else { k };
+        let a = 1u32 << b2;
+        if num_syms <= mk + 3 * a {
+            bw.write_ns(num_syms - mk, v - mk);
+            return;
+        }
+        if v < mk + a {
+            // subexp_more_bits = 0, then f(b2).
+            bw.write_bit(0);
+            bw.write_bits(b2, u64::from(v - mk));
+            return;
+        }
+        bw.write_bit(1);
+        i += 1;
+        mk += a;
+    }
+}
+
+/// r422 — inverse of §5.9.27 `decode_unsigned_subexp_with_ref(mx, r)`
+/// for a target decoded value `v` in `0..mx`.
+fn encode_unsigned_subexp_with_ref(bw: &mut BitWriter, mx: i64, r: i64, v: i64) {
+    debug_assert!((0..mx).contains(&v), "unsigned subexp value out of range");
+    let x = if (r << 1) <= mx {
+        recenter(r, v)
+    } else {
+        recenter(mx - 1 - r, mx - 1 - v)
+    };
+    encode_subexp(bw, mx as u32, x as u32);
+}
+
+/// r422 — inverse of §5.9.26 `decode_signed_subexp_with_ref(low,
+/// high, r)` for a target decoded value `v` in `low..high`.
+fn encode_signed_subexp_with_ref(bw: &mut BitWriter, low: i64, high: i64, r: i64, v: i64) {
+    encode_unsigned_subexp_with_ref(bw, high - low, r - low, v - low);
+}
+
+/// r422 — the §5.9.25 `read_global_param(type, ref, idx)` write arm:
+/// derives the same `(absBits, precBits, precDiff, round, sub, mx,
+/// r)` scalars the reader derives, maps the stored
+/// `WARPEDMODEL_PREC_BITS`-precision `value` back to its coded
+/// ordinal, and emits the §5.9.26 signed-subexp chain. `value` must
+/// sit on the codable grid (`(decoded << precDiff) + round` for a
+/// `decoded` in `-mx..=mx`) — [`quantize_global_param`] snaps
+/// arbitrary models onto it; an off-grid value is a caller bug.
+fn write_global_param(
+    bw: &mut BitWriter,
+    gm_type: WarpModelType,
+    allow_high_precision_mv: bool,
+    prev_gm_params: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+    ref_idx: usize,
+    idx: usize,
+    value: i32,
+) {
+    let (abs_bits, prec_bits) = global_param_bits(gm_type, allow_high_precision_mv, idx);
+    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+    let round: i64 = if idx % 3 == 2 {
+        1i64 << WARPEDMODEL_PREC_BITS
+    } else {
+        0
+    };
+    let sub: i64 = if idx % 3 == 2 { 1i64 << prec_bits } else { 0 };
+    let mx: i64 = 1i64 << abs_bits;
+    let r: i64 = (i64::from(prev_gm_params[ref_idx][idx]) >> prec_diff) - sub;
+    let decoded = (i64::from(value) - round) >> prec_diff;
+    debug_assert_eq!(
+        (decoded << prec_diff) + round,
+        i64::from(value),
+        "global_param value off the §5.9.25 codable grid (ref {ref_idx} idx {idx})"
+    );
+    debug_assert!(
+        (-mx..=mx).contains(&decoded),
+        "global_param ordinal outside [-mx, mx] (ref {ref_idx} idx {idx})"
+    );
+    encode_signed_subexp_with_ref(bw, -mx, mx + 1, r, decoded);
+}
+
+/// The §5.9.25 `(absBits, precBits)` pair for one coefficient slot.
+fn global_param_bits(
+    gm_type: WarpModelType,
+    allow_high_precision_mv: bool,
+    idx: usize,
+) -> (u32, u32) {
+    let not_high_prec: u32 = u32::from(!allow_high_precision_mv);
+    if idx < 2 {
+        if gm_type == WarpModelType::Translation {
+            (
+                GM_ABS_TRANS_ONLY_BITS - not_high_prec,
+                GM_TRANS_ONLY_PREC_BITS - not_high_prec,
+            )
+        } else {
+            (GM_ABS_TRANS_BITS, GM_TRANS_PREC_BITS)
+        }
+    } else {
+        (GM_ABS_ALPHA_BITS, GM_ALPHA_PREC_BITS)
+    }
+}
+
+/// r422 — snap a `WARPEDMODEL_PREC_BITS`-precision warp coefficient
+/// onto the §5.9.25 codable grid for `(gm_type, idx)`: round the
+/// coded ordinal to nearest, clamp it to the `[-mx, mx]` coded range,
+/// and return the exact value the decoder will reconstruct
+/// (`(decoded << precDiff) + round`). The frame-level global-motion
+/// election quantizes every estimated model through this before
+/// pricing or committing it, so the encoder-side `gm_params` are
+/// identical to the parsed ones by construction.
+#[allow(dead_code)] // r422: the frame-level global-motion election (this arc) consumes it.
+pub(crate) fn quantize_global_param(
+    gm_type: WarpModelType,
+    allow_high_precision_mv: bool,
+    idx: usize,
+    value: i32,
+) -> i32 {
+    let (abs_bits, prec_bits) = global_param_bits(gm_type, allow_high_precision_mv, idx);
+    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+    let round: i64 = if idx % 3 == 2 {
+        1i64 << WARPEDMODEL_PREC_BITS
+    } else {
+        0
+    };
+    let mx: i64 = 1i64 << abs_bits;
+    // Round-to-nearest (half away from zero) onto the ordinal grid.
+    let num = i64::from(value) - round;
+    let half = 1i64 << (prec_diff.saturating_sub(1));
+    let decoded = if prec_diff == 0 {
+        num
+    } else if num >= 0 {
+        (num + half) >> prec_diff
+    } else {
+        -((-num + half) >> prec_diff)
+    };
+    let decoded = decoded.clamp(-mx, mx);
+    ((decoded << prec_diff) + round) as i32
+}
+
+/// r422 — the full §5.9.24 inter-path `global_motion_params()` write
+/// loop over `LAST_FRAME..=ALTREF_FRAME`: the 1–3 type bits per ref
+/// (`is_global` / `is_rot_zoom` / `is_translation`), then the
+/// per-type [`write_global_param`] coefficients in the reader's exact
+/// order (idx 2, 3 [, 4, 5] then 0, 1). ROTZOOM refs must carry the
+/// §5.9.24 derived pair (`[4] = -[3]`, `[5] = [2]`) — the reader
+/// recomputes it and the two sides must agree.
+fn encode_inter_global_motion(
+    bw: &mut BitWriter,
+    gm: &GlobalMotionParams,
+    allow_high_precision_mv: bool,
+    prev_gm_params: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+) {
     for ref_idx in 1usize..=7 {
-        debug_assert!(
-            matches!(gm.gm_type[ref_idx], WarpModelType::Identity),
-            "global_motion round-trip for non-IDENTITY refs lands next arc"
-        );
-        bw.write_bits(1, 0);
+        let gm_type = gm.gm_type[ref_idx];
+        // Type bits per the §5.9.24 decision tree.
+        match gm_type {
+            WarpModelType::Identity => {
+                bw.write_bit(0);
+                continue;
+            }
+            WarpModelType::RotZoom => {
+                bw.write_bit(1); // is_global
+                bw.write_bit(1); // is_rot_zoom
+            }
+            WarpModelType::Translation => {
+                bw.write_bit(1); // is_global
+                bw.write_bit(0); // is_rot_zoom
+                bw.write_bit(1); // is_translation
+            }
+            WarpModelType::Affine => {
+                bw.write_bit(1); // is_global
+                bw.write_bit(0); // is_rot_zoom
+                bw.write_bit(0); // is_translation
+            }
+        }
+        let p = &gm.gm_params[ref_idx];
+        if gm_type as u8 >= WarpModelType::RotZoom as u8 {
+            for idx in [2usize, 3] {
+                write_global_param(
+                    bw,
+                    gm_type,
+                    allow_high_precision_mv,
+                    prev_gm_params,
+                    ref_idx,
+                    idx,
+                    p[idx],
+                );
+            }
+            if gm_type == WarpModelType::Affine {
+                for idx in [4usize, 5] {
+                    write_global_param(
+                        bw,
+                        gm_type,
+                        allow_high_precision_mv,
+                        prev_gm_params,
+                        ref_idx,
+                        idx,
+                        p[idx],
+                    );
+                }
+            } else {
+                debug_assert!(
+                    p[4] == -p[3] && p[5] == p[2],
+                    "ROTZOOM ref {ref_idx} must carry the §5.9.24 derived [4]/[5] pair"
+                );
+            }
+        }
+        if gm_type as u8 >= WarpModelType::Translation as u8 {
+            for idx in [0usize, 1] {
+                write_global_param(
+                    bw,
+                    gm_type,
+                    allow_high_precision_mv,
+                    prev_gm_params,
+                    ref_idx,
+                    idx,
+                    p[idx],
+                );
+            }
+        }
     }
 }
 
@@ -1846,5 +2110,257 @@ mod tests {
         let mut expected = fh.clone();
         expected.bits_consumed = parsed.bits_consumed;
         assert_eq!(parsed, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // r422 — §5.9.24/§5.9.25 write arm: byte-exact round trips of the
+    // signed-subexp global-motion coefficients against the crate's own
+    // §5.9.24 parser.
+    // -----------------------------------------------------------------
+
+    use crate::uncompressed_header_tail::{
+        parse_global_motion_params, prev_gm_params_default, TOTAL_REFS_PER_FRAME,
+        WARPEDMODEL_PREC_BITS,
+    };
+
+    /// Write `gm` through the §5.9.24 inverse and re-parse it with the
+    /// crate parser; types, params and the exact bit count must match.
+    fn assert_gm_round_trip(
+        gm: &GlobalMotionParams,
+        hp: bool,
+        prev: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+    ) {
+        let mut bw = BitWriter::new();
+        encode_inter_global_motion(&mut bw, gm, hp, prev);
+        let bits_written = bw.bit_position();
+        let payload = bw.finish();
+        let (parsed, bits_read) =
+            parse_global_motion_params(&payload, false, hp, prev).expect("writer output parses");
+        assert_eq!(
+            bits_read, bits_written,
+            "reader consumed a different bit count"
+        );
+        assert_eq!(parsed.gm_type, gm.gm_type, "GmType mismatch");
+        assert_eq!(parsed.gm_params, gm.gm_params, "gm_params mismatch");
+    }
+
+    /// The §5.9.25 grid value for a coded ordinal `decoded` at
+    /// `(type, idx)` — the exact inverse of the reader's
+    /// `(decoded << precDiff) + round` reconstruction.
+    fn grid_value(gm_type: WarpModelType, hp: bool, idx: usize, decoded: i64) -> i32 {
+        let (_, prec_bits) = global_param_bits(gm_type, hp, idx);
+        let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+        let round: i64 = if idx % 3 == 2 {
+            1i64 << WARPEDMODEL_PREC_BITS
+        } else {
+            0
+        };
+        ((decoded << prec_diff) + round) as i32
+    }
+
+    /// A set of coded ordinals covering both subexp arms (bucket 0,
+    /// climbing buckets, the ns() tail) and both recenter arms, plus
+    /// the exact range extremes.
+    fn ordinal_sweep(gm_type: WarpModelType, hp: bool, idx: usize) -> Vec<i64> {
+        let (abs_bits, _) = global_param_bits(gm_type, hp, idx);
+        let mx = 1i64 << abs_bits;
+        vec![
+            -mx,
+            -mx + 1,
+            -1000,
+            -257,
+            -64,
+            -9,
+            -1,
+            0,
+            1,
+            2,
+            7,
+            8,
+            33,
+            250,
+            1023,
+            mx - 1,
+            mx,
+        ]
+        .into_iter()
+        .filter(|d| (-mx..=mx).contains(d))
+        .collect()
+    }
+
+    fn identity_gm_struct() -> GlobalMotionParams {
+        let mut gm = GlobalMotionParams::identity();
+        gm.short_circuited = false;
+        gm
+    }
+
+    #[test]
+    fn global_motion_translation_sweep_round_trips() {
+        for hp in [false, true] {
+            for &ref_idx in &[1usize, 4, 7] {
+                for d0 in ordinal_sweep(WarpModelType::Translation, hp, 0) {
+                    let mut gm = identity_gm_struct();
+                    gm.gm_type[ref_idx] = WarpModelType::Translation;
+                    gm.gm_params[ref_idx][0] = grid_value(WarpModelType::Translation, hp, 0, d0);
+                    gm.gm_params[ref_idx][1] =
+                        grid_value(WarpModelType::Translation, hp, 1, -d0 / 2);
+                    assert_gm_round_trip(&gm, hp, &prev_gm_params_default());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_motion_rotzoom_sweep_round_trips() {
+        for hp in [false, true] {
+            for d2 in ordinal_sweep(WarpModelType::RotZoom, hp, 2) {
+                for &d3 in &[-4096i64, -33, 0, 8, 4096] {
+                    let mut gm = identity_gm_struct();
+                    gm.gm_type[2] = WarpModelType::RotZoom;
+                    let p = &mut gm.gm_params[2];
+                    p[2] = grid_value(WarpModelType::RotZoom, hp, 2, d2);
+                    p[3] = grid_value(WarpModelType::RotZoom, hp, 3, d3);
+                    // §5.9.24 ROTZOOM derived pair.
+                    p[4] = -p[3];
+                    p[5] = p[2];
+                    p[0] = grid_value(WarpModelType::RotZoom, hp, 0, d3.clamp(-64, 64));
+                    p[1] = grid_value(WarpModelType::RotZoom, hp, 1, d2.clamp(-64, 64));
+                    assert_gm_round_trip(&gm, hp, &prev_gm_params_default());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_motion_affine_sweep_round_trips() {
+        for hp in [false, true] {
+            for d in ordinal_sweep(WarpModelType::Affine, hp, 2) {
+                let mut gm = identity_gm_struct();
+                gm.gm_type[1] = WarpModelType::Affine;
+                let p = &mut gm.gm_params[1];
+                p[2] = grid_value(WarpModelType::Affine, hp, 2, d);
+                p[3] = grid_value(WarpModelType::Affine, hp, 3, -d / 3);
+                p[4] = grid_value(WarpModelType::Affine, hp, 4, d / 5);
+                p[5] = grid_value(WarpModelType::Affine, hp, 5, -d);
+                p[0] = grid_value(WarpModelType::Affine, hp, 0, d.clamp(-4096, 4096));
+                p[1] = grid_value(WarpModelType::Affine, hp, 1, (-d).clamp(-4096, 4096));
+                assert_gm_round_trip(&gm, hp, &prev_gm_params_default());
+            }
+        }
+    }
+
+    /// Mixed per-ref types in one §5.9.24 loop — the writer must keep
+    /// the reader's exact per-ref ordering (type bits, then idx 2, 3
+    /// [, 4, 5], then 0, 1).
+    #[test]
+    fn global_motion_mixed_refs_round_trip() {
+        for hp in [false, true] {
+            let mut gm = identity_gm_struct();
+            gm.gm_type[1] = WarpModelType::Translation;
+            gm.gm_params[1][0] = grid_value(WarpModelType::Translation, hp, 0, -37);
+            gm.gm_params[1][1] = grid_value(WarpModelType::Translation, hp, 1, 122);
+            gm.gm_type[3] = WarpModelType::RotZoom;
+            {
+                let p = &mut gm.gm_params[3];
+                p[2] = grid_value(WarpModelType::RotZoom, hp, 2, 51);
+                p[3] = grid_value(WarpModelType::RotZoom, hp, 3, -17);
+                p[4] = -p[3];
+                p[5] = p[2];
+                p[0] = grid_value(WarpModelType::RotZoom, hp, 0, 900);
+                p[1] = grid_value(WarpModelType::RotZoom, hp, 1, -2048);
+            }
+            gm.gm_type[6] = WarpModelType::Affine;
+            {
+                let p = &mut gm.gm_params[6];
+                p[2] = grid_value(WarpModelType::Affine, hp, 2, -200);
+                p[3] = grid_value(WarpModelType::Affine, hp, 3, 77);
+                p[4] = grid_value(WarpModelType::Affine, hp, 4, -77);
+                p[5] = grid_value(WarpModelType::Affine, hp, 5, 200);
+                p[0] = grid_value(WarpModelType::Affine, hp, 0, 4096);
+                p[1] = grid_value(WarpModelType::Affine, hp, 1, -4096);
+            }
+            assert_gm_round_trip(&gm, hp, &prev_gm_params_default());
+        }
+    }
+
+    /// A non-default `PrevGmParams` table pushes `r` off zero and into
+    /// the §5.9.27 flipped-recenter arm (`(r << 1) > mx`) — both sides
+    /// must take the same arm.
+    #[test]
+    fn global_motion_nondefault_prev_hits_flipped_recenter_arm() {
+        for hp in [false, true] {
+            let mut prev = prev_gm_params_default();
+            // Push every slot of ref 5's prediction near the +max of
+            // its grid so `r - low` lands in the upper half.
+            for (idx, slot) in prev[5].iter_mut().enumerate() {
+                *slot = grid_value(WarpModelType::Affine, hp, idx, 4000);
+            }
+            for &d in &[-4096i64, -100, 0, 100, 3999, 4000, 4001, 4096] {
+                let mut gm = identity_gm_struct();
+                gm.gm_type[5] = WarpModelType::Affine;
+                for (idx, slot) in gm.gm_params[5].iter_mut().enumerate() {
+                    *slot = grid_value(WarpModelType::Affine, hp, idx, d);
+                }
+                assert_gm_round_trip(&gm, hp, &prev);
+            }
+        }
+    }
+
+    /// [`quantize_global_param`] output always sits on the codable
+    /// grid (the writer's own debug_asserts accept it) and the decoder
+    /// reconstructs it exactly.
+    #[test]
+    fn quantize_global_param_snaps_arbitrary_models_onto_the_grid() {
+        let raws: [i32; 9] = [
+            i32::MIN / 4,
+            -65_537,
+            -65_536,
+            -12_345,
+            -1,
+            0,
+            999,
+            65_535,
+            i32::MAX / 4,
+        ];
+        for hp in [false, true] {
+            for (gm_type, idxs) in [
+                (WarpModelType::Translation, &[0usize, 1][..]),
+                (WarpModelType::RotZoom, &[0usize, 1, 2, 3][..]),
+                (WarpModelType::Affine, &[0usize, 1, 2, 3, 4, 5][..]),
+            ] {
+                for &idx in idxs {
+                    for &raw in &raws {
+                        // The diagonal slots carry the identity offset.
+                        let raw = if idx % 3 == 2 {
+                            raw.saturating_add(1 << WARPEDMODEL_PREC_BITS)
+                        } else {
+                            raw
+                        };
+                        let q = quantize_global_param(gm_type, hp, idx, raw);
+                        // Idempotent (already on-grid values are fixed
+                        // points).
+                        assert_eq!(q, quantize_global_param(gm_type, hp, idx, q));
+                        // And the writer round-trips it exactly.
+                        let mut gm = identity_gm_struct();
+                        gm.gm_type[1] = gm_type;
+                        if gm_type == WarpModelType::RotZoom || gm_type == WarpModelType::Affine {
+                            // keep untouched slots on their identity
+                            // grid; stamp the probe slot.
+                            gm.gm_params[1][idx] = q;
+                            if gm_type == WarpModelType::RotZoom {
+                                gm.gm_params[1][4] = -gm.gm_params[1][3];
+                                gm.gm_params[1][5] = gm.gm_params[1][2];
+                            }
+                        } else {
+                            if idx >= 2 {
+                                continue;
+                            }
+                            gm.gm_params[1][idx] = q;
+                        }
+                        assert_gm_round_trip(&gm, hp, &prev_gm_params_default());
+                    }
+                }
+            }
+        }
     }
 }
