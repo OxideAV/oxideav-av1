@@ -651,6 +651,53 @@ S() costs ≈ 0.4% on translational content. The sweep matrix gains the
 self-encoded pins decode byte-exact in THREE independent reference
 decoders (corpus 67 total).
 
+### True bit-accounting rate costs: the search-side rate twin (r421)
+
+r421 replaces every RD ladder's heuristic rate proxy with the real
+thing. The encoder now carries a **rate twin** — a shadow of the
+tile's live write state (the §8.3.1 working CDFs, the §5.11
+neighbour-context mirror, the §8.2.6 arithmetic-coder `range`) that
+the search runs candidate symbol sequences through WITHOUT emitting,
+reading off each candidate's exact fractional bit cost (1/256-bit
+fixed point: renormalisation bits plus the `log2(range)` drift,
+deterministic integer arithmetic throughout). The twin re-implements
+no syntax: pricing and committing run the SAME
+`write_partition_tree_syntax` / `write_block_syntax` / partition-arm
+functions the emitting pass runs, only with a counting symbol writer
+(identical §8.2.6 range trajectory and §8.3 adaptation, no `low`
+accumulator) — so it cannot drift from the writer's arm selection,
+and the driver asserts the committed twin equals the writer's CDFs +
+coder range after every superblock's real emission (an end-to-end
+witness additionally pins the summed per-superblock costs to the
+emitted tile payload within the §8.2.4 termination slack). Elections
+priced with exact bits: KEY — leaf-vs-split partitions, tx-depth
+ladder, palette combos, intra-bc; INTER — the full §5.11.4 shape
+election (multi-block shapes thread a running fork so later blocks
+are searched and validated under their siblings' committed stamps),
+inter-vs-intra, skip-mode, depth ladder, and the §5.11.27 motion-mode
+election (SIMPLE / OBMC / WARPED_CAUSAL priced through the writer's
+own arm derivation against the current adaptive rows). The twin's
+write-path validation also surfaced and fixed two search/header
+inconsistencies (compound candidates offered without
+`reference_select`; filter trials under a non-SWITCHABLE frame
+filter). Measured on the committed A/B matrices (heuristic → twin,
+same inputs, joint `SSE + λ·bits` objective never worse): 66-config
+inter GOP **−3.06% bytes** at −0.05 dB (twin smaller on 62/66);
+30-config pyramid **−4.98% bytes** at −0.19 dB (smaller on 27/30);
+315-config intra +0.41% bytes for **+0.15 dB** mean PSNR (smaller on
+159/315 — the byte regressions pair with outsized PSNR gains, e.g.
++4.1 dB on q200 noise). The r419 OBMC-at-q60 flag re-judged: on
+q60 shear content the twin saves 2.9% bytes AND gains 0.13 dB, and
+the OBMC selection witness still commits OBMC leaves under exact
+costs. The pre-r421 heuristics stay selectable through hidden
+`*_rate_model` entry points as the measurement baseline
+(`tests/rate_twin_ab.rs`, env-gated full measurement + always-on
+conformance A/B); the full 411-stream twin sweep decodes
+byte-identical in THREE independent black-box reference decoders, and
+two representative improved streams are pinned in the conformance
+corpus — the re-judged q60 shear GOP and the −27% q255 shear pyramid
+(corpus 69 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
