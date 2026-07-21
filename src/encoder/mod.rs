@@ -338,6 +338,8 @@ pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 #[doc(hidden)]
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model;
+#[doc(hidden)]
+pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model_gm;
 pub use inter_frame::{
     encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg, EncodedGop,
     GopFrameRecon, GOP_MAX_FRAMES,

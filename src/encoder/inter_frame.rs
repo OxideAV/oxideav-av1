@@ -329,6 +329,22 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model(
     alt_q: &[i16],
     model: RateModel,
 ) -> Result<EncodedGop, Error> {
+    encode_gop_yuv420_with_q_seg_rate_model_gm(frames, base_q_idx, alt_q, model, true)
+}
+
+/// r422 — [`encode_gop_yuv420_with_q_seg_rate_model`] with an explicit
+/// global-motion switch, kept public (hidden) so the measurement
+/// harness can A/B the §5.9.24 election against the identity-only
+/// baseline on identical inputs. Production entry points always
+/// enable it.
+#[doc(hidden)]
+pub fn encode_gop_yuv420_with_q_seg_rate_model_gm(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    model: RateModel,
+    global_motion: bool,
+) -> Result<EncodedGop, Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -384,7 +400,16 @@ pub fn encode_gop_yuv420_with_q_seg_rate_model(
         let prev = recon.last().expect("at least the KEY recon");
         let prevprev = &recon[recon.len().saturating_sub(2)];
         let (tu, rc, saved_mf) = encode_p_frame_yuv420(
-            input, prev, prevprev, &seq, base_q_idx, p_index, alt_q, &mf_store, model,
+            input,
+            prev,
+            prevprev,
+            &seq,
+            base_q_idx,
+            p_index,
+            alt_q,
+            &mf_store,
+            model,
+            global_motion,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -655,10 +680,19 @@ fn encode_p_frame_yuv420(
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
     model: RateModel,
+    global_motion: bool,
 ) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField), Error> {
     let cfg = p_frame_config(prev, prevprev, p_index);
-    let (obu, recon, saved) =
-        encode_inter_frame_generic(input, seq, base_q_idx, &cfg, alt_q, mf_store, model)?;
+    let (obu, recon, saved) = encode_inter_frame_generic_gm(
+        input,
+        seq,
+        base_q_idx,
+        &cfg,
+        alt_q,
+        mf_store,
+        model,
+        global_motion,
+    )?;
     // §7.5 temporal unit: TD + OBU_FRAME (the SH rode the KEY frame's
     // unit; §7.5 requires it once per coded video sequence). Every
     // P-frame is shown, so the one-OBU unit satisfies the "exactly
@@ -685,6 +719,23 @@ pub(crate) fn encode_inter_frame_generic(
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
     model: RateModel,
+) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
+    encode_inter_frame_generic_gm(input, seq, base_q_idx, cfg, alt_q, mf_store, model, true)
+}
+
+/// r422 — [`encode_inter_frame_generic`] with the global-motion
+/// election switch (`false` = identity-only headers, the pre-r422
+/// baseline the measurement harness A/Bs against).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_inter_frame_generic_gm(
+    input: &Yuv420Frame,
+    seq: &SequenceHeader,
+    base_q_idx: u8,
+    cfg: &InterFrameConfig<'_>,
+    alt_q: &[i16],
+    mf_store: &[SavedMotionField; 8],
+    model: RateModel,
+    global_motion: bool,
 ) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
     if input.width < 8
         || input.height < 8
@@ -849,7 +900,7 @@ pub(crate) fn encode_inter_frame_generic(
     // write pass) and into the frame header (feeding the §5.9.24
     // write arm) — one source of truth on every side, so the stream
     // and the search can never disagree about the model.
-    {
+    if global_motion {
         let hp = fh
             .inter_refs
             .as_ref()
@@ -5390,6 +5441,7 @@ mod tests {
             &[],
             &mf_store,
             RateModel::Twin,
+            true,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
