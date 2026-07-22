@@ -815,9 +815,11 @@ full-leaf twin bits — the last proxy prices inside the residual
 chain are gone. The screen-content ladder opens with the §5.11.46
 **signed-delta V-plane arm election** (UV-palette leaves price both
 V-entry coding arms and commit the exact-bits winner — witnessed on
-tight-V-cluster content). Harness: `tests/pyramid_deep_ab.rs`; two
-streams pinned: `self-pyr-64x64-q60-len17-deep` and
-`self-adaptive-96x80-q60-cut-n13` (corpus 75 total).
+tight-V-cluster content). Harnesses: `tests/pyramid_deep_ab.rs` +
+`tests/screen_content_polish.rs`; three streams pinned:
+`self-pyr-64x64-q60-len17-deep`, `self-adaptive-96x80-q60-cut-n13`
+and `self-kf-64x64-q60-vdelta` — the first self-encoded signed-delta
+V-plane stream on the wire (corpus 76 total).
 
 ### Not yet supported
 
