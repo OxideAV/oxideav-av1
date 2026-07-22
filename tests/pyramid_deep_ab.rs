@@ -310,6 +310,52 @@ fn adaptive_scene_cut_is_isolated() {
     assert_round_trip(&tuned.gop, n, "adaptive cut");
 }
 
+/// Env-gated fixture-generation twin (`OXIDEAV_AV1_PYR_FIXTURE_DIR`):
+/// the two r424 corpus candidates — the 17-frame four-level deep
+/// pyramid and the 13-frame adaptive scene-cut stream — written as
+/// IVF + encoder-reconstruction YUV for external black-box decoder
+/// validation and corpus pinning (fixture bytes + notes staged under
+/// `docs/video/av1/fixtures/`).
+#[test]
+fn pyramid_deep_fixture_dump() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_PYR_FIXTURE_DIR") else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut dump = |name: &str, gop: &EncodedGop| {
+        std::fs::write(format!("{dir}/{name}.ivf"), &gop.ivf_bytes).unwrap();
+        let mut yuv = Vec::new();
+        for rc in &gop.recon {
+            yuv.extend_from_slice(&rc.y);
+            yuv.extend_from_slice(&rc.u);
+            yuv.extend_from_slice(&rc.v);
+        }
+        std::fs::write(format!("{dir}/{name}.yuv"), &yuv).unwrap();
+    };
+    // Four-level deep pyramid: KEY + one L=16 mini-GOP, per-layer q,
+    // primary-reference election live on every coded frame.
+    let frames: Vec<Yuv420Frame> = (0..17)
+        .map(|k| moving_gradient(64, 64, 2 * k, 3 * k, 29))
+        .collect();
+    let deep = encode_pyramid_gop_yuv420_with_q_tuned(&frames, 60, PyramidTuning::default())
+        .expect("deep fixture encode");
+    assert_round_trip(&deep.gop, 17, "fixture deep len17");
+    assert_eq!(deep.chunk_lengths, vec![16]);
+    dump("self-pyr-64x64-q60-len17-deep", &deep.gop);
+    // Adaptive scene-cut stream: mixed pyramid depths + the flat P
+    // step absorbing the cut.
+    let cut_frames = build_content("cut", 96, 80, 13, 3);
+    let adap = encode_adaptive_gop_yuv420_with_q_tuned(&cut_frames, 60, AdaptiveTuning::default())
+        .expect("adaptive fixture encode");
+    assert_round_trip(&adap.gop, 13, "fixture adaptive cut n13");
+    assert!(adap.cuts.iter().any(|&c| c), "cut must trip the probe");
+    dump("self-adaptive-96x80-q60-cut-n13", &adap.gop);
+    eprintln!(
+        "fixture dump: deep chunks {:?}, adaptive chunks {:?} (cuts {:?})",
+        deep.chunk_lengths, adap.chunk_lengths, adap.cuts
+    );
+}
+
 /// Env-gated measurement matrix: baseline (r423 two-level) vs deep
 /// (r424) vs adaptive on identical inputs — per-config bytes + PSNR
 /// CSV, aggregate deltas, and every deep/adaptive stream +

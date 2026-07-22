@@ -115,7 +115,7 @@ use crate::encoder::pixel_driver_dyn::{
     build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq, sb_grid_origins,
     Yuv420Frame,
 };
-use crate::encoder::rate_twin::{score256, RateModel, RateTwin};
+use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
@@ -1013,6 +1013,14 @@ pub(crate) fn residual_tx(
 /// `Quant[]` plus the `TxType` label — forced to `DCT_DCT` when the
 /// winning TU quantises to all-zero (the §5.11.39 `all_zero` arm reads
 /// no `transform_type` symbol and the walker stamps `DCT_DCT`).
+///
+/// r424 — with `fork = Some((tu_fork, tu_ctx))` each candidate's rate
+/// is the EXACT §5.11.39 coefficient chain (the `all_zero` symbol at
+/// its true neighbour context, the `intra_tx_type` S() against the
+/// current adaptive CDFs at the leaf's §8.3.2 `intra_dir` axis, and
+/// the full coefficient tail) priced through the writer's own one-TU
+/// body, and the winner is committed into the running fork; `None`
+/// keeps the magnitude proxy.
 #[allow(clippy::too_many_arguments)]
 fn residual_tx_search_luma(
     input_plane: &[u8],
@@ -1023,7 +1031,8 @@ fn residual_tx_search_luma(
     tx_sz: usize,
     pred: &[u8],
     qp: &QuantizerParams,
-) -> (Vec<i32>, u8) {
+    fork: Option<(&mut TuFork, &TuCtx<'_>)>,
+) -> Result<(Vec<i32>, u8), Error> {
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
     let mut residual = vec![0i64; w * h];
@@ -1039,6 +1048,12 @@ fn residual_tx_search_luma(
         false,
     );
     let lambda = lambda_for(qp);
+    let fork_xy = fork.as_ref().map(|(_, ctx)| {
+        (
+            (col0 as u32 - ctx.base_x) / 4,
+            (row0 as u32 - ctx.base_y) / 4,
+        )
+    });
     let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
     for t in 0..crate::cdf::TX_TYPES {
         let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(false, set, t));
@@ -1058,16 +1073,26 @@ fn residual_tx_search_luma(
                 d += (diff * diff) as u64;
             }
         }
-        let mut rate = 0u64;
-        for &qv in &quant {
-            if qv != 0 {
-                rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
-            }
-        }
-        let score = d + lambda * rate;
         // §5.11.39: an all-zero TU codes no transform_type symbol and
         // the walker stamps DCT_DCT — the label must follow.
         let label = if all_zero { DCT_DCT as u8 } else { t as u8 };
+        // r424 — exact §5.11.39 chain bits through the running fork,
+        // or the pre-r424 magnitude proxy. One scale per call.
+        let score = match (&fork, fork_xy) {
+            (Some((tu_fork, ctx)), Some((fx, fy))) => {
+                let bits256 = tu_fork.price_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
+                score256(d, lambda, bits256)
+            }
+            _ => {
+                let mut rate = 0u64;
+                for &qv in &quant {
+                    if qv != 0 {
+                        rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
+                    }
+                }
+                d + lambda * rate
+            }
+        };
         let improves = match best.as_ref() {
             Some((_, _, _, s)) => score < *s,
             None => true,
@@ -1084,13 +1109,16 @@ fn residual_tx_search_luma(
         }
     }
     let (quant, res_back, label, _) = best.expect("DCT_DCT is always admissible");
+    if let (Some((tu_fork, ctx)), Some((fx, fy))) = (fork, fork_xy) {
+        tu_fork.commit_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
+    }
     for i in 0..h {
         for j in 0..w {
             let p = pred[i * w + j] as i64 + res_back[i * w + j];
             recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
         }
     }
-    (quant, label)
+    Ok((quant, label))
 }
 
 // ---------------------------------------------------------------------
@@ -1358,13 +1386,19 @@ pub(crate) fn encode_leaf_sq(
 ) -> Result<SyntaxBlock, Error> {
     // §5.11.46 palette candidates (r418) — only built when the
     // frame-header gate is open and the block is an eligible square.
-    let (pal_y, pal_uv) = if recon.allow_screen_content_tools {
+    // r424: with twin pricing available the k-means proxy ladder
+    // surfaces its top TWO per-`k` palettes per plane and the exact
+    // full-leaf price (§5.11.46 entries + §5.11.49 tokens + the
+    // palette-predicted §5.11.39 residual chain) settles `k`; the
+    // heuristic path keeps the single proxy pick.
+    let max_pal = if pricing.is_some() { 2 } else { 1 };
+    let (pal_y_list, pal_uv_list) = if recon.allow_screen_content_tools {
         (
-            palette_candidate_y(input, recon, mi_r, mi_c, b_size),
-            palette_candidate_uv(input, recon, mi_r, mi_c, b_size),
+            palette_candidates_y(input, recon, mi_r, mi_c, b_size, max_pal),
+            palette_candidates_uv(input, recon, mi_r, mi_c, b_size, max_pal),
         )
     } else {
-        (None, None)
+        (Vec::new(), Vec::new())
     };
     // §5.11.15: lossless forces TX_4X4; a BLOCK_4X4 block has no
     // tx_depth choice. Otherwise step the luma TX down from
@@ -1390,16 +1424,19 @@ pub(crate) fn encode_leaf_sq(
     };
     // r418: per-TX-shape §5.11.46 palette combinations — every
     // available candidate arm (luma / chroma / both) trials against
-    // the plain intra leaf over the same starting state.
+    // the plain intra leaf over the same starting state (r424: per-`k`
+    // candidates fan out the arms under twin pricing).
     let mut combos: Vec<(Option<&PaletteCandY>, Option<&PaletteCandUv>)> = vec![(None, None)];
-    if let Some(p) = pal_y.as_ref() {
+    for p in &pal_y_list {
         combos.push((Some(p), None));
     }
-    if let Some(p) = pal_uv.as_ref() {
+    for p in &pal_uv_list {
         combos.push((None, Some(p)));
     }
-    if let (Some(a), Some(b)) = (pal_y.as_ref(), pal_uv.as_ref()) {
-        combos.push((Some(a), Some(b)));
+    for a in &pal_y_list {
+        for b in &pal_uv_list {
+            combos.push((Some(a), Some(b)));
+        }
     }
     // r418 §5.11.7 intra-block-copy candidate — ranked on the pristine
     // pre-trial reconstruction (the ladder below restores it between
@@ -1414,7 +1451,9 @@ pub(crate) fn encode_leaf_sq(
         None
     };
     if single_shape && combos.len() == 1 && intrabc_dv.is_none() {
-        let mut leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cands[0], input, recon, None, None);
+        let mut leaf = encode_leaf_with_tx(
+            mi_r, mi_c, b_size, cands[0], input, recon, None, None, pricing,
+        )?;
         // r423 — same §5.11.19 skip-leaf invariant as the ladder
         // below (see `fix_skip_segment`): a segmented-inter-frame
         // caller prices this leaf through the write path next.
@@ -1461,7 +1500,8 @@ pub(crate) fn encode_leaf_sq(
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
         for &(py, puv) in combos.iter() {
-            let mut leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv);
+            let mut leaf =
+                encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv, pricing)?;
             fix_skip_segment(&mut leaf);
             let d = region_distortion(recon, input, mi_r, mi_c, n4);
             let score = score_of(d, rate_of(&leaf, depth as u64)?);
@@ -1478,7 +1518,7 @@ pub(crate) fn encode_leaf_sq(
     // r418 §5.11.7 intra-block-copy trial — one fixed-shape candidate
     // against the same starting state.
     if let Some(dv) = intrabc_dv {
-        let mut leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon);
+        let mut leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon, pricing)?;
         fix_skip_segment(&mut leaf);
         let d = region_distortion(recon, input, mi_r, mi_c, n4);
         let score = score_of(d, rate_of(&leaf, 0)?);
@@ -1517,6 +1557,7 @@ pub(crate) struct PaletteCandY {
 /// carry `2..=PALETTE_COLORS` distinct sample values (r418 scope —
 /// exact-representable blocks; quantised palettes for busier blocks
 /// are a follow-up arc).
+#[cfg(test)]
 fn palette_candidate_y(
     input: &Yuv420Frame,
     recon: &ReconState,
@@ -1524,18 +1565,39 @@ fn palette_candidate_y(
     mi_c: u32,
     b_size: usize,
 ) -> Option<PaletteCandY> {
+    palette_candidates_y(input, recon, mi_r, mi_c, b_size, 1)
+        .into_iter()
+        .next()
+}
+
+/// r424 — up to `max_cands` §5.11.46 luma palette candidates for one
+/// leaf, best proxy score first: the exact-representable arm yields
+/// its single zero-distortion palette; the k-means arm yields the
+/// proxy ladder's top `max_cands` DISTINCT per-`k` palettes so the
+/// caller's exact-bits election (`RateTwin::price_block` over the
+/// fully-coded leaf — §5.11.46 entries, §5.11.49 tokens AND the
+/// palette-predicted §5.11.39 residual chain) settles the `k` choice
+/// the `SSE + λ·entry-cost` proxy used to make alone.
+fn palette_candidates_y(
+    input: &Yuv420Frame,
+    recon: &ReconState,
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    max_cands: usize,
+) -> Vec<PaletteCandY> {
     use crate::cdf::PALETTE_COLORS;
     // §5.11.46 outer gate (square driver shapes only).
     if !matches!(
         b_size,
         BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
     ) {
-        return None;
+        return Vec::new();
     }
     let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
     if row0 + n > recon.height || col0 + n > recon.width {
-        return None;
+        return Vec::new();
     }
     let mut hist = [0u32; 256];
     let mut distinct = 0usize;
@@ -1549,49 +1611,54 @@ fn palette_candidate_y(
         }
     }
     if distinct < 2 {
-        return None;
+        return Vec::new();
     }
-    let colors: Vec<u16> = if distinct <= PALETTE_COLORS {
+    let color_lists: Vec<Vec<u16>> = if distinct <= PALETTE_COLORS {
         // Exact-representable block: the distinct values ARE the
         // palette (zero-distortion prediction).
-        (0..256u16).filter(|&c| hist[c as usize] > 0).collect()
+        vec![(0..256u16).filter(|&c| hist[c as usize] > 0).collect()]
     } else if !recon.lossless && distinct <= kmeans_distinct_bound(n * n) {
         // r418 colour clustering: weighted 1-D k-means over the value
         // histogram with a size-RD pick of `k` (§5.11.46
         // `palette_size` election — each extra colour costs entry
-        // bits, each dropped colour costs clustering SSE).
-        kmeans_palette_1d(&hist, lambda_for(&recon.qp))?
+        // bits, each dropped colour costs clustering SSE). r424: the
+        // proxy ladder now surfaces its top candidates for the exact
+        // election.
+        kmeans_palette_1d_candidates(&hist, lambda_for(&recon.qp), max_cands)
     } else {
-        return None;
+        return Vec::new();
     };
-    if colors.len() < 2 {
-        return None;
-    }
-    // Nearest-colour LUT over the present values (identity on the
-    // exact arm).
-    let mut lut = [0u8; 256];
-    for (c, &cnt) in hist.iter().enumerate() {
-        if cnt > 0 {
-            let mut best = 0usize;
-            let mut best_d = u32::MAX;
-            for (idx, &pc) in colors.iter().enumerate() {
-                let d = (c as i32 - i32::from(pc)).unsigned_abs();
-                if d < best_d {
-                    best_d = d;
-                    best = idx;
+    color_lists
+        .into_iter()
+        .filter(|colors| colors.len() >= 2)
+        .map(|colors| {
+            // Nearest-colour LUT over the present values (identity on
+            // the exact arm).
+            let mut lut = [0u8; 256];
+            for (c, &cnt) in hist.iter().enumerate() {
+                if cnt > 0 {
+                    let mut best = 0usize;
+                    let mut best_d = u32::MAX;
+                    for (idx, &pc) in colors.iter().enumerate() {
+                        let d = (c as i32 - i32::from(pc)).unsigned_abs();
+                        if d < best_d {
+                            best_d = d;
+                            best = idx;
+                        }
+                    }
+                    lut[c] = best as u8;
                 }
             }
-            lut[c] = best as u8;
-        }
-    }
-    let mut map = vec![0u8; n * n];
-    for i in 0..n {
-        let row = &input.y[(row0 + i) * recon.width + col0..][..n];
-        for (j, &v) in row.iter().enumerate() {
-            map[i * n + j] = lut[v as usize];
-        }
-    }
-    Some(PaletteCandY { colors, map })
+            let mut map = vec![0u8; n * n];
+            for i in 0..n {
+                let row = &input.y[(row0 + i) * recon.width + col0..][..n];
+                for (j, &v) in row.iter().enumerate() {
+                    map[i * n + j] = lut[v as usize];
+                }
+            }
+            PaletteCandY { colors, map }
+        })
+        .collect()
 }
 
 /// Distinct-value bound above which the k-means arm is not attempted
@@ -1610,19 +1677,20 @@ fn kmeans_distinct_bound(samples: usize) -> usize {
 }
 
 /// Weighted 1-D k-means (Lloyd) over a value histogram with a
-/// size-RD pick of `k ∈ 2..=PALETTE_COLORS`: for each `k`, quantile
-/// seeding + 8 Lloyd rounds, scored as `SSE + λ · (10 + 8k)` (the
-/// [`leaf_rate`] palette entry cost); the winner's rounded centroids
-/// are returned strictly ascending (merged duplicates may shrink the
-/// list — `None` when fewer than 2 survive).
-fn kmeans_palette_1d(hist: &[u32; 256], lambda: u64) -> Option<Vec<u16>> {
+/// size-RD proxy score of `k ∈ 2..=PALETTE_COLORS`: for each `k`,
+/// quantile seeding + 8 Lloyd rounds, scored as `SSE + λ · (10 + 8k)`
+/// (the [`leaf_rate`] palette entry cost); every `k`'s converged
+/// (rounded, deduped, strictly-ascending) palette is returned
+/// best-first, truncated to `max_cands` DISTINCT lists — r424: the
+/// caller's exact-bits election picks among them.
+fn kmeans_palette_1d_candidates(hist: &[u32; 256], lambda: u64, max_cands: usize) -> Vec<Vec<u16>> {
     use crate::cdf::PALETTE_COLORS;
     let values: Vec<(u32, u32)> = (0..256u32)
         .filter(|&c| hist[c as usize] > 0)
         .map(|c| (c, hist[c as usize]))
         .collect();
     let total: u64 = values.iter().map(|&(_, w)| u64::from(w)).sum();
-    let mut best: Option<(Vec<u16>, u64)> = None;
+    let mut scored: Vec<(Vec<u16>, u64)> = Vec::new();
     for k in 2..=PALETTE_COLORS {
         // Quantile seeding over the cumulative distribution.
         let mut centroids: Vec<f64> = Vec::with_capacity(k);
@@ -1680,11 +1748,13 @@ fn kmeans_palette_1d(hist: &[u32; 256], lambda: u64) -> Option<Vec<u16>> {
             sse += d * d * u64::from(w);
         }
         let score = sse + lambda * (10 + 8 * cols.len() as u64);
-        if best.as_ref().map_or(true, |&(_, s)| score < s) {
-            best = Some((cols, score));
+        if !scored.iter().any(|(c, _)| *c == cols) {
+            scored.push((cols, score));
         }
     }
-    best.map(|(cols, _)| cols)
+    scored.sort_by_key(|&(_, s)| s);
+    scored.truncate(max_cands);
+    scored.into_iter().map(|(cols, _)| cols).collect()
 }
 
 /// §5.11.46 chroma palette commitment candidate for one square leaf —
@@ -1701,18 +1771,19 @@ pub(crate) struct PaletteCandUv {
     pub(crate) map: Vec<u8>,
 }
 
-/// Build the §5.11.46 chroma palette candidate for one square leaf,
-/// or `None` when ineligible / not exactly representable. Same
-/// eligibility as [`palette_candidate_y`] with the distinct count
-/// taken over joint (U, V) sample PAIRS of the subsampled block —
-/// §5.11.49 codes ONE shared `ColorMapUV` for both chroma planes.
-fn palette_candidate_uv(
+/// r424 — up to `max_cands` §5.11.46 chroma palette candidates, best
+/// proxy score first (the chroma twin of [`palette_candidates_y`]):
+/// the distinct count is taken over joint (U, V) sample PAIRS of the
+/// subsampled block — §5.11.49 codes ONE shared `ColorMapUV` for both
+/// chroma planes.
+fn palette_candidates_uv(
     input: &Yuv420Frame,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-) -> Option<PaletteCandUv> {
+    max_cands: usize,
+) -> Vec<PaletteCandUv> {
     use crate::cdf::PALETTE_COLORS;
     // §5.11.46 outer gate (square driver shapes only). Every square
     // `>= BLOCK_8X8` leaf has chroma under 4:2:0.
@@ -1720,12 +1791,12 @@ fn palette_candidate_uv(
         b_size,
         BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
     ) {
-        return None;
+        return Vec::new();
     }
     let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
     if row0 + n > recon.height || col0 + n > recon.width {
-        return None;
+        return Vec::new();
     }
     let cn = n / 2;
     let (crow0, ccol0) = (row0 / 2, col0 / 2);
@@ -1739,73 +1810,79 @@ fn palette_candidate_uv(
             let p = (u16::from(input.u[off]), u16::from(input.v[off]));
             *weights.entry(p).or_insert(0) += 1;
             if weights.len() > kmeans_distinct_bound(cn * cn).max(PALETTE_COLORS) {
-                return None;
+                return Vec::new();
             }
         }
     }
     if weights.len() < 2 {
-        return None;
+        return Vec::new();
     }
-    let mut pairs: Vec<(u16, u16)> = if weights.len() <= PALETTE_COLORS {
+    let pair_lists: Vec<Vec<(u16, u16)>> = if weights.len() <= PALETTE_COLORS {
         // Exact-representable chroma block.
-        weights.keys().copied().collect()
+        vec![weights.keys().copied().collect()]
     } else if !recon.lossless {
         // r418 colour clustering: weighted 2-D k-means over the joint
         // (U, V) pairs with the size-RD pick of `k` (each pair codes
         // BOTH a U and a V entry — double the entry cost of the luma
-        // arm).
-        kmeans_palette_2d(&weights, lambda_for(&recon.qp))?
+        // arm). r424: the proxy ladder surfaces its top candidates
+        // for the exact election.
+        kmeans_palette_2d_candidates(&weights, lambda_for(&recon.qp), max_cands)
     } else {
-        return None;
+        return Vec::new();
     };
-    if pairs.len() < 2 {
-        return None;
-    }
-    // §5.11.46 canonical order: U non-strictly ascending (ties broken
-    // by V for determinism — pair order among equal U values is
-    // unconstrained by the entry coding).
-    pairs.sort_unstable();
-    let mut map = vec![0u8; cn * cn];
-    for i in 0..cn {
-        for j in 0..cn {
-            let off = (crow0 + i) * cw + (ccol0 + j);
-            let p = (i64::from(input.u[off]), i64::from(input.v[off]));
-            // Nearest pair (exact arm: the pair itself).
-            let mut bi = 0usize;
-            let mut bd = i64::MAX;
-            for (idx, &(pu, pv)) in pairs.iter().enumerate() {
-                let d = (p.0 - i64::from(pu)).pow(2) + (p.1 - i64::from(pv)).pow(2);
-                if d < bd {
-                    bd = d;
-                    bi = idx;
+    pair_lists
+        .into_iter()
+        .filter(|pairs| pairs.len() >= 2)
+        .map(|mut pairs| {
+            // §5.11.46 canonical order: U non-strictly ascending
+            // (ties broken by V for determinism — pair order among
+            // equal U values is unconstrained by the entry coding).
+            pairs.sort_unstable();
+            let mut map = vec![0u8; cn * cn];
+            for i in 0..cn {
+                for j in 0..cn {
+                    let off = (crow0 + i) * cw + (ccol0 + j);
+                    let p = (i64::from(input.u[off]), i64::from(input.v[off]));
+                    // Nearest pair (exact arm: the pair itself).
+                    let mut bi = 0usize;
+                    let mut bd = i64::MAX;
+                    for (idx, &(pu, pv)) in pairs.iter().enumerate() {
+                        let d = (p.0 - i64::from(pu)).pow(2) + (p.1 - i64::from(pv)).pow(2);
+                        if d < bd {
+                            bd = d;
+                            bi = idx;
+                        }
+                    }
+                    map[i * cn + j] = bi as u8;
                 }
             }
-            map[i * cn + j] = bi as u8;
-        }
-    }
-    Some(PaletteCandUv {
-        colors_u: pairs.iter().map(|&(u, _)| u).collect(),
-        colors_v: pairs.iter().map(|&(_, v)| v).collect(),
-        map,
-    })
+            PaletteCandUv {
+                colors_u: pairs.iter().map(|&(u, _)| u).collect(),
+                colors_v: pairs.iter().map(|&(_, v)| v).collect(),
+                map,
+            }
+        })
+        .collect()
 }
 
 /// Weighted 2-D k-means (Lloyd) over joint (U, V) pair weights with a
-/// size-RD pick of `k ∈ 2..=PALETTE_COLORS` — the chroma twin of
-/// [`kmeans_palette_1d`] (entry cost doubled: each §5.11.46 UV pair
-/// codes a U and a V entry). Returns the winner's rounded centroid
-/// pairs (deduped; `None` when fewer than 2 survive).
-fn kmeans_palette_2d(
+/// size-RD pick of `k ∈ 2..=PALETTE_COLORS` — the chroma twin of the
+/// 1-D ladder (entry cost doubled: each §5.11.46 UV pair codes a U
+/// and a V entry). r424: returns the proxy ladder's top `max_cands`
+/// DISTINCT per-`k` centroid-pair lists, best first — the caller's
+/// exact-bits election settles the final `k`.
+fn kmeans_palette_2d_candidates(
     weights: &std::collections::BTreeMap<(u16, u16), u32>,
     lambda: u64,
-) -> Option<Vec<(u16, u16)>> {
+    max_cands: usize,
+) -> Vec<Vec<(u16, u16)>> {
     use crate::cdf::PALETTE_COLORS;
     let values: Vec<((f64, f64), u32)> = weights
         .iter()
         .map(|(&(u, v), &w)| ((f64::from(u), f64::from(v)), w))
         .collect();
     let total: u64 = values.iter().map(|&(_, w)| u64::from(w)).sum();
-    let mut best: Option<(Vec<(u16, u16)>, u64)> = None;
+    let mut scored: Vec<(Vec<(u16, u16)>, u64)> = Vec::new();
     for k in 2..=PALETTE_COLORS {
         // Seed along the weighted BTreeMap (U-major) order.
         let mut centroids: Vec<(f64, f64)> = Vec::with_capacity(k);
@@ -1870,11 +1947,13 @@ fn kmeans_palette_2d(
             sse += d * u64::from(w);
         }
         let score = sse + lambda * (10 + 16 * cols.len() as u64);
-        if best.as_ref().map_or(true, |&(_, s)| score < s) {
-            best = Some((cols, score));
+        if !scored.iter().any(|(c, _)| *c == cols) {
+            scored.push((cols, score));
         }
     }
-    best.map(|(cols, _)| cols)
+    scored.sort_by_key(|&(_, s)| s);
+    scored.truncate(max_cands);
+    scored.into_iter().map(|(cols, _)| cols).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -2064,13 +2143,34 @@ fn encode_intrabc_leaf(
     dv: (i32, i32),
     input: &Yuv420Frame,
     recon: &mut ReconState,
-) -> SyntaxBlock {
+    // r424 — running per-TU twin fork threading (the intrabc arm
+    // prices the §5.11.48 INTER-set candidates exactly like an inter
+    // leaf: `is_inter = 1` on the residual layout).
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
     use crate::cdf::inter_tx_type_set;
     let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
     let width = recon.width;
     let lossless = recon.lossless;
     let qp = recon.qp;
+    let mut tu_fork = match (&pricing, lossless) {
+        (Some((twin, _)), false) => Some(twin.tu_fork()),
+        _ => None,
+    };
+    let tu_ctx = pricing.map(|(_, params)| TuCtx {
+        params,
+        mi_row: mi_r,
+        mi_col: mi_c,
+        mi_size: b_size,
+        base_x: col0 as u32,
+        base_y: row0 as u32,
+        is_inter: true,
+        segment_id: 0,
+        y_mode: 0,
+        use_filter_intra: false,
+        filter_intra_mode: None,
+    });
     let (dv_r, dv_c) = dv;
     let (src_row0, src_col0) = ((row0 as i32 + dv_r) as usize, (col0 as i32 + dv_c) as usize);
 
@@ -2125,7 +2225,11 @@ fn encode_intrabc_leaf(
                     luma_tx,
                     &pred,
                     &qp,
-                )
+                    match (&mut tu_fork, &tu_ctx) {
+                        (Some(f), Some(c)) => Some((f, c)),
+                        _ => None,
+                    },
+                )?
             };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
             residual_quant.push(q);
@@ -2232,7 +2336,7 @@ fn encode_intrabc_leaf(
             0,
         )];
     }
-    block
+    Ok(block)
 }
 
 /// One-shape leaf encode at a fixed luma TX size — see
@@ -2255,7 +2359,11 @@ pub(crate) fn encode_leaf_with_tx(
     recon: &mut ReconState,
     palette_y: Option<&PaletteCandY>,
     palette_uv: Option<&PaletteCandUv>,
-) -> SyntaxBlock {
+    // r424 — `Some` threads a running per-TU twin fork through the
+    // luma residual chain (exact §5.11.47/§5.11.39 candidate pricing
+    // — see [`TuFork`]); `None` keeps the magnitude proxy.
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let n = n4 * 4;
     let row0 = (mi_r as usize) * 4;
@@ -2272,6 +2380,25 @@ pub(crate) fn encode_leaf_with_tx(
         Some(_) => (DC_PRED as u8, 0i8, None),
         None => pick_y_mode(recon, input, row0, col0, n),
     };
+    // r424 — the running per-TU fork (lossy arm only), armed with the
+    // leaf's §8.3.2 `intra_dir` inputs.
+    let mut tu_fork = match (&pricing, lossless) {
+        (Some((twin, _)), false) => Some(twin.tu_fork()),
+        _ => None,
+    };
+    let tu_ctx = pricing.map(|(_, params)| TuCtx {
+        params,
+        mi_row: mi_r,
+        mi_col: mi_c,
+        mi_size: b_size,
+        base_x: col0 as u32,
+        base_y: row0 as u32,
+        is_inter: false,
+        segment_id: 0,
+        y_mode,
+        use_filter_intra: filter_intra_mode.is_some(),
+        filter_intra_mode,
+    });
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
     let mut luma_tx_types: Vec<u8> = Vec::new();
@@ -2324,8 +2451,22 @@ pub(crate) fn encode_leaf_with_tx(
                 )
             } else {
                 // r410: §5.11.47 per-TU luma transform-type RD search
-                // over the §5.11.48 intra set for this TX size.
-                residual_tx_search_luma(&input.y, &mut recon.y, width, tr, tc, luma_tx, &pred, &qp)
+                // over the §5.11.48 intra set for this TX size (r424:
+                // exact chain pricing through the running fork).
+                residual_tx_search_luma(
+                    &input.y,
+                    &mut recon.y,
+                    width,
+                    tr,
+                    tc,
+                    luma_tx,
+                    &pred,
+                    &qp,
+                    match (&mut tu_fork, &tu_ctx) {
+                        (Some(f), Some(c)) => Some((f, c)),
+                        _ => None,
+                    },
+                )?
             };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
             residual_quant.push(q);
@@ -2507,7 +2648,7 @@ pub(crate) fn encode_leaf_with_tx(
         palette.color_map_uv = p.map.clone();
     }
 
-    SyntaxBlock {
+    Ok(SyntaxBlock {
         skip,
         segment_id: 0,
         cdef_idx: 0,
@@ -2536,7 +2677,7 @@ pub(crate) fn encode_leaf_with_tx(
         residual_tx_type: luma_tx_types,
         var_tx_trees: Vec::new(),
         inter: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------

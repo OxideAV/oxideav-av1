@@ -324,4 +324,151 @@ impl RateTwin {
     pub fn matches(&self, cdfs: &TileCdfContext, writer: &SymbolWriter) -> bool {
         self.range == writer.range() && self.cdfs == *cdfs
     }
+
+    /// r424 — fork the twin's state into a running per-TU pricing
+    /// fork for one leaf's residual chain (see [`TuFork`]).
+    pub fn tu_fork(&self) -> TuFork {
+        TuFork {
+            cdfs: self.cdfs.clone(),
+            state: self.state.clone(),
+            range: self.range,
+            disable_cdf_update: self.disable_cdf_update,
+        }
+    }
+}
+
+/// r424 — the running per-TU twin fork for one leaf's residual chain:
+/// snapshot the leaf-entry twin ([`RateTwin::tu_fork`]), then price
+/// each §5.11.47 tx-type candidate's ACTUAL §5.11.39 coefficient
+/// chain (the `all_zero` symbol at its true neighbour context, the
+/// `inter_tx_type` / `intra_tx_type` S() against the CURRENT adaptive
+/// CDFs, `eob_pt` / `coeff_base` / `coeff_br` / `dc_sign` / golomb
+/// tails) through the writer's own one-TU body
+/// ([`write_single_transform_block`] — the same
+/// `write_transform_block` the emitting pass runs), and COMMIT the
+/// winner so the next TU's candidates see its CDF adaptation and
+/// §6.10.2 level-context stamps exactly as the emitting pass will.
+///
+/// Exactness note: the fork prices luma TUs from the leaf-entry state
+/// — the block's mode-info prefix (coded between the snapshot and the
+/// first TU in the real stream) touches no coefficient CDF row and no
+/// level-context cell, and chroma TUs (coded after every luma TU of a
+/// ≤ 64-sample-wide block) touch only the chroma context rows
+/// (disjoint `txb_skip` context indices, `ptype = 1` tables), so the
+/// per-candidate prices differ from the true in-stream costs only by
+/// the shared §8.2.6 range fraction — identical across the candidates
+/// of one election, which is all an argmin consumes.
+pub(crate) struct TuFork {
+    cdfs: TileCdfContext,
+    state: PartitionSyntaxWriter,
+    range: u32,
+    disable_cdf_update: bool,
+}
+
+/// The leaf-constant inputs of one [`TuFork`] pricing/commit call —
+/// everything the §5.11.47 / §5.11.39 one-TU write reads besides the
+/// candidate itself.
+pub(crate) struct TuCtx<'a> {
+    pub params: &'a SyntaxFrameParams,
+    /// Leaf position / size (mi units + §3 block-size ordinal).
+    pub mi_row: u32,
+    pub mi_col: u32,
+    pub mi_size: usize,
+    /// Leaf luma origin in pixels (`MiCol * MI_SIZE`, `MiRow * MI_SIZE`).
+    pub base_x: u32,
+    pub base_y: u32,
+    /// §5.11.47 arm selector (`inter_tx_type` vs `intra_tx_type`).
+    pub is_inter: bool,
+    /// §5.11.47 quantiser-guard segment (`get_qindex( 1, segment_id )`).
+    pub segment_id: u8,
+    /// §8.3.2 `intra_dir` axis inputs (intra arm only).
+    pub y_mode: u8,
+    pub use_filter_intra: bool,
+    pub filter_intra_mode: Option<u8>,
+}
+
+impl TuCtx<'_> {
+    /// The facade [`SyntaxBlock`] carrying one TU's commitment at
+    /// vector index 0.
+    fn facade(&self, quant: &[i32], tx_type: u8) -> SyntaxBlock {
+        let mut b = SyntaxBlock::skip_leaf(self.y_mode, None);
+        b.segment_id = self.segment_id;
+        b.use_filter_intra = u8::from(self.use_filter_intra);
+        b.filter_intra_mode = self.filter_intra_mode;
+        b.residual_quant = vec![quant.to_vec()];
+        b.residual_tx_type = vec![tx_type];
+        b
+    }
+}
+
+impl TuFork {
+    /// Exact price (1/256-bit units) of one LUMA TU candidate —
+    /// `Quant[]` array + committed §5.11.47 `TxType` at the TU whose
+    /// origin is `(x, y)` in 4-sample units from the leaf's luma
+    /// origin — against this fork's CURRENT state. No commit.
+    pub fn price_luma_tu(
+        &self,
+        ctx: &TuCtx<'_>,
+        tx_sz: usize,
+        x: u32,
+        y: u32,
+        quant: &[i32],
+        tx_type: u8,
+    ) -> Result<u64, Error> {
+        let mut cdfs = self.cdfs.clone();
+        let mut state = self.state.clone();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        crate::encoder::partition_tree::write_single_transform_block(
+            &mut w,
+            &mut cdfs,
+            &mut state,
+            &ctx.facade(quant, tx_type),
+            ctx.params,
+            /* plane = */ 0,
+            ctx.base_x,
+            ctx.base_y,
+            tx_sz,
+            x,
+            y,
+            ctx.mi_row,
+            ctx.mi_col,
+            ctx.mi_size,
+            ctx.is_inter,
+        )?;
+        Ok(w.cost_bits256())
+    }
+
+    /// Commit the elected LUMA TU into the fork — advancing the CDFs,
+    /// the §6.10.2 level-context mirror and the coder range exactly
+    /// as the emitting pass will for the same TU.
+    pub fn commit_luma_tu(
+        &mut self,
+        ctx: &TuCtx<'_>,
+        tx_sz: usize,
+        x: u32,
+        y: u32,
+        quant: &[i32],
+        tx_type: u8,
+    ) -> Result<(), Error> {
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        crate::encoder::partition_tree::write_single_transform_block(
+            &mut w,
+            &mut self.cdfs,
+            &mut self.state,
+            &ctx.facade(quant, tx_type),
+            ctx.params,
+            /* plane = */ 0,
+            ctx.base_x,
+            ctx.base_y,
+            tx_sz,
+            x,
+            y,
+            ctx.mi_row,
+            ctx.mi_col,
+            ctx.mi_size,
+            ctx.is_inter,
+        )?;
+        self.range = w.range();
+        Ok(())
+    }
 }

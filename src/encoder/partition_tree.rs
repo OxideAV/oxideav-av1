@@ -3958,6 +3958,59 @@ fn write_transform_block(
     Ok(())
 }
 
+/// r424 — one-TU entry for the search-side TU fork
+/// ([`crate::encoder::rate_twin::TuFork`]): runs the private
+/// [`write_transform_block`] body — the §5.11.39 `all_zero` symbol,
+/// the §5.11.47 `transform_type()` mirror, the §5.11.40 derivation
+/// and the gate-open coefficient emission, with every context read
+/// and mirror stamp — for exactly one TU whose `Quant[]` /
+/// committed-`TxType` sit at index 0 of the facade `block`'s
+/// `residual_quant` / `residual_tx_type` vectors. The caller owns the
+/// cursor discipline (one call = one TU).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_single_transform_block(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    params: &SyntaxFrameParams,
+    plane: u8,
+    base_x: u32,
+    base_y: u32,
+    tx_sz: usize,
+    x: u32,
+    y: u32,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: usize,
+    is_inter: bool,
+) -> Result<(), Error> {
+    let mut tu_idx = 0usize;
+    let mut luma_tx_idx = 0usize;
+    write_transform_block(
+        writer,
+        cdfs,
+        state,
+        block,
+        params,
+        plane,
+        base_x,
+        base_y,
+        tx_sz,
+        x,
+        y,
+        /* sub_x = */ 0,
+        /* sub_y = */ 0,
+        mi_row,
+        mi_col,
+        mi_size,
+        /* lossless = */ false,
+        is_inter,
+        &mut tu_idx,
+        &mut luma_tx_idx,
+    )
+}
+
 /// §5.11.36 `transform_tree( startX, startY, w, h )` write twin — the
 /// bit-emitting mirror of the decode walker's §5.11.36 recursion
 /// (`residual_transform_tree`), invoked from [`write_residual`] on the

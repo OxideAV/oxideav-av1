@@ -83,7 +83,7 @@ use crate::encoder::partition_tree::{
 use crate::encoder::pixel_driver_dyn::{
     build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
 };
-use crate::encoder::rate_twin::{score256, RateModel, RateTwin};
+use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
 use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
@@ -3870,6 +3870,7 @@ fn encode_inter_leaf_modes(
             0,
             segment_id,
             &seg_qp,
+            pricing,
         );
     }
 
@@ -3921,6 +3922,7 @@ fn encode_inter_leaf_modes(
             depth,
             segment_id,
             &seg_qp,
+            pricing,
         )?;
         let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
         // r421 — exact twin bits (the §5.11.17 depth symbols are part
@@ -3979,6 +3981,14 @@ fn transform_tree_tu_order(
 /// plane. The returned label is forced to `DCT_DCT` when the winning
 /// TU quantises to all-zero (the §5.11.39 `all_zero` arm reads no
 /// `inter_tx_type` symbol and the walker stamps `DCT_DCT`).
+///
+/// r424 — with `fork = Some((tu_fork, tu_ctx))` each candidate's rate
+/// is the EXACT §5.11.39 coefficient chain (priced through the
+/// writer's own one-TU body against the fork's running CDF /
+/// level-context state — see [`TuFork`]) and the winner is COMMITTED
+/// into the fork so the leaf's next TU prices against the true
+/// post-TU state; `None` keeps the magnitude proxy (the pre-r424
+/// heuristic and the `RateModel::Heuristic` baseline).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_search_luma_inter(
     input_plane: &[u8],
@@ -3989,7 +3999,8 @@ pub(crate) fn residual_tx_search_luma_inter(
     tx_sz: usize,
     pred: &[u8],
     qp: &QuantizerParams,
-) -> (Vec<i32>, u8) {
+    fork: Option<(&mut TuFork, &TuCtx<'_>)>,
+) -> Result<(Vec<i32>, u8), Error> {
     use crate::cdf::{dequantize_step1, is_tx_type_in_set, tx_size_sqr_index, TX_SIZE_SQR_UP};
     use crate::encoder::forward_quantize::forward_quantize;
     use crate::encoder::forward_transform_2d::forward_transform_2d;
@@ -4011,6 +4022,14 @@ pub(crate) fn residual_tx_search_luma_inter(
         false,
     );
     let lambda = lambda_for(qp);
+    // r424 — the fork prices the TU at its block-relative 4-sample
+    // position; the winner is committed after the election.
+    let fork_xy = fork.as_ref().map(|(_, ctx)| {
+        (
+            (col0 as u32 - ctx.base_x) / 4,
+            (row0 as u32 - ctx.base_y) / 4,
+        )
+    });
     let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
     for t in 0..crate::cdf::TX_TYPES {
         let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(true, set, t));
@@ -4034,14 +4053,24 @@ pub(crate) fn residual_tx_search_luma_inter(
                 d += (diff * diff) as u64;
             }
         }
-        let mut rate = 0u64;
-        for &qv in &quant {
-            if qv != 0 {
-                rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
-            }
-        }
-        let score = d + lambda * rate;
         let label = if all_zero { DCT_DCT as u8 } else { t as u8 };
+        // r424 — exact §5.11.39 chain bits through the running fork,
+        // or the pre-r424 magnitude proxy. One scale per call.
+        let score = match (&fork, fork_xy) {
+            (Some((tu_fork, ctx)), Some((fx, fy))) => {
+                let bits256 = tu_fork.price_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
+                crate::encoder::rate_twin::score256(d, lambda, bits256)
+            }
+            _ => {
+                let mut rate = 0u64;
+                for &qv in &quant {
+                    if qv != 0 {
+                        rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
+                    }
+                }
+                d + lambda * rate
+            }
+        };
         let improves = match best.as_ref() {
             Some((_, _, _, s)) => score < *s,
             None => true,
@@ -4056,6 +4085,11 @@ pub(crate) fn residual_tx_search_luma_inter(
         }
     }
     let (quant, res_back, label, _) = best.expect("DCT_DCT is always admissible");
+    // r424 — commit the elected TU into the fork: the next TU's
+    // candidates price against the true post-TU CDF / context state.
+    if let (Some((tu_fork, ctx)), Some((fx, fy))) = (fork, fork_xy) {
+        tu_fork.commit_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
+    }
     // NOTE: the winning trial's `label` may be DCT_DCT (all-zero) even
     // though `res_back` came from a FLIPADST trial — but an all-zero
     // TU's residual is identically zero, so the remap is inert there;
@@ -4069,7 +4103,7 @@ pub(crate) fn residual_tx_search_luma_inter(
             recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
         }
     }
-    (quant, label)
+    Ok((quant, label))
 }
 
 /// §5.11.17 uniform split-decision tree of the given depth rooted at
@@ -4118,6 +4152,10 @@ fn encode_inter_leaf_residual(
     depth: u32,
     segment_id: u8,
     seg_qp: &QuantizerParams,
+    // r424 — `Some` threads a running per-TU twin fork through the
+    // luma residual chain: each §5.11.47 tx-type candidate prices its
+    // ACTUAL §5.11.39 coefficient chain (see [`TuFork`]).
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
     let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
@@ -4127,6 +4165,26 @@ fn encode_inter_leaf_residual(
     let width = recon.width;
     let lossless = recon.lossless;
     let qp = *seg_qp;
+    // r424 — the running per-TU fork (lossy arm only: the lossless
+    // §5.11.47 guard never codes a tx-type symbol and the TU chain is
+    // not searched).
+    let mut tu_fork = match (&pricing, lossless) {
+        (Some((twin, _)), false) => Some(twin.tu_fork()),
+        _ => None,
+    };
+    let tu_ctx = pricing.map(|(_, params)| TuCtx {
+        params,
+        mi_row: mi_r,
+        mi_col: mi_c,
+        mi_size: b_size,
+        base_x: col0 as u32,
+        base_y: row0 as u32,
+        is_inter: true,
+        segment_id,
+        y_mode: 0,
+        use_filter_intra: false,
+        filter_intra_mode: None,
+    });
 
     // --- Luma residual over the §5.11.36 TU walk. ---
     let luma_tx = if lossless {
@@ -4191,7 +4249,8 @@ fn encode_inter_leaf_residual(
             )
         } else {
             // r411: §5.11.47 per-TU luma transform-type RD search over
-            // the §5.11.48 INTER set for this TX size.
+            // the §5.11.48 INTER set for this TX size (r424: exact
+            // chain pricing through the running fork when priced).
             residual_tx_search_luma_inter(
                 &input.y,
                 &mut recon.y,
@@ -4201,7 +4260,11 @@ fn encode_inter_leaf_residual(
                 luma_tx,
                 &pred,
                 &qp,
-            )
+                match (&mut tu_fork, &tu_ctx) {
+                    (Some(f), Some(c)) => Some((f, c)),
+                    _ => None,
+                },
+            )?
         };
         tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
         residual_quant.push(q);
