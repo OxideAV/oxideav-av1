@@ -889,13 +889,30 @@ reference decoders: `self-gop-64x64-q60-mixll-typing` and
 `self-gop-96x80-q160-mixll-bigpanel` (mi-unaligned 43×30 panel,
 su(1+8) `-160` delta; corpus 80 total).
 
+### Segmentation inter overrides: SKIP / GLOBALMV / REF_FRAME pinned (r426)
+
+r426 closes ladder item 8. The encoder codes all three §5.9.14
+inter-override features: the writer derives every
+§5.11.10/§5.11.11/§5.11.20/§5.11.23/§5.11.25 gate per BLOCK from the
+committed segment id (a frame-level any-segment collapse in the
+decode-side intra prefix — which mis-forced `skip = 1` on mixed
+tables — is fixed with it), `SegIdPreSkip = 1` moves segment-id
+coding to the pre-skip arm on every block, and three twin-priced
+per-leaf trials elect the segments (pure-derivation SKIP blocks,
+mode/ref-silent GLOBALMV blocks over the full depth ladder,
+REF_FRAME re-labels of single-LAST winners). Three streams pinned
+byte-identical in THREE independent reference decoders —
+`self-gop-96x80-q80-seg-skip`, `self-gop-96x80-q72-seg-globalmv`,
+`self-gop-64x64-q60-seg-refframe` (corpus 83) — closing the
+decoder's last unpinned §5.11 segmentation paths. The GLOBALMV work
+surfaced and fixed a latent r422 bug: §7.10.2.1 stores TRANSLATION
+models in (row, col) order while the affine projection is x-first —
+the estimator packed x-first for every class, so TRANSLATION
+GLOBALMV predictions ran on a swapped vector (conformant, never
+elected).
+
 ### Not yet supported
 
-- `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
-  overrides are implemented per §5.11.14/§5.11.20/§5.11.25 and
-  unit-tested, but no conformance stream pins them — the black-box
-  encoder's CLI cannot signal those features (`SEG_LVL_ALT_Q` streams
-  are pinned byte-exact).
 - The historical intra `encode_av1` mirror paths emit non-conformant
   streams (kept for their bit-exact self round-trip through
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
