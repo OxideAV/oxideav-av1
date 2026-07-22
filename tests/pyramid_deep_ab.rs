@@ -322,7 +322,7 @@ fn pyramid_deep_fixture_dump() {
         return;
     };
     std::fs::create_dir_all(&dir).unwrap();
-    let mut dump = |name: &str, gop: &EncodedGop| {
+    let dump = |name: &str, gop: &EncodedGop| {
         std::fs::write(format!("{dir}/{name}.ivf"), &gop.ivf_bytes).unwrap();
         let mut yuv = Vec::new();
         for rc in &gop.recon {
@@ -351,8 +351,13 @@ fn pyramid_deep_fixture_dump() {
     assert!(adap.cuts.iter().any(|&c| c), "cut must trip the probe");
     dump("self-adaptive-96x80-q60-cut-n13", &adap.gop);
     eprintln!(
-        "fixture dump: deep chunks {:?}, adaptive chunks {:?} (cuts {:?})",
-        deep.chunk_lengths, adap.chunk_lengths, adap.cuts
+        "fixture dump: deep chunks {:?}, adaptive chunks {:?} (cuts {:?})\n\
+         deep primaries {:?}\nadaptive primaries {:?}",
+        deep.chunk_lengths,
+        adap.chunk_lengths,
+        adap.cuts,
+        deep.primary_elections,
+        adap.primary_elections
     );
 }
 

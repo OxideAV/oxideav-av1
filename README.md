@@ -776,6 +776,46 @@ hard-erroring segmented encodes). Witnesses + A/B harness in
 `self-gop-128x64-q72-seg-temporal-moving` and
 `self-gop-192x128-q72-seg-temporal-static` (corpus 73 total).
 
+### Deep B-pyramids, adaptive mini-GOPs, per-TU twin residue (r424)
+
+r424 deepens the GOP structure end-to-end. The **B-pyramid planner**
+generalizes from the fixed two-level mini-GOP to a recursive dyadic
+pyramid of arbitrary depth (`encode_pyramid_gop_yuv420*` now codes
+mini-GOPs up to 16 frames = four temporal layers): the ALT anchor
+codes first decoded-not-shown, midpoints recurse level by level, and
+shown non-reference B leaves bottom out gap-2 intervals — with
+backward roles drawn from the enclosing-anchor chain (`BWDREF` the
+nearest coded future frame, `ALTREF2` the next enclosing anchor,
+`ALTREF` the mini-GOP ALT), the matching §5.11.25 BIDIR compound
+pairs in the RD ladder, all eight §7.20 slots under a free-list
+rotation, and per-layer quantiser offsets. The r423
+**primary-reference carry flows through the pyramid** with a
+per-frame exact-bytes election: the search runs under the LAST-slot
+carry, the committed trees replay bit-exactly under the
+nearest-backward anchor's carry and under per-frame defaults, and
+the smallest total frame wins — pure rate, identical reconstruction
+by construction. **Adaptive mini-GOP sizing**
+(`encode_adaptive_gop_yuv420_with_q`): a motion-compensated MAD
+probe drives scene-cut detection (cuts are absorbed by flat P steps
+— no mini-GOP spans one) and depth classes, with a twin-consistent
+trial-encode election at the class boundary (deep chunk vs
+half-depth splits over the identical frame span). Measured on the
+36-config A/B matrix: deep −4.11% bytes at −0.15 dB vs the two-level
+baseline; adaptive −2.85% bytes at **+0.16 dB** (smaller AND better —
+the election puts depth only where it pays); the primary election
+adopts a carried primary on essentially every coherent frame and
+demotes to `PRIMARY_REF_NONE` exactly at post-cut frames. r424 also
+lands the **per-TU twin residue** standing since r421: a running
+`TuFork` threads the leaf residual chain so every §5.11.47 tx-type
+candidate (inter, intra and intrabc arms) prices its ACTUAL §5.11.39
+coefficient chain through the writer's own one-TU body against the
+fork's running CDF / level-context state, and the §5.11.46 palette
+k-means inner ladders surface per-`k` candidates settled by exact
+full-leaf twin bits — the last proxy prices inside the residual
+chain are gone. Harness: `tests/pyramid_deep_ab.rs`; two streams
+pinned: `self-pyr-64x64-q60-len17-deep` and
+`self-adaptive-96x80-q60-cut-n13` (corpus 75 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -788,14 +828,12 @@ hard-erroring segmented encodes). Witnesses + A/B harness in
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
-  `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r423 scope (primary-reference carry across the
-  B-pyramid refresh graph, deeper-than-two pyramid levels / adaptive
-  mini-GOP sizing, per-TU tx-type + palette-k-means elections on
-  twin pricing — the coefficient chain is still proxy-priced inside
-  those two inner ladders —, per-segment lossless mixing, intrabc
+  `encoder::encode_pyramid_gop_yuv420{,_with_q}` /
+  `encoder::encode_adaptive_gop_yuv420_with_q`. Conformant encoding
+  beyond the r424 scope (per-segment lossless mixing, intrabc
   hash-match DV search + rect / clipped palette leaves, the §5.11.46
-  signed-delta V-plane arm) is the follow-up ladder.
+  signed-delta V-plane arm — the screen-content polish ladder item)
+  is the follow-up ladder.
 
 ## Module layout
 

@@ -742,6 +742,10 @@ pub struct TunedAdaptiveGop {
     pub cuts: Vec<bool>,
     /// Boundary elections: `(pos, deep_len, split_len, chosen_len)`.
     pub elections: Vec<(usize, usize, usize, usize)>,
+    /// Per coded inter frame in coding order: `(order_hint, elected
+    /// §5.9.2 primary_ref_frame ordinal)` — see
+    /// [`TunedPyramidGop::primary_elections`].
+    pub primary_elections: Vec<(u32, u8)>,
 }
 
 /// Half-resolution luma (2×2 box filter) for the motion probe.
@@ -914,6 +918,7 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
         mc_mads,
         cuts,
         elections,
+        primary_elections: tuned.primary_elections,
     })
 }
 
