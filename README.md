@@ -852,6 +852,43 @@ corpus's first rectangular AND first clipped palette leaves) and
 not forced — edge partitions), byte-identical in THREE independent
 reference decoders (corpus 78 total).
 
+### Per-segment lossless mixing: pixel-exact regions in lossy frames (r426)
+
+r426 lands ladder item 6. A §5.9.14 `SEG_LVL_ALT_Q` segment whose
+§7.12.2 `get_qindex` clamps to 0 flips the full §5.9.2
+`LosslessArray[]` leaf semantics for its blocks INSIDE an
+otherwise-lossy frame — TX_4X4-only §5.11.34 row-major TU walk,
+§7.13.2.10 WHT residuals (bit-exact), no tx-size / tx-type symbols —
+exactly the decoder's per-block `Lossless = LosslessArray[
+segment_id ]` derivation (the spec decode driver was already
+per-segment; no decode gap found). The encoder resolves `Lossless`
+from each leaf's OWN committed segment across the residual/depth
+ladder, mirror stamps, skip-mode guard and intra fallback, with two
+§5.11.9 skip-inheritance corners: the bit-silent `segment_id = pred`
+short-circuit is frame-type-agnostic (segmented KEY frames too), and
+a skip leaf whose pred segment flips its `Lossless` derivation
+reverts its tx commitment to the spec-forced default. **Exactness
+demand**: `encode_gop_yuv420_with_q_lossless_regions` turns caller
+`LosslessRegion` pixel rectangles into an mi-cell mask (2×2-mi group
+dilation covers the sub-8×8 `HasChroma` coder + 4:2:0 cositing);
+every overlapping leaf is FORCED onto the lossless segment on every
+arm, so the region decodes pixel-exact against the INPUT on EVERY
+frame — asserted per-sample across aligned/unaligned rects,
+multi-superblock frames and lossy-delta ladders. Measured on the
+5-config typing-panel matrix: mixed streams run **18–56 % of
+full-lossless** while keeping the panel exact, and at 64×64 q60 the
+mixed stream (575 B) UNDERCUTS plain lossy (907 B) — exact
+references collapse later panel blocks to skips, cross-frame value
+the per-leaf greedy election cannot see. The content-driven
+`auto_detect` election (synthetic leaves outside the mask trial the
+lossless segment on twin bits + distortion) measured honestly inert
+on this matrix — ≤8-alphabet panels are already palette-exact
+(r425), and the 12-value irregular panel keeps the lossy arm at
+q100. Two streams pinned byte-identical in THREE independent
+reference decoders: `self-gop-64x64-q60-mixll-typing` and
+`self-gop-96x80-q160-mixll-bigpanel` (mi-unaligned 43×30 panel,
+su(1+8) `-160` delta; corpus 80 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -864,12 +901,11 @@ reference decoders (corpus 78 total).
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
+  `encoder::encode_gop_yuv420_with_q_lossless_regions` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}` /
-  `encoder::encode_adaptive_gop_yuv420_with_q`. Conformant encoding
-  beyond the r425 scope (per-segment lossless mixing — `SEG_LVL_ALT_Q`
-  segments reaching qindex 0 with per-segment `LosslessArray`
-  TX/coef semantics inside a lossy frame — is ladder item 6) is the
-  follow-up ladder.
+  `encoder::encode_adaptive_gop_yuv420_with_q`. The remaining ladder
+  axis is item 7 (chroma subsampling / bit-depth generalisation of
+  the conformance-grade encoder).
 
 ## Module layout
 
