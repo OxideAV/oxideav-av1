@@ -987,9 +987,52 @@ pub(crate) fn residual_tx(
 ) -> Vec<i32> {
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
+    residual_tx_avail(
+        input_plane,
+        recon_plane,
+        pw,
+        row0,
+        col0,
+        tx_sz,
+        pred,
+        plane,
+        lossless,
+        tx_type,
+        qp,
+        w,
+        h,
+    )
+}
+
+/// r425 — clip-aware twin of [`residual_tx`] for TUs of a
+/// frame-edge-straddling block that extend past the plane: only the
+/// `avail_w × avail_h` on-screen sub-rectangle reads input samples
+/// (the off-screen residual is coded as zero — the decoder discards
+/// those samples, so the choice is free) and only on-screen samples
+/// are stitched back. Fully-on-screen TUs (`avail >= (w, h)`) take
+/// the exact pre-r425 path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn residual_tx_avail(
+    input_plane: &[u8],
+    recon_plane: &mut [u8],
+    pw: usize,
+    row0: usize,
+    col0: usize,
+    tx_sz: usize,
+    pred: &[u8],
+    plane: u8,
+    lossless: bool,
+    tx_type: usize,
+    qp: &QuantizerParams,
+    avail_w: usize,
+    avail_h: usize,
+) -> Vec<i32> {
+    let w = TX_WIDTH[tx_sz];
+    let h = TX_HEIGHT[tx_sz];
+    let (aw, ah) = (avail_w.min(w), avail_h.min(h));
     let mut residual = vec![0i64; w * h];
-    for i in 0..h {
-        for j in 0..w {
+    for i in 0..ah {
+        for j in 0..aw {
             residual[i * w + j] =
                 input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * w + j] as i64;
         }
@@ -1011,6 +1054,9 @@ pub(crate) fn residual_tx(
         let yy = if flip_ud { h - 1 - i } else { i };
         for j in 0..w {
             let xx = if flip_lr { w - 1 - j } else { j };
+            if yy >= ah || xx >= aw {
+                continue;
+            }
             let p = pred[yy * w + xx] as i64 + res_back[i * w + j];
             recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
         }
@@ -1035,8 +1081,12 @@ pub(crate) fn residual_tx(
 /// the full coefficient tail) priced through the writer's own one-TU
 /// body, and the winner is committed into the running fork; `None`
 /// keeps the magnitude proxy.
+/// r425 — the search is clip-aware (see [`residual_tx_avail`]):
+/// input reads, distortion and stitching stay inside the
+/// `avail_w × avail_h` on-screen sub-rectangle; the coded off-screen
+/// residual is zero. Fully-on-screen TUs pass the full TU extent.
 #[allow(clippy::too_many_arguments)]
-fn residual_tx_search_luma(
+fn residual_tx_search_luma_avail(
     input_plane: &[u8],
     recon_plane: &mut [u8],
     pw: usize,
@@ -1046,12 +1096,15 @@ fn residual_tx_search_luma(
     pred: &[u8],
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
+    avail_w: usize,
+    avail_h: usize,
 ) -> Result<(Vec<i32>, u8), Error> {
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
+    let (aw, ah) = (avail_w.min(w), avail_h.min(h));
     let mut residual = vec![0i64; w * h];
-    for i in 0..h {
-        for j in 0..w {
+    for i in 0..ah {
+        for j in 0..aw {
             residual[i * w + j] =
                 input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * w + j] as i64;
         }
@@ -1080,8 +1133,8 @@ fn residual_tx_search_luma(
         let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
         let res_back = inverse_transform_2d(&dequant, tx_sz, t, 8, false);
         let mut d = 0u64;
-        for i in 0..h {
-            for j in 0..w {
+        for i in 0..ah {
+            for j in 0..aw {
                 let rec = (pred[i * w + j] as i64 + res_back[i * w + j]).clamp(0, 255);
                 let diff = input_plane[(row0 + i) * pw + (col0 + j)] as i64 - rec;
                 d += (diff * diff) as u64;
@@ -1126,8 +1179,8 @@ fn residual_tx_search_luma(
     if let (Some((tu_fork, ctx)), Some((fx, fy))) = (fork, fork_xy) {
         tu_fork.commit_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
     }
-    for i in 0..h {
-        for j in 0..w {
+    for i in 0..ah {
+        for j in 0..aw {
             let p = pred[i * w + j] as i64 + res_back[i * w + j];
             recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
         }
@@ -1156,34 +1209,40 @@ fn angle_delta_candidates(mode: usize, n: usize) -> core::ops::RangeInclusive<i3
 /// the directional ones, and (r410) the five §7.11.2.3 filter-intra
 /// modes on §5.11.24-eligible blocks (`Max(w, h) <= 32`; a
 /// filter-intra win codes `y_mode = DC_PRED` + `use_filter_intra`) —
-/// for one `n × n` block (recon-neighbour prediction at whole-block
-/// extent, input-target SSD). The neighbour build uses the same
-/// `BlockDecoded[]` state the block's first luma TU will observe.
+/// for one `bw × bh` block (recon-neighbour prediction at whole-block
+/// extent, input-target SSD; r425: rectangular shapes ride the same
+/// picker). The neighbour build uses the same `BlockDecoded[]` state
+/// the block's first luma TU will observe.
 fn pick_y_mode(
     recon: &ReconState,
     input: &Yuv420Frame,
     row0: usize,
     col0: usize,
-    n: usize,
+    bw: usize,
+    bh: usize,
 ) -> (u8, i8, Option<u8>) {
-    let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, 0, col0, row0, n, n);
+    // r425 — frame-edge-straddling blocks score on the on-screen
+    // sub-rectangle only (the off-screen samples are discarded by the
+    // decoder and carry no distortion).
+    let (aw, ah) = (bw.min(recon.width - col0), bh.min(recon.height - row0));
+    let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, 0, col0, row0, bw, bh);
     let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
         &recon.y,
         recon.width,
         recon.height,
         col0,
         row0,
-        n,
-        n,
+        bw,
+        bh,
         avail_ar,
         avail_bl,
     );
     let ssd_of = |pred: &[u8]| -> u64 {
         let mut ssd = 0u64;
-        for i in 0..n {
-            for j in 0..n {
+        for i in 0..ah {
+            for j in 0..aw {
                 let d =
-                    input.y[(row0 + i) * recon.width + (col0 + j)] as i64 - pred[i * n + j] as i64;
+                    input.y[(row0 + i) * recon.width + (col0 + j)] as i64 - pred[i * bw + j] as i64;
                 ssd += (d * d) as u64;
             }
         }
@@ -1192,9 +1251,9 @@ fn pick_y_mode(
     let mut best = (DC_PRED as u8, 0i8, None);
     let mut best_ssd = u64::MAX;
     for mode in 0..INTRA_MODES {
-        for delta in angle_delta_candidates(mode, n) {
+        for delta in angle_delta_candidates(mode, bw.min(bh)) {
             let Some(pred) = predict_mode_from_neighbours(
-                mode, delta, n, n, &above_ext, &left_ext, have_above, have_left,
+                mode, delta, bw, bh, &above_ext, &left_ext, have_above, have_left,
             ) else {
                 continue;
             };
@@ -1207,9 +1266,10 @@ fn pick_y_mode(
     }
     // §5.11.24 gate: Max(Block_Width, Block_Height) <= 32 (the coded
     // y_mode is DC_PRED and this driver never codes palette).
-    if n <= 32 {
+    if bw.max(bh) <= 32 {
         for fim in 0..crate::cdf::INTRA_FILTER_MODES {
-            let Some(pred) = predict_filter_intra_from_neighbours(fim, n, n, &above_ext, &left_ext)
+            let Some(pred) =
+                predict_filter_intra_from_neighbours(fim, bw, bh, &above_ext, &left_ext)
             else {
                 continue;
             };
@@ -1232,7 +1292,8 @@ fn pick_uv_mode(
     input: &Yuv420Frame,
     crow0: usize,
     ccol0: usize,
-    cn: usize,
+    cbw: usize,
+    cbh: usize,
     cfl_allowed: bool,
     // §5.11.43 gate operand: the block's LUMA extent (`Block_Width[
     // MiSize ]`) — angle deltas are coded for `MiSize >= BLOCK_8X8`
@@ -1242,37 +1303,42 @@ fn pick_uv_mode(
     max_luma_h: usize,
 ) -> (u8, i8, Option<(i8, i8)>) {
     let pw = recon.chroma_w;
-    let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cn, cn);
+    let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cbw, cbh);
     let (above_u, left_u, ha_u, hl_u) = build_tu_neighbours(
         &recon.u,
         recon.chroma_w,
         recon.chroma_h,
         ccol0,
         crow0,
-        cn,
-        cn,
+        cbw,
+        cbh,
         ar_u,
         bl_u,
     );
-    let (ar_v, bl_v) = tu_corner_avail(&recon.bd, 2, ccol0, crow0, cn, cn);
+    let (ar_v, bl_v) = tu_corner_avail(&recon.bd, 2, ccol0, crow0, cbw, cbh);
     let (above_v, left_v, ha_v, hl_v) = build_tu_neighbours(
         &recon.v,
         recon.chroma_w,
         recon.chroma_h,
         ccol0,
         crow0,
-        cn,
-        cn,
+        cbw,
+        cbh,
         ar_v,
         bl_v,
     );
+    // r425 — clipped blocks score on-screen chroma only.
+    let (caw, cah) = (
+        cbw.min(recon.chroma_w - ccol0),
+        cbh.min(recon.chroma_h - crow0),
+    );
     let ssd_uv = |pred_u: &[u8], pred_v: &[u8]| -> u64 {
         let mut ssd = 0u64;
-        for i in 0..cn {
-            for j in 0..cn {
+        for i in 0..cah {
+            for j in 0..caw {
                 let idx = (crow0 + i) * pw + (ccol0 + j);
-                let du = input.u[idx] as i64 - pred_u[i * cn + j] as i64;
-                let dv = input.v[idx] as i64 - pred_v[i * cn + j] as i64;
+                let du = input.u[idx] as i64 - pred_u[i * cbw + j] as i64;
+                let dv = input.v[idx] as i64 - pred_v[i * cbw + j] as i64;
                 ssd += (du * du + dv * dv) as u64;
             }
         }
@@ -1287,12 +1353,12 @@ fn pick_uv_mode(
     for mode in 0..INTRA_MODES {
         for delta in angle_delta_candidates(mode, luma_n) {
             let Some(pred_u) =
-                predict_mode_from_neighbours(mode, delta, cn, cn, &above_u, &left_u, ha_u, hl_u)
+                predict_mode_from_neighbours(mode, delta, cbw, cbh, &above_u, &left_u, ha_u, hl_u)
             else {
                 continue;
             };
             let Some(pred_v) =
-                predict_mode_from_neighbours(mode, delta, cn, cn, &above_v, &left_v, ha_v, hl_v)
+                predict_mode_from_neighbours(mode, delta, cbw, cbh, &above_v, &left_v, ha_v, hl_v)
             else {
                 continue;
             };
@@ -1317,8 +1383,8 @@ fn pick_uv_mode(
                 recon.width,
                 ccol0,
                 crow0,
-                cn,
-                cn,
+                cbw,
+                cbh,
                 au,
                 max_luma_w,
                 max_luma_h,
@@ -1329,8 +1395,8 @@ fn pick_uv_mode(
                 recon.width,
                 ccol0,
                 crow0,
-                cn,
-                cn,
+                cbw,
+                cbh,
                 av,
                 max_luma_w,
                 max_luma_h,
@@ -1478,7 +1544,8 @@ pub(crate) fn encode_leaf_sq(
         }
         return Ok(leaf);
     }
-    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let w4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let h4 = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size];
     let lambda = lambda_for(&recon.qp);
     // r421 — one election, one rate scale: exact twin bits (1/256-bit
     // units, block syntax only — the partition symbol is constant
@@ -1496,7 +1563,7 @@ pub(crate) fn encode_leaf_sq(
             None => d + lambda * rate,
         }
     };
-    let before = save_region(recon, mi_r, mi_c, n4);
+    let before = save_region_wh(recon, mi_r, mi_c, w4, h4);
     // r423 — §5.11.19: on a segmented INTER frame a `skip == 1` leaf's
     // segment id is the bit-silent spatial `pred` cascade, and the
     // write path (which prices these candidates through its own
@@ -1542,14 +1609,14 @@ pub(crate) fn encode_leaf_sq(
                 encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv, pricing)?;
             fix_skip_segment(&mut leaf);
             elect_v_arm(&mut leaf)?;
-            let d = region_distortion(recon, input, mi_r, mi_c, n4);
+            let d = region_distortion_wh(recon, input, mi_r, mi_c, w4, h4);
             let score = score_of(d, rate_of(&leaf, depth as u64)?);
             let improves = match best.as_ref() {
                 Some((_, _, s)) => score < *s,
                 None => true,
             };
             if improves {
-                best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+                best = Some((leaf, save_region_wh(recon, mi_r, mi_c, w4, h4), score));
             }
             restore_region(recon, mi_r, mi_c, &before);
         }
@@ -1559,14 +1626,14 @@ pub(crate) fn encode_leaf_sq(
     if let Some(dv) = intrabc_dv {
         let mut leaf = encode_intrabc_leaf(mi_r, mi_c, b_size, dv, input, recon, pricing)?;
         fix_skip_segment(&mut leaf);
-        let d = region_distortion(recon, input, mi_r, mi_c, n4);
+        let d = region_distortion_wh(recon, input, mi_r, mi_c, w4, h4);
         let score = score_of(d, rate_of(&leaf, 0)?);
         let improves = match best.as_ref() {
             Some((_, _, s)) => score < *s,
             None => true,
         };
         if improves {
-            best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+            best = Some((leaf, save_region_wh(recon, mi_r, mi_c, w4, h4), score));
         }
         restore_region(recon, mi_r, mi_c, &before);
     }
@@ -1626,22 +1693,28 @@ fn palette_candidates_y(
     max_cands: usize,
 ) -> Vec<PaletteCandY> {
     use crate::cdf::PALETTE_COLORS;
-    // §5.11.46 outer gate (square driver shapes only).
-    if !matches!(
-        b_size,
-        BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
-    ) {
+    // §5.11.46 outer gate — r425: rectangular shapes join the squares
+    // (`MiSize >= BLOCK_8X8 && Block_Width <= 64 && Block_Height <=
+    // 64`; this driver keeps both dims >= 8 — its rect leaves come
+    // from the >= 16 HORZ / VERT arms).
+    let bw = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let bh = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] * 4;
+    if !(8..=64).contains(&bw) || !(8..=64).contains(&bh) {
         return Vec::new();
     }
-    let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
-    if row0 + n > recon.height || col0 + n > recon.width {
+    if row0 >= recon.height || col0 >= recon.width {
         return Vec::new();
     }
+    // r425 — frame-edge-straddling blocks build over the ACTUAL
+    // on-screen sub-rectangle (§5.11.49 codes only its
+    // anti-diagonals; the off-screen map is spec-replicated below).
+    let os_w = bw.min(recon.width - col0);
+    let os_h = bh.min(recon.height - row0);
     let mut hist = [0u32; 256];
     let mut distinct = 0usize;
-    for i in 0..n {
-        let row = &input.y[(row0 + i) * recon.width + col0..][..n];
+    for i in 0..os_h {
+        let row = &input.y[(row0 + i) * recon.width + col0..][..os_w];
         for &v in row {
             if hist[v as usize] == 0 {
                 distinct += 1;
@@ -1656,7 +1729,7 @@ fn palette_candidates_y(
         // Exact-representable block: the distinct values ARE the
         // palette (zero-distortion prediction).
         vec![(0..256u16).filter(|&c| hist[c as usize] > 0).collect()]
-    } else if !recon.lossless && distinct <= kmeans_distinct_bound(n * n) {
+    } else if !recon.lossless && distinct <= kmeans_distinct_bound(os_w * os_h) {
         // r418 colour clustering: weighted 1-D k-means over the value
         // histogram with a size-RD pick of `k` (§5.11.46
         // `palette_size` election — each extra colour costs entry
@@ -1688,12 +1761,25 @@ fn palette_candidates_y(
                     lut[c] = best as u8;
                 }
             }
-            let mut map = vec![0u8; n * n];
-            for i in 0..n {
-                let row = &input.y[(row0 + i) * recon.width + col0..][..n];
+            let mut map = vec![0u8; bw * bh];
+            for i in 0..os_h {
+                let row = &input.y[(row0 + i) * recon.width + col0..][..os_w];
                 for (j, &v) in row.iter().enumerate() {
-                    map[i * n + j] = lut[v as usize];
+                    map[i * bw + j] = lut[v as usize];
                 }
+            }
+            // §5.11.49 off-screen replication (right columns from the
+            // last on-screen column, bottom rows from the last
+            // on-screen row) — the decoder's ColorMap fill, so the
+            // §7.11.4 prediction of overhanging TUs matches exactly.
+            for i in 0..os_h {
+                for j in os_w..bw {
+                    map[i * bw + j] = map[i * bw + os_w - 1];
+                }
+            }
+            for i in os_h..bh {
+                let (head, tail) = map.split_at_mut(i * bw);
+                tail[..bw].copy_from_slice(&head[(os_h - 1) * bw..][..bw]);
             }
             PaletteCandY { colors, map }
         })
@@ -1824,31 +1910,34 @@ fn palette_candidates_uv(
     max_cands: usize,
 ) -> Vec<PaletteCandUv> {
     use crate::cdf::PALETTE_COLORS;
-    // §5.11.46 outer gate (square driver shapes only). Every square
-    // `>= BLOCK_8X8` leaf has chroma under 4:2:0.
-    if !matches!(
-        b_size,
-        BLOCK_8X8 | crate::cdf::BLOCK_16X16 | crate::cdf::BLOCK_32X32 | BLOCK_64X64
-    ) {
+    // §5.11.46 outer gate — r425: rectangular shapes join the squares
+    // (both dims `8..=64` for this driver). Every such leaf has
+    // chroma under 4:2:0.
+    let bw = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let bh = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] * 4;
+    if !(8..=64).contains(&bw) || !(8..=64).contains(&bh) {
         return Vec::new();
     }
-    let n = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
-    if row0 + n > recon.height || col0 + n > recon.width {
+    if row0 >= recon.height || col0 >= recon.width {
         return Vec::new();
     }
-    let cn = n / 2;
+    let (cbw, cbh) = (bw / 2, bh / 2);
     let (crow0, ccol0) = (row0 / 2, col0 / 2);
     let cw = recon.chroma_w;
+    // r425 — clipped blocks build over the on-screen chroma
+    // sub-rectangle (see the luma twin).
+    let os_cw = cbw.min(cw - ccol0);
+    let os_ch = cbh.min(recon.chroma_h - crow0);
     // Distinct joint (U, V) pairs with weights.
     let mut weights: std::collections::BTreeMap<(u16, u16), u32> =
         std::collections::BTreeMap::new();
-    for i in 0..cn {
-        for j in 0..cn {
+    for i in 0..os_ch {
+        for j in 0..os_cw {
             let off = (crow0 + i) * cw + (ccol0 + j);
             let p = (u16::from(input.u[off]), u16::from(input.v[off]));
             *weights.entry(p).or_insert(0) += 1;
-            if weights.len() > kmeans_distinct_bound(cn * cn).max(PALETTE_COLORS) {
+            if weights.len() > kmeans_distinct_bound(os_cw * os_ch).max(PALETTE_COLORS) {
                 return Vec::new();
             }
         }
@@ -1877,9 +1966,9 @@ fn palette_candidates_uv(
             // (ties broken by V for determinism — pair order among
             // equal U values is unconstrained by the entry coding).
             pairs.sort_unstable();
-            let mut map = vec![0u8; cn * cn];
-            for i in 0..cn {
-                for j in 0..cn {
+            let mut map = vec![0u8; cbw * cbh];
+            for i in 0..os_ch {
+                for j in 0..os_cw {
                     let off = (crow0 + i) * cw + (ccol0 + j);
                     let p = (i64::from(input.u[off]), i64::from(input.v[off]));
                     // Nearest pair (exact arm: the pair itself).
@@ -1892,8 +1981,18 @@ fn palette_candidates_uv(
                             bi = idx;
                         }
                     }
-                    map[i * cn + j] = bi as u8;
+                    map[i * cbw + j] = bi as u8;
                 }
+            }
+            // §5.11.49 off-screen replication on the shared UV map.
+            for i in 0..os_ch {
+                for j in os_cw..cbw {
+                    map[i * cbw + j] = map[i * cbw + os_cw - 1];
+                }
+            }
+            for i in os_ch..cbh {
+                let (head, tail) = map.split_at_mut(i * cbw);
+                tail[..cbw].copy_from_slice(&head[(os_ch - 1) * cbw..][..cbw]);
             }
             PaletteCandUv {
                 colors_u: pairs.iter().map(|&(u, _)| u).collect(),
@@ -2486,8 +2585,10 @@ pub(crate) fn encode_leaf_with_tx(
     // — see [`TuFork`]); `None` keeps the magnitude proxy.
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
-    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
-    let n = n4 * 4;
+    // r425 — rectangular leaves ride the same encoder: all extents
+    // split into (bw, bh) / (cbw, cbh).
+    let bw = NUM_4X4_BLOCKS_WIDE[b_size] * 4;
+    let bh = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] * 4;
     let row0 = (mi_r as usize) * 4;
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
@@ -2500,7 +2601,7 @@ pub(crate) fn encode_leaf_with_tx(
     // the §7.11.4 palette map instead of a §7.11.2 neighbour mode.
     let (y_mode, angle_delta_y, filter_intra_mode) = match palette_y {
         Some(_) => (DC_PRED as u8, 0i8, None),
-        None => pick_y_mode(recon, input, row0, col0, n),
+        None => pick_y_mode(recon, input, row0, col0, bw, bh),
     };
     // r424 — the running per-TU fork (lossy arm only), armed with the
     // leaf's §8.3.2 `intra_dir` inputs.
@@ -2522,12 +2623,23 @@ pub(crate) fn encode_leaf_with_tx(
         filter_intra_mode,
     });
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
+    // r425 — on-screen extent for frame-edge-straddling leaves: the
+    // §5.11.35 walk skips TUs whose origin is off-screen and the
+    // clip-aware residual legs zero the off-screen samples.
+    let os_w = bw.min(width - col0);
+    let os_h = bh.min(recon.height - row0);
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
     let mut luma_tx_types: Vec<u8> = Vec::new();
     let mut ty = 0usize;
-    while ty < n {
+    while ty < bh {
         let mut tx = 0usize;
-        while tx < n {
+        while tx < bw {
+            // §5.11.35 line-13 `startX >= maxX || startY >= maxY`
+            // early return — the TU is never coded.
+            if ty >= os_h || tx >= os_w {
+                tx += ltw;
+                continue;
+            }
             let (tr, tc) = (row0 + ty, col0 + tx);
             let pred = match palette_y {
                 Some(p) => {
@@ -2536,7 +2648,7 @@ pub(crate) fn encode_leaf_with_tx(
                     let mut buf = vec![0u8; ltw * lth];
                     for i in 0..lth {
                         for j in 0..ltw {
-                            let idx = p.map[(ty + i) * n + (tx + j)] as usize;
+                            let idx = p.map[(ty + i) * bw + (tx + j)] as usize;
                             buf[i * ltw + j] = p.colors[idx] as u8;
                         }
                     }
@@ -2556,7 +2668,7 @@ pub(crate) fn encode_leaf_with_tx(
             };
             let (q, tt) = if lossless {
                 (
-                    residual_tx(
+                    residual_tx_avail(
                         &input.y,
                         &mut recon.y,
                         width,
@@ -2568,6 +2680,8 @@ pub(crate) fn encode_leaf_with_tx(
                         lossless,
                         DCT_DCT,
                         &qp,
+                        os_w - tx,
+                        os_h - ty,
                     ),
                     DCT_DCT as u8,
                 )
@@ -2575,7 +2689,7 @@ pub(crate) fn encode_leaf_with_tx(
                 // r410: §5.11.47 per-TU luma transform-type RD search
                 // over the §5.11.48 intra set for this TX size (r424:
                 // exact chain pricing through the running fork).
-                residual_tx_search_luma(
+                residual_tx_search_luma_avail(
                     &input.y,
                     &mut recon.y,
                     width,
@@ -2588,6 +2702,8 @@ pub(crate) fn encode_leaf_with_tx(
                         (Some(f), Some(c)) => Some((f, c)),
                         _ => None,
                     },
+                    os_w - tx,
+                    os_h - ty,
                 )?
             };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
@@ -2613,13 +2729,23 @@ pub(crate) fn encode_leaf_with_tx(
         let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
         // §5.11.35 MaxLumaW / MaxLumaH: the block's own luma extent
         // (the last luma TU coded above ends the block).
-        let max_luma_w = col0 + n;
-        let max_luma_h = row0 + n;
+        let max_luma_w = col0 + bw;
+        let max_luma_h = row0 + bh;
         // §8.3.2 cfl_allowed: on the lossless arm CFL is only allowed
         // when the subsampled chroma residual block is 4×4
         // (`get_plane_residual_size(MiSize, 1) == BLOCK_4X4`); on the
-        // lossy arm `Max(Block_Width, Block_Height) <= 32`.
-        let cfl_allowed = if lossless { n <= 8 } else { n <= 32 };
+        // lossy arm `Max(Block_Width, Block_Height) <= 32`. r425:
+        // this driver additionally keeps CFL off frame-edge-clipped
+        // leaves (an encoder choice — the §7.11.5 luma-average region
+        // interacts with the visited-TU extent there, and the palette
+        // / directional arms carry the clipped shapes).
+        let cfl_allowed = if os_w < bw || os_h < bh {
+            false
+        } else if lossless {
+            bw <= 8 && bh <= 8
+        } else {
+            bw.max(bh) <= 32
+        };
         let chroma_tx = if lossless {
             TX_4X4
         } else {
@@ -2628,7 +2754,11 @@ pub(crate) fn encode_leaf_with_tx(
         let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
         // Chroma extent of this leaf's residual grid (§5.11.38
         // subsampled plane size; BLOCK_4X4 leaves keep the full 4×4).
-        let cn = if b_size >= BLOCK_8X8 { n / 2 } else { 4 };
+        let (cbw, cbh) = if b_size >= BLOCK_8X8 {
+            (bw / 2, bh / 2)
+        } else {
+            (4, 4)
+        };
         // §5.11.46 UV palette arm (r418): the coded `uv_mode` is
         // DC_PRED (the UV palette gate) and CFL is off; each chroma
         // TU predicts from the §7.11.4 palette map instead.
@@ -2639,9 +2769,10 @@ pub(crate) fn encode_leaf_with_tx(
                 input,
                 crow0,
                 ccol0,
-                cn,
+                cbw,
+                cbh,
                 cfl_allowed,
-                n,
+                bw.min(bh),
                 max_luma_w,
                 max_luma_h,
             ),
@@ -2658,10 +2789,19 @@ pub(crate) fn encode_leaf_with_tx(
                 (true, 2, Some((_, av))) => Some(av),
                 _ => None,
             };
+            // r425 — on-screen chroma extent (clipped leaves).
+            let os_cw = cbw.min(cw - ccol0);
+            let os_ch = cbh.min(recon.chroma_h - crow0);
             let mut ty = 0usize;
-            while ty < cn {
+            while ty < cbh {
                 let mut tx = 0usize;
-                while tx < cn {
+                while tx < cbw {
+                    // §5.11.35 off-screen-origin skip (chroma maxX /
+                    // maxY are the subsampled plane bounds).
+                    if ty >= os_ch || tx >= os_cw {
+                        tx += ctw;
+                        continue;
+                    }
                     let (tr, tc) = (crow0 + ty, ccol0 + tx);
                     // §5.11.35: a CFL chroma TU writes the DC_PRED
                     // base, then §7.11.5 layers the luma AC on top.
@@ -2672,7 +2812,7 @@ pub(crate) fn encode_leaf_with_tx(
                         let mut buf = vec![0u8; ctw * cth];
                         for i in 0..cth {
                             for j in 0..ctw {
-                                let idx = p.map[(ty + i) * cn + (tx + j)] as usize;
+                                let idx = p.map[(ty + i) * cbw + (tx + j)] as usize;
                                 buf[i * ctw + j] = colors[idx] as u8;
                             }
                         }
@@ -2709,7 +2849,7 @@ pub(crate) fn encode_leaf_with_tx(
                     } else {
                         &mut recon.v
                     };
-                    let q = residual_tx(
+                    let q = residual_tx_avail(
                         if plane == 1 { &input.u } else { &input.v },
                         plane_buf,
                         cw,
@@ -2721,6 +2861,8 @@ pub(crate) fn encode_leaf_with_tx(
                         lossless,
                         chroma_tx_type,
                         &qp,
+                        os_cw - tx,
+                        os_ch - ty,
                     );
                     tu_bd_stamp(&mut recon.bd, plane, tc, tr, ctw, cth);
                     residual_quant.push(q);
@@ -2835,10 +2977,14 @@ pub(crate) fn save_region_wh(
     w4: usize,
     h4: usize,
 ) -> RegionSnapshot {
-    let (w, h) = (w4 * 4, h4 * 4);
-    let (cw, ch) = (w / 2, h / 2);
+    // r425 — frame-edge-straddling nodes snapshot the on-screen
+    // intersection only (there is nothing else to save or restore).
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
     let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
+    let w = (w4 * 4).min(recon.width - col0);
+    let h = (h4 * 4).min(recon.height - row0);
+    let cw = (w4 * 2).min(recon.chroma_w - ccol0);
+    let ch = (h4 * 2).min(recon.chroma_h - crow0);
     let mut y = vec![0u8; w * h];
     let mut u = vec![0u8; cw * ch];
     let mut v = vec![0u8; cw * ch];
@@ -2899,10 +3045,13 @@ pub(crate) fn region_distortion_wh(
     w4: usize,
     h4: usize,
 ) -> u64 {
-    let (w, h) = (w4 * 4, h4 * 4);
-    let (cw, ch) = (w / 2, h / 2);
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
     let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
+    // r425 — straddling nodes score their on-screen intersection.
+    let w = (w4 * 4).min(recon.width - col0);
+    let h = (h4 * 4).min(recon.height - row0);
+    let cw = (w4 * 2).min(recon.chroma_w - ccol0);
+    let ch = (h4 * 2).min(recon.chroma_h - crow0);
     let mut ssd = 0u64;
     for i in 0..h {
         for j in 0..w {
@@ -3040,18 +3189,98 @@ fn build_search_tree(
     let fully_inside = r + n4 <= recon.mi_rows && c + n4 <= recon.mi_cols;
 
     if !fully_inside {
-        // §5.11.4 forced arms: a node straddling the frame edge cannot
-        // code PARTITION_NONE at this driver's leaf shapes — split
-        // (the partition arm may still cost bits: the `split_or_*`
-        // half-straddle bools).
-        let mut cost = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-        let (nw, c0) = build_search_tree(r, c, sub, input, recon, twin, params, model)?;
-        let (ne, c1) = build_search_tree(r, c + half, sub, input, recon, twin, params, model)?;
-        let (sw, c2) = build_search_tree(r + half, c, sub, input, recon, twin, params, model)?;
-        let (se, c3) =
-            build_search_tree(r + half, c + half, sub, input, recon, twin, params, model)?;
+        // §5.11.4 edge arms: a node straddling the frame edge cannot
+        // code PARTITION_NONE. The half-straddle cases carry a real
+        // choice — `split_or_horz` (hasCols && !hasRows) admits a
+        // single clipped HORZ top block, `split_or_vert` (hasRows &&
+        // !hasCols) a single clipped VERT left block — which r425
+        // elects against the recursive SPLIT under the same scoring
+        // as the interior ladder. The bottom-right corner stays the
+        // forced no-symbol SPLIT. BLOCK_8X8 keeps the pre-r425 forced
+        // split (its rect subs are the sub-8-chroma shapes).
+        let has_rows = r + half < recon.mi_rows;
+        let has_cols = c + half < recon.mi_cols;
+        let lambda = lambda_for(&recon.qp);
+        // Twin-model only: the heuristic arm stays the pre-r425
+        // forced-split baseline the A/B harnesses measure against.
+        let rect_part = if model != RateModel::Twin {
+            None
+        } else if b_size > BLOCK_8X8 && has_cols && !has_rows {
+            Some(crate::cdf::PARTITION_HORZ)
+        } else if b_size > BLOCK_8X8 && has_rows && !has_cols {
+            Some(crate::cdf::PARTITION_VERT)
+        } else {
+            None
+        };
+        let before = save_region_wh(recon, r, c, n4 as usize, n4 as usize);
+        let mut rect_best: Option<(SyntaxNode, RegionSnapshot, u64, RateTwin, u64)> = None;
+        if let Some(part) = rect_part {
+            if let Some(psub) = crate::cdf::partition_subsize(part, b_size) {
+                let mut twin_s = twin.clone();
+                let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
+                let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
+                let blk = encode_leaf_sq(r, c, psub, input, recon, pricing_s)?;
+                let h_rate = 4 + leaf_rate(&blk);
+                cost_s += twin_s.commit_block(&blk, r, c, psub, params)?;
+                let d = region_distortion_wh(recon, input, r, c, n4 as usize, n4 as usize);
+                // §5.11.4: the second block of the pair is never
+                // coded on the edge arm — the writer ignores the
+                // placeholder entry.
+                let placeholder = Box::new(SyntaxBlock::skip_leaf(0, None));
+                let node = if part == crate::cdf::PARTITION_HORZ {
+                    SyntaxNode::Horz([Box::new(blk), placeholder])
+                } else {
+                    SyntaxNode::Vert([Box::new(blk), placeholder])
+                };
+                let score = match model {
+                    RateModel::Twin => score256(d, lambda, cost_s),
+                    RateModel::Heuristic => score256(d, lambda, h_rate * 256),
+                };
+                rect_best = Some((
+                    node,
+                    save_region_wh(recon, r, c, n4 as usize, n4 as usize),
+                    score,
+                    twin_s,
+                    cost_s,
+                ));
+                restore_region(recon, r, c, &before);
+            }
+        }
+        // SPLIT arm (forced on the corner case; elected otherwise).
+        let mut twin_b = twin.clone();
+        let mut cost = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model)?;
+        let (ne, c1) =
+            build_search_tree(r, c + half, sub, input, recon, &mut twin_b, params, model)?;
+        let (sw, c2) =
+            build_search_tree(r + half, c, sub, input, recon, &mut twin_b, params, model)?;
+        let (se, c3) = build_search_tree(
+            r + half,
+            c + half,
+            sub,
+            input,
+            recon,
+            &mut twin_b,
+            params,
+            model,
+        )?;
         cost += c0 + c1 + c2 + c3;
         let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
+        if let Some((node, after, rect_score, twin_s, rect_cost)) = rect_best {
+            let d_b = region_distortion_wh(recon, input, r, c, n4 as usize, n4 as usize);
+            let r_b = match model {
+                RateModel::Twin => cost,
+                RateModel::Heuristic => {
+                    (children.iter().map(|ch| tree_rate(ch)).sum::<u64>() + 4) * 256
+                }
+            };
+            if rect_score <= score256(d_b, lambda, r_b) {
+                restore_region(recon, r, c, &after);
+                *twin = twin_s;
+                return Ok((node, rect_cost));
+            }
+        }
+        *twin = twin_b;
         return Ok((SyntaxNode::Split(children), cost));
     }
 
@@ -3068,6 +3297,81 @@ fn build_search_tree(
     let cost_a = twin_a.commit_subtree(&node_a, r, c, b_size, params)?;
     let after_a = save_region(recon, r, c, n4 as usize);
     restore_region(recon, r, c, &before);
+    let score_a = {
+        let r_a = match model {
+            RateModel::Twin => cost_a,
+            RateModel::Heuristic => {
+                let lr = match &node_a {
+                    SyntaxNode::Leaf(b) => leaf_rate(b),
+                    _ => unreachable!("candidate A is always a leaf"),
+                };
+                lr * 256
+            }
+        };
+        score256(d_a, lambda, r_a)
+    };
+    // Running best over the non-split candidates (ties prefer the
+    // earlier candidate — fewer coded blocks).
+    let mut best: (SyntaxNode, RegionSnapshot, u64, RateTwin, u64) =
+        (node_a, after_a, score_a, twin_a, cost_a);
+
+    // Candidates A2/A3 (r425): §5.11.4 PARTITION_HORZ / PARTITION_VERT
+    // with two INTRA leaves — the rectangular §5.11.46 palette /
+    // §7.11.2 shapes. `BLOCK_16X16` and larger (the 8×8 HORZ / VERT
+    // arms code 8×4 / 4×8 leaves, whose sub-8 chroma pairing stays
+    // out of this driver's scope); Twin model only (the heuristic arm
+    // stays the pre-r425 NONE/SPLIT baseline the A/B harnesses
+    // measure against). Each shape's second leaf searches against the
+    // first leaf's committed twin state, exactly like the emitting
+    // pass.
+    if model == RateModel::Twin && b_size >= crate::cdf::BLOCK_16X16 {
+        for part in [crate::cdf::PARTITION_HORZ, crate::cdf::PARTITION_VERT] {
+            let Some(psub) = crate::cdf::partition_subsize(part, b_size) else {
+                continue;
+            };
+            let cells: [(u32, u32); 2] = if part == crate::cdf::PARTITION_HORZ {
+                [(r, c), (r + half, c)]
+            } else {
+                [(r, c), (r, c + half)]
+            };
+            let mut twin_s = twin.clone();
+            let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
+            let mut h_rate = 4u64;
+            let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(2);
+            for &(rr, cc) in &cells {
+                let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
+                let blk = encode_leaf_sq(rr, cc, psub, input, recon, pricing_s)?;
+                h_rate += leaf_rate(&blk);
+                cost_s += twin_s.commit_block(&blk, rr, cc, psub, params)?;
+                blocks.push(blk);
+            }
+            let d = region_distortion(recon, input, r, c, n4 as usize);
+            let mut it = blocks.into_iter();
+            let pair = [
+                Box::new(it.next().expect("two leaves")),
+                Box::new(it.next().expect("two leaves")),
+            ];
+            let node = if part == crate::cdf::PARTITION_HORZ {
+                SyntaxNode::Horz(pair)
+            } else {
+                SyntaxNode::Vert(pair)
+            };
+            let score = match model {
+                RateModel::Twin => score256(d, lambda, cost_s),
+                RateModel::Heuristic => score256(d, lambda, h_rate * 256),
+            };
+            if score < best.2 {
+                best = (
+                    node,
+                    save_region(recon, r, c, n4 as usize),
+                    score,
+                    twin_s,
+                    cost_s,
+                );
+            }
+            restore_region(recon, r, c, &before);
+        }
+    }
 
     // Candidate B: PARTITION_SPLIT into four recursively-searched
     // quadrants (NW/NE/SW/SE dispatch order — the writer's order),
@@ -3092,26 +3396,19 @@ fn build_search_tree(
     let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
     let d_b = region_distortion(recon, input, r, c, n4 as usize);
 
-    let (r_a, r_b) = match model {
-        RateModel::Twin => (cost_a, cost_b),
+    let r_b = match model {
+        RateModel::Twin => cost_b,
         // Heuristic scores scaled by 256 so both models run through
         // the same `score256` comparison with identical decisions to
         // the pre-r421 integer scores.
-        RateModel::Heuristic => {
-            let lr = match &node_a {
-                SyntaxNode::Leaf(b) => leaf_rate(b),
-                _ => unreachable!("candidate A is always a leaf"),
-            };
-            let tr = children.iter().map(|ch| tree_rate(ch)).sum::<u64>() + 4;
-            (lr * 256, tr * 256)
-        }
+        RateModel::Heuristic => (children.iter().map(|ch| tree_rate(ch)).sum::<u64>() + 4) * 256,
     };
-    let score_a = score256(d_a, lambda, r_a);
     let score_b = score256(d_b, lambda, r_b);
-    if score_a <= score_b {
-        restore_region(recon, r, c, &after_a);
-        *twin = twin_a;
-        Ok((node_a, cost_a))
+    if best.2 <= score_b {
+        let (node, after, _, twin_best, cost) = best;
+        restore_region(recon, r, c, &after);
+        *twin = twin_best;
+        Ok((node, cost))
     } else {
         *twin = twin_b;
         Ok((SyntaxNode::Split(children), cost_b))
@@ -3771,6 +4068,455 @@ mod tests {
                 assert_eq!(enc.recon_y, input.y, "lossless glyph copies must be exact");
             }
         }
+    }
+
+    /// r425 — rectangular §5.11.46 palette leaves: a 64×64 superblock
+    /// made of two DIFFERENT 8-colour dither strips (left / right
+    /// 32×64, disjoint colour sets) must elect PARTITION_VERT with
+    /// palette-coded 32×64 leaves — each strip is exactly
+    /// representable at the §5.11.46 cap while the whole block's 16
+    /// colours are not, and the VERT pair costs two palette lists /
+    /// token walks against the SPLIT arm's four — and the stream must
+    /// round-trip byte-exact through the spec driver on the lossy AND
+    /// lossless arms.
+    #[test]
+    fn r425_rect_palette_leaf_elected_on_split_content() {
+        let (w, h) = (64usize, 64usize);
+        const LEFT: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
+        const RIGHT: [u8; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
+        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let mut state = 0x5EED_0425u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for i in 0..h {
+            for j in 0..w {
+                let pal = if j < 32 { &LEFT } else { &RIGHT };
+                input.y[i * w + j] = pal[(next() & 7) as usize];
+            }
+        }
+
+        for q in [60u8, 0] {
+            let mut recon = ReconState {
+                y: vec![0u8; w * h],
+                u: vec![0u8; (w / 2) * (h / 2)],
+                v: vec![0u8; (w / 2) * (h / 2)],
+                width: w,
+                height: h,
+                chroma_w: w / 2,
+                chroma_h: h / 2,
+                mi_rows: (h / 4) as u32,
+                mi_cols: (w / 4) as u32,
+                lossless: q == 0,
+                allow_screen_content_tools: true,
+                allow_intrabc: false,
+                qp: QuantizerParams::neutral(q, 8),
+                bd: BlockDecodedMirror::new(),
+                dv_hash: Default::default(),
+            };
+            let (mut twin, params) = search_ctx_for_tests(&recon);
+            recon.bd.clear_for_sb(0, 0, recon.mi_rows, recon.mi_cols);
+            twin.arm_read_deltas();
+            let (tree, _) = build_search_tree(
+                0,
+                0,
+                BLOCK_64X64,
+                &input,
+                &mut recon,
+                &mut twin,
+                &params,
+                RateModel::Twin,
+            )
+            .unwrap();
+            // The winning shape must be a rect node carrying a
+            // palette leaf on a non-square block.
+            fn find_rect_palette(node: &SyntaxNode) -> bool {
+                match node {
+                    SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                        blocks.iter().any(|b| b.palette.size_y > 0)
+                    }
+                    SyntaxNode::Split(ch) => ch.iter().any(|c| find_rect_palette(c)),
+                    _ => false,
+                }
+            }
+            assert!(
+                find_rect_palette(&tree),
+                "q={q}: split-content superblock must elect a rect palette leaf: {tree:?}"
+            );
+
+            // Full-stream conformance through the public API + spec
+            // driver (the emitting pass walks the same elected rect
+            // shapes).
+            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
+            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
+            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            if q == 0 {
+                assert_eq!(enc.recon_y, input.y, "lossless rect palette must be exact");
+            }
+        }
+    }
+
+    /// r425 — clipped palette leaves on the §5.11.4 `split_or_horz`
+    /// edge arm: a 64×80 frame (bottom superblock row straddles the
+    /// edge by 48 rows) filled with a 2-colour dither must elect the
+    /// single clipped HORZ top block (64×32 coded, 16 rows on-screen)
+    /// over the forced-split cascade — one palette list + one
+    /// §5.11.49 on-screen-sub-rectangle token walk instead of the
+    /// split arm's duplicated pairs — and the stream must round-trip
+    /// byte-exact through the spec driver on the lossy AND lossless
+    /// arms (the driver's own §5.11.49 reader walks the same
+    /// on-screen anti-diagonals).
+    #[test]
+    fn r425_clipped_palette_leaf_on_bottom_edge() {
+        let (w, h) = (64usize, 80usize);
+        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let mut state = 0xC11B_0425u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for p in input.y.iter_mut() {
+            *p = if next() & 1 == 0 { 40 } else { 200 };
+        }
+
+        for q in [60u8, 0] {
+            let mut recon = ReconState {
+                y: vec![0u8; w * h],
+                u: vec![0u8; (w / 2) * (h / 2)],
+                v: vec![0u8; (w / 2) * (h / 2)],
+                width: w,
+                height: h,
+                chroma_w: w / 2,
+                chroma_h: h / 2,
+                mi_rows: (h / 4) as u32,
+                mi_cols: (w / 4) as u32,
+                lossless: q == 0,
+                allow_screen_content_tools: true,
+                allow_intrabc: false,
+                qp: QuantizerParams::neutral(q, 8),
+                bd: BlockDecodedMirror::new(),
+                dv_hash: Default::default(),
+            };
+            let (mut twin, params) = search_ctx_for_tests(&recon);
+            let mut found_clipped_palette = false;
+            for (sb_r, sb_c) in sb_grid_origins(recon.mi_rows, recon.mi_cols) {
+                recon
+                    .bd
+                    .clear_for_sb(sb_r, sb_c, recon.mi_rows, recon.mi_cols);
+                twin.arm_read_deltas();
+                let (tree, _) = build_search_tree(
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &input,
+                    &mut recon,
+                    &mut twin,
+                    &params,
+                    RateModel::Twin,
+                )
+                .unwrap();
+                if sb_r == 16 {
+                    // The straddling superblock: the elected shape
+                    // must be the HORZ edge arm with a palette-coded
+                    // clipped top block.
+                    if let SyntaxNode::Horz(blocks) = &tree {
+                        found_clipped_palette = blocks[0].palette.size_y > 0;
+                    }
+                }
+            }
+            assert!(
+                found_clipped_palette,
+                "q={q}: the straddling superblock must elect a clipped HORZ palette leaf"
+            );
+
+            // Full-stream conformance through the public API + spec
+            // driver.
+            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
+            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
+            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            if q == 0 {
+                assert_eq!(
+                    enc.recon_y, input.y,
+                    "lossless clipped palette must be exact"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // r425 — screen-content measurement harness (ladder item 5).
+    // -----------------------------------------------------------------
+
+    /// One tile-payload encode of `input` through the search + write
+    /// path: `screen` opens the §5.9.2/§5.9.20 tool gates exactly like
+    /// the public driver (content-adaptive intrabc gate + armed hash
+    /// index), `hash = false` leaves the r425 DV index inert (the
+    /// r418-r424 geometric search). Returns (tile bytes, luma SSD).
+    fn scc_tile_encode(input: &Yuv420Frame, q: u8, screen: bool, hash: bool) -> (usize, u64) {
+        let (w, h) = (input.width as usize, input.height as usize);
+        let allow_intrabc = screen && intrabc_beneficial(input);
+        let mut recon = ReconState {
+            y: vec![0u8; w * h],
+            u: vec![0u8; (w / 2) * (h / 2)],
+            v: vec![0u8; (w / 2) * (h / 2)],
+            width: w,
+            height: h,
+            chroma_w: w / 2,
+            chroma_h: h / 2,
+            mi_rows: (h / 4) as u32,
+            mi_cols: (w / 4) as u32,
+            lossless: q == 0,
+            allow_screen_content_tools: screen,
+            allow_intrabc,
+            qp: QuantizerParams::neutral(q, 8),
+            bd: BlockDecodedMirror::new(),
+            dv_hash: if hash && allow_intrabc {
+                crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h)
+            } else {
+                Default::default()
+            },
+        };
+        let (_, params) = search_ctx_for_tests(&recon);
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.init_coeff_cdfs(q);
+        let mut state = PartitionSyntaxWriter::new(
+            recon.mi_rows,
+            recon.mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: recon.mi_rows,
+                mi_col_start: 0,
+                mi_col_end: recon.mi_cols,
+            },
+        )
+        .expect("geometry");
+        for (sb_r, sb_c) in sb_grid_origins(recon.mi_rows, recon.mi_cols) {
+            recon
+                .bd
+                .clear_for_sb(sb_r, sb_c, recon.mi_rows, recon.mi_cols);
+            state.arm_read_deltas();
+            let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+            twin.arm_read_deltas();
+            let (tree, _) = build_search_tree(
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                input,
+                &mut recon,
+                &mut twin,
+                &params,
+                RateModel::Twin,
+            )
+            .expect("search");
+            crate::encoder::partition_tree::write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &tree,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &params,
+            )
+            .expect("write");
+        }
+        let bytes = writer.finish().len();
+        let mut ssd = 0u64;
+        for (a, b) in recon.y.iter().zip(input.y.iter()) {
+            let d = *a as i64 - *b as i64;
+            ssd += (d * d) as u64;
+        }
+        (bytes, ssd)
+    }
+
+    /// Deterministic 2-colour glyph-text page: flat paper, six random
+    /// 8×8 bit-pattern glyphs laid out in text lines — the canonical
+    /// repeated-glyph screen content (palette-exact blocks, intrabc
+    /// sources at arbitrary offsets).
+    fn scc_glyph_text(w: usize, h: usize, seed: u32) -> Yuv420Frame {
+        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+        for p in f.y.iter_mut() {
+            *p = 235;
+        }
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let glyphs: Vec<u64> = (0..6)
+            .map(|_| (u64::from(next()) << 32) | u64::from(next()))
+            .collect();
+        let mut row = 8usize;
+        while row + 8 <= h.saturating_sub(4) {
+            let mut col = 8usize;
+            while col + 8 <= w.saturating_sub(4) {
+                if next() % 5 == 0 {
+                    col += 8; // word gap
+                    continue;
+                }
+                let g = glyphs[(next() % 6) as usize];
+                for i in 0..8 {
+                    for j in 0..8 {
+                        if (g >> (i * 8 + j)) & 1 == 1 {
+                            f.y[(row + i) * w + col + j] = 32;
+                        }
+                    }
+                }
+                col += 8;
+            }
+            row += 12;
+        }
+        f
+    }
+
+    /// UI-panel content: flat regions, a title bar, hairline borders,
+    /// a 2-colour dither texture pane and a repeated 16×16 icon.
+    fn scc_ui_panel(w: usize, h: usize, seed: u32) -> Yuv420Frame {
+        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for i in 0..h {
+            for j in 0..w {
+                f.y[i * w + j] = if i < 16 {
+                    64
+                } else if i == 16 || j == 0 || j + 1 == w || i + 1 == h {
+                    16
+                } else {
+                    200
+                };
+            }
+        }
+        // Dither pane in the lower-left quadrant.
+        for i in (h / 2)..(h - 8) {
+            for j in 8..(w / 2) {
+                f.y[i * w + j] = if next() & 1 == 0 { 40 } else { 200 };
+            }
+        }
+        // One 16×16 2-colour icon repeated on the top row of panes.
+        let icon: Vec<bool> = (0..256).map(|_| next() & 1 == 1).collect();
+        let mut anchors = vec![(24usize, 8usize)];
+        let mut x = 8 + 40;
+        while x + 16 < w - 8 {
+            anchors.push((24, x));
+            x += 40;
+        }
+        for &(ay, ax) in &anchors {
+            if ay + 16 <= h && ax + 16 <= w {
+                for i in 0..16 {
+                    for j in 0..16 {
+                        f.y[(ay + i) * w + ax + j] = if icon[i * 16 + j] { 96 } else { 224 };
+                    }
+                }
+            }
+        }
+        f
+    }
+
+    /// Text lines over a smooth diagonal gradient — the mixed case
+    /// (screen tools must pay only where they win).
+    fn scc_text_over_gradient(w: usize, h: usize, seed: u32) -> Yuv420Frame {
+        let mut f = scc_glyph_text(w, h, seed);
+        for i in 0..h {
+            for j in 0..w {
+                if f.y[i * w + j] == 235 {
+                    f.y[i * w + j] = (48 + (i + j) * 160 / (w + h)) as u8;
+                }
+            }
+        }
+        f
+    }
+
+    /// Always-on tripwire: on canonical glyph-text screen content the
+    /// full r425 screen path must code pixel-exact luma at a fraction
+    /// of the natural-coding bytes, and the hash-armed DV search must
+    /// not lose to the geometric-only search.
+    #[test]
+    fn r425_scc_screen_tools_multiple_tripwire() {
+        let input = scc_glyph_text(192, 192, 0x7357_0425);
+        let (natural, _) = scc_tile_encode(&input, 60, false, false);
+        let (screen, ssd) = scc_tile_encode(&input, 60, true, true);
+        let (nohash, _) = scc_tile_encode(&input, 60, true, false);
+        assert_eq!(ssd, 0, "glyph text must code pixel-exact luma at q60");
+        assert!(
+            screen * 2 < natural,
+            "screen tools must at least halve glyph-text bytes (screen={screen} natural={natural})"
+        );
+        assert!(
+            screen <= nohash,
+            "hash-armed DV search must not lose to geometric-only (hash={screen} nohash={nohash})"
+        );
+    }
+
+    /// Env-gated (`OXIDEAV_AV1_SCC_AB_DIR`) screen-content matrix:
+    /// 3 content kinds × 2 sizes (one with a clipped bottom edge) ×
+    /// 3 quantisers, natural vs screen vs screen-without-hash tile
+    /// bytes + luma SSD, CSV per config + aggregate multiples.
+    #[test]
+    fn r425_scc_measurement_matrix() {
+        let Ok(dir) = std::env::var("OXIDEAV_AV1_SCC_AB_DIR") else {
+            return;
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut csv = String::from("content,w,h,q,natural,screen,nohash,ssd_screen\n");
+        let (mut nat_total, mut scr_total, mut nohash_total) = (0u64, 0u64, 0u64);
+        let mut exact_nat = 0u64;
+        let mut exact_scr = 0u64;
+        let mut exact_n = 0u32;
+        for &(name, which) in &[("glyph", 0u8), ("ui", 1), ("textgrad", 2)] {
+            for &(w, h) in &[(192usize, 192usize), (256, 144)] {
+                for &q in &[20u8, 60, 100] {
+                    let input = match which {
+                        0 => scc_glyph_text(w, h, 0x7357_0425),
+                        1 => scc_ui_panel(w, h, 0x0425_0426),
+                        _ => scc_text_over_gradient(w, h, 0x0425_0427),
+                    };
+                    let (nat, _) = scc_tile_encode(&input, q, false, false);
+                    let (scr, ssd) = scc_tile_encode(&input, q, true, true);
+                    let (noh, _) = scc_tile_encode(&input, q, true, false);
+                    csv.push_str(&format!("{name},{w},{h},{q},{nat},{scr},{noh},{ssd}\n"));
+                    nat_total += nat as u64;
+                    scr_total += scr as u64;
+                    nohash_total += noh as u64;
+                    if ssd == 0 {
+                        exact_nat += nat as u64;
+                        exact_scr += scr as u64;
+                        exact_n += 1;
+                    }
+                }
+            }
+        }
+        csv.push_str(&format!(
+            "# totals natural={nat_total} screen={scr_total} nohash={nohash_total} \
+             multiple={:.2} nohash_multiple={:.2} exact_multiple={:.2} exact_configs={exact_n}\n",
+            nat_total as f64 / scr_total as f64,
+            nat_total as f64 / nohash_total as f64,
+            if exact_scr > 0 {
+                exact_nat as f64 / exact_scr as f64
+            } else {
+                0.0
+            },
+        ));
+        std::fs::write(format!("{dir}/scc_ab_r425.csv"), &csv).unwrap();
+        eprintln!("{csv}");
     }
 
     /// r418 — the k-means clustering arm must win where the block is

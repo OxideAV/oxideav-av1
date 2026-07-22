@@ -1387,14 +1387,19 @@ pub fn write_partition_tree_syntax(
             PARTITION_SPLIT
         }
         SyntaxNode::Horz(_) => {
-            // r412 scope: the general S() arm only (fully in frame).
-            if b_size < BLOCK_8X8 || !has_rows || !has_cols {
+            // r412 general S() arm (fully in frame) + r425 edge arm:
+            // §5.11.4 reaches PARTITION_HORZ through `split_or_horz`
+            // whenever `hasCols` holds — on `!hasRows` only the top
+            // block is coded (the node's second entry is ignored).
+            if b_size < BLOCK_8X8 || !has_cols {
                 return Err(Error::PartitionWalkOutOfRange);
             }
             PARTITION_HORZ
         }
         SyntaxNode::Vert(_) => {
-            if b_size < BLOCK_8X8 || !has_rows || !has_cols {
+            // Mirror of the HORZ scope: `split_or_vert` needs
+            // `hasRows`; on `!hasCols` only the left block is coded.
+            if b_size < BLOCK_8X8 || !has_rows {
                 return Err(Error::PartitionWalkOutOfRange);
             }
             PARTITION_VERT
@@ -1431,37 +1436,44 @@ pub fn write_partition_tree_syntax(
             write_block_syntax(writer, cdfs, state, block, r, c, sub_size, params)?;
         }
         (SyntaxNode::Horz(blocks), PARTITION_HORZ) => {
-            // §5.11.4: `decode_block( r, c, subSize )` then
-            // `decode_block( r + halfBlock4x4, c, subSize )` (the
-            // `hasRows` gate held by the scope check above).
+            // §5.11.4: `decode_block( r, c, subSize )` then — only
+            // `if ( hasRows )` — `decode_block( r + halfBlock4x4, c,
+            // subSize )`. On the r425 `split_or_horz` edge arm the
+            // second entry is never coded.
             let [top, bottom] = blocks;
             write_block_syntax(writer, cdfs, state, top, r, c, sub_size, params)?;
-            write_block_syntax(
-                writer,
-                cdfs,
-                state,
-                bottom,
-                r + half_block4x4,
-                c,
-                sub_size,
-                params,
-            )?;
+            if has_rows {
+                write_block_syntax(
+                    writer,
+                    cdfs,
+                    state,
+                    bottom,
+                    r + half_block4x4,
+                    c,
+                    sub_size,
+                    params,
+                )?;
+            }
         }
         (SyntaxNode::Vert(blocks), PARTITION_VERT) => {
-            // §5.11.4: `decode_block( r, c, subSize )` then
-            // `decode_block( r, c + halfBlock4x4, subSize )`.
+            // §5.11.4: `decode_block( r, c, subSize )` then — only
+            // `if ( hasCols )` — `decode_block( r, c + halfBlock4x4,
+            // subSize )`. On the r425 `split_or_vert` edge arm the
+            // second entry is never coded.
             let [left, right] = blocks;
             write_block_syntax(writer, cdfs, state, left, r, c, sub_size, params)?;
-            write_block_syntax(
-                writer,
-                cdfs,
-                state,
-                right,
-                r,
-                c + half_block4x4,
-                sub_size,
-                params,
-            )?;
+            if has_cols {
+                write_block_syntax(
+                    writer,
+                    cdfs,
+                    state,
+                    right,
+                    r,
+                    c + half_block4x4,
+                    sub_size,
+                    params,
+                )?;
+            }
         }
         // r413 — §5.11.4 T-shape / four-way dispatch, transcribed
         // block-for-block (splitSize = Partition_Subsize[ SPLIT ]).

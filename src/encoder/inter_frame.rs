@@ -6822,7 +6822,13 @@ mod tests {
     fn r417_search_selects_wedge_inter_intra_on_wedge_blend_content() {
         use crate::cdf::{BLOCK_32X32, II_V_PRED};
         let f0 = moving_gradient(64, 64, 0, 0, 40);
-        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        // r425 — brightness 220 (was 140): the intra half of the
+        // first quadrant's blend derives from border-constant
+        // neighbours (~128), so the wedge contrast |inter − intra|
+        // must dwarf the coding noise of the anchors or the election
+        // turns rate-marginal (the r425 KEY rect arms shifted the
+        // anchor reconstruction by a hair and flipped it at 140).
+        let f1 = moving_gradient(64, 64, 0, 0, 220);
         let base_q_idx = 60u8;
         let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
