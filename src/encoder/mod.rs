@@ -347,8 +347,8 @@ pub use inter_frame::{
 };
 #[doc(hidden)]
 pub use inter_frame::{
-    encode_gop_yuv420_with_q_seg_lossless_tuned, encode_gop_yuv420_with_q_seg_tuned, GopTuning,
-    TunedGop,
+    encode_gop_yuv420_with_q_seg_extras_tuned, encode_gop_yuv420_with_q_seg_lossless_tuned,
+    encode_gop_yuv420_with_q_seg_tuned, GopTuning, SegExtras, TunedGop,
 };
 #[doc(hidden)]
 pub use inter_predict::{

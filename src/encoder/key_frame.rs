@@ -351,7 +351,9 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
         num_planes: 3,
         seg_id_pre_skip: false,
         segmentation_enabled: !alt_q.is_empty(),
-        seg_skip_active: false,
+        seg_ref_frame: [None; crate::uncompressed_header_tail::MAX_SEGMENTS],
+        seg_skip: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
+        seg_globalmv: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
         last_active_seg_id: alt_q.len().saturating_sub(1) as u8,
         lossless_array: seg_ll,
         coded_lossless: lossless,
@@ -1637,7 +1639,7 @@ pub(crate) fn encode_leaf_sq_seg(
         // §5.11.8 arm too — so segmented KEY frames take the same
         // bit-silent inheritance.
         if let Some((twin, params)) = pricing {
-            if params.segmentation_enabled && leaf.skip == 1 {
+            if params.segmentation_enabled && !params.seg_id_pre_skip && leaf.skip == 1 {
                 leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
                 // r426 — a lossless pred segment flips the §5.11.15
                 // derivation to the bit-silent TX_4X4 default: the
@@ -1684,7 +1686,7 @@ pub(crate) fn encode_leaf_sq_seg(
             leaf.segment_id = seg;
         }
         if let Some((twin, params)) = pricing {
-            if params.segmentation_enabled && leaf.skip == 1 {
+            if params.segmentation_enabled && !params.seg_id_pre_skip && leaf.skip == 1 {
                 leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
                 // r426 — lossless pred segment ⇒ bit-silent TX_4X4
                 // default (see the single-shape arm above).
@@ -3653,7 +3655,9 @@ mod tests {
             num_planes: 3,
             seg_id_pre_skip: false,
             segmentation_enabled: false,
-            seg_skip_active: false,
+            seg_ref_frame: [None; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            seg_skip: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            seg_globalmv: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
             last_active_seg_id: 0,
             lossless_array: [recon.lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
             coded_lossless: recon.lossless,

@@ -514,6 +514,7 @@ impl PyramidSession {
                         alt_primaries,
                         exact_mask: None,
                         auto_lossless: false,
+                        seg_extras: None,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(

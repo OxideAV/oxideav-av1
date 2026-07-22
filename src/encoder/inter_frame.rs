@@ -593,6 +593,49 @@ pub fn encode_gop_yuv420_with_q_seg_lossless_tuned(
     auto_detect: bool,
     tuning: GopTuning,
 ) -> Result<TunedGop, Error> {
+    encode_gop_yuv420_with_q_seg_extras_tuned(
+        frames,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        None,
+        tuning,
+    )
+}
+
+/// r426 — the full-surface GOP entry (ladder items 6 + 8):
+/// segmentation deltas, exactness-demand rectangles, the
+/// auto-lossless election, the three §5.9.14 inter-override features
+/// and the [`GopTuning`] measurement switches. `extras` requires a
+/// non-empty `alt_q` (the segmentation carrier), a feature-free
+/// segment 0 (the encoder's intra/skip-mode fallback segment), no
+/// SEG_LVL_SKIP on a lossless segment (a skip block codes no
+/// residual — it cannot honour a qindex-0 exactness contract), and
+/// SEG_LVL_REF_FRAME data within the P-GOP reference ladder.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+    extras: Option<&SegExtras>,
+    tuning: GopTuning,
+) -> Result<TunedGop, Error> {
+    if let Some(x) = extras {
+        let ll = seg_lossless_array(base_q_idx, alt_q);
+        if alt_q.is_empty()
+            || x.ref_frame[0].is_some()
+            || x.skip[0]
+            || x.globalmv[0]
+            || x.ref_frame.iter().flatten().any(|rf| !(1..=7).contains(rf))
+            || (0..crate::uncompressed_header_tail::MAX_SEGMENTS).any(|s| x.skip[s] && ll[s])
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
     let model = tuning.model;
     let global_motion = tuning.global_motion;
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
@@ -715,6 +758,7 @@ pub fn encode_gop_yuv420_with_q_seg_lossless_tuned(
             tuning.temporal_seg,
             exact_mask.as_deref(),
             auto_detect,
+            extras,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -856,6 +900,11 @@ pub(crate) struct InterFrameConfig<'a> {
     /// leaves OUTSIDE the demand mask (see
     /// [`GopTuning`]-level docs on the twin-priced trial).
     pub auto_lossless: bool,
+    /// r426 — the three §5.9.14 inter-override features (ladder item
+    /// 8): SEG_LVL_REF_FRAME / SEG_LVL_SKIP / SEG_LVL_GLOBALMV per
+    /// segment. `Some` requires a non-empty `alt_q` table (the
+    /// segmentation-enabled carrier) and flips `SegIdPreSkip` to 1.
+    pub seg_extras: Option<&'a SegExtras>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -956,7 +1005,10 @@ fn build_inter_frame_fh(
     // (`su(1+8)` each). `SegIdPreSkip = 0` (no feature at `j >=
     // SEG_LVL_REF_FRAME`); `LastActiveSegId = alt_q.len() - 1`.
     if !alt_q.is_empty() {
-        fh.segmentation_params = Some(segmentation_params_for(alt_q));
+        fh.segmentation_params = Some(match cfg.seg_extras {
+            Some(x) => segmentation_params_for_plan(alt_q, x),
+            None => segmentation_params_for(alt_q),
+        });
     }
     fh
 }
@@ -969,7 +1021,54 @@ fn build_inter_frame_fh(
 pub(crate) fn segmentation_params_for(
     alt_q: &[i16],
 ) -> crate::uncompressed_header_tail::SegmentationParams {
-    use crate::uncompressed_header_tail::{SegmentationParams, SEG_LVL_ALT_Q};
+    segmentation_params_for_plan(alt_q, &SegExtras::default())
+}
+
+/// r426 — the three §5.9.14 inter-override features per segment
+/// (ladder item 8): `ref_frame[ s ] = Some(data)` activates
+/// SEG_LVL_REF_FRAME with `FeatureData = data` (a raw `RefFrame`
+/// ordinal, `LAST_FRAME = 1 ..= ALTREF_FRAME = 7`); `skip[ s ]` /
+/// `globalmv[ s ]` activate SEG_LVL_SKIP / SEG_LVL_GLOBALMV
+/// (bits = 0 features — no data). Any active slot flips the §5.9.14
+/// `SegIdPreSkip` derivation to 1 (segment ids code BEFORE skip on
+/// every block).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegExtras {
+    pub ref_frame: [Option<i8>; crate::uncompressed_header_tail::MAX_SEGMENTS],
+    pub skip: [bool; crate::uncompressed_header_tail::MAX_SEGMENTS],
+    pub globalmv: [bool; crate::uncompressed_header_tail::MAX_SEGMENTS],
+}
+
+impl SegExtras {
+    /// Any feature slot active (⇒ §5.9.14 `SegIdPreSkip = 1`).
+    pub(crate) fn any(&self) -> bool {
+        self.ref_frame.iter().any(|r| r.is_some())
+            || self.skip.iter().any(|&b| b)
+            || self.globalmv.iter().any(|&b| b)
+    }
+
+    /// Highest segment index carrying any feature slot.
+    pub(crate) fn top_segment(&self) -> usize {
+        (0..crate::uncompressed_header_tail::MAX_SEGMENTS)
+            .rev()
+            .find(|&s| self.ref_frame[s].is_some() || self.skip[s] || self.globalmv[s])
+            .unwrap_or(0)
+    }
+}
+
+/// [`segmentation_params_for`] plus the r426 inter-override features:
+/// SEG_LVL_REF_FRAME data is the §5.9.14 3-bit unsigned field,
+/// SEG_LVL_SKIP / SEG_LVL_GLOBALMV are `bits = 0` active flags. The
+/// §5.9.14 `SegIdPreSkip` / `LastActiveSegId` derivations follow the
+/// combined table.
+pub(crate) fn segmentation_params_for_plan(
+    alt_q: &[i16],
+    extras: &SegExtras,
+) -> crate::uncompressed_header_tail::SegmentationParams {
+    use crate::uncompressed_header_tail::{
+        SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+    };
     let mut sp = SegmentationParams::disabled();
     sp.enabled = true;
     sp.update_map = true;
@@ -979,8 +1078,25 @@ pub(crate) fn segmentation_params_for(
         sp.segment_feature_active[seg][SEG_LVL_ALT_Q] = true;
         sp.segment_feature_data[seg][SEG_LVL_ALT_Q] = d;
     }
-    sp.seg_id_pre_skip = false;
-    sp.last_active_seg_id = (alt_q.len() - 1) as u8;
+    for (seg, rf) in extras.ref_frame.iter().enumerate() {
+        if let Some(data) = rf {
+            sp.segment_feature_active[seg][SEG_LVL_REF_FRAME] = true;
+            sp.segment_feature_data[seg][SEG_LVL_REF_FRAME] = i16::from(*data);
+        }
+    }
+    for (seg, &on) in extras.skip.iter().enumerate() {
+        sp.segment_feature_active[seg][SEG_LVL_SKIP] = on;
+    }
+    for (seg, &on) in extras.globalmv.iter().enumerate() {
+        sp.segment_feature_active[seg][SEG_LVL_GLOBALMV] = on;
+    }
+    // §5.9.14 derivations over the combined table.
+    sp.seg_id_pre_skip = extras.any();
+    sp.last_active_seg_id = alt_q.len().saturating_sub(1).max(if extras.any() {
+        extras.top_segment()
+    } else {
+        0
+    }) as u8;
     sp
 }
 
@@ -1057,6 +1173,7 @@ fn p_frame_config_primary<'a>(
         alt_primaries: Vec::new(),
         exact_mask: None,
         auto_lossless: false,
+        seg_extras: None,
     }
 }
 
@@ -1100,6 +1217,7 @@ fn encode_p_frame_yuv420(
     allow_temporal_seg: bool,
     exact_mask: Option<&[bool]>,
     auto_lossless: bool,
+    seg_extras: Option<&SegExtras>,
 ) -> Result<
     (
         Vec<u8>,
@@ -1114,6 +1232,7 @@ fn encode_p_frame_yuv420(
     cfg.allow_temporal_seg = allow_temporal_seg;
     cfg.exact_mask = exact_mask;
     cfg.auto_lossless = auto_lossless;
+    cfg.seg_extras = seg_extras;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -1429,14 +1548,25 @@ pub(crate) fn encode_inter_frame_generic_gm(
         fh.global_motion_params = Some(gmp);
     }
 
+    // r426 — the §5.9.14 inter-override feature tables + derivations
+    // (SegIdPreSkip / LastActiveSegId over the combined table).
+    let x = cfg.seg_extras.copied().unwrap_or_default();
+    let seg_id_pre_skip = x.any();
+    let last_active_seg_id =
+        alt_q
+            .len()
+            .saturating_sub(1)
+            .max(if x.any() { x.top_segment() } else { 0 }) as u8;
     let params = SyntaxFrameParams {
         subsampling_x: 1,
         subsampling_y: 1,
         num_planes: 3,
-        seg_id_pre_skip: false,
+        seg_id_pre_skip,
         segmentation_enabled: !alt_q.is_empty(),
-        seg_skip_active: false,
-        last_active_seg_id: alt_q.len().saturating_sub(1) as u8,
+        seg_ref_frame: x.ref_frame,
+        seg_skip: x.skip,
+        seg_globalmv: x.globalmv,
+        last_active_seg_id,
         // r426 — per-segment §5.9.2 `LosslessArray[]`: a segment whose
         // §7.12.2 qindex clamps to 0 flips the full lossless leaf
         // semantics for its blocks while the frame stays lossy.
@@ -1493,6 +1623,21 @@ pub(crate) fn encode_inter_frame_generic_gm(
         base_q_idx,
         alt_q,
     )?;
+    // r426 — arm the §5.9.14 inter-override features (ladder item 8):
+    // requires the segmentation carrier (non-empty alt_q), raw
+    // RefFrame data within the ladder, and flips SegIdPreSkip.
+    if let Some(x) = cfg.seg_extras {
+        if alt_q.is_empty()
+            || x.ref_frame
+                .iter()
+                .flatten()
+                .any(|rf| !cfg.single_refs.contains(rf))
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        ictx.extras = Some(*x);
+        ictx.seg_id_pre_skip = x.any();
+    }
     // r426 — arm the exactness-demand / auto-lossless election. Both
     // require a lossless segment in the table, and the mask must
     // cover the mi grid exactly.
@@ -2000,6 +2145,13 @@ struct PSearchCtx {
     /// (`None` when the table has no lossless segment; the mask and
     /// auto arms are inert then).
     lossless_seg: Option<u8>,
+    /// r426 — the three §5.9.14 inter-override features (ladder item
+    /// 8); `None` = no feature segments (the pre-r426 shape).
+    extras: Option<SegExtras>,
+    /// r426 — §5.9.14 `SegIdPreSkip` (1 whenever any override feature
+    /// is active): segment ids code BEFORE skip, so skip leaves keep
+    /// their own committed segment instead of the §5.11.9 pred.
+    seg_id_pre_skip: bool,
     /// r412 — driver-side write-mirror twin for §7.10.2 MV prediction
     /// (see the struct docs).
     mirror: PartitionWalker,
@@ -2164,6 +2316,8 @@ impl PSearchCtx {
             base_q_idx,
             exact_mask: None,
             auto_lossless: false,
+            extras: None,
+            seg_id_pre_skip: false,
             lossless_seg: {
                 let ll = seg_lossless_array(base_q_idx, seg_alt_q);
                 (0..seg_alt_q.len()).find(|&s| ll[s]).map(|s| s as u8)
@@ -2208,7 +2362,18 @@ impl PSearchCtx {
             }
         }
         let act = self.block_activity(input, mi_row, mi_col, b_size);
-        let top = (self.seg_alt_q.len() - 1) as u64;
+        let mut top = (self.seg_alt_q.len() - 1) as u64;
+        // r426 — inter-override feature segments (ladder item 8) are
+        // TRIAL-elected, never activity-assigned: their blocks carry
+        // forced §5.11.10/§5.11.11/§5.11.23/§5.11.25 derivations the
+        // plain residual ladder does not honour. The activity policy
+        // maps onto the feature-free prefix only.
+        if let Some(x) = self.extras.as_ref() {
+            let first_feature = (0..self.seg_alt_q.len())
+                .find(|&s| x.ref_frame[s].is_some() || x.skip[s] || x.globalmv[s])
+                .unwrap_or(self.seg_alt_q.len());
+            top = top.min(first_feature.saturating_sub(1) as u64);
+        }
         (act / 6).min(top) as u8
     }
 
@@ -3211,6 +3376,31 @@ fn encode_inter_leaf(
     // bits; `None` keeps the pre-r421 heuristics.
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
+    let leaf = encode_inter_leaf_base(mi_r, mi_c, b_size, input, recon, ictx, pricing)?;
+    // r426 — ladder item 8: the §5.9.14 inter-override feature-segment
+    // trials (SEG_LVL_SKIP / SEG_LVL_GLOBALMV / SEG_LVL_REF_FRAME)
+    // against the fully-searched winner, on >= 8x8 leaves.
+    if ictx.extras.is_some()
+        && crate::cdf::block_width(b_size) >= 8
+        && crate::cdf::block_height(b_size) >= 8
+    {
+        return seg_extras_trials(mi_r, mi_c, b_size, input, recon, ictx, pricing, leaf);
+    }
+    Ok(leaf)
+}
+
+/// The pre-r426 [`encode_inter_leaf`] body: the fully-searched leaf
+/// plus the §5.11.10 skip-mode trial.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_leaf_base(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    ictx: &mut PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
     let leaf = encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx, pricing)?;
 
     // r413 — §5.11.10 skip-mode trial: on a skip-mode frame, every
@@ -3291,8 +3481,15 @@ fn encode_inter_leaf(
     tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
 
     let mut sm_leaf = SyntaxBlock::skip_leaf(0, None);
-    // §5.11.19/§5.11.20: skip leaves inherit the segment pred cascade.
-    sm_leaf.segment_id = ictx.segment_pred(mi_r, mi_c);
+    // §5.11.19/§5.11.20: skip leaves inherit the segment pred cascade
+    // (r426: except under SegIdPreSkip, where the id codes pre-skip —
+    // skip-mode blocks then commit segment 0, whose feature slots are
+    // empty by the entry validation, keeping §5.11.10 codable).
+    sm_leaf.segment_id = if ictx.seg_id_pre_skip {
+        0
+    } else {
+        ictx.segment_pred(mi_r, mi_c)
+    };
     sm_leaf.inter = Some(SyntaxInterBlock {
         ref_frame: sm_ref,
         y_mode: MODE_NEAREST_NEARESTMV,
@@ -3375,6 +3572,267 @@ fn encode_inter_leaf(
         )?;
     }
     Ok(leaf)
+}
+
+/// r426 — re-run the committed leaf's prediction arm so the driver
+/// grids (and the prediction scratch) hold the WINNER's stamps — the
+/// same re-predict discipline as the skip-mode loser path.
+fn repredict_leaf_arm(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    recon: &ReconState,
+    ictx: &mut PSearchCtx,
+    leaf: &SyntaxBlock,
+) -> Result<(), Error> {
+    let Some(ib) = leaf.inter.as_ref() else {
+        return Ok(());
+    };
+    let ii = ib.interintra_mode.map(|m| InterIntraTrial {
+        mode: m,
+        wedge: (ib.wedge_interintra == 1).then_some(ib.interintra_wedge_index),
+        neigh: recon,
+    });
+    let sel = if ib.interintra_mode.is_some() {
+        CompoundSel::AVERAGE
+    } else {
+        CompoundSel {
+            ctype: ib.compound_type,
+            wedge_index: ib.wedge_index,
+            wedge_sign: ib.wedge_sign,
+            mask_type: ib.mask_type,
+        }
+    };
+    let motion = match ib.motion_mode {
+        MOTION_MODE_OBMC => MotionSel::Obmc,
+        MOTION_MODE_WARPED_CAUSAL => MotionSel::Warp(
+            ictx.warp_fit(mi_r, mi_c, b_size, ib.ref_frame[0], ib.mv)
+                .ok_or(Error::PartitionWalkOutOfRange)?,
+        ),
+        _ => MotionSel::Simple,
+    };
+    ictx.predict_leaf(
+        mi_r,
+        mi_c,
+        b_size,
+        ib.ref_frame,
+        ib.y_mode,
+        ib.mv,
+        ib.interp_filter[0],
+        sel,
+        ii,
+        motion,
+    )
+}
+
+/// r426 — ladder item 8: the §5.9.14 inter-override feature-segment
+/// trials against the fully-searched winner, in three arms:
+///
+/// * **SEG_LVL_REF_FRAME** re-labelling: a single-reference winner
+///   whose `RefFrame[ 0 ]` equals the feature data moves onto the
+///   feature segment — identical pixels, the §5.11.25 reference bits
+///   and the §5.11.20 `is_inter` S() fall bit-silent (elected by
+///   exact twin bits; requires the identical §7.12.2 quantiser).
+/// * **SEG_LVL_SKIP**: a pure-derivation block (skip = 1 with NO
+///   §5.11.11 bit, mode GLOBALMV, `RefFrame = [ LAST, NONE ]`, no
+///   residual) — the §5.9.14 static-region form; scored as bare
+///   prediction against the winner like the §5.11.10 skip-mode
+///   trial.
+/// * **SEG_LVL_GLOBALMV**: mode/ref fall bit-silent, the residual
+///   still codes at the segment's quantiser through the normal
+///   §5.11.34 chain.
+///
+/// All trials run on `>= 8x8` leaves only and finish by re-running
+/// the winner's prediction arm (grid-invariant discipline).
+#[allow(clippy::too_many_arguments)]
+fn seg_extras_trials(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    ictx: &mut PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+    mut best: SyntaxBlock,
+) -> Result<SyntaxBlock, Error> {
+    let x = ictx.extras.expect("caller gated on extras");
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
+    let lambda = lambda_for(&recon.qp);
+    let rate_of = |blk: &SyntaxBlock| -> Result<u64, Error> {
+        match pricing {
+            Some((twin, params)) => twin.price_block(blk, mi_r, mi_c, b_size, params),
+            None => Ok(p_leaf_rate(blk) * 256),
+        }
+    };
+    let d_now = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let mut score_best = score256(d_now, lambda, rate_of(&best)?);
+
+    // Arm 1 — SEG_LVL_REF_FRAME re-labelling (no pixel change).
+    for (s, rf) in x.ref_frame.iter().enumerate() {
+        let Some(rf) = rf else { continue };
+        if x.skip[s] || x.globalmv[s] {
+            continue;
+        }
+        let Some(ib) = best.inter.as_ref() else {
+            break;
+        };
+        if ib.skip_mode != 0
+            || ib.ref_frame[0] != *rf
+            || ib.ref_frame[1] > 0
+            || best.segment_id as usize == s
+        {
+            continue;
+        }
+        // The residual was quantised at the winner's segment — the
+        // re-label is only valid on an identical §7.12.2 qindex.
+        if ictx.seg_qp(&recon.qp, s as u8).base_q_idx
+            != ictx.seg_qp(&recon.qp, best.segment_id).base_q_idx
+        {
+            continue;
+        }
+        let mut alt = best.clone();
+        alt.segment_id = s as u8;
+        let sc = score256(d_now, lambda, rate_of(&alt)?);
+        if sc < score_best {
+            score_best = sc;
+            best = alt;
+        }
+    }
+
+    // Arms 2/3 — SEG_LVL_SKIP / SEG_LVL_GLOBALMV prediction trials.
+    let mut after_best = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+    for s in 0..crate::uncompressed_header_tail::MAX_SEGMENTS {
+        let (is_skip_seg, is_gmv_seg) = (x.skip[s], x.globalmv[s]);
+        if !is_skip_seg && !is_gmv_seg {
+            continue;
+        }
+        // §5.11.25 arm 3: RefFrame = [ LAST_FRAME, NONE ]; §5.11.23
+        // arm 2: YMode = GLOBALMV; Mv = GlobalMvs[ 0 ] (§7.10.2.1).
+        let stack = ictx.find_stack(mi_r, mi_c, b_size, [1, -1])?;
+        let gmv = [stack.global_mvs[0], [0, 0]];
+        if gmv[0][0].unsigned_abs() >= (1 << 14) || gmv[0][1].unsigned_abs() >= (1 << 14) {
+            continue;
+        }
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            [1, -1],
+            MODE_GLOBALMV,
+            gmv,
+            EIGHTTAP,
+            CompoundSel::AVERAGE,
+            None,
+            MotionSel::Simple,
+        )?;
+        let trial: SyntaxBlock = if is_skip_seg {
+            // Bare-prediction block (skip = 1, no residual) — stitch
+            // the scratch prediction into the recon planes.
+            let (bw, bh) = (bw4 * 4, bh4 * 4);
+            let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
+            let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
+            let (cbw, cbh) = (bw / 2, bh / 2);
+            let width = recon.width;
+            let cw = recon.chroma_w;
+            for i in 0..bh {
+                for j in 0..bw {
+                    recon.y[(row0 + i) * width + (col0 + j)] =
+                        ictx.scratch[0][(row0 + i) * width + (col0 + j)] as u8;
+                }
+            }
+            for i in 0..cbh {
+                for j in 0..cbw {
+                    recon.u[(crow0 + i) * cw + (ccol0 + j)] =
+                        ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                    recon.v[(crow0 + i) * cw + (ccol0 + j)] =
+                        ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                }
+            }
+            tu_bd_stamp(&mut recon.bd, 0, col0, row0, bw, bh);
+            tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
+            tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+            let mut l = SyntaxBlock::skip_leaf(0, None);
+            l.segment_id = s as u8;
+            l.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, -1],
+                y_mode: MODE_GLOBALMV,
+                mv: gmv,
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
+                interintra_mode: None,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
+                motion_mode: MOTION_MODE_SIMPLE,
+            });
+            l
+        } else {
+            // SEG_LVL_GLOBALMV — residual-coded at the segment's
+            // quantiser, over the SAME §5.11.17 uniform-depth ladder
+            // the normal leaf searched (a depth-0-only trial would
+            // concede distortion the mode/ref bit savings cannot
+            // recoup).
+            let seg_qp = ictx.seg_qp(&recon.qp, s as u8);
+            let mut max_depth = 0u32;
+            let mut t = MAX_TX_SIZE_RECT[b_size];
+            while max_depth < MAX_VARTX_DEPTH && t != TX_4X4 {
+                t = SPLIT_TX_SIZE[t];
+                max_depth += 1;
+            }
+            let before_trial = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+            let mut inner: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
+            for depth in 0..=max_depth {
+                let cand = encode_inter_leaf_residual(
+                    mi_r,
+                    mi_c,
+                    b_size,
+                    input,
+                    recon,
+                    ictx,
+                    [1, -1],
+                    MODE_GLOBALMV,
+                    gmv,
+                    0,
+                    EIGHTTAP,
+                    CompoundSel::AVERAGE,
+                    None,
+                    MOTION_MODE_SIMPLE,
+                    depth,
+                    s as u8,
+                    &seg_qp,
+                    pricing,
+                )?;
+                let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+                let sc = score256(d, lambda, rate_of(&cand)?);
+                if inner.as_ref().map(|(_, _, s0)| sc < *s0).unwrap_or(true) {
+                    inner = Some((cand, save_region_wh(recon, mi_r, mi_c, bw4, bh4), sc));
+                }
+                restore_region(recon, mi_r, mi_c, &before_trial);
+            }
+            let (cand, after_cand, _) = inner.expect("at least depth 0");
+            restore_region(recon, mi_r, mi_c, &after_cand);
+            cand
+        };
+        let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+        let sc = score256(d, lambda, rate_of(&trial)?);
+        if sc < score_best {
+            score_best = sc;
+            best = trial;
+            after_best = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+        } else {
+            restore_region(recon, mi_r, mi_c, &after_best);
+        }
+    }
+    // Grid-invariant finish: recon holds the winner; re-run its
+    // prediction arm so the §5.11.5 driver grids match.
+    restore_region(recon, mi_r, mi_c, &after_best);
+    repredict_leaf_arm(mi_r, mi_c, b_size, recon, ictx, &best)?;
+    Ok(best)
 }
 
 /// r411/r412 fully-searched inter leaf (mode + filter + residual RD);
@@ -4795,7 +5253,10 @@ fn encode_inter_leaf_residual(
     // r413 — §5.11.19/§5.11.20: a `skip == 1` leaf's segment_id is the
     // bit-silent `pred` cascade; a coded leaf commits the segment its
     // residual was quantised at.
-    block.segment_id = if skip == 1 {
+    // r426 — under §5.9.14 `SegIdPreSkip = 1` (any inter-override
+    // feature active) the segment id codes BEFORE skip, so a skip
+    // leaf keeps its own committed segment.
+    block.segment_id = if skip == 1 && !ictx.seg_id_pre_skip {
         ictx.segment_pred(mi_r, mi_c)
     } else {
         segment_id
@@ -4936,7 +5397,7 @@ fn encode_intra_candidate(
         // r413 — a skip intra leaf inherits the §5.11.20 `pred`
         // (bit-silent); a coded intra leaf keeps segment 0 (its
         // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
-        if !ictx.seg_alt_q.is_empty() && leaf.skip == 1 {
+        if !ictx.seg_alt_q.is_empty() && leaf.skip == 1 && !ictx.seg_id_pre_skip {
             leaf.segment_id = ictx.segment_pred(r, c);
             // r426 — a lossless pred segment flips §5.11.15 to the
             // bit-silent TX_4X4 default; the skip leaf's lossy tx
@@ -4972,7 +5433,8 @@ fn encode_intra_candidate(
     // The §5.11.19 skip arm is bit-silent — the override never
     // survives on a skip leaf (already applied inside the ladder for
     // priced candidates; re-derive here for the heuristic path).
-    if leaf.skip == 1 {
+    // r426: under SegIdPreSkip the id codes pre-skip and stands.
+    if leaf.skip == 1 && !ictx.seg_id_pre_skip {
         leaf.segment_id = ictx.segment_pred(r, c);
     }
     Ok(leaf)
@@ -5533,7 +5995,9 @@ mod tests {
             num_planes: 3,
             seg_id_pre_skip: false,
             segmentation_enabled: !ictx.seg_alt_q.is_empty(),
-            seg_skip_active: false,
+            seg_ref_frame: [None; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            seg_skip: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            seg_globalmv: [false; crate::uncompressed_header_tail::MAX_SEGMENTS],
             last_active_seg_id: ictx.seg_alt_q.len().saturating_sub(1) as u8,
             lossless_array: seg_lossless_array(recon.qp.base_q_idx, &ictx.seg_alt_q),
             coded_lossless: recon.lossless,
@@ -6631,6 +7095,7 @@ mod tests {
             true,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
