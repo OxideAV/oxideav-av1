@@ -344,12 +344,13 @@ fn decode_frame_spec_full(
         seg_qm_level,
     };
 
-    // `seg_skip_active`: any segment with SEG_LVL_SKIP active.
-    let seg_skip_active = sp.enabled
-        && sp
-            .segment_feature_active
-            .iter()
-            .any(|features| features[SEG_LVL_SKIP]);
+    // r426 — per-segment SEG_LVL_SKIP active flags: the §5.11.11
+    // short-circuit derives per block from the coded segment id.
+    let seg_skip: [bool; MAX_SEGMENTS] = if sp.enabled {
+        core::array::from_fn(|s| sp.segment_feature_active[s][SEG_LVL_SKIP])
+    } else {
+        [false; MAX_SEGMENTS]
+    };
 
     let cdef_bits = fh
         .cdef_params
@@ -367,7 +368,7 @@ fn decode_frame_spec_full(
         num_planes: cc.num_planes,
         seg_id_pre_skip: sp.seg_id_pre_skip,
         segmentation_enabled: sp.enabled,
-        seg_skip_active,
+        seg_skip,
         last_active_seg_id: sp.last_active_seg_id,
         lossless_array: &lossless,
         coded_lossless,

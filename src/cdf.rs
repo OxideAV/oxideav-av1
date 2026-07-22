@@ -16209,8 +16209,12 @@ pub struct TileDecodeParams<'a> {
     pub seg_id_pre_skip: bool,
     /// `segmentation_enabled` per §5.9.14.
     pub segmentation_enabled: bool,
-    /// `seg_skip_active` (any segment with `SEG_LVL_SKIP`).
-    pub seg_skip_active: bool,
+    /// r426 — per-segment `SEG_LVL_SKIP` active flags (§5.9.14
+    /// `FeatureEnabled[ s ][ SEG_LVL_SKIP ]`). The §5.11.11
+    /// `read_skip` short-circuit derives per BLOCK from the coded
+    /// segment id — a frame-level any-segment collapse forced
+    /// `skip = 1` onto blocks of SKIP-less segments on mixed tables.
+    pub seg_skip: [bool; MAX_SEGMENTS],
     /// `LastActiveSegId` per §5.9.14.
     pub last_active_seg_id: u8,
     /// `LosslessArray[ segment_id ]` per §5.9.2.
@@ -23693,7 +23697,7 @@ impl PartitionWalker {
         // Segmentation state (§5.9.14):
         seg_id_pre_skip: bool,
         segmentation_enabled: bool,
-        seg_skip_active: bool,
+        seg_skip: &[bool; MAX_SEGMENTS],
         last_active_seg_id: u8,
         lossless_array: &[bool; MAX_SEGMENTS],
         // Frame-header / sequence-header scalars:
@@ -23770,8 +23774,20 @@ impl PartitionWalker {
 
         // §5.11.7 line 5: `read_skip( )`. Routes through r152
         // `decode_skip` with `seg_skip_active = SegIdPreSkip &&
-        // seg_feature_active( SEG_LVL_SKIP )`.
-        let skip = self.decode_skip(decoder, cdfs, mi_row, mi_col, sub_size, seg_skip_active)?;
+        // seg_feature_active( SEG_LVL_SKIP )` — derived per BLOCK
+        // from the pre-skip-committed segment id (r426: the arm can
+        // only fire on the `SegIdPreSkip == 1` shape, where the
+        // §5.11.8 read above already resolved `segment_id`; a
+        // frame-level any-segment collapse mis-forced `skip = 1` on
+        // mixed tables).
+        let skip = self.decode_skip(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            seg_id_pre_skip && segmentation_enabled && seg_skip[segment_id as usize],
+        )?;
 
         // §5.11.7 lines 6-7: `if ( !SegIdPreSkip ) intra_segment_id( )`.
         // Post-skip arm — the §5.11.9 path now sees the just-decoded
@@ -29798,7 +29814,7 @@ impl PartitionWalker {
         // semantics match the §5.11.7 dispatcher (av1-spec p.65).
         seg_id_pre_skip: bool,
         segmentation_enabled: bool,
-        seg_skip_active: bool,
+        seg_skip: &[bool; MAX_SEGMENTS],
         last_active_seg_id: u8,
         lossless_array: &[bool; MAX_SEGMENTS],
         coded_lossless: bool,
@@ -30010,7 +30026,7 @@ impl PartitionWalker {
                 subsampling_y,
                 seg_id_pre_skip,
                 segmentation_enabled,
-                seg_skip_active,
+                seg_skip,
                 last_active_seg_id,
                 lossless_array,
                 coded_lossless,
@@ -30041,7 +30057,7 @@ impl PartitionWalker {
             sub_size,
             seg_id_pre_skip,
             segmentation_enabled,
-            seg_skip_active,
+            seg_skip,
             last_active_seg_id,
             lossless_array,
             coded_lossless,
@@ -30591,7 +30607,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         seg_id_pre_skip: bool,
         segmentation_enabled: bool,
-        seg_skip_active: bool,
+        seg_skip: &[bool; MAX_SEGMENTS],
         last_active_seg_id: u8,
         lossless_array: &[bool; MAX_SEGMENTS],
         coded_lossless: bool,
@@ -30647,7 +30663,7 @@ impl PartitionWalker {
         } else {
             0
         };
-        let _ = seg_skip_active;
+        let _ = seg_skip;
         // §5.11.6 inter arm — full §5.11.18 cascade.
         let info = self.decode_inter_frame_mode_info(
             decoder,
@@ -32945,7 +32961,7 @@ impl PartitionWalker {
         num_planes: u8,
         seg_id_pre_skip: bool,
         segmentation_enabled: bool,
-        seg_skip_active: bool,
+        seg_skip: &[bool; MAX_SEGMENTS],
         last_active_seg_id: u8,
         lossless_array: &[bool; MAX_SEGMENTS],
         coded_lossless: bool,
@@ -33052,7 +33068,7 @@ impl PartitionWalker {
                     num_planes,
                     seg_id_pre_skip,
                     segmentation_enabled,
-                    seg_skip_active,
+                    seg_skip,
                     last_active_seg_id,
                     lossless_array,
                     coded_lossless,
@@ -33106,7 +33122,7 @@ impl PartitionWalker {
                     num_planes,
                     seg_id_pre_skip,
                     segmentation_enabled,
-                    seg_skip_active,
+                    seg_skip,
                     last_active_seg_id,
                     lossless_array,
                     coded_lossless,
@@ -33140,7 +33156,7 @@ impl PartitionWalker {
                     num_planes,
                     seg_id_pre_skip,
                     segmentation_enabled,
-                    seg_skip_active,
+                    seg_skip,
                     last_active_seg_id,
                     lossless_array,
                     coded_lossless,
@@ -33174,7 +33190,7 @@ impl PartitionWalker {
                     num_planes,
                     seg_id_pre_skip,
                     segmentation_enabled,
-                    seg_skip_active,
+                    seg_skip,
                     last_active_seg_id,
                     lossless_array,
                     coded_lossless,
@@ -33208,7 +33224,7 @@ impl PartitionWalker {
                     num_planes,
                     seg_id_pre_skip,
                     segmentation_enabled,
-                    seg_skip_active,
+                    seg_skip,
                     last_active_seg_id,
                     lossless_array,
                     coded_lossless,
@@ -33450,7 +33466,7 @@ impl PartitionWalker {
                     params.num_planes,
                     params.seg_id_pre_skip,
                     params.segmentation_enabled,
-                    params.seg_skip_active,
+                    &params.seg_skip,
                     params.last_active_seg_id,
                     params.lossless_array,
                     params.coded_lossless,
@@ -49573,7 +49589,7 @@ mod tests {
                 BLOCK_8X8,
                 /* seg_id_pre_skip = */ false,
                 /* segmentation_enabled = */ false,
-                /* seg_skip_active = */ false,
+                /* seg_skip_active = */ &[false; MAX_SEGMENTS],
                 /* last_active_seg_id = */ 0,
                 &lossless_array,
                 /* coded_lossless = */ false,
@@ -49663,7 +49679,7 @@ mod tests {
                 BLOCK_8X8,
                 /* seg_id_pre_skip = */ true,
                 /* segmentation_enabled = */ true,
-                /* seg_skip_active = */ false,
+                /* seg_skip_active = */ &[false; MAX_SEGMENTS],
                 /* last_active_seg_id = */ 7,
                 &lossless_array,
                 /* coded_lossless = */ false,
@@ -49730,7 +49746,7 @@ mod tests {
                 BLOCK_8X8,
                 /* seg_id_pre_skip = */ false,
                 /* segmentation_enabled = */ true,
-                /* seg_skip_active = */ false,
+                /* seg_skip_active = */ &[false; MAX_SEGMENTS],
                 /* last_active_seg_id = */ 7,
                 &lossless_array,
                 /* coded_lossless = */ false,
@@ -49754,10 +49770,15 @@ mod tests {
         assert!(prefix.lossless, "lossless_array[0] = true");
     }
 
-    /// §5.11.7 with seg-skip-active: `read_skip` short-circuits to
-    /// `skip = 1` without reading any bit (the §5.11.11 outer arm).
-    /// On the pre-skip arm the §5.11.9 `S()` still fires because the
-    /// pre-skip arm passes `skip = 0` to `decode_intra_segment_id`.
+    /// §5.11.7 with SEG_LVL_SKIP active on the block's segment:
+    /// `read_skip` short-circuits to `skip = 1` without reading any
+    /// bit (the §5.11.11 outer arm). r426: the arm derives per BLOCK
+    /// — it requires the spec-consistent `SegIdPreSkip = 1` +
+    /// `segmentation_enabled = 1` configuration (§5.9.14 forces
+    /// SegIdPreSkip whenever a feature `>= SEG_LVL_REF_FRAME` is
+    /// active), and the pre-skip §5.11.8 read resolves the segment
+    /// id FIRST (consuming its §5.11.9 `S()` bits), so only the skip
+    /// element itself is bit-silent.
     #[test]
     fn decode_intra_frame_mode_info_prefix_seg_skip_active_no_skip_bit() {
         let geom = TileGeometry {
@@ -49768,23 +49789,54 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-
-        let bytes = [0xFFu8; 8];
-        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
-        let pos_before = dec.position();
         let lossless_array = [false; MAX_SEGMENTS];
 
-        let prefix = walker
+        // Reference run: identical configuration with SEG_LVL_SKIP
+        // INACTIVE — consumes the same pre-skip segment-id bits PLUS
+        // one §5.11.11 skip S().
+        let bytes = [0xFFu8; 8];
+        let mut dec_ref = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let mut cdfs_ref = TileCdfContext::new_from_defaults();
+        walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec_ref,
+                &mut cdfs_ref,
+                0,
+                0,
+                BLOCK_16X16,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* seg_skip = */ &[false; MAX_SEGMENTS],
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ false, // short-circuit cdef
+                /* allow_intrabc = */ false,
+                /* cdef_bits = */ 0,
+                /* read_deltas = */ false,
+                /* use_128x128_superblock = */ false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ false,
+                /* delta_lf_multi = */ false,
+                /* mono_chrome = */ false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+        let pos_with_skip_bit = dec_ref.position();
+
+        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let prefix = walker2
             .decode_intra_frame_mode_info_prefix(
                 &mut dec,
                 &mut cdfs,
                 0,
                 0,
                 BLOCK_16X16,
-                /* seg_id_pre_skip = */ false, // post-skip, but irrelevant
-                /* segmentation_enabled = */ false,
-                /* seg_skip_active = */ true,
-                /* last_active_seg_id = */ 0,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* seg_skip = */ &[true; MAX_SEGMENTS],
+                /* last_active_seg_id = */ 7,
                 &lossless_array,
                 /* coded_lossless = */ false,
                 /* enable_cdef = */ false, // short-circuit cdef
@@ -49800,12 +49852,16 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(prefix.skip, 1, "seg_skip_active ⇒ skip = 1");
-        assert_eq!(prefix.segment_id, 0);
         assert_eq!(
+            prefix.skip, 1,
+            "seg_feature_active(SEG_LVL_SKIP) ⇒ skip = 1"
+        );
+        assert!(
+            dec.position() < pos_with_skip_bit,
+            "the seg-skip arm must consume strictly fewer bits than \
+             the coded-skip reference ({} vs {})",
             dec.position(),
-            pos_before,
-            "no bits consumed on the seg-skip + no-cdef path",
+            pos_with_skip_bit,
         );
         // §5.11.56 short-circuit returned the pre-existing -1
         // sentinel (skip=1 and !enable_cdef both fire).
@@ -49838,7 +49894,7 @@ mod tests {
                 BLOCK_4X4,
                 false,
                 false,
-                /* seg_skip_active = */ true,
+                /* seg_skip_active = */ &[true; MAX_SEGMENTS],
                 0,
                 &lossless_array,
                 false,
@@ -49911,7 +49967,7 @@ mod tests {
                 BLOCK_8X8,
                 false,
                 false,
-                false,
+                &[false; MAX_SEGMENTS],
                 0,
                 &lossless_array,
                 false,
@@ -49973,7 +50029,7 @@ mod tests {
                 sub_size,
                 false,
                 false,
-                false,
+                &[false; MAX_SEGMENTS],
                 last_active_seg_id,
                 &lossless_array,
                 false,
@@ -50056,7 +50112,7 @@ mod tests {
                     BLOCK_8X8,
                     pre_skip,
                     /* segmentation_enabled = */ false,
-                    /* seg_skip_active = */ false,
+                    /* seg_skip_active = */ &[false; MAX_SEGMENTS],
                     0,
                     &lossless_array,
                     false,

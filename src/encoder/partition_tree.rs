@@ -1108,8 +1108,18 @@ pub struct SyntaxFrameParams {
     pub seg_id_pre_skip: bool,
     /// §5.9.14 `segmentation_enabled`.
     pub segmentation_enabled: bool,
-    /// §5.11.11 `SegIdPreSkip && seg_feature_active( SEG_LVL_SKIP )`.
-    pub seg_skip_active: bool,
+    /// r426 — per-segment §5.9.14 feature table for the three inter
+    /// overrides. `seg_ref_frame[ s ] = Some(data)` means
+    /// SEG_LVL_REF_FRAME is active on segment `s` with
+    /// `FeatureData = data` (a §6.10.24 `RefFrame` ordinal;
+    /// `0 = INTRA_FRAME` forces the intra arm); `seg_skip[ s ]` /
+    /// `seg_globalmv[ s ]` are the SEG_LVL_SKIP / SEG_LVL_GLOBALMV
+    /// active flags. Every §5.11.10/§5.11.11/§5.11.20/§5.11.23/
+    /// §5.11.25 gate derives per BLOCK from the committed segment
+    /// id. All-inert defaults preserve the pre-r426 behaviour.
+    pub seg_ref_frame: [Option<i8>; MAX_SEGMENTS],
+    pub seg_skip: [bool; MAX_SEGMENTS],
+    pub seg_globalmv: [bool; MAX_SEGMENTS],
     /// §5.9.14 `LastActiveSegId`.
     pub last_active_seg_id: u8,
     /// §6.8.2 per-segment `LosslessArray[]`.
@@ -1185,7 +1195,9 @@ impl SyntaxFrameParams {
             num_planes: 3,
             seg_id_pre_skip: false,
             segmentation_enabled: false,
-            seg_skip_active: false,
+            seg_ref_frame: [None; MAX_SEGMENTS],
+            seg_skip: [false; MAX_SEGMENTS],
+            seg_globalmv: [false; MAX_SEGMENTS],
             last_active_seg_id: 0,
             lossless_array: [false; MAX_SEGMENTS],
             coded_lossless: false,
@@ -1817,7 +1829,11 @@ pub fn write_block_syntax(
         cdfs,
         block.skip,
         skip_ctx(above_skip, left_skip),
-        params.seg_skip_active,
+        // §5.11.11 `SegIdPreSkip && seg_feature_active( SEG_LVL_SKIP )`
+        // at the block's own segment (r426).
+        params.seg_id_pre_skip
+            && params.segmentation_enabled
+            && params.seg_skip[block.segment_id as usize],
     )?;
 
     // §5.11.7 lines 6-7: `if ( !SegIdPreSkip ) intra_segment_id( )` —
@@ -2506,6 +2522,15 @@ fn write_block_syntax_inter_frame(
         delta_lf_res: params.delta_lf_res,
     };
     let is_inter_flag = u8::from(block.inter.is_some());
+    // r426 — the §5.9.14 per-segment feature gates at the block's own
+    // committed segment id (the §5.11.10/§5.11.11/§5.11.20 arms).
+    let seg_ref_data: i8 = params.seg_ref_frame[block.segment_id as usize].unwrap_or(0);
+    let seg_ref_active: bool =
+        params.segmentation_enabled && params.seg_ref_frame[block.segment_id as usize].is_some();
+    let seg_skip_feat: bool =
+        params.segmentation_enabled && params.seg_skip[block.segment_id as usize];
+    let seg_gmv_active: bool =
+        params.segmentation_enabled && params.seg_globalmv[block.segment_id as usize];
     let prefix = write_inter_frame_mode_info_prefix(
         writer,
         cdfs,
@@ -2521,11 +2546,11 @@ fn write_block_syntax_inter_frame(
         /* seg_id_read_ctx = */ seg_ctx,
         seg_pred_ctx_v,
         is_inter_ctx_v,
-        /* seg_skip_mode_off = */ false,
-        /* seg_skip_active = */ params.seg_skip_active,
-        /* seg_ref_frame_active = */ false,
-        /* seg_ref_frame_is_inter = */ false,
-        /* seg_globalmv_active = */ false,
+        /* seg_skip_mode_off = */ seg_ref_active || seg_skip_feat || seg_gmv_active,
+        /* seg_skip_active = */ params.seg_id_pre_skip && seg_skip_feat,
+        seg_ref_active,
+        /* seg_ref_frame_is_inter = */ seg_ref_data != 0,
+        seg_gmv_active,
         params.segmentation_enabled,
         ip.segmentation_update_map,
         ip.segmentation_temporal_update,
@@ -2915,10 +2940,10 @@ fn write_block_syntax_inter_frame(
             sub_size,
             skip_mode,
             ip.skip_mode_frame,
-            /* seg_ref_frame_active = */ false,
-            /* seg_ref_frame_data = */ 0,
-            /* seg_skip_active = */ false,
-            /* seg_globalmv_active = */ false,
+            seg_ref_active,
+            seg_ref_data,
+            /* seg_skip_active = */ seg_skip_feat,
+            seg_gmv_active,
             ip.reference_select,
             avail_u,
             avail_l,
@@ -4903,7 +4928,7 @@ mod tests {
                 params.num_planes,
                 params.seg_id_pre_skip,
                 params.segmentation_enabled,
-                params.seg_skip_active,
+                &params.seg_skip,
                 params.last_active_seg_id,
                 &params.lossless_array,
                 params.coded_lossless,
@@ -6510,7 +6535,7 @@ mod tests {
                 params.num_planes,
                 params.seg_id_pre_skip,
                 params.segmentation_enabled,
-                params.seg_skip_active,
+                &params.seg_skip,
                 params.last_active_seg_id,
                 &params.lossless_array,
                 params.coded_lossless,
