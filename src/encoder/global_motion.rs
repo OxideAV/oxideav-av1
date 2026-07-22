@@ -542,6 +542,24 @@ fn candidate_for(
     // Score the CODABLE model over the untrimmed field (the stream
     // affects every block, not just the inliers).
     let err = mean_sq_residual(&continuous_of_params(&params), samples);
+    // r426 — §7.10.2.1 stores the TRANSLATION model in (row, col)
+    // order: `mv[ 0 ] = gm_params[ ref ][ 0 ] >> ..` with `mv[ 0 ]`
+    // the ROW component, while the ROTZOOM/AFFINE projection reads
+    // `gm_params[ 0 ]` as the X (column) offset (`xc = .. +
+    // gm_params[ 0 ]`, `mv[ 1 ] = xc`). The fit works in the affine
+    // x-first convention throughout (including the codable-model
+    // scoring above) and swaps at the emission boundary — the
+    // pre-r426 packing shipped x-first TRANSLATION params, so
+    // GLOBALMV predictions ran on a 90°-swapped vector: conformant
+    // both sides (the header and §7.10.2.1 agreed), but the arm
+    // never won an election.
+    let params = if gm_type == WarpModelType::Translation {
+        [
+            params[1], params[0], params[2], params[3], params[4], params[5],
+        ]
+    } else {
+        params
+    };
     Some(Candidate {
         gm_type,
         params,
@@ -639,8 +657,12 @@ mod tests {
         let (t, p) = estimate_global_motion(&field(&model, 0.05), false);
         assert_eq!(t, WarpModelType::Translation);
         // hp = false ⇒ translation grid step is 1/4 pel (2 << 13).
-        assert_eq!(p[0], (3.25f64 * 65536.0) as i32);
-        assert_eq!(p[1], (-1.5f64 * 65536.0) as i32);
+        // r426 — §7.10.2.1 TRANSLATION order: `gm_params[ 0 ]` is the
+        // ROW (v) component (`mv[ 0 ] = gm_params[ 0 ] >> ..`),
+        // `gm_params[ 1 ]` the COLUMN (u) — the emission boundary
+        // swaps out of the fit's x-first convention.
+        assert_eq!(p[0], (-1.5f64 * 65536.0) as i32);
+        assert_eq!(p[1], (3.25f64 * 65536.0) as i32);
     }
 
     #[test]
