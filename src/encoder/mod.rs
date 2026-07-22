@@ -342,11 +342,14 @@ pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model;
 #[doc(hidden)]
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model_gm;
 pub use inter_frame::{
-    encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg, EncodedGop,
-    GopFrameRecon, GOP_MAX_FRAMES,
+    encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_lossless_regions,
+    encode_gop_yuv420_with_q_seg, EncodedGop, GopFrameRecon, LosslessRegion, GOP_MAX_FRAMES,
 };
 #[doc(hidden)]
-pub use inter_frame::{encode_gop_yuv420_with_q_seg_tuned, GopTuning, TunedGop};
+pub use inter_frame::{
+    encode_gop_yuv420_with_q_seg_lossless_tuned, encode_gop_yuv420_with_q_seg_tuned, GopTuning,
+    TunedGop,
+};
 #[doc(hidden)]
 pub use inter_predict::{
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,

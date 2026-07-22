@@ -135,6 +135,12 @@ pub struct EncodedGop {
 pub struct TunedGop {
     pub gop: EncodedGop,
     pub seg_temporal_updates: Vec<bool>,
+    /// r426 — each P-frame's committed §5.11.20 `SegmentIds[]` grid
+    /// (row-major `mi_rows × mi_cols`; index 0 is the first P-frame;
+    /// empty on unsegmented GOPs). Lets the measurement harnesses
+    /// locate the per-segment-lossless blocks without re-deriving the
+    /// election.
+    pub p_segment_maps: Vec<Vec<i32>>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -352,6 +358,19 @@ pub fn encode_gop_yuv420_with_q(
 /// every P-frame header re-codes the full feature table under the
 /// `PRIMARY_REF_NONE` forced `update_data = 1`).
 ///
+/// r426 — **per-segment lossless mixing**: a segment whose §5.9.14
+/// `get_qindex( s ) = Clip3( 0, 255, base_q_idx + alt_q[ s ] )`
+/// reaches 0 takes the full §5.9.2 `LosslessArray[ s ]` leaf
+/// semantics inside the otherwise-lossy frame — its blocks code the
+/// `TX_4X4`-only §5.11.34 row-major TU grid through the §7.13.2.10
+/// WHT chain (bit-exact residual round-trip), read no §5.11.15 /
+/// §5.11.16 tx-size symbols and no §5.11.47 tx-type symbol, exactly
+/// as the decode side derives per block from
+/// `Lossless = LosslessArray[ segment_id ]`. Blocks in the other
+/// segments stay on the lossy ladder. `CodedLossless` stays 0 (the
+/// frame still codes `TX_MODE_SELECT`, and segment 0 rides
+/// `base_q_idx > 0`), so the mix is purely per-block.
+///
 /// ## Errors
 ///
 /// [`Error::PartitionWalkOutOfRange`] on the
@@ -360,8 +379,15 @@ pub fn encode_gop_yuv420_with_q(
 /// * `alt_q.len() > MAX_SEGMENTS = 8` or `alt_q.len() == 1`;
 /// * `alt_q[ 0 ] != 0` (intra leaves code segment 0 at the frame
 ///   quantiser — the residual chain requires the identity delta);
-/// * any segment's `base_q_idx + alt_q[ s ]` outside `1..=255`
-///   (per-segment lossless mixing is a follow-up arc).
+/// * `base_q_idx == 0` with a non-empty `alt_q` (a `base_q_idx = 0`
+///   GOP is the `CodedLossless` configuration — segment deltas would
+///   make segment 0 the only lossless segment while the header
+///   builder still derives the ONLY_4X4 frame shape);
+/// * any `alt_q[ s ]` outside the §5.9.14 `su(1+8)` range
+///   `-255..=255`, or any segment's `base_q_idx + alt_q[ s ] > 255`
+///   (the §7.12.2 clamp makes over-255 deltas unreachable dead
+///   weight; deltas that clamp BELOW zero are the per-segment
+///   lossless election and are accepted).
 pub fn encode_gop_yuv420_with_q_seg(
     frames: &[Yuv420Frame],
     base_q_idx: u8,
@@ -445,6 +471,102 @@ impl Default for GopTuning {
     }
 }
 
+/// r426 — one caller-supplied exactness-demand rectangle in LUMA
+/// pixel coordinates (top-left `(x, y)`, `width × height`; clipped to
+/// the frame). Every block overlapping the rectangle is coded on the
+/// lossless segment (§5.9.14 `SEG_LVL_ALT_Q` to qindex 0 — the
+/// §5.9.2 `LosslessArray[]` TX_4X4/WHT leaf semantics), so the
+/// decoded region equals the input pixel-for-pixel on every frame
+/// the encoder segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LosslessRegion {
+    /// Left edge (luma samples).
+    pub x: u32,
+    /// Top edge (luma samples).
+    pub y: u32,
+    /// Width (luma samples; > 0).
+    pub width: u32,
+    /// Height (luma samples; > 0).
+    pub height: u32,
+}
+
+/// r426 — build the row-major mi-cell exactness mask for the demand
+/// rectangles: a 4×4 luma cell is demanded when it intersects any
+/// (frame-clipped) rectangle, then the demand dilates to the full
+/// 2×2-mi group so a sub-8×8 group's single §5.11.34 `HasChroma`
+/// coder (the SE cell's leaf) and the 4:2:0 chroma cositing are
+/// covered by the same lossless segment.
+fn build_exact_mask(
+    regions: &[LosslessRegion],
+    width: u32,
+    height: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+) -> Vec<bool> {
+    let mut mask = vec![false; (mi_rows as usize) * (mi_cols as usize)];
+    for reg in regions {
+        let x0 = reg.x.min(width);
+        let y0 = reg.y.min(height);
+        let x1 = reg.x.saturating_add(reg.width).min(width);
+        let y1 = reg.y.saturating_add(reg.height).min(height);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let (c0, r0) = (x0 / 4, y0 / 4);
+        let (c1, r1) = (x1.div_ceil(4).min(mi_cols), y1.div_ceil(4).min(mi_rows));
+        for r in r0..r1 {
+            for c in c0..c1 {
+                mask[(r * mi_cols + c) as usize] = true;
+            }
+        }
+    }
+    // 2×2-mi group dilation.
+    let mut out = mask.clone();
+    for r in 0..mi_rows {
+        for c in 0..mi_cols {
+            if mask[(r * mi_cols + c) as usize] {
+                let (gr, gc) = (r & !1, c & !1);
+                for rr in gr..(gr + 2).min(mi_rows) {
+                    for cc in gc..(gc + 2).min(mi_cols) {
+                        out[(rr * mi_cols + cc) as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// r426 — the pixel-exact-region GOP entry point: encode at
+/// `base_q_idx` with the demand `regions` coded PIXEL-EXACT through
+/// the per-segment lossless machinery (`alt_q = [ 0, -base_q_idx ]`
+/// — segment 1's §7.12.2 qindex is exactly 0), optionally electing
+/// additional synthetic leaves onto the lossless segment by twin
+/// bits + distortion (`auto_detect`). The KEY frame is unsegmented
+/// (r413 shape) — the exactness contract covers the P-frames; a
+/// segmented-KEY arm is the follow-up.
+pub fn encode_gop_yuv420_with_q_lossless_regions(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+) -> Result<EncodedGop, Error> {
+    if base_q_idx == 0 {
+        // Already CodedLossless everywhere — the demand is vacuous.
+        return encode_gop_yuv420_with_q(frames, 0);
+    }
+    let alt_q = [0i16, -i16::from(base_q_idx)];
+    encode_gop_yuv420_with_q_seg_lossless_tuned(
+        frames,
+        base_q_idx,
+        &alt_q,
+        regions,
+        auto_detect,
+        GopTuning::default(),
+    )
+    .map(|t| t.gop)
+}
+
 /// r423 — [`encode_gop_yuv420_with_q_seg`] with explicit
 /// [`GopTuning`] switches (the measurement-harness entry point).
 #[doc(hidden)]
@@ -452,6 +574,23 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
     frames: &[Yuv420Frame],
     base_q_idx: u8,
     alt_q: &[i16],
+    tuning: GopTuning,
+) -> Result<TunedGop, Error> {
+    encode_gop_yuv420_with_q_seg_lossless_tuned(frames, base_q_idx, alt_q, &[], false, tuning)
+}
+
+/// r426 — the full-surface GOP entry: segmentation deltas, exactness
+/// demand rectangles, the auto-lossless election switch and the
+/// [`GopTuning`] measurement switches. `regions`/`auto_detect`
+/// require an `alt_q` table carrying a lossless segment (a delta
+/// clamping the §7.12.2 qindex to 0).
+#[doc(hidden)]
+pub fn encode_gop_yuv420_with_q_seg_lossless_tuned(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
     tuning: GopTuning,
 ) -> Result<TunedGop, Error> {
     let model = tuning.model;
@@ -463,12 +602,15 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
         if alt_q.len() == 1
             || alt_q.len() > crate::uncompressed_header_tail::MAX_SEGMENTS
             || alt_q[0] != 0
+            || base_q_idx == 0
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
         for &d in alt_q {
-            let q = i32::from(base_q_idx) + i32::from(d);
-            if !(1..=255).contains(&q) {
+            // §5.9.14 su(1+8) representability; §7.12.2 clamps the
+            // derived qindex at 0 (the r426 per-segment lossless
+            // election) but over-255 sums are rejected as dead weight.
+            if !(-255..=255).contains(&d) || i32::from(base_q_idx) + i32::from(d) > 255 {
                 return Err(Error::PartitionWalkOutOfRange);
             }
         }
@@ -484,10 +626,29 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
     // Frame 0: the r410 conformance-grade KEY-frame encoder (which
     // also validates the dimension rules). r423: also take the KEY
     // frame's §7.20 slot payload — its `allFrames` refresh seeds
-    // every slot of the carry store below.
-    let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_carry(
-        &frames[0], base_q_idx, model,
-    )?;
+    // every slot of the carry store below. r426: with demand
+    // rectangles the KEY frame is SEGMENTED too (same delta table,
+    // §5.11.8 per-block segment ids) so the demanded region is
+    // pixel-exact from frame 0, not just on the P-frames.
+    let key_mask: Option<Vec<bool>> = (!regions.is_empty()).then(|| {
+        // §5.9.5: dimensions are validated multiples of 8, so
+        // `MiCols = width / 4` / `MiRows = height / 4` exactly (the
+        // same grid the fh builder below derives).
+        build_exact_mask(regions, width, height, height / 4, width / 4)
+    });
+    let (key, key_carry) = if let Some(mask) = key_mask.as_deref() {
+        crate::encoder::key_frame::encode_key_frame_yuv420_with_q_seg_carry(
+            &frames[0],
+            base_q_idx,
+            model,
+            alt_q,
+            Some(mask),
+        )?
+    } else {
+        crate::encoder::key_frame::encode_key_frame_yuv420_with_q_carry(
+            &frames[0], base_q_idx, model,
+        )?
+    };
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
     let mut recon = vec![GopFrameRecon {
@@ -505,6 +666,17 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
         let fs0 = fh0.frame_size.expect("KEY builder always sizes");
         (fs0.mi_rows, fs0.mi_cols)
     };
+    // r426 — exactness-demand mask + auto-lossless election arming:
+    // both require a lossless segment in the table.
+    if (!regions.is_empty() || auto_detect)
+        && !seg_lossless_array(base_q_idx, alt_q)[..alt_q.len()]
+            .iter()
+            .any(|&l| l)
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let exact_mask: Option<Vec<bool>> =
+        (!regions.is_empty()).then(|| build_exact_mask(regions, width, height, key_mi.0, key_mi.1));
     let mut mf_store: [SavedMotionField; 8] =
         core::array::from_fn(|_| SavedMotionField::intra(key_mi.0, key_mi.1));
     // r423 — encoder-side §7.20 cross-frame carry store (CDFs /
@@ -515,6 +687,7 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
     let mut carry_store: [std::rc::Rc<RefSlotCarry>; 8] =
         core::array::from_fn(|_| key_carry.clone());
     let mut seg_temporal_updates: Vec<bool> = Vec::new();
+    let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -540,10 +713,15 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
             global_motion,
             primary.as_deref(),
             tuning.temporal_seg,
+            exact_mask.as_deref(),
+            auto_detect,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
         seg_temporal_updates.push(aux.seg_temporal);
+        if !alt_q.is_empty() {
+            p_segment_maps.push(carry.segment_ids.clone());
+        }
         // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
         mf_store[((p_index - 1) & 1) as usize] = saved_mf;
         carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
@@ -571,6 +749,7 @@ pub fn encode_gop_yuv420_with_q_seg_tuned(
             seq,
         },
         seg_temporal_updates,
+        p_segment_maps,
     })
 }
 
@@ -667,6 +846,16 @@ pub(crate) struct InterFrameConfig<'a> {
     /// (caller bug — the pyramid drivers that use this never
     /// segment).
     pub alt_primaries: Vec<(u8, Option<&'a RefSlotCarry>)>,
+    /// r426 — exactness-demand mask (row-major `mi_rows × mi_cols`
+    /// cells; `None` = no demand). Requires a lossless segment in the
+    /// frame's `alt_q` table. Leaves overlapping demanded cells are
+    /// forced onto the lossless segment on every arm, making the
+    /// demanded region reconstruct pixel-exact.
+    pub exact_mask: Option<&'a [bool]>,
+    /// r426 — content-driven per-segment-lossless election for
+    /// leaves OUTSIDE the demand mask (see
+    /// [`GopTuning`]-level docs on the twin-priced trial).
+    pub auto_lossless: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -767,21 +956,51 @@ fn build_inter_frame_fh(
     // (`su(1+8)` each). `SegIdPreSkip = 0` (no feature at `j >=
     // SEG_LVL_REF_FRAME`); `LastActiveSegId = alt_q.len() - 1`.
     if !alt_q.is_empty() {
-        use crate::uncompressed_header_tail::{SegmentationParams, SEG_LVL_ALT_Q};
-        let mut sp = SegmentationParams::disabled();
-        sp.enabled = true;
-        sp.update_map = true;
-        sp.temporal_update = false;
-        sp.update_data = true;
-        for (seg, &d) in alt_q.iter().enumerate() {
-            sp.segment_feature_active[seg][SEG_LVL_ALT_Q] = true;
-            sp.segment_feature_data[seg][SEG_LVL_ALT_Q] = d;
-        }
-        sp.seg_id_pre_skip = false;
-        sp.last_active_seg_id = (alt_q.len() - 1) as u8;
-        fh.segmentation_params = Some(sp);
+        fh.segmentation_params = Some(segmentation_params_for(alt_q));
     }
     fh
+}
+
+/// The §5.9.14 feature table this encoder codes for a SEG_LVL_ALT_Q
+/// delta ladder: one active ALT_Q slot per segment (`su(1+8)` each),
+/// `update_map = update_data = 1`, `temporal_update` starting at 0
+/// (the r423 per-frame election may flip it after the tile is
+/// priced), `SegIdPreSkip = 0`, `LastActiveSegId = alt_q.len() - 1`.
+pub(crate) fn segmentation_params_for(
+    alt_q: &[i16],
+) -> crate::uncompressed_header_tail::SegmentationParams {
+    use crate::uncompressed_header_tail::{SegmentationParams, SEG_LVL_ALT_Q};
+    let mut sp = SegmentationParams::disabled();
+    sp.enabled = true;
+    sp.update_map = true;
+    sp.temporal_update = false;
+    sp.update_data = true;
+    for (seg, &d) in alt_q.iter().enumerate() {
+        sp.segment_feature_active[seg][SEG_LVL_ALT_Q] = true;
+        sp.segment_feature_data[seg][SEG_LVL_ALT_Q] = d;
+    }
+    sp.seg_id_pre_skip = false;
+    sp.last_active_seg_id = (alt_q.len() - 1) as u8;
+    sp
+}
+
+/// r426 — the §5.9.2 `LosslessArray[]` this encoder's headers derive:
+/// `LosslessArray[ s ] = get_qindex( 1, s ) == 0` (every `DeltaQ??`
+/// side value is zero on every header this encoder emits, so the
+/// §5.9.2 conjunction collapses to the qindex test). Segments at or
+/// past `alt_q.len()` carry no active `SEG_LVL_ALT_Q` feature —
+/// §7.12.2 returns `base_q_idx` for them.
+pub(crate) fn seg_lossless_array(
+    base_q_idx: u8,
+    alt_q: &[i16],
+) -> [bool; crate::uncompressed_header_tail::MAX_SEGMENTS] {
+    core::array::from_fn(|s| {
+        let q = match alt_q.get(s) {
+            Some(&d) => (i32::from(base_q_idx) + i32::from(d)).clamp(0, 255),
+            None => i32::from(base_q_idx),
+        };
+        q == 0
+    })
 }
 
 /// The r412/r413 two-slot P-frame [`InterFrameConfig`] for P-frame
@@ -836,6 +1055,8 @@ fn p_frame_config_primary<'a>(
         primary_carry,
         allow_temporal_seg: true,
         alt_primaries: Vec::new(),
+        exact_mask: None,
+        auto_lossless: false,
     }
 }
 
@@ -877,6 +1098,8 @@ fn encode_p_frame_yuv420(
     global_motion: bool,
     primary_carry: Option<&RefSlotCarry>,
     allow_temporal_seg: bool,
+    exact_mask: Option<&[bool]>,
+    auto_lossless: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -889,6 +1112,8 @@ fn encode_p_frame_yuv420(
 > {
     let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry);
     cfg.allow_temporal_seg = allow_temporal_seg;
+    cfg.exact_mask = exact_mask;
+    cfg.auto_lossless = auto_lossless;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -1212,7 +1437,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
         segmentation_enabled: !alt_q.is_empty(),
         seg_skip_active: false,
         last_active_seg_id: alt_q.len().saturating_sub(1) as u8,
-        lossless_array: [lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
+        // r426 — per-segment §5.9.2 `LosslessArray[]`: a segment whose
+        // §7.12.2 qindex clamps to 0 flips the full lossless leaf
+        // semantics for its blocks while the frame stays lossy.
+        lossless_array: seg_lossless_array(base_q_idx, alt_q),
         coded_lossless: lossless,
         enable_cdef: seq.enable_cdef,
         allow_intrabc: false,
@@ -1265,6 +1493,21 @@ pub(crate) fn encode_inter_frame_generic_gm(
         base_q_idx,
         alt_q,
     )?;
+    // r426 — arm the exactness-demand / auto-lossless election. Both
+    // require a lossless segment in the table, and the mask must
+    // cover the mi grid exactly.
+    if cfg.exact_mask.is_some() || cfg.auto_lossless {
+        if ictx.lossless_seg.is_none() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if let Some(mask) = cfg.exact_mask {
+            if mask.len() != (mi_rows as usize) * (mi_cols as usize) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            ictx.exact_mask = Some(mask.to_vec());
+        }
+        ictx.auto_lossless = cfg.auto_lossless;
+    }
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
     // §8.3.1 frame-start CDF state (mirroring the decode driver):
@@ -1741,6 +1984,22 @@ struct PSearchCtx {
     seg_alt_q: Vec<i16>,
     /// §5.9.12 `base_q_idx` (the segment-0 quantiser).
     base_q_idx: u8,
+    /// r426 — the exactness-demand mask (row-major mi-cell grid;
+    /// `None` = no demand). A leaf overlapping a demanded cell is
+    /// FORCED onto the lossless segment ([`Self::lossless_seg`]) on
+    /// every arm — inter residual, intra fallback, and the skip-mode
+    /// admissibility guard — so the demanded region reconstructs
+    /// pixel-exact by the WHT chain's bit-exactness.
+    exact_mask: Option<Vec<bool>>,
+    /// r426 — content-driven election: when `true`, synthetic leaves
+    /// OUTSIDE the demand mask additionally trial the lossless
+    /// segment against the lossy depth ladder on twin bits +
+    /// distortion.
+    auto_lossless: bool,
+    /// r426 — the lowest segment whose §7.12.2 qindex clamps to 0
+    /// (`None` when the table has no lossless segment; the mask and
+    /// auto arms are inert then).
+    lossless_seg: Option<u8>,
     /// r412 — driver-side write-mirror twin for §7.10.2 MV prediction
     /// (see the struct docs).
     mirror: PartitionWalker,
@@ -1903,6 +2162,12 @@ impl PSearchCtx {
             current_hint: ip.order_hints.current_order_hint,
             seg_alt_q: seg_alt_q.to_vec(),
             base_q_idx,
+            exact_mask: None,
+            auto_lossless: false,
+            lossless_seg: {
+                let ll = seg_lossless_array(base_q_idx, seg_alt_q);
+                (0..seg_alt_q.len()).find(|&s| ll[s]).map(|s| s as u8)
+            },
             no_scaled: [false; 8],
             mirror,
             ip,
@@ -1925,6 +2190,31 @@ impl PSearchCtx {
         if self.seg_alt_q.is_empty() {
             return 0;
         }
+        // r426 — exactness-demand override: a leaf overlapping the
+        // demand mask is FORCED onto the lossless segment (the
+        // caller validated the table carries one).
+        if let Some(ll) = self.lossless_seg {
+            if self.demands_exact(mi_row, mi_col, b_size) {
+                return ll;
+            }
+            if self.exact_mask.is_some() || self.auto_lossless {
+                // Region/auto configuration: the activity policy maps
+                // non-demanded leaves onto the LOSSY prefix only —
+                // lossless coding outside the demand is the r426
+                // twin-priced election's call, never the policy's.
+                let cap = u64::from(ll.saturating_sub(1));
+                let act = self.block_activity(input, mi_row, mi_col, b_size);
+                return (act / 6).min(cap) as u8;
+            }
+        }
+        let act = self.block_activity(input, mi_row, mi_col, b_size);
+        let top = (self.seg_alt_q.len() - 1) as u64;
+        (act / 6).min(top) as u8
+    }
+
+    /// r413 — the activity metric behind [`Self::segment_for_block`]:
+    /// the input block's luma mean-absolute-deviation.
+    fn block_activity(&self, input: &Yuv420Frame, mi_row: u32, mi_col: u32, b_size: usize) -> u64 {
         let (bw, bh) = (
             NUM_4X4_BLOCKS_WIDE[b_size] * 4,
             NUM_4X4_BLOCKS_HIGH[b_size] * 4,
@@ -1946,9 +2236,7 @@ impl PSearchCtx {
                 mad += v.abs_diff(mean);
             }
         }
-        let act = mad / n;
-        let top = (self.seg_alt_q.len() - 1) as u64;
-        (act / 6).min(top) as u8
+        mad / n
     }
 
     /// r413 — the quantiser bundle for one segment: §7.12.2
@@ -1963,6 +2251,68 @@ impl PSearchCtx {
         let q = (i32::from(self.base_q_idx) + i32::from(self.seg_alt_q[segment_id as usize]))
             .clamp(0, 255) as u8;
         QuantizerParams::neutral(q, 8)
+    }
+
+    /// r426 — `LosslessArray[ segment_id ]` for this GOP's frames
+    /// (see [`seg_lossless_array`]): `true` exactly when the block's
+    /// §7.12.2 qindex clamps to 0, flipping the §5.11.15 `TX_4X4` /
+    /// §7.13.2.10 WHT leaf semantics for that block.
+    fn seg_lossless(&self, segment_id: u8) -> bool {
+        let s = segment_id as usize;
+        let q = if self.seg_alt_q.is_empty() || s >= self.seg_alt_q.len() {
+            i32::from(self.base_q_idx)
+        } else {
+            (i32::from(self.base_q_idx) + i32::from(self.seg_alt_q[s])).clamp(0, 255)
+        };
+        q == 0
+    }
+
+    /// r426 — synthetic-content detector for the auto-lossless
+    /// election: `true` when the input block's luma alphabet is small
+    /// (`<= 16` distinct values — flat fills, text glyphs, UI edges,
+    /// lightly antialiased text). The bound deliberately exceeds the
+    /// §5.11.46 `PALETTE_COLORS = 8` ceiling: at `<= 8` the
+    /// screen-content palette already codes the block exactly, so the
+    /// lossless segment's unique territory starts where the palette
+    /// alphabet ends. Pure gate: it only bounds which leaves PAY for
+    /// the extra lossless trial; the election itself is twin bits +
+    /// distortion.
+    fn synthetic_leaf(&self, input: &Yuv420Frame, mi_row: u32, mi_col: u32, b_size: usize) -> bool {
+        let (bw, bh) = (
+            NUM_4X4_BLOCKS_WIDE[b_size] * 4,
+            NUM_4X4_BLOCKS_HIGH[b_size] * 4,
+        );
+        let (row0, col0) = ((mi_row as usize) * 4, (mi_col as usize) * 4);
+        let w = input.width as usize;
+        let mut seen = [false; 256];
+        let mut distinct = 0usize;
+        for i in 0..bh {
+            for j in 0..bw {
+                let v = input.y[(row0 + i) * w + (col0 + j)] as usize;
+                if !seen[v] {
+                    seen[v] = true;
+                    distinct += 1;
+                    if distinct > 16 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// r426 — `true` iff the leaf at `(mi_row, mi_col, b_size)`
+    /// overlaps a demanded cell of the exactness mask. Demanded
+    /// leaves are forced onto the lossless segment on every arm.
+    fn demands_exact(&self, mi_row: u32, mi_col: u32, b_size: usize) -> bool {
+        let Some(mask) = self.exact_mask.as_ref() else {
+            return false;
+        };
+        let bh4 = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let r1 = (mi_row + bh4).min(self.mi_rows);
+        let c1 = (mi_col + bw4).min(self.mi_cols);
+        (mi_row..r1).any(|r| (mi_col..c1).any(|c| mask[(r * self.mi_cols + c) as usize]))
     }
 
     /// r413 — the §5.11.20 `pred` cascade over the mirror's
@@ -2962,11 +3312,18 @@ fn encode_inter_leaf(
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
     let score_sm = score256(d_sm, lambda, rate_of(&sm_leaf)?);
-    // On the CodedLossless configuration a skip-mode leaf (which can
-    // never code a residual) is only admissible when its bare
-    // prediction is already exact — the q = 0 contract is
-    // reconstruction == input.
-    if score_sm < score_normal && (!recon.lossless || d_sm == 0) {
+    // On a lossless-segment leaf a skip-mode block (which can never
+    // code a residual) is only admissible when its bare prediction is
+    // already exact — the q = 0 contract is reconstruction == input.
+    // r426: the skip-mode leaf's segment is the §5.11.20 `pred`
+    // cascade value, so ITS `LosslessArray[]` slot gates the check
+    // (on CodedLossless frames every slot is lossless — the pre-r426
+    // frame-wide guard falls out as the uniform case); a leaf
+    // overlapping the exactness-demand mask takes the same exactness
+    // gate regardless of the pred segment.
+    let must_be_exact =
+        ictx.seg_lossless(sm_leaf.segment_id) || ictx.demands_exact(mi_r, mi_c, b_size);
+    if score_sm < score_normal && (!must_be_exact || d_sm == 0) {
         return Ok(sm_leaf);
     }
     // Skip-mode loses: restore the residual-coded reconstruction and
@@ -3039,7 +3396,6 @@ fn encode_inter_leaf_modes(
     let row0 = (mi_r as usize) * 4;
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
-    let lossless = recon.lossless;
 
     // r412 — §5.11.24 single-pred mode + reference selection over the
     // full candidate set the syntax can express at this leaf. For
@@ -3851,8 +4207,14 @@ fn encode_inter_leaf_modes(
     let segment_id = ictx.segment_for_block(input, mi_r, mi_c, b_size);
     let seg_qp = ictx.seg_qp(&recon.qp, segment_id);
 
-    if lossless {
-        // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
+    // r426 — per-segment §5.9.2 `LosslessArray[]`: a leaf whose
+    // segment derives `Lossless = 1` codes the §5.11.34 row-major
+    // `TX_4X4` grid through the WHT chain with no §5.11.16 trees and
+    // no §5.11.15 depth choice, whether the FRAME is CodedLossless
+    // (the pre-r426 arm — every segment lossless) or lossy (the r426
+    // mixed configuration — this segment only).
+    if ictx.seg_lossless(segment_id) {
+        // §5.11.15: Lossless forces TX_4X4, no §5.11.17 trees.
         return encode_inter_leaf_residual(
             mi_r,
             mi_c,
@@ -3942,6 +4304,52 @@ fn encode_inter_leaf_modes(
             best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
         }
         restore_region(recon, sr, sc, &before);
+    }
+    // r426 — content-driven per-segment-lossless election: synthetic
+    // leaves (tiny luma alphabet) additionally trial the lossless
+    // segment — same prediction, qindex-0 WHT residual, `D = 0` by
+    // bit-exactness — against the lossy depth ladder on the identical
+    // `D + λ·R` scale (twin bits when priced). The lossless arm wins
+    // exactly when the ladder's distortion outprices the WHT chain's
+    // rate premium.
+    if ictx.auto_lossless && ictx.synthetic_leaf(input, mi_r, mi_c, b_size) {
+        if let Some(ll_seg) = ictx.lossless_seg {
+            let ll_qp = ictx.seg_qp(&recon.qp, ll_seg);
+            let leaf = encode_inter_leaf_residual(
+                mi_r,
+                mi_c,
+                b_size,
+                input,
+                recon,
+                ictx,
+                ref_frame,
+                y_mode,
+                mv,
+                ref_mv_idx,
+                filter,
+                comp,
+                ii_sel,
+                motion.ordinal(),
+                0,
+                ll_seg,
+                &ll_qp,
+                pricing,
+            )?;
+            let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
+            let rate256 = match pricing {
+                Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
+                None => p_leaf_rate(&leaf) * 256,
+            };
+            let score = score256(d, lambda, rate256);
+            let improves = match best.as_ref() {
+                Some((_, _, s)) => score < *s,
+                None => true,
+            };
+            if improves {
+                best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
+            }
+            restore_region(recon, sr, sc, &before);
+        }
     }
     let (leaf, after, _) = best.expect("at least depth 0");
     restore_region(recon, sr, sc, &after);
@@ -4164,7 +4572,10 @@ fn encode_inter_leaf_residual(
     let row0 = (mi_r as usize) * 4;
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
-    let lossless = recon.lossless;
+    // r426 — the leaf's OWN §5.9.2 `Lossless = LosslessArray[
+    // segment_id ]` (per-segment on mixed frames; uniform on the
+    // CodedLossless and plain-lossy configurations).
+    let lossless = ictx.seg_lossless(segment_id);
     let qp = *seg_qp;
     // r424 — the running per-TU fork (lossy arm only: the lossless
     // §5.11.47 guard never codes a tx-type symbol and the TU chain is
@@ -4499,6 +4910,74 @@ fn p_tree_rate(node: &SyntaxNode) -> u64 {
     }
 }
 
+/// r426 — the §5.11.22 INTRA fallback candidate with per-segment
+/// lossless awareness: a leaf overlapping the exactness-demand mask
+/// codes its intra arm ON THE LOSSLESS SEGMENT — the KEY driver runs
+/// with the segment's quantiser (`qindex = 0`) and the `Lossless`
+/// leaf shape (TX_4X4 / WHT / row-major §5.11.34 walk), and every
+/// candidate is priced carrying the committed segment id — while
+/// every other leaf keeps the r413 segment-0 shape. Skip leaves take
+/// the §5.11.20 bit-silent pred cascade on both arms (a skip leaf in
+/// a lossless coding pass has an all-zero qindex-0 residual, i.e. an
+/// EXACT bare prediction, so the demand contract holds whatever
+/// segment the cascade yields).
+#[allow(clippy::too_many_arguments)]
+fn encode_intra_candidate(
+    r: u32,
+    c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    ictx: &PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
+    if !ictx.demands_exact(r, c, b_size) {
+        let mut leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+        // r413 — a skip intra leaf inherits the §5.11.20 `pred`
+        // (bit-silent); a coded intra leaf keeps segment 0 (its
+        // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
+        if !ictx.seg_alt_q.is_empty() && leaf.skip == 1 {
+            leaf.segment_id = ictx.segment_pred(r, c);
+            // r426 — a lossless pred segment flips §5.11.15 to the
+            // bit-silent TX_4X4 default; the skip leaf's lossy tx
+            // commitment reverts to `None`.
+            if ictx.seg_lossless(leaf.segment_id) {
+                leaf.tx_size = None;
+            }
+        }
+        return Ok(leaf);
+    }
+    let ll_seg = ictx
+        .lossless_seg
+        .expect("demand mask requires a lossless segment (validated at arm time)");
+    // Scoped swap: the KEY driver reads its frame arm from
+    // `recon.qp` / `recon.lossless`; the demanded leaf runs on the
+    // lossless segment's qindex-0 configuration.
+    let saved_qp = recon.qp;
+    let saved_lossless = recon.lossless;
+    recon.qp = QuantizerParams::neutral(0, 8);
+    recon.lossless = true;
+    let out = crate::encoder::key_frame::encode_leaf_sq_seg(
+        r,
+        c,
+        b_size,
+        input,
+        recon,
+        pricing,
+        Some(ll_seg),
+    );
+    recon.qp = saved_qp;
+    recon.lossless = saved_lossless;
+    let mut leaf = out?;
+    // The §5.11.19 skip arm is bit-silent — the override never
+    // survives on a skip leaf (already applied inside the ladder for
+    // priced candidates; re-derive here for the heuristic path).
+    if leaf.skip == 1 {
+        leaf.segment_id = ictx.segment_pred(r, c);
+    }
+    Ok(leaf)
+}
+
 /// Recursive §5.11.4 rate-distortion partition search for a P-frame:
 /// at every fully-in-frame square node from `BLOCK_64X64` down to
 /// `BLOCK_8X8`, trial-encode an INTER leaf and an INTRA leaf against
@@ -4551,7 +5030,13 @@ fn build_p_search_tree(
             ictx,
             (model == RateModel::Twin).then_some((&*twin, params)),
         )?;
-        ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
+        ictx.stamp_leaf(
+            &inter_leaf,
+            r,
+            c,
+            b_size,
+            ictx.seg_lossless(inter_leaf.segment_id),
+        );
         let d_inter = region_distortion_wh(recon, input, sr, sc, 2, 2);
         let h_rate_inter = p_leaf_rate(&inter_leaf);
         let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
@@ -4568,18 +5053,22 @@ fn build_p_search_tree(
 
         // Candidate B: the §5.11.22 INTRA leaf (the KEY driver's 4×4
         // arm — group-chroma coding on the `HasChroma` SE cell).
-        let mut intra_leaf = encode_leaf_sq(
+        let intra_leaf = encode_intra_candidate(
             r,
             c,
             b_size,
             input,
             recon,
+            ictx,
             (model == RateModel::Twin).then_some((&*twin, params)),
         )?;
-        if !ictx.seg_alt_q.is_empty() && intra_leaf.skip == 1 {
-            intra_leaf.segment_id = ictx.segment_pred(r, c);
-        }
-        ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
+        ictx.stamp_leaf(
+            &intra_leaf,
+            r,
+            c,
+            b_size,
+            ictx.seg_lossless(intra_leaf.segment_id),
+        );
         let d_intra = region_distortion_wh(recon, input, sr, sc, 2, 2);
         let h_rate_intra = p_leaf_rate(&intra_leaf);
         let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
@@ -4601,7 +5090,13 @@ fn build_p_search_tree(
             // hold the winner's stamps ([`encode_inter_leaf`]'s
             // final-predict guarantee — candidate B never touches
             // them).
-            ictx.stamp_leaf(inter_leaf, r, c, b_size, recon.lossless);
+            ictx.stamp_leaf(
+                inter_leaf,
+                r,
+                c,
+                b_size,
+                ictx.seg_lossless(inter_leaf.segment_id),
+            );
             *twin = twin_inter;
             return Ok((node_inter, cost_inter));
         }
@@ -4681,7 +5176,13 @@ fn build_p_search_tree(
         ictx,
         (model == RateModel::Twin).then_some((&*twin, params)),
     )?;
-    ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
+    ictx.stamp_leaf(
+        &inter_leaf,
+        r,
+        c,
+        b_size,
+        ictx.seg_lossless(inter_leaf.segment_id),
+    );
     let d_inter = region_distortion(recon, input, r, c, n4 as usize);
     let h_rate_inter = p_leaf_rate(&inter_leaf);
     let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
@@ -4698,21 +5199,22 @@ fn build_p_search_tree(
     // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
     // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
     // lossy arm; the lossless arm stays on the TX_4X4 grid).
-    let mut intra_leaf = encode_leaf_sq(
+    let intra_leaf = encode_intra_candidate(
         r,
         c,
         b_size,
         input,
         recon,
+        ictx,
         (model == RateModel::Twin).then_some((&*twin, params)),
     )?;
-    // r413 — segmentation: a skip intra leaf inherits the §5.11.20
-    // `pred` (bit-silent); a coded intra leaf keeps segment 0 (its
-    // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
-    if !ictx.seg_alt_q.is_empty() && intra_leaf.skip == 1 {
-        intra_leaf.segment_id = ictx.segment_pred(r, c);
-    }
-    ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
+    ictx.stamp_leaf(
+        &intra_leaf,
+        r,
+        c,
+        b_size,
+        ictx.seg_lossless(intra_leaf.segment_id),
+    );
     // r419 — driver-grid intra stamps (the decode walker's grid-fill
     // twins): a later leaf's OBMC neighbour scan must see
     // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` on a committed intra
@@ -4844,7 +5346,7 @@ fn build_p_search_tree(
                 ictx,
                 (model == RateModel::Twin).then_some((&twin_shape, params)),
             )?;
-            ictx.stamp_leaf(&blk, rr, cc, sz, recon.lossless);
+            ictx.stamp_leaf(&blk, rr, cc, sz, ictx.seg_lossless(blk.segment_id));
             h_rate += p_leaf_rate(&blk);
             cost_shape += twin_shape.commit_block(&blk, rr, cc, sz, params)?;
             blocks.push(blk);
@@ -5033,7 +5535,7 @@ mod tests {
             segmentation_enabled: !ictx.seg_alt_q.is_empty(),
             seg_skip_active: false,
             last_active_seg_id: ictx.seg_alt_q.len().saturating_sub(1) as u8,
-            lossless_array: [recon.lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
+            lossless_array: seg_lossless_array(recon.qp.base_q_idx, &ictx.seg_alt_q),
             coded_lossless: recon.lossless,
             enable_cdef: false,
             allow_intrabc: false,
@@ -5227,7 +5729,7 @@ mod tests {
             64,
             ip,
             1,
-            0,
+            base_q_idx,
             &[],
         )
         .unwrap();
@@ -5278,8 +5780,19 @@ mod tests {
         let mut f1 = Yuv420Frame::filled(64, 64, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
-            let mut probe =
-                PSearchCtx::new(&reference, &reference, 16, 16, 64, 64, ip, 1, 0, &[]).unwrap();
+            let mut probe = PSearchCtx::new(
+                &reference,
+                &reference,
+                16,
+                16,
+                64,
+                64,
+                ip,
+                1,
+                base_q_idx,
+                &[],
+            )
+            .unwrap();
             probe
                 .predict_leaf(
                     0,
@@ -5335,7 +5848,7 @@ mod tests {
             64,
             ip,
             1,
-            0,
+            base_q_idx,
             &[],
         )
         .unwrap();
@@ -5459,7 +5972,7 @@ mod tests {
             64,
             ip,
             1,
-            0,
+            base_q_idx,
             &[],
         )
         .unwrap();
@@ -5554,8 +6067,19 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx =
-            PSearchCtx::new(&prev, &prevprev, mi_rows, mi_cols, 64, 64, ip, 2, 0, &[]).unwrap();
+        let mut ictx = PSearchCtx::new(
+            &prev,
+            &prevprev,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
             build_p_search_tree_for_tests(0, 0, BLOCK_64X64, &frames[2], &mut recon, &mut ictx)
@@ -5929,10 +6453,15 @@ mod tests {
             "mixed content must code multiple segments (histogram: {seen:?})"
         );
 
-        // Invalid configurations reject.
+        // Invalid configurations reject. (r426: a delta clamping the
+        // §7.12.2 qindex to 0 is no longer an error — it is the
+        // per-segment lossless election, covered by
+        // `tests/mixed_lossless.rs` — but unrepresentable su(1+8)
+        // deltas, over-255 sums and base-0 segmentation still do.)
         assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[1, 2]).is_err());
         assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0]).is_err());
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0, -60]).is_err());
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0, -256]).is_err());
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 200, &[0, 100]).is_err());
         assert!(encode_gop_yuv420_with_q_seg(&frames, 0, &[0, 10]).is_err());
     }
 
@@ -6100,6 +6629,8 @@ mod tests {
             true,
             None,
             true,
+            None,
+            false,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);

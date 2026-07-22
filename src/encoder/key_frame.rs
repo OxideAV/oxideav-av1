@@ -230,6 +230,47 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
     base_q_idx: u8,
     model: RateModel,
 ) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
+    encode_key_frame_yuv420_with_q_seg_carry(input, base_q_idx, model, &[], None)
+}
+
+/// r426 — [`encode_key_frame_yuv420_with_q_carry`] with §5.9.14
+/// SEG_LVL_ALT_Q segmentation and the exactness-demand mask: the KEY
+/// frame codes the same delta table as the GOP's P-frames
+/// (`segmentation_enabled = 1`, the §5.11.8 `intra_segment_id` per
+/// block), and every leaf overlapping `exact_mask` commits the
+/// table's lossless segment — its blocks run the §5.9.2
+/// `LosslessArray[]` TX_4X4/WHT semantics, so the demanded region
+/// reconstructs pixel-exact from frame 0. `alt_q` empty keeps the
+/// unsegmented r413 shape (and `exact_mask` must then be `None`).
+pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
+    // r426 — same table validation as the P-frame entry (`alt_q[0] ==
+    // 0`, su(1+8) range, no over-255 sums, no base-0 segmentation).
+    if !alt_q.is_empty() {
+        if alt_q.len() == 1
+            || alt_q.len() > crate::uncompressed_header_tail::MAX_SEGMENTS
+            || alt_q[0] != 0
+            || base_q_idx == 0
+            || model != RateModel::Twin
+        {
+            // (The §5.11.9 skip-leaf pred inheritance rides the rate
+            // twin's writer mirror — the segmented-KEY arm is
+            // twin-model-only, like every production entry point.)
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        for &d in alt_q {
+            if !(-255..=255).contains(&d) || i32::from(base_q_idx) + i32::from(d) > 255 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        }
+    } else if exact_mask.is_some() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
     // Own dimension gate (wider than `Yuv420Frame::validate`'s
     // single-superblock bound): multiples of 8, [8, MAX] per axis.
     if input.width < 8
@@ -277,7 +318,30 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
 
     let lossless = base_q_idx == 0;
-    let qp = QuantizerParams::neutral(base_q_idx, 8);
+    let mut qp = QuantizerParams::neutral(base_q_idx, 8);
+    if !alt_q.is_empty() {
+        // r426 — §7.12.2 get_qindex inputs: the write-side §5.11.47
+        // guard and the §5.11.39 quantiser chain key off these.
+        qp.segmentation_enabled = true;
+        for (seg, &d) in alt_q.iter().enumerate() {
+            qp.seg_alt_q_active[seg] = true;
+            qp.seg_alt_q_data[seg] = d;
+        }
+        fh.segmentation_params = Some(crate::encoder::inter_frame::segmentation_params_for(alt_q));
+    }
+    // r426 — the mask requires a lossless segment; resolve it once.
+    let seg_ll = crate::encoder::inter_frame::seg_lossless_array(base_q_idx, alt_q);
+    let ll_seg = (0..alt_q.len())
+        .find(|&sid| seg_ll[sid])
+        .map(|sid| sid as u8);
+    if exact_mask.is_some() && ll_seg.is_none() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if let Some(mask) = exact_mask {
+        if mask.len() != (mi_rows as usize) * (mi_cols as usize) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
 
     // §5.11 frame-scope parameter bundle — mirrors the decode driver's
     // `TileDecodeParams` derivation for this header set field by field.
@@ -286,10 +350,10 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
         subsampling_y: 1,
         num_planes: 3,
         seg_id_pre_skip: false,
-        segmentation_enabled: false,
+        segmentation_enabled: !alt_q.is_empty(),
         seg_skip_active: false,
-        last_active_seg_id: 0,
-        lossless_array: [lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
+        last_active_seg_id: alt_q.len().saturating_sub(1) as u8,
+        lossless_array: seg_ll,
         coded_lossless: lossless,
         enable_cdef: seq.enable_cdef,
         allow_intrabc: fh.allow_intrabc,
@@ -364,6 +428,10 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
         state.arm_read_deltas();
         let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
         twin.arm_read_deltas();
+        let seg_demand = exact_mask.map(|mask| KeySegDemand {
+            mask,
+            ll_seg: ll_seg.expect("mask requires a lossless segment (validated above)"),
+        });
         let (tree, _cost) = build_search_tree(
             sb_r,
             sb_c,
@@ -373,6 +441,7 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
             &mut twin,
             &params,
             model,
+            seg_demand.as_ref(),
         )?;
         write_partition_tree_syntax(
             &mut writer,
@@ -1464,6 +1533,27 @@ pub(crate) fn encode_leaf_sq(
     // with exact twin bits; `None` keeps the pre-r421 heuristics.
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
+    encode_leaf_sq_seg(mi_r, mi_c, b_size, input, recon, pricing, None)
+}
+
+/// r426 — [`encode_leaf_sq`] with a committed segment id: every
+/// candidate leaf carries `segment_override` BEFORE it is priced
+/// (skip leaves on segmented INTER frames still take the §5.11.19
+/// bit-silent pred cascade afterwards), so the twin prices the
+/// §5.11.9 segment symbols and the per-segment
+/// `Lossless`/quantiser-derived syntax shape exactly as the write
+/// pass will emit them. The caller owns the matching `recon.qp` /
+/// `recon.lossless` configuration for the override's segment.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_leaf_sq_seg(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+    segment_override: Option<u8>,
+) -> Result<SyntaxBlock, Error> {
     // §5.11.46 palette candidates (r418) — only built when the
     // frame-header gate is open and the block is an eligible square.
     // r424: with twin pricing available the k-means proxy ladder
@@ -1534,12 +1624,28 @@ pub(crate) fn encode_leaf_sq(
         let mut leaf = encode_leaf_with_tx(
             mi_r, mi_c, b_size, cands[0], input, recon, None, None, pricing,
         )?;
+        // r426 — the committed segment rides every candidate before
+        // any pricing (see `encode_leaf_sq_seg`).
+        if let Some(seg) = segment_override {
+            leaf.segment_id = seg;
+        }
         // r423 — same §5.11.19 skip-leaf invariant as the ladder
-        // below (see `fix_skip_segment`): a segmented-inter-frame
-        // caller prices this leaf through the write path next.
+        // below (see `fix_skip_segment`): a segmented caller prices
+        // this leaf through the write path next. r426: the §5.11.9
+        // `if ( skip ) segment_id = pred` short-circuit is
+        // frame-type-agnostic — read_segment_id runs it on the intra
+        // §5.11.8 arm too — so segmented KEY frames take the same
+        // bit-silent inheritance.
         if let Some((twin, params)) = pricing {
-            if params.segmentation_enabled && params.inter.is_some() && leaf.skip == 1 {
+            if params.segmentation_enabled && leaf.skip == 1 {
                 leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
+                // r426 — a lossless pred segment flips the §5.11.15
+                // derivation to the bit-silent TX_4X4 default: the
+                // skip leaf's tx commitment reverts to `None` (its
+                // residual is empty either way).
+                if params.lossless_array[leaf.segment_id as usize] {
+                    leaf.tx_size = None;
+                }
             }
         }
         return Ok(leaf);
@@ -1572,9 +1678,19 @@ pub(crate) fn encode_leaf_sq(
     // heuristic paths (no twin, or segmentation off) are untouched —
     // their callers apply the same rule before any pricing runs.
     let fix_skip_segment = |leaf: &mut SyntaxBlock| {
+        // r426 — committed segment first (see `encode_leaf_sq_seg`),
+        // then the §5.11.19 bit-silent pred on skip leaves.
+        if let Some(seg) = segment_override {
+            leaf.segment_id = seg;
+        }
         if let Some((twin, params)) = pricing {
-            if params.segmentation_enabled && params.inter.is_some() && leaf.skip == 1 {
+            if params.segmentation_enabled && leaf.skip == 1 {
                 leaf.segment_id = twin.spatial_segment_pred(mi_r, mi_c);
+                // r426 — lossless pred segment ⇒ bit-silent TX_4X4
+                // default (see the single-shape arm above).
+                if params.lossless_array[leaf.segment_id as usize] {
+                    leaf.tx_size = None;
+                }
             }
         }
     };
@@ -3139,6 +3255,53 @@ pub(crate) fn tree_rate(node: &SyntaxNode) -> u64 {
     }
 }
 
+/// r426 — the KEY frame's exactness-demand configuration: the
+/// row-major mi-cell demand mask plus the (validated) lossless
+/// segment every demanded leaf commits. On intra frames the §5.11.8
+/// `intra_segment_id` is coded for EVERY block — no skip-pred
+/// cascade — so a demanded leaf always carries the lossless segment
+/// explicitly.
+pub(crate) struct KeySegDemand<'a> {
+    pub(crate) mask: &'a [bool],
+    pub(crate) ll_seg: u8,
+}
+
+/// r426 — one KEY-frame leaf with per-segment lossless awareness:
+/// a leaf overlapping the demand mask codes on the lossless segment
+/// (segment id committed on every candidate BEFORE pricing; the KEY
+/// driver's `recon.qp` / `recon.lossless` swapped to the qindex-0
+/// configuration for the call), everything else keeps the segment-0
+/// frame-quantiser shape.
+fn encode_key_leaf(
+    r: u32,
+    c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+    seg: Option<&KeySegDemand<'_>>,
+) -> Result<SyntaxBlock, Error> {
+    let demanded = seg.is_some_and(|d| {
+        let bh4 = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let r1 = (r + bh4).min(recon.mi_rows);
+        let c1 = (c + bw4).min(recon.mi_cols);
+        (r..r1).any(|rr| (c..c1).any(|cc| d.mask[(rr * recon.mi_cols + cc) as usize]))
+    });
+    if !demanded {
+        return encode_leaf_sq(r, c, b_size, input, recon, pricing);
+    }
+    let ll_seg = seg.expect("demanded implies seg").ll_seg;
+    let saved_qp = recon.qp;
+    let saved_lossless = recon.lossless;
+    recon.qp = QuantizerParams::neutral(0, 8);
+    recon.lossless = true;
+    let out = encode_leaf_sq_seg(r, c, b_size, input, recon, pricing, Some(ll_seg));
+    recon.qp = saved_qp;
+    recon.lossless = saved_lossless;
+    out
+}
+
 /// Recursive §5.11.4 rate-distortion partition search. At every
 /// fully-in-frame square node from `BLOCK_64X64` down to `BLOCK_8X8`,
 /// trial-encode the node both as one `PARTITION_NONE` leaf and as a
@@ -3169,6 +3332,7 @@ fn build_search_tree(
     twin: &mut RateTwin,
     params: &SyntaxFrameParams,
     model: RateModel,
+    seg: Option<&KeySegDemand<'_>>,
 ) -> Result<(SyntaxNode, u64), Error> {
     if r >= recon.mi_rows || c >= recon.mi_cols {
         // §5.11.4 line 1 — never inspected by the writer (and never
@@ -3177,7 +3341,7 @@ fn build_search_tree(
     }
     if b_size == BLOCK_4X4 {
         let pricing = (model == RateModel::Twin).then_some((&*twin, params));
-        let leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+        let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg)?;
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let cost = twin.commit_subtree(&node, r, c, b_size, params)?;
         return Ok((node, cost));
@@ -3219,7 +3383,7 @@ fn build_search_tree(
                 let mut twin_s = twin.clone();
                 let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
                 let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
-                let blk = encode_leaf_sq(r, c, psub, input, recon, pricing_s)?;
+                let blk = encode_key_leaf(r, c, psub, input, recon, pricing_s, seg)?;
                 let h_rate = 4 + leaf_rate(&blk);
                 cost_s += twin_s.commit_block(&blk, r, c, psub, params)?;
                 let d = region_distortion_wh(recon, input, r, c, n4 as usize, n4 as usize);
@@ -3249,11 +3413,29 @@ fn build_search_tree(
         // SPLIT arm (forced on the corner case; elected otherwise).
         let mut twin_b = twin.clone();
         let mut cost = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-        let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model)?;
-        let (ne, c1) =
-            build_search_tree(r, c + half, sub, input, recon, &mut twin_b, params, model)?;
-        let (sw, c2) =
-            build_search_tree(r + half, c, sub, input, recon, &mut twin_b, params, model)?;
+        let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model, seg)?;
+        let (ne, c1) = build_search_tree(
+            r,
+            c + half,
+            sub,
+            input,
+            recon,
+            &mut twin_b,
+            params,
+            model,
+            seg,
+        )?;
+        let (sw, c2) = build_search_tree(
+            r + half,
+            c,
+            sub,
+            input,
+            recon,
+            &mut twin_b,
+            params,
+            model,
+            seg,
+        )?;
         let (se, c3) = build_search_tree(
             r + half,
             c + half,
@@ -3263,6 +3445,7 @@ fn build_search_tree(
             &mut twin_b,
             params,
             model,
+            seg,
         )?;
         cost += c0 + c1 + c2 + c3;
         let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
@@ -3290,7 +3473,7 @@ fn build_search_tree(
     // Candidate A: one PARTITION_NONE leaf (partition symbol + block
     // syntax committed to a twin fork).
     let pricing = (model == RateModel::Twin).then_some((&*twin, params));
-    let leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+    let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg)?;
     let node_a = SyntaxNode::Leaf(Box::new(leaf));
     let d_a = region_distortion(recon, input, r, c, n4 as usize);
     let mut twin_a = twin.clone();
@@ -3340,7 +3523,7 @@ fn build_search_tree(
             let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(2);
             for &(rr, cc) in &cells {
                 let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
-                let blk = encode_leaf_sq(rr, cc, psub, input, recon, pricing_s)?;
+                let blk = encode_key_leaf(rr, cc, psub, input, recon, pricing_s, seg)?;
                 h_rate += leaf_rate(&blk);
                 cost_s += twin_s.commit_block(&blk, rr, cc, psub, params)?;
                 blocks.push(blk);
@@ -3379,9 +3562,29 @@ fn build_search_tree(
     // actually be written under (SPLIT arm + earlier siblings).
     let mut twin_b = twin.clone();
     let mut cost_b = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-    let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model)?;
-    let (ne, c1) = build_search_tree(r, c + half, sub, input, recon, &mut twin_b, params, model)?;
-    let (sw, c2) = build_search_tree(r + half, c, sub, input, recon, &mut twin_b, params, model)?;
+    let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model, seg)?;
+    let (ne, c1) = build_search_tree(
+        r,
+        c + half,
+        sub,
+        input,
+        recon,
+        &mut twin_b,
+        params,
+        model,
+        seg,
+    )?;
+    let (sw, c2) = build_search_tree(
+        r + half,
+        c,
+        sub,
+        input,
+        recon,
+        &mut twin_b,
+        params,
+        model,
+        seg,
+    )?;
     let (se, c3) = build_search_tree(
         r + half,
         c + half,
@@ -3391,6 +3594,7 @@ fn build_search_tree(
         &mut twin_b,
         params,
         model,
+        seg,
     )?;
     cost_b += c0 + c1 + c2 + c3;
     let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
@@ -3568,6 +3772,7 @@ mod tests {
                 &mut twin,
                 &params,
                 RateModel::Twin,
+                None,
             )
             .unwrap();
             total_cost256 += cost;
@@ -3676,6 +3881,7 @@ mod tests {
                 &mut twin,
                 &params,
                 RateModel::Twin,
+                None,
             )
             .unwrap();
             let (mut pal, mut other) = (0u32, 0u32);
@@ -3786,6 +3992,7 @@ mod tests {
             &mut twin,
             &params,
             RateModel::Twin,
+            None,
         )
         .unwrap();
         let (mut pal_uv, mut other_uv) = (0u32, 0u32);
@@ -3892,6 +4099,7 @@ mod tests {
                     &mut twin,
                     &params,
                     RateModel::Twin,
+                    None,
                 )
                 .unwrap();
                 count_palette_leaves_by(&tree, &mut ibc, &mut other, |b| b.intrabc_mv.is_some());
@@ -4047,6 +4255,7 @@ mod tests {
                     &mut twin,
                     &params,
                     RateModel::Twin,
+                    None,
                 )
                 .unwrap();
                 collect_dvs(&tree, &mut committed);
@@ -4129,6 +4338,7 @@ mod tests {
                 &mut twin,
                 &params,
                 RateModel::Twin,
+                None,
             )
             .unwrap();
             // The winning shape must be a rect node carrying a
@@ -4221,6 +4431,7 @@ mod tests {
                     &mut twin,
                     &params,
                     RateModel::Twin,
+                    None,
                 )
                 .unwrap();
                 if sb_r == 16 {
@@ -4318,6 +4529,7 @@ mod tests {
                 &mut twin,
                 &params,
                 RateModel::Twin,
+                None,
             )
             .expect("search");
             crate::encoder::partition_tree::write_partition_tree_syntax(
@@ -4664,6 +4876,7 @@ mod tests {
                 &mut twin,
                 &params,
                 RateModel::Twin,
+                None,
             )
             .unwrap();
             if sb_r == 32 {
@@ -4811,6 +5024,7 @@ mod tests {
             &mut twin,
             &params,
             RateModel::Twin,
+            None,
         )
         .unwrap();
         let (mut pal, mut other) = (0u32, 0u32);
