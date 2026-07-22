@@ -327,6 +327,14 @@ pub(crate) fn encode_key_frame_yuv420_with_q_carry(
         allow_intrabc: fh.allow_intrabc,
         qp,
         bd: BlockDecodedMirror::new(),
+        // r425 — arm the exact-match DV index whenever the §5.9.20
+        // gate opened (input-space hash seeds for the §5.11.7
+        // search; validity + SSD/RD stay reconstruction-space).
+        dv_hash: if fh.allow_intrabc {
+            crate::encoder::dv_hash::DvHashIndex::build(&input.y, width, height)
+        } else {
+            crate::encoder::dv_hash::DvHashIndex::default()
+        },
     };
 
     // §5.11.2 tile walk: one tile, 64×64 superblocks in raster order.
@@ -622,6 +630,12 @@ pub(crate) struct ReconState {
     pub(crate) allow_intrabc: bool,
     pub(crate) qp: QuantizerParams,
     pub(crate) bd: BlockDecodedMirror,
+    /// r425 — per-frame block-hash index over the §6.10.24-reachable
+    /// intra-block-copy source region (see
+    /// [`crate::encoder::dv_hash`]). Inert (`Default`) unless the KEY
+    /// driver armed it alongside `allow_intrabc`; maintained once per
+    /// superblock via [`Self::advance_dv_hash`].
+    pub(crate) dv_hash: crate::encoder::dv_hash::DvHashIndex,
 }
 
 impl ReconState {
@@ -2045,62 +2059,131 @@ pub(crate) fn intrabc_dv_valid(
     true
 }
 
-/// Frame-level §5.9.20 gate heuristic: `true` iff some pair of exact
-/// duplicate 64×64 tiles (all three planes) exists where the later
-/// one can §6.10.24-validly copy the earlier one. Content without a
-/// provable copy source keeps the gate closed — the per-leaf
-/// `use_intrabc` S() is pure overhead there.
+/// Frame-level §5.9.20 gate heuristic — `true` iff a provable
+/// §6.10.24-reachable exact copy source exists, on either tier:
+///
+/// * **r418 superblock tier**: some pair of exact duplicate 64×64
+///   tiles (all three planes) where the later can copy the earlier.
+/// * **r425 glyph tier**: at least [`INTRABC_GATE_MIN_CELLS`] 16×16
+///   grid cells (all three planes, non-flat luma) with an exact
+///   earlier duplicate at a §6.10.24-valid displacement, covering at
+///   least 1/[`INTRABC_GATE_CELL_FRACTION`] of the grid — repeated
+///   glyphs / UI patterns that never align to whole superblocks.
+///
+/// Content without a provable copy source keeps the gate closed —
+/// the per-leaf `use_intrabc` S() is pure overhead there.
 fn intrabc_beneficial(input: &Yuv420Frame) -> bool {
     let (w, h) = (input.width as usize, input.height as usize);
-    let (sb_rows, sb_cols) = (h / 64, w / 64);
-    if sb_rows * sb_cols < 2 {
-        return false;
-    }
     let cw = w / 2;
-    let mut tiles: Vec<(usize, usize, u64)> = Vec::new();
-    for sbr in 0..sb_rows {
-        for sbc in 0..sb_cols {
-            let mut hash = 0xcbf2_9ce4_8422_2325u64;
-            let mut mix = |v: u8| {
-                hash ^= u64::from(v);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
-            };
-            for i in 0..64 {
-                for j in 0..64 {
-                    mix(input.y[(sbr * 64 + i) * w + sbc * 64 + j]);
-                }
-            }
-            for i in 0..32 {
-                for j in 0..32 {
-                    let off = (sbr * 32 + i) * cw + sbc * 32 + j;
-                    mix(input.u[off]);
-                    mix(input.v[off]);
-                }
-            }
-            tiles.push((sbr, sbc, hash));
-        }
-    }
     let mi_rows = 2 * ((h as u32 + 7) >> 3);
     let mi_cols = 2 * ((w as u32 + 7) >> 3);
-    for (i, &(r1, c1, h1)) in tiles.iter().enumerate() {
-        for &(r0, c0, h0) in &tiles[..i] {
-            if h0 == h1
-                && intrabc_dv_valid(
-                    (r1 * 16) as u32,
-                    (c1 * 16) as u32,
-                    BLOCK_64X64,
-                    (r0 as i32 - r1 as i32) * 64,
-                    (c0 as i32 - c1 as i32) * 64,
+    let fnv = |hash: &mut u64, v: u8| {
+        *hash ^= u64::from(v);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    };
+
+    // --- r418 superblock tier. ---
+    let (sb_rows, sb_cols) = (h / 64, w / 64);
+    if sb_rows * sb_cols >= 2 {
+        let mut tiles: Vec<(usize, usize, u64)> = Vec::new();
+        for sbr in 0..sb_rows {
+            for sbc in 0..sb_cols {
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                for i in 0..64 {
+                    for j in 0..64 {
+                        fnv(&mut hash, input.y[(sbr * 64 + i) * w + sbc * 64 + j]);
+                    }
+                }
+                for i in 0..32 {
+                    for j in 0..32 {
+                        let off = (sbr * 32 + i) * cw + sbc * 32 + j;
+                        fnv(&mut hash, input.u[off]);
+                        fnv(&mut hash, input.v[off]);
+                    }
+                }
+                tiles.push((sbr, sbc, hash));
+            }
+        }
+        for (i, &(r1, c1, h1)) in tiles.iter().enumerate() {
+            for &(r0, c0, h0) in &tiles[..i] {
+                if h0 == h1
+                    && intrabc_dv_valid(
+                        (r1 * 16) as u32,
+                        (c1 * 16) as u32,
+                        BLOCK_64X64,
+                        (r0 as i32 - r1 as i32) * 64,
+                        (c0 as i32 - c1 as i32) * 64,
+                        mi_rows,
+                        mi_cols,
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // --- r425 glyph tier: 16×16 grid cells. ---
+    let (cell_rows, cell_cols) = (h / 16, w / 16);
+    let total_cells = cell_rows * cell_cols;
+    if total_cells < 2 * INTRABC_GATE_MIN_CELLS {
+        return false;
+    }
+    let mut buckets: std::collections::HashMap<u64, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    let mut matched = 0usize;
+    for cr in 0..cell_rows {
+        for cc in 0..cell_cols {
+            let (py, px) = (cr * 16, cc * 16);
+            let first = input.y[py * w + px];
+            let mut flat = true;
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for i in 0..16 {
+                for j in 0..16 {
+                    let v = input.y[(py + i) * w + px + j];
+                    flat &= v == first;
+                    fnv(&mut hash, v);
+                }
+            }
+            if flat {
+                continue;
+            }
+            for i in 0..8 {
+                for j in 0..8 {
+                    let off = (py / 2 + i) * cw + px / 2 + j;
+                    fnv(&mut hash, input.u[off]);
+                    fnv(&mut hash, input.v[off]);
+                }
+            }
+            let bucket = buckets.entry(hash).or_default();
+            // Scan a bounded prefix of earlier duplicates for one the
+            // §6.10.24 lag admits.
+            if bucket.iter().take(16).any(|&(sy, sx)| {
+                intrabc_dv_valid(
+                    (py / 4) as u32,
+                    (px / 4) as u32,
+                    crate::cdf::BLOCK_16X16,
+                    sy as i32 - py as i32,
+                    sx as i32 - px as i32,
                     mi_rows,
                     mi_cols,
                 )
-            {
-                return true;
+            }) {
+                matched += 1;
             }
+            bucket.push((py, px));
         }
     }
-    false
+    matched >= INTRABC_GATE_MIN_CELLS && matched * INTRABC_GATE_CELL_FRACTION >= total_cells
 }
+
+/// r425 glyph-tier gate floor: fewer provable copies than this can't
+/// amortise the frame-wide `use_intrabc` flag overhead.
+const INTRABC_GATE_MIN_CELLS: usize = 4;
+
+/// r425 glyph-tier gate density: matched cells must cover at least
+/// `1 / INTRABC_GATE_CELL_FRACTION` of the 16×16 grid.
+const INTRABC_GATE_CELL_FRACTION: usize = 64;
 
 /// Pick the best §5.11.7 DV candidate for one square leaf by luma SSD
 /// of the reconstruction copy against the input block, over a bounded
@@ -2120,6 +2203,20 @@ fn intrabc_best_dv(
         return None;
     }
     let mut cands: Vec<(i32, i32)> = Vec::new();
+    // r425 — exact-match seeds first: probe the per-frame block-hash
+    // index with this block's INPUT samples (nearest sources first —
+    // strictly-better ties in the SSD ranking below keep the first,
+    // i.e. cheapest-DV, winner; §6.10.24-unreachable seeds fall to
+    // the validity check like any other candidate). Uniform blocks
+    // skip the probe: DC / palette arms already code them at
+    // near-zero cost.
+    if let Some(tier) = crate::encoder::dv_hash::dv_hash_size_idx(n) {
+        let (hash, uniform) =
+            crate::encoder::dv_hash::hash_block_direct(&input.y, recon.width, row0, col0, n);
+        if !uniform {
+            cands.extend(recon.dv_hash.candidates(hash, tier, row0, col0));
+        }
+    }
     for k in 1..=3i32 {
         for &(dr, dc) in &[(0, -64 * k), (-64 * k, 0), (-64 * k, -64 * k)] {
             cands.push((dr, dc));
@@ -3141,6 +3238,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut writer = SymbolWriter::new(false);
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -3268,6 +3366,7 @@ mod tests {
                 allow_intrabc: false,
                 qp: QuantizerParams::neutral(q, 8),
                 bd: BlockDecodedMirror::new(),
+                dv_hash: Default::default(),
             };
             recon.bd.clear_for_sb(0, 0, 16, 16);
             let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -3377,6 +3476,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         recon.bd.clear_for_sb(0, 0, 16, 16);
         let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -3479,6 +3579,7 @@ mod tests {
                 allow_intrabc: true,
                 qp: QuantizerParams::neutral(q, 8),
                 bd: BlockDecodedMirror::new(),
+                dv_hash: Default::default(),
             };
             let (mut ibc, mut other) = (0u32, 0u32);
             let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -3514,6 +3615,160 @@ mod tests {
                 assert_eq!(enc.recon_y, input.y, "lossless intrabc arm must be exact");
                 assert_eq!(enc.recon_u, input.u);
                 assert_eq!(enc.recon_v, input.v);
+            }
+        }
+    }
+
+    /// r425 — the hash-match DV search must find exact copy sources
+    /// the geometric candidate set cannot reach, and the glyph-tier
+    /// §5.9.20 gate must open on repeated sub-superblock patterns:
+    /// a 256×192 frame with a per-superblock DISTINCT flat background
+    /// (no duplicate 64×64 tiles — the r418 tier stays closed) and
+    /// one 16×16 noise glyph stamped at four §6.10.24-reachable
+    /// destinations whose displacements sit on none of the geometric
+    /// strides. The search must commit `use_intrabc = 1` leaves at
+    /// exactly those hash-seeded DVs, and the stream must round-trip
+    /// byte-exact through the spec driver (whose own §6.10.24
+    /// validation re-checks every committed DV).
+    #[test]
+    fn r425_hash_dv_search_finds_off_stride_glyph_copies() {
+        let (w, h) = (256usize, 192usize);
+        // Distinct flat background per superblock: kills the r418
+        // duplicate-superblock tier AND flat-cell false matches.
+        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        for i in 0..h {
+            for j in 0..w {
+                let sb = (i / 64) * 4 + j / 64;
+                input.y[i * w + j] = 60 + 3 * sb as u8;
+            }
+        }
+        // One 16×16 xorshift noise glyph...
+        let mut glyph = [0u8; 16 * 16];
+        let mut state = 0x0BAD_CAFEu32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for p in glyph.iter_mut() {
+            *p = (next() & 0xFF) as u8;
+        }
+        // ... stamped at one early source and four late destinations.
+        // Sources sit in superblocks 0..=1; every destination's
+        // superblock raster index is >= 5, so §6.10.24 admits the
+        // copy. None of the displacements is a multiple of the
+        // 16-/64-stride geometric candidate set.
+        // Destination superblocks (raster 5, 6, 7, 8) all watermark
+        // BELOW every other glyph superblock, so (0, 0) is each
+        // destination's only reachable source — the committed DVs
+        // are fully determined.
+        let stamps: [(usize, usize); 5] = [(0, 0), (80, 80), (80, 160), (80, 224), (144, 32)];
+        for &(sy, sx) in &stamps {
+            for i in 0..16 {
+                for j in 0..16 {
+                    input.y[(sy + i) * w + sx + j] = glyph[i * 16 + j];
+                }
+            }
+        }
+        let expected_dvs: Vec<[i32; 2]> = stamps[1..]
+            .iter()
+            .map(|&(dy, dx)| [-8 * (dy as i32), -8 * (dx as i32)])
+            .collect();
+
+        // Background-only twin: the glyph tier must be what opens the
+        // gate (no duplicate superblocks, no duplicate glyph cells).
+        let mut bg_only = input.clone();
+        for &(sy, sx) in &stamps {
+            let sb = (sy / 64) * 4 + sx / 64;
+            for i in 0..16 {
+                for j in 0..16 {
+                    bg_only.y[(sy + i) * w + sx + j] = 60 + 3 * sb as u8;
+                }
+            }
+        }
+        assert!(
+            !intrabc_beneficial(&bg_only),
+            "background alone opens the gate"
+        );
+        assert!(
+            intrabc_beneficial(&input),
+            "four reachable glyph duplicates must open the glyph tier"
+        );
+
+        for q in [60u8, 0] {
+            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            assert!(enc.fh.allow_intrabc, "q={q}: glyph tier gate");
+
+            // Tree-level witness with an armed index, mirroring the
+            // driver's staircase maintenance.
+            let mut recon = ReconState {
+                y: vec![0u8; w * h],
+                u: vec![0u8; (w / 2) * (h / 2)],
+                v: vec![0u8; (w / 2) * (h / 2)],
+                width: w,
+                height: h,
+                chroma_w: w / 2,
+                chroma_h: h / 2,
+                mi_rows: (h / 4) as u32,
+                mi_cols: (w / 4) as u32,
+                lossless: q == 0,
+                allow_screen_content_tools: true,
+                allow_intrabc: true,
+                qp: QuantizerParams::neutral(q, 8),
+                bd: BlockDecodedMirror::new(),
+                dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
+            };
+            let (mut twin, params) = search_ctx_for_tests(&recon);
+            let mut committed: Vec<[i32; 2]> = Vec::new();
+            fn collect_dvs(node: &SyntaxNode, out: &mut Vec<[i32; 2]>) {
+                match node {
+                    SyntaxNode::Leaf(b) => {
+                        if let Some(mv) = b.intrabc_mv {
+                            out.push(mv);
+                        }
+                    }
+                    SyntaxNode::Split(ch) => {
+                        for c in ch.iter() {
+                            collect_dvs(c, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (sb_r, sb_c) in sb_grid_origins(recon.mi_rows, recon.mi_cols) {
+                recon
+                    .bd
+                    .clear_for_sb(sb_r, sb_c, recon.mi_rows, recon.mi_cols);
+                twin.arm_read_deltas();
+                let (tree, _) = build_search_tree(
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &input,
+                    &mut recon,
+                    &mut twin,
+                    &params,
+                    RateModel::Twin,
+                )
+                .unwrap();
+                collect_dvs(&tree, &mut committed);
+            }
+            for dv in &expected_dvs {
+                assert!(
+                    committed.contains(dv),
+                    "q={q}: hash-seeded DV {dv:?} missing from committed set {committed:?}"
+                );
+            }
+
+            // Full-stream conformance through the spec driver.
+            let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
+            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
+            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            if q == 0 {
+                assert_eq!(enc.recon_y, input.y, "lossless glyph copies must be exact");
             }
         }
     }
@@ -3564,6 +3819,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         recon.bd.clear_for_sb(0, 0, 16, 16);
         let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -3727,6 +3983,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         assert!(
             palette_candidate_y(&flat, &recon, 0, 0, BLOCK_64X64).is_none(),

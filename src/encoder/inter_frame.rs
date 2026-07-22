@@ -1249,6 +1249,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         allow_intrabc: false,
         qp,
         bd: BlockDecodedMirror::new(),
+        dv_hash: Default::default(),
     };
     let mut ictx = PSearchCtx::with_refs(
         &cfg.refs,
@@ -5214,6 +5215,7 @@ mod tests {
             allow_intrabc: false,
             qp,
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         let mut ictx = PSearchCtx::new(
@@ -5320,6 +5322,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5443,6 +5446,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5546,6 +5550,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5645,6 +5650,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5742,6 +5748,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5874,6 +5881,7 @@ mod tests {
                 q
             },
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -5988,6 +5996,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -6426,6 +6435,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(q, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         }
     }
 
@@ -7778,6 +7788,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -7892,6 +7903,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
@@ -8029,6 +8041,7 @@ mod tests {
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
             bd: BlockDecodedMirror::new(),
+            dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;

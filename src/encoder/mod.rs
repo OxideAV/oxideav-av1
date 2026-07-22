@@ -249,6 +249,7 @@ pub mod bitwriter;
 pub mod block_mode_info;
 #[doc(hidden)]
 pub mod coefficients;
+pub(crate) mod dv_hash;
 #[doc(hidden)]
 pub mod forward_adst;
 #[doc(hidden)]
