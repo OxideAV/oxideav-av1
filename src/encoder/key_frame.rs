@@ -4519,6 +4519,239 @@ mod tests {
         eprintln!("{csv}");
     }
 
+    /// r425 pin content — one deterministic 256×144 "screen page"
+    /// exercising every ladder-item-5 arm at once: 2-colour glyph
+    /// text lines (repeated glyphs at §6.10.24-reachable off-stride
+    /// lags — the hash-DV win case), a two-strip 8+8-colour dither
+    /// band (rect VERT palette territory), and a full-width 2-colour
+    /// dither footer over the clipped bottom superblock row (144 =
+    /// 2×64 + 16 — the `split_or_horz` clipped-palette arm).
+    fn scc_pin_page(w: usize, h: usize) -> Yuv420Frame {
+        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+        for p in f.y.iter_mut() {
+            *p = 235;
+        }
+        let mut state = 0x0425_C0DEu32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        // Six "anti-aliased" glyphs: dense multi-value 8×8 patterns
+        // (deliberately NOT palette-representable — the exact-copy
+        // arms are the only cheap coding for a repeat).
+        let glyphs: Vec<[u8; 64]> = (0..6)
+            .map(|_| {
+                let mut g = [0u8; 64];
+                for p in g.iter_mut() {
+                    *p = (next() & 0xFF) as u8;
+                }
+                g
+            })
+            .collect();
+        // Text lines at a 16-row pitch (every line lands at the same
+        // offset inside its 16×16 gate cell) whose content repeats
+        // every third line — later repeats sit at §6.10.24-reachable
+        // lags that only the hash index seeds (e.g. Δrow = −48).
+        let footer_top = (h / 64) * 64;
+        let mut line = 0usize;
+        let mut row = 8usize;
+        while row + 8 + 4 <= footer_top {
+            for slot in 0..(w / 8).saturating_sub(2) {
+                // Deterministic per-(repeated-line, slot) glyph pick
+                // with sparse word gaps.
+                let key = (line % 3) * 131 + slot;
+                if key % 5 == 0 {
+                    continue;
+                }
+                let g = &glyphs[key % 6];
+                let col = 8 + slot * 8;
+                for i in 0..8 {
+                    for j in 0..8 {
+                        f.y[(row + i) * w + col + j] = g[i * 8 + j];
+                    }
+                }
+            }
+            line += 1;
+            row += 16;
+        }
+        // Two-strip band: cols w-64..w of the second superblock row
+        // (rect VERT palette territory — two disjoint 8-colour
+        // dithers).
+        const LEFT: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
+        const RIGHT: [u8; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
+        let band_c = w - 64;
+        for i in 64..footer_top.min(128) {
+            for j in band_c..w {
+                let pal = if j < band_c + 32 { &LEFT } else { &RIGHT };
+                f.y[i * w + j] = pal[(next() & 7) as usize];
+            }
+        }
+        // Clipped footer: the last (partial) superblock row.
+        for i in footer_top..h {
+            for j in 0..w {
+                f.y[i * w + j] = if next() & 1 == 0 { 40 } else { 200 };
+            }
+        }
+        f
+    }
+
+    /// The pin page must actually carry all three r425 arms in its
+    /// elected tree: hash-seeded intrabc leaves, an interior rect
+    /// palette node, and a clipped-edge HORZ palette top block — and
+    /// the emitted stream must round-trip byte-exact through the spec
+    /// driver (whose §6.10.24 / §5.11.49 readers re-validate them).
+    #[test]
+    fn r425_scc_pin_page_features() {
+        let (w, h) = (256usize, 144usize);
+        let input = scc_pin_page(w, h);
+        let q = 60u8;
+        let allow_intrabc = intrabc_beneficial(&input);
+        assert!(allow_intrabc, "the glyph page must open the §5.9.20 gate");
+        let mut recon = ReconState {
+            y: vec![0u8; w * h],
+            u: vec![0u8; (w / 2) * (h / 2)],
+            v: vec![0u8; (w / 2) * (h / 2)],
+            width: w,
+            height: h,
+            chroma_w: w / 2,
+            chroma_h: h / 2,
+            mi_rows: (h / 4) as u32,
+            mi_cols: (w / 4) as u32,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc,
+            qp: QuantizerParams::neutral(q, 8),
+            bd: BlockDecodedMirror::new(),
+            dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
+        };
+        let (mut twin, params) = search_ctx_for_tests(&recon);
+        let (mut ibc, mut rect_pal, mut clipped_pal) = (0u32, 0u32, 0u32);
+        fn scan(node: &SyntaxNode, ibc: &mut u32, rect_pal: &mut u32) {
+            match node {
+                SyntaxNode::Leaf(b) if b.intrabc_mv.is_some() => *ibc += 1,
+                SyntaxNode::Leaf(_) => {}
+                SyntaxNode::Split(ch) => {
+                    for c in ch.iter() {
+                        scan(c, ibc, rect_pal);
+                    }
+                }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        if b.intrabc_mv.is_some() {
+                            *ibc += 1;
+                        }
+                        if b.palette.size_y > 0 {
+                            *rect_pal += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (sb_r, sb_c) in sb_grid_origins(recon.mi_rows, recon.mi_cols) {
+            recon
+                .bd
+                .clear_for_sb(sb_r, sb_c, recon.mi_rows, recon.mi_cols);
+            twin.arm_read_deltas();
+            let (tree, _) = build_search_tree(
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &input,
+                &mut recon,
+                &mut twin,
+                &params,
+                RateModel::Twin,
+            )
+            .unwrap();
+            if sb_r == 32 {
+                if let SyntaxNode::Horz(blocks) = &tree {
+                    if blocks[0].palette.size_y > 0 {
+                        clipped_pal += 1;
+                    }
+                }
+            }
+            scan(&tree, &mut ibc, &mut rect_pal);
+        }
+        assert!(ibc > 0, "pin page must commit intrabc leaves");
+        assert!(rect_pal > 0, "pin page must commit rect palette leaves");
+        assert!(
+            clipped_pal > 0,
+            "pin page must elect the clipped HORZ palette arm on the footer row"
+        );
+
+        // Public-API stream conformance through the spec driver.
+        let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+        let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].planes[0], enc.recon_y, "luma");
+        assert_eq!(frames[0].planes[1], enc.recon_u, "U");
+        assert_eq!(frames[0].planes[2], enc.recon_v, "V");
+    }
+
+    /// Env-gated pin generation twin (`OXIDEAV_AV1_SCC_FIXTURE_DIR`):
+    /// the r425 KEY screen page and a 3-frame scrolled-page GOP,
+    /// written as IVF + encoder-reconstruction YUV for external
+    /// black-box decoder validation and corpus pinning.
+    #[test]
+    fn r425_scc_pin_dump() {
+        let Ok(dir) = std::env::var("OXIDEAV_AV1_SCC_FIXTURE_DIR") else {
+            return;
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pin A — KEY screen page.
+        let input = scc_pin_page(256, 144);
+        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        std::fs::write(
+            format!("{dir}/self-kf-256x144-q60-screen-rect.ivf"),
+            &enc.ivf_bytes,
+        )
+        .unwrap();
+        let mut yuv = Vec::new();
+        yuv.extend_from_slice(&enc.recon_y);
+        yuv.extend_from_slice(&enc.recon_u);
+        yuv.extend_from_slice(&enc.recon_v);
+        std::fs::write(format!("{dir}/self-kf-256x144-q60-screen-rect.yuv"), &yuv).unwrap();
+
+        // Pin B — 3-frame GOP: the page scrolls up 8 px per frame
+        // (the text region moves; the footer dither refreshes), so
+        // the P-frames mix inter text motion with palette intra
+        // re-coding of the changed regions.
+        let (w, h) = (192usize, 112usize);
+        let page = scc_pin_page(w, h + 16);
+        let frame_at = |scroll: usize| -> Yuv420Frame {
+            let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+            for i in 0..h {
+                for j in 0..w {
+                    f.y[i * w + j] = page.y[(i + scroll) * w + j];
+                }
+            }
+            f
+        };
+        let gop: Vec<Yuv420Frame> = vec![frame_at(0), frame_at(8), frame_at(16)];
+        let enc =
+            crate::encoder::inter_frame::encode_gop_yuv420_with_q(&gop, 60).expect("gop encode");
+        std::fs::write(
+            format!("{dir}/self-gop-192x112-q60-screen-scroll.ivf"),
+            &enc.ivf_bytes,
+        )
+        .unwrap();
+        let mut yuv = Vec::new();
+        for fr in &enc.recon {
+            yuv.extend_from_slice(&fr.y);
+            yuv.extend_from_slice(&fr.u);
+            yuv.extend_from_slice(&fr.v);
+        }
+        std::fs::write(
+            format!("{dir}/self-gop-192x112-q60-screen-scroll.yuv"),
+            &yuv,
+        )
+        .unwrap();
+        eprintln!("r425 scc pins dumped to {dir}");
+    }
+
     /// r418 — the k-means clustering arm must win where the block is
     /// NOT exactly representable: 4 colour groups with ±1 jitter
     /// (~12 distinct values per block) cluster to a `<= 8`-colour

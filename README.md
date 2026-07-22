@@ -821,6 +821,37 @@ tight-V-cluster content). Harnesses: `tests/pyramid_deep_ab.rs` +
 and `self-kf-64x64-q60-vdelta` — the first self-encoded signed-delta
 V-plane stream on the wire (corpus 76 total).
 
+### Screen-content completion: hash-match intrabc + rect/clipped palette (r425)
+
+r425 closes the screen-content ladder item. **Hash-match DV
+search**: a per-frame block-hash index (own design — FNV-1a 8×8 base
+tier at every even input position, 16/32/64 tiers composed from
+quadrant hashes, flat-block suppression, capped buckets) arms with
+the §5.9.20 gate; eligible leaves probe it with their input samples
+and exact-match sources seed the §5.11.7 DV search at ARBITRARY even
+offsets, nearest-first, ahead of the r418 geometric strides — every
+seed still passes the full §6.10.24 transcription, the
+reconstruction-space SSD ranking and the exact-twin-bits election.
+The frame gate grows a **glyph tier** (16×16 duplicate-cell scan at
+§6.10.24-valid lags) for repeated patterns that never align to whole
+superblocks. **Rectangular + clipped palette leaves**: the KEY RD
+ladder trials `PARTITION_HORZ`/`PARTITION_VERT` with two intra
+leaves at `BLOCK_16X16+`, and frame-edge half-straddle nodes elect
+the `split_or_horz`/`split_or_vert` single-rect arm — a clipped
+HORZ-top / VERT-left block whose §5.11.46 candidates build over the
+ACTUAL on-screen sub-rectangle, whose colour maps carry the §5.11.49
+off-screen replication fill, and whose residual walk skips
+off-screen-origin TUs with clip-aware legs. Measured on the
+18-config screen matrix: screen tools code **5.49× smaller than
+natural coding** (6.97× on the 11 pixel-exact-luma configs; r418
+stood at 4.6×), the hash index alone is worth **−34.9%** on the
+repeated-glyph page. Two streams pinned:
+`self-kf-256x144-q60-screen-rect` (hash-seeded off-stride DVs, the
+corpus's first rectangular AND first clipped palette leaves) and
+`self-gop-192x112-q60-screen-scroll` (scrolling page GOP, elected —
+not forced — edge partitions), byte-identical in THREE independent
+reference decoders (corpus 78 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -835,10 +866,10 @@ V-plane stream on the wire (corpus 76 total).
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}` /
   `encoder::encode_adaptive_gop_yuv420_with_q`. Conformant encoding
-  beyond the r424 scope (per-segment lossless mixing, intrabc
-  hash-match DV search, rect / clipped palette leaves — the rest of
-  the screen-content polish ladder item; the §5.11.46 signed-delta
-  V-plane arm landed in r424) is the follow-up ladder.
+  beyond the r425 scope (per-segment lossless mixing — `SEG_LVL_ALT_Q`
+  segments reaching qindex 0 with per-segment `LosslessArray`
+  TX/coef semantics inside a lossy frame — is ladder item 6) is the
+  follow-up ladder.
 
 ## Module layout
 
