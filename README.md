@@ -812,8 +812,11 @@ coefficient chain through the writer's own one-TU body against the
 fork's running CDF / level-context state, and the §5.11.46 palette
 k-means inner ladders surface per-`k` candidates settled by exact
 full-leaf twin bits — the last proxy prices inside the residual
-chain are gone. Harness: `tests/pyramid_deep_ab.rs`; two streams
-pinned: `self-pyr-64x64-q60-len17-deep` and
+chain are gone. The screen-content ladder opens with the §5.11.46
+**signed-delta V-plane arm election** (UV-palette leaves price both
+V-entry coding arms and commit the exact-bits winner — witnessed on
+tight-V-cluster content). Harness: `tests/pyramid_deep_ab.rs`; two
+streams pinned: `self-pyr-64x64-q60-len17-deep` and
 `self-adaptive-96x80-q60-cut-n13` (corpus 75 total).
 
 ### Not yet supported
@@ -831,9 +834,9 @@ pinned: `self-pyr-64x64-q60-len17-deep` and
   `encoder::encode_pyramid_gop_yuv420{,_with_q}` /
   `encoder::encode_adaptive_gop_yuv420_with_q`. Conformant encoding
   beyond the r424 scope (per-segment lossless mixing, intrabc
-  hash-match DV search + rect / clipped palette leaves, the §5.11.46
-  signed-delta V-plane arm — the screen-content polish ladder item)
-  is the follow-up ladder.
+  hash-match DV search, rect / clipped palette leaves — the rest of
+  the screen-content polish ladder item; the §5.11.46 signed-delta
+  V-plane arm landed in r424) is the follow-up ladder.
 
 ## Module layout
 

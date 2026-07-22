@@ -1497,12 +1497,37 @@ pub(crate) fn encode_leaf_sq(
             }
         }
     };
+    // r424 — §5.11.46 signed-delta V-plane arm election (ladder item
+    // 5): a UV-palette leaf's V entries code either as direct
+    // literals or through the `delta_encode_palette_colors_v` chain;
+    // both arms decode to the identical entry values, so under twin
+    // pricing the exact-bits smaller arm wins outright. A V list
+    // whose deltas the signed-subexp chain cannot represent simply
+    // keeps the literal arm (the writer rejects the commitment and
+    // the trial is dropped).
+    let elect_v_arm = |leaf: &mut SyntaxBlock| -> Result<(), Error> {
+        if leaf.palette.size_uv == 0 {
+            return Ok(());
+        }
+        if let Some((twin, params)) = pricing {
+            let literal = twin.price_block(leaf, mi_r, mi_c, b_size, params)?;
+            let mut alt = leaf.clone();
+            alt.palette.delta_encode_v = true;
+            if let Ok(delta) = twin.price_block(&alt, mi_r, mi_c, b_size, params) {
+                if delta < literal {
+                    *leaf = alt;
+                }
+            }
+        }
+        Ok(())
+    };
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
         for &(py, puv) in combos.iter() {
             let mut leaf =
                 encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv, pricing)?;
             fix_skip_segment(&mut leaf);
+            elect_v_arm(&mut leaf)?;
             let d = region_distortion(recon, input, mi_r, mi_c, n4);
             let score = score_of(d, rate_of(&leaf, depth as u64)?);
             let improves = match best.as_ref() {
@@ -3315,6 +3340,77 @@ mod tests {
                 assert_eq!(enc.recon_y, input.y, "lossless palette arm must be exact");
             }
         }
+    }
+
+    /// r424 — the §5.11.46 signed-delta V-plane arm must actually be
+    /// ELECTED where it is cheaper: chroma content whose UV-palette V
+    /// entries cluster tightly (delta 6 fits the 4-bit minimum-width
+    /// delta chain; the direct literal costs the full 8 bits per
+    /// entry) must commit `delta_encode_palette_colors_v = 1` on the
+    /// UV-palette leaves under exact twin pricing, and the emitted
+    /// stream must still round-trip byte-exact through the spec
+    /// driver's §5.11.46 delta-arm reader.
+    #[test]
+    fn r424_search_elects_signed_delta_v_palette_arm() {
+        // Luma: 4-colour dither (palette-friendly). Chroma: 2x2-cell
+        // checker with a WIDE U spread and a TIGHT V spread.
+        let mut input = dither4(64, 64, 91);
+        for i in 0..32usize {
+            for j in 0..32usize {
+                let cell = ((i / 2) + (j / 2)) & 1;
+                input.u[i * 32 + j] = if cell == 0 { 64 } else { 192 };
+                input.v[i * 32 + j] = if cell == 0 { 100 } else { 106 };
+            }
+        }
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows: 16,
+            mi_cols: 16,
+            lossless: false,
+            allow_screen_content_tools: true,
+            allow_intrabc: false,
+            qp: QuantizerParams::neutral(60, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        recon.bd.clear_for_sb(0, 0, 16, 16);
+        let (mut twin, params) = search_ctx_for_tests(&recon);
+        let (tree, _) = build_search_tree(
+            0,
+            0,
+            BLOCK_64X64,
+            &input,
+            &mut recon,
+            &mut twin,
+            &params,
+            RateModel::Twin,
+        )
+        .unwrap();
+        let (mut pal_uv, mut other_uv) = (0u32, 0u32);
+        count_palette_uv_leaves(&tree, &mut pal_uv, &mut other_uv);
+        assert!(pal_uv > 0, "the checker chroma must commit UV palettes");
+        let (mut delta_v, mut literal_v) = (0u32, 0u32);
+        count_palette_leaves_by(&tree, &mut delta_v, &mut literal_v, |b| {
+            b.palette.size_uv > 0 && b.palette.delta_encode_v
+        });
+        assert!(
+            delta_v > 0,
+            "tight V clustering must elect the §5.11.46 signed-delta arm \
+             (delta={delta_v} literal-or-other={literal_v})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].planes[0], enc.recon_y, "luma");
+        assert_eq!(frames[0].planes[1], enc.recon_u, "U");
+        assert_eq!(frames[0].planes[2], enc.recon_v, "V");
     }
 
     /// r418 — the §5.11.7 intra-block-copy arm must actually be
