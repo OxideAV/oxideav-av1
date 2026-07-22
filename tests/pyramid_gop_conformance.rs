@@ -91,6 +91,28 @@ fn pyramid_every_gop_length_1_to_9_round_trips() {
     }
 }
 
+/// r424: a full four-level mini-GOP (17 frames = KEY + L=16): ALT +
+/// MID levels 1..3 + eight shown B leaves with distinct BWDREF /
+/// ALTREF2 / ALTREF backward roles, per-layer q offsets and the
+/// primary-reference election live on every coded frame.
+#[test]
+fn pyramid_len17_four_levels_round_trips() {
+    let frames: Vec<Yuv420Frame> = (0..17)
+        .map(|k| moving_gradient(64, 64, 2 * k, 3 * k, 29))
+        .collect();
+    assert_pyramid_round_trip(&frames, 100);
+}
+
+/// r424: non-dyadic deep tail (12 frames = KEY + L=11 — uneven
+/// midpoint recursion with mixed-depth subtrees).
+#[test]
+fn pyramid_len12_non_dyadic_round_trips() {
+    let frames: Vec<Yuv420Frame> = (0..12)
+        .map(|k| moving_gradient(64, 64, k, 2 * k, 41))
+        .collect();
+    assert_pyramid_round_trip(&frames, 160);
+}
+
 /// Lossless full pyramid (5 frames = KEY + one L=4 mini-GOP): the
 /// decoded display-order output must equal the INPUT byte-for-byte
 /// through the out-of-order coding, backward prediction and
@@ -310,7 +332,9 @@ fn pyramid_external_sweep_dump() {
         "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands", "iifade", "screen",
         "shear", "zoom",
     ];
-    let lengths = [2usize, 3, 4, 5, 7, 9];
+    // r424: deep lengths join the rotation (12 = non-dyadic L=11
+    // recursion, 17 = the full four-level L=16 mini-GOP).
+    let lengths = [2usize, 3, 5, 9, 12, 17];
     let mut count = 0u32;
     for (gi, &(w, h)) in geometries.iter().enumerate() {
         for (qi, &q) in qs.iter().enumerate() {
