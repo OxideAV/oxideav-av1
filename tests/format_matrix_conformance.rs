@@ -334,3 +334,66 @@ fn r427_format_matrix_fixture_dump() {
     }
     eprintln!("r427 format-matrix pins dumped to {dir}");
 }
+
+/// r427 — the deep-pyramid driver at the new pairings (cheap sweep:
+/// one 5-frame pyramid at 10-bit 4:2:0 and one at 8-bit 4:4:4): the
+/// out-of-order coding, show_existing units and §7.20 slot rotation
+/// must hold at any depth/format exactly like the flat GOP.
+#[test]
+fn pyramid_round_trips_at_new_pairings() {
+    use oxideav_av1::encoder::encode_pyramid_gop_yuv_with_q;
+    for &(bd, fmt) in &[(10u8, ChromaFormat::Yuv420), (8u8, ChromaFormat::Yuv444)] {
+        let frames: Vec<YuvFrame> = (0..5)
+            .map(|k| textured(64, 64, bd, fmt, k, 2 * k))
+            .collect();
+        let enc = encode_pyramid_gop_yuv_with_q(&frames, 60)
+            .unwrap_or_else(|e| panic!("bd={bd} {fmt:?}: pyramid encode failed: {e:?}"));
+        let decoded = decode_av1_spec(&enc.ivf_bytes)
+            .unwrap_or_else(|e| panic!("bd={bd} {fmt:?}: spec driver rejected: {e:?}"));
+        assert_eq!(decoded.len(), frames.len());
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.bit_depth, bd);
+            assert_eq!(
+                f.planes[0],
+                plane_bytes(bd, &enc.recon[idx].y),
+                "bd={bd} {fmt:?} display {idx}: luma"
+            );
+            assert_eq!(
+                f.planes[1],
+                plane_bytes(bd, &enc.recon[idx].u),
+                "bd={bd} {fmt:?} display {idx}: U"
+            );
+            assert_eq!(
+                f.planes[2],
+                plane_bytes(bd, &enc.recon[idx].v),
+                "bd={bd} {fmt:?} display {idx}: V"
+            );
+        }
+        // External black-box validation of these exact streams runs
+        // during the round via the matrix dump flow.
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_R427_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let tag = format!(
+                "{}bit-{}",
+                bd,
+                if fmt == ChromaFormat::Yuv444 {
+                    "444"
+                } else {
+                    "420"
+                }
+            );
+            std::fs::write(
+                format!("{dir}/self-pyr-64x64-q60-{tag}.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+            let mut yuv = Vec::new();
+            for rc in &enc.recon {
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.y));
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.u));
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.v));
+            }
+            std::fs::write(format!("{dir}/self-pyr-64x64-q60-{tag}.yuv"), &yuv).unwrap();
+        }
+    }
+}
