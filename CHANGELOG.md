@@ -4,6 +4,75 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.15...v0.2.0) - 2026-07-23
+
+### Other
+
+- Annex B length-delimited bitstream — read + write, triple-validated on both arms
+- retire the encoder-mirror paths — spec-driver-only decode, conformance-grade-only encode (user-ruled)
+- pin the first self-encoded CDEF stream (corpus 108)
+- frame-level CDEF election — §5.9.19 strengths on the wire, §7.15 mirrored on recon
+- pin the first per-superblock delta-q stream (corpus 107)
+- §5.9.17 per-superblock delta-q — probed plan, per-SB lambda, masking-weighted exact election
+- pin the first high-precision-MV stream (corpus 106)
+- §5.9.2 allow_high_precision_mv — eighth-pel search + exact-bytes precision election
+- inter module scope note — general (depth, format) pairings
+- deep-pyramid sweep at the new pairings
+- r427 chroma/bit-depth axis — CHANGELOG + README rollup
+- pin the 22-stream format matrix (corpus 83 -> 105)
+- the chroma/bit-depth axis — every §6.4.1 (depth, format) pairing encodes
+- pin the three SEG_LVL feature streams (corpus 83)
+- SEG_LVL_SKIP / SEG_LVL_GLOBALMV / SEG_LVL_REF_FRAME write arms + twin-priced elections
+- global motion: fix the $7.10.2.1 TRANSLATION parameter order
+- walk chain: per-BLOCK SEG_LVL_SKIP derivation replaces the frame-level any-segment collapse
+- pin two mixed-lossless GOPs (corpus 80) + measured demand-region rates
+- per-segment lossless mixing — SEG_LVL_ALT_Q to qindex 0 flips the LosslessArray leaf semantics inside lossy frames
+- av1 r425: pin two screen-content streams — corpus 76 -> 78; measured 5.49x vs natural
+- av1 encoder r425: rectangular + clipped palette leaves in the KEY RD ladder
+- av1 encoder r425: intra-block-copy hash-match DV search + glyph-tier gate
+- av1 r424: pin the signed-delta V-plane stream — corpus 75 -> 76
+- av1 encoder r424: §5.11.46 signed-delta V-plane arm election — screen-content ladder opener
+- av1 r424: pin two deep-pyramid / adaptive conformance streams — corpus 73 -> 75
+- av1 encoder r424: per-TU twin residue — exact §5.11.39 chain pricing for tx-type + palette-k elections
+- av1 r424: deep-pyramid / adaptive A/B harness — measured -4.11% (deep) and -2.85% at +0.16 dB (adaptive) vs two-level baseline
+- av1 encoder r424: deep B-pyramids — recursive dyadic planner, per-layer q, primary-ref carry election, adaptive mini-GOP driver
+- av1 r423: gm witnesses parse with the carried SavedGmParams session state
+- av1 r423: keep EncodedGop field-stable — TunedGop wrapper for the election trace
+- av1 README: r423 cross-frame carry + temporal segment-map section
+- av1 r423: pin two temporal-segmentation conformance streams — corpus 71 -> 73
+- av1 r423: temporal-segmentation witnesses, A/B harness + measured deltas
+- av1 encoder r423: temporal election flipped — spatial-searched trees, temporal replay
+- av1 encoder r423: §5.9.2 primary-reference election — cross-frame carry + temporal election
+- av1 encoder r423: §5.11.19 temporal segment-map write arm — driver threading
+- av1 encoder r422: mode-cascade candidate rates on the rate twin
+- av1 r422: pin two global-motion conformance streams — corpus 69 -> 71
+- av1 r422: global-motion A/B harness — election toggle, joint-objective smoke, 30-config measurement
+- av1 encoder r422: frame-level global-motion estimation + §5.9.24 election
+- av1 encoder r422: §5.9.24/§5.9.25 write arm — signed-subexp global-motion coefficients
+- av1 r421: measured deltas + two rate-twin streams pinned — corpus 67 -> 69
+- av1 r421: rate-twin A/B harness — conformance A/B, smoke tripwire, env-gated three-matrix measurement
+- av1 encoder r421: the search-side rate twin — true bit-accounting rate costs in every RD election
+- av1 encoder r421: SymbolWriter counting mode — exact fractional-bit pricing for the search-side rate twin
+- av1 r419: README — motion-mode election + intra tools in inter frames (corpus 67)
+- av1 r419: filter-intra + CfL-in-inter witnesses; pin OBMC / warp / intra-tool streams — corpus 64 -> 67
+- av1 encoder r419: §5.11.27 motion-mode election — OBMC + WARPED_CAUSAL in the RD ladder
+- av1 r418: README — screen-content encoding section (palette + intrabc search)
+- av1 encoder r418: k-means colour clustering for quantised palettes
+- av1 r418: inter-frame palette witness + screen sweep content kind
+- av1 r418: corpus-pin follow-up — fmt + CHANGELOG entry for the two screen-content fixtures
+- av1 r418: pin palette + screen-content KEY conformance streams — corpus 62 -> 64
+- av1 encoder r418: §5.11.7 intra-block-copy search on KEY frames
+- av1 encoder r418: §5.11.46 chroma (UV) palette in the RD ladder
+- av1 encoder r418: §5.11.46 luma palette in the RD ladder
+- av1 encoder r417: wedge inter-intra selection witness
+- av1 r417: README rollup — inter-intra blends, sub-8 intra leaves, corpus 62
+- av1 encoder r417: sub-8x8 intra leaves in inter frames — encode-side someUseIntra + pinned stream (corpus 61 -> 62)
+- av1 r417: sweep matrix gains the iifade inter-intra content kind
+- av1 r417: pin inter-intra GOP conformance stream — corpus 60 -> 61
+- av1 encoder r417: inter-intra in the RD ladder — smooth + wedge blends, sequence gate on
+- av1 encoder r417: §5.11.28 inter-intra WRITE arm — commitments, mirror stamps, grid parity
+- av1 encoder r417: buffer-parameterised §7.11.2 core + inter-intra search prediction
+
 - av1 r428: **Annex B length-delimited bitstream — read + write** (the completable slice of extension item 13) — new `annexb` module: `split_temporal_units` walks the Annex B.2 `temporal_unit_size` / `frame_unit_size` / `obu_length` `leb128` nesting and converts each temporal unit to its §5.2 low-overhead equivalent (OBUs with their own size field are validated for the Annex B.3 `obu_size`/`obu_length` consistency rule — inconsistency is "deemed invalid" — and passed through verbatim; size-field-less OBUs, legal under Annex B, are re-emitted with a synthesised `leb128` size), enforcing both structural rules (temporal delimiter FIRST in every temporal unit's first frame unit, and nowhere else; nested sizes must tile their container exactly — new typed `Error::AnnexBInvalid`); `build_from_temporal_units` wraps this crate's §7.5 low-overhead units into Annex B framing (one frame unit per frame — `OBU_FRAME` / `OBU_FRAME_HEADER` starts a unit, TD + SH prefix rides the first). New `decoder::decode_av1_annexb` public entry drives the SAME `SpecDecodeSession` as the IVF path. Conformance-gated on BOTH arms in `tests/annexb_conformance.rs`: an independently produced external `--annexb` stream decodes byte-exact to the digest THREE black-box reference decoders agree on (each fed the Annex B bytes directly), and this crate's own KEY / inter-GOP / pyramid streams repack → decode to the per-frame reconstructions (the pyramid case splits a multi-frame temporal unit into per-frame frame units), with the repacked stream ALSO byte-identical through the three external decoders; malformed-framing truncation sweep + IVF-rejection hygiene. Fixtures staged: `ext-annexb-96x80` (external) + `self-annexb-96x80-q80` (deterministic in-tree witness). Large-scale-tile (`OBU_TILE_LIST` / Annex E) and scalability operating-point selection remain open.
 
 - av1 r428: **encoder-mirror path retirement** (user-ruled) — the historical non-conformant intra mirror surface is deleted end to end: the fixed-16×16 and dyn-extent mirror EMIT arms (`encode_intra_frame_y{,uv}{,_dyn}{,_multi_sb}{,_with_q}` and their result types), `decode_av1`'s mirror-ACCEPTANCE arm (the writer-inverse decoder that claimed those streams before falling back to the spec driver), the hidden `decoder::decode_temporal_unit` mirror walk, and the historical `Frame::Yuv420_16x16` / `Frame::Yuv420Dyn` / `Frame::YDyn` variants — the `#[non_exhaustive]` `Frame` enum now constructs `Frame::Spec` exclusively, and every stream decodes through the conformance-corpus-validated spec driver (`encode_av1` has emitted spec-conformant streams since r409, so no reachable producer of mirror streams remains). The shared scaffolding the mirror module housed — `Yuv420Frame`, the intra-only SH/FH builders, `sb_grid_origins` — moved to `encoder::yuv_frame` (same signatures, re-exported at the same paths where public). The mirror-pinned suites were REWRITTEN onto conformance-grade equivalents, not ignored: `tests/encode_decode_pixel_roundtrip.rs` now walks the historical dimension × quantiser × content matrix (incl. the old fixed 16×16 shape, rectangular + multi-superblock extents, monochrome at 8/10/12-bit, 4:2:2/4:4:4 pairings, the public `encode_av1` arm, a public-API GOP, and malformed-input rejection) through the PUBLIC `decode_av1`, asserting `Frame::Spec` recon equality everywhere and input equality on the lossless arm; `tests/encoder_pixel_driver_y_only.rs` (mirror-only monochrome) is absorbed by the same suite's general-format section. Net −12,000 lines of mirror machinery.
