@@ -21,12 +21,18 @@
 //! ([`crate::decoder::decode_av1_spec`]) and by independent AV1
 //! decoders.
 //!
-//! ## Scope (r410)
+//! ## Scope (r410, format-generalised r427)
 //!
-//! * 8-bit 4:2:0 YUV input ([`Yuv420Frame`]): `(width, height)`
-//!   multiples of 8 in `[8, KEY_FRAME_MAX_DIM]` per axis (any
-//!   rectangle; frames wider/taller than 64 ride the multi-superblock
-//!   walk).
+//! * Any §6.4.1 (bit depth, chroma format) pairing ([`YuvFrame`]):
+//!   8 / 10 / 12-bit samples in 4:2:0, 4:2:2, 4:4:4 or monochrome
+//!   layout, with `seq_profile` elected per pairing (the historical
+//!   [`Yuv420Frame`] entries widen into the same core). `(width,
+//!   height)` multiples of 8 in `[8, KEY_FRAME_MAX_DIM]` per axis
+//!   (any rectangle; frames wider/taller than 64 ride the
+//!   multi-superblock walk). The §5.11.46 palette and §5.9.20
+//!   intra-block-copy elections stay 8-bit-4:2:0-scoped (an encoder
+//!   choice); under 4:2:2 the §5.11.38 admissibility rule bars the
+//!   tall partition shapes from the search.
 //! * One KEY frame per stream (`show_frame = 1`,
 //!   `error_resilient_mode = 1`, `refresh_frame_flags = allFrames`),
 //!   single tile, 64×64 superblocks.
@@ -112,18 +118,43 @@ use crate::encoder::partition_tree::{
     write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxNode,
 };
 use crate::encoder::pixel_driver_dyn::{
-    build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq, sb_grid_origins,
-    Yuv420Frame,
+    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
 };
 use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
+use crate::encoder::yuv_frame::{build_intra_only_seq_yuv, ChromaFormat, YuvFrame};
 use crate::frame_header::FrameHeader;
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::transform::inverse_transform_2d;
 use crate::Error;
+
+/// Result of [`encode_key_frame_yuv`] / [`encode_key_frame_yuv_with_q`]
+/// — the general-format sibling of [`EncodedKeyFrame`] (r427): recon
+/// planes are `u16` at the input's bit depth, chroma at the input's
+/// subsampled extent (empty on the monochrome arm).
+#[derive(Debug, Clone)]
+pub struct EncodedKeyFrameYuv {
+    /// Complete IVF v0 file (header + one frame record).
+    pub ivf_bytes: Vec<u8>,
+    /// The bare §7.5 temporal unit (TD + SH + §5.10 `OBU_FRAME`).
+    pub temporal_unit_bytes: Vec<u8>,
+    /// Encoder reconstruction of the luma plane (row-major). The
+    /// decoded output equals these sample-for-sample; at `base_q_idx
+    /// == 0` they additionally equal the input.
+    pub recon_y: Vec<u16>,
+    /// U plane reconstruction (subsampled extent; empty on
+    /// monochrome).
+    pub recon_u: Vec<u16>,
+    /// V plane reconstruction.
+    pub recon_v: Vec<u16>,
+    /// The emitted sequence header descriptor.
+    pub seq: SequenceHeader,
+    /// The emitted frame header descriptor.
+    pub fh: FrameHeader,
+}
 
 /// Result of [`encode_key_frame_yuv420`] /
 /// [`encode_key_frame_yuv420_with_q`].
@@ -249,6 +280,67 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     alt_q: &[i16],
     exact_mask: Option<&[bool]>,
 ) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let (k, carry) = encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask)?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok((
+        EncodedKeyFrame {
+            ivf_bytes: k.ivf_bytes,
+            temporal_unit_bytes: k.temporal_unit_bytes,
+            recon_y: narrow(k.recon_y),
+            recon_u: narrow(k.recon_u),
+            recon_v: narrow(k.recon_v),
+            seq: k.seq,
+            fh: k.fh,
+        },
+        carry,
+    ))
+}
+
+/// r427 — general-format lossless (`base_q_idx = 0`) KEY-frame encode:
+/// see [`encode_key_frame_yuv_with_q`].
+pub fn encode_key_frame_yuv(input: &YuvFrame) -> Result<EncodedKeyFrameYuv, Error> {
+    encode_key_frame_yuv_with_q(input, 0)
+}
+
+/// r427 — encode one KEY frame at any conformant (bit depth, chroma
+/// format) pairing into a spec-conformant IVF stream: 8 / 10 / 12-bit
+/// samples in 4:2:0, 4:2:2, 4:4:4 or monochrome layout, with the
+/// §6.4.1 `seq_profile` elected per pairing. Same scope and
+/// reconstruction-exactness argument as
+/// [`encode_key_frame_yuv420_with_q`] (whose 8-bit 4:2:0 arm now
+/// routes through this driver); the §5.11.46 palette and §5.9.20
+/// intra-block-copy elections stay 8-bit-4:2:0-scoped (an encoder
+/// choice — the header gates close on the other pairings).
+///
+/// ## Errors
+///
+/// * [`YuvFrame::validate`] failures (shape / depth / sample range) —
+///   [`Error::PartitionWalkOutOfRange`].
+/// * Internal writer overflow surfaces the underlying [`Error`].
+pub fn encode_key_frame_yuv_with_q(
+    input: &YuvFrame,
+    base_q_idx: u8,
+) -> Result<EncodedKeyFrameYuv, Error> {
+    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None).map(|(k, _)| k)
+}
+
+/// r427 — the general-format KEY-frame core: every entry point above
+/// funnels here. `alt_q` / `exact_mask` carry the r426 §5.9.14
+/// SEG_LVL_ALT_Q + exactness-demand configuration.
+pub(crate) fn encode_key_frame_yuv_seg_carry(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
     // r426 — same table validation as the P-frame entry (`alt_q[0] ==
     // 0`, su(1+8) range, no over-255 sums, no base-0 segmentation).
     if !alt_q.is_empty() {
@@ -271,28 +363,25 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     } else if exact_mask.is_some() {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    // Own dimension gate (wider than `Yuv420Frame::validate`'s
-    // single-superblock bound): multiples of 8, [8, MAX] per axis.
-    if input.width < 8
-        || input.height < 8
-        || input.width > KEY_FRAME_MAX_DIM
-        || input.height > KEY_FRAME_MAX_DIM
-        || input.width % 8 != 0
-        || input.height % 8 != 0
-    {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    let expected_y = (input.width * input.height) as usize;
-    let expected_uv = ((input.width / 2) * (input.height / 2)) as usize;
-    if input.y.len() != expected_y || input.u.len() != expected_uv || input.v.len() != expected_uv {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
+    // Shape / depth / sample-range gate (multiples of 8, [8, MAX] per
+    // axis, planes consistent with the format).
+    input.validate()?;
+    let bit_depth = input.bit_depth;
+    let (ssx, ssy) = input.format.subsampling();
+    let mono = input.format == ChromaFormat::Monochrome;
+    let num_planes = input.format.num_planes();
     let width = input.width as usize;
     let height = input.height as usize;
-    let chroma_w = width / 2;
-    let chroma_h = height / 2;
+    let chroma_w = input.chroma_width() as usize;
+    let chroma_h = input.chroma_height() as usize;
+    // §5.11.46 palette + §5.9.20 intra-block-copy scope (r427): the
+    // screen-content searches stay 8-bit 4:2:0 (their content scans
+    // and the even-DV chroma alignment are built for that pairing);
+    // other pairings close the §5.9.5 header gate — an encoder
+    // election, not a conformance constraint.
+    let sc_eligible = bit_depth == 8 && input.format == ChromaFormat::Yuv420;
 
-    let mut seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
+    let mut seq = build_intra_only_seq_yuv(input.width, input.height, bit_depth, input.format)?;
     // r410: open the §5.11.24 filter-intra gate — the mode picker now
     // evaluates the five §7.11.2.3 recursive modes on eligible luma
     // blocks (the historical mirror drivers build their own sequence
@@ -300,6 +389,10 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     seq.enable_filter_intra = true;
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    // r427 — screen-content election is 8-bit-4:2:0-scoped (see
+    // `sc_eligible` above); the §5.9.5 SELECT arm codes the header
+    // bit either way.
+    fh.allow_screen_content_tools = fh.allow_screen_content_tools && sc_eligible;
     // r418: open the §5.9.20 intra-block-copy gate only when the
     // content-level scan finds at least one §6.10.24-reachable exact
     // duplicate superblock — the per-leaf `use_intrabc` S() overhead
@@ -318,7 +411,7 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
 
     let lossless = base_q_idx == 0;
-    let mut qp = QuantizerParams::neutral(base_q_idx, 8);
+    let mut qp = QuantizerParams::neutral(base_q_idx, bit_depth);
     if !alt_q.is_empty() {
         // r426 — §7.12.2 get_qindex inputs: the write-side §5.11.47
         // guard and the §5.11.39 quantiser chain key off these.
@@ -346,9 +439,9 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     // §5.11 frame-scope parameter bundle — mirrors the decode driver's
     // `TileDecodeParams` derivation for this header set field by field.
     let params = SyntaxFrameParams {
-        subsampling_x: 1,
-        subsampling_y: 1,
-        num_planes: 3,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        num_planes,
         seg_id_pre_skip: false,
         segmentation_enabled: !alt_q.is_empty(),
         seg_ref_frame: [None; crate::uncompressed_header_tail::MAX_SEGMENTS],
@@ -365,11 +458,11 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
         delta_q_res: 0,
         delta_lf_present: false,
         delta_lf_multi: false,
-        mono_chrome: false,
+        mono_chrome: mono,
         delta_lf_res: 0,
         allow_screen_content_tools: fh.allow_screen_content_tools,
         enable_filter_intra: seq.enable_filter_intra,
-        bit_depth: 8,
+        bit_depth,
         tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
@@ -379,20 +472,24 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     // Running reconstruction — tracks the decoder's `CurrFrame`
     // sample-for-sample (see module docs).
     let mut recon = ReconState {
-        y: vec![0u8; width * height],
-        u: vec![0u8; chroma_w * chroma_h],
-        v: vec![0u8; chroma_w * chroma_h],
+        y: vec![0u16; width * height],
+        u: vec![0u16; chroma_w * chroma_h],
+        v: vec![0u16; chroma_w * chroma_h],
         width,
         height,
         chroma_w,
         chroma_h,
+        bit_depth,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        num_planes,
         mi_rows,
         mi_cols,
         lossless,
         allow_screen_content_tools: fh.allow_screen_content_tools,
         allow_intrabc: fh.allow_intrabc,
         qp,
-        bd: BlockDecodedMirror::new(),
+        bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
         // r425 — arm the exact-match DV index whenever the §5.9.20
         // gate opened (input-space hash seeds for the §5.11.7
         // search; validity + SSD/RD stay reconstruction-space).
@@ -529,7 +626,7 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     };
 
     Ok((
-        EncodedKeyFrame {
+        EncodedKeyFrameYuv {
             ivf_bytes,
             temporal_unit_bytes,
             recon_y: recon.y,
@@ -559,12 +656,33 @@ const BD_STRIDE: usize = 18;
 #[derive(Clone)]
 pub(crate) struct BlockDecodedMirror {
     bd: Vec<u8>,
+    /// §5.5.2 `subsampling_x` for the chroma planes (r427 — the
+    /// §5.11.3 clear and the §5.11.35 anchor derivations key off it).
+    sub_x: u8,
+    /// §5.5.2 `subsampling_y`.
+    sub_y: u8,
+    /// §5.5.2 `NumPlanes` (1 or 3).
+    num_planes: u8,
 }
 
 impl BlockDecodedMirror {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(sub_x: u8, sub_y: u8, num_planes: u8) -> Self {
         Self {
             bd: vec![0u8; 3 * BD_STRIDE * BD_STRIDE],
+            sub_x,
+            sub_y,
+            num_planes,
+        }
+    }
+
+    /// Per-plane §6.4.2 `(subX, subY)` (`(0, 0)` for luma, the
+    /// sequence pair for chroma).
+    #[inline]
+    fn plane_sub(&self, plane: usize) -> (u32, u32) {
+        if plane > 0 {
+            (u32::from(self.sub_x), u32::from(self.sub_y))
+        } else {
+            (0, 0)
         }
     }
 
@@ -586,12 +704,13 @@ impl BlockDecodedMirror {
     }
 
     /// §5.11.3 `clear_block_decoded_flags( r, c, sbSize4 = 16 )` for a
-    /// single-tile frame (`MiRowEnd = MiRows`, `MiColEnd = MiCols`),
-    /// 4:2:0, 3 planes.
+    /// single-tile frame (`MiRowEnd = MiRows`, `MiColEnd = MiCols`) at
+    /// this mirror's subsampling / plane count.
     pub(crate) fn clear_for_sb(&mut self, sb_r: u32, sb_c: u32, mi_rows: u32, mi_cols: u32) {
         const SB_SIZE4: i32 = 16;
-        for plane in 0..3usize {
-            let (sub_x, sub_y): (i32, i32) = if plane > 0 { (1, 1) } else { (0, 0) };
+        for plane in 0..usize::from(self.num_planes) {
+            let (sx, sy) = self.plane_sub(plane);
+            let (sub_x, sub_y) = (sx as i32, sy as i32);
             let sb_width4 = (mi_cols as i32 - sb_c as i32) >> sub_x;
             let sb_height4 = (mi_rows as i32 - sb_r as i32) >> sub_y;
             let y_max = SB_SIZE4 >> sub_y;
@@ -629,8 +748,13 @@ impl BlockDecodedMirror {
 /// start_y)`: `(base_row, base_col)` per the spec's
 /// `subBlockMiRow/Col` derivation (`sbMask = 15` for 64×64 SBs).
 #[inline]
-fn tu_bd_anchor(plane: usize, start_x: usize, start_y: usize) -> (i32, i32) {
-    let (sub_x, sub_y): (u32, u32) = if plane > 0 { (1, 1) } else { (0, 0) };
+fn tu_bd_anchor(
+    bd: &BlockDecodedMirror,
+    plane: usize,
+    start_x: usize,
+    start_y: usize,
+) -> (i32, i32) {
+    let (sub_x, sub_y) = bd.plane_sub(plane);
     let row = ((start_y as u32) << sub_y) >> 2;
     let col = ((start_x as u32) << sub_x) >> 2;
     let base_row = ((row & 15) >> sub_y) as i32;
@@ -649,7 +773,7 @@ pub(crate) fn tu_corner_avail(
     tx_w: usize,
     tx_h: usize,
 ) -> (bool, bool) {
-    let (base_row, base_col) = tu_bd_anchor(plane, start_x, start_y);
+    let (base_row, base_col) = tu_bd_anchor(bd, plane, start_x, start_y);
     let step_x4 = (tx_w >> 2) as i32;
     let step_y4 = (tx_h >> 2) as i32;
     let above_right = bd.get(plane, base_row - 1, base_col + step_x4);
@@ -667,7 +791,7 @@ pub(crate) fn tu_bd_stamp(
     tx_w: usize,
     tx_h: usize,
 ) {
-    let (base_row, base_col) = tu_bd_anchor(plane, start_x, start_y);
+    let (base_row, base_col) = tu_bd_anchor(bd, plane, start_x, start_y);
     let step_x4 = (tx_w >> 2) as i32;
     let step_y4 = (tx_h >> 2) as i32;
     for i in 0..step_y4 {
@@ -677,15 +801,26 @@ pub(crate) fn tu_bd_stamp(
     }
 }
 
-/// Encoder-side running reconstruction + quantiser bundle.
+/// Encoder-side running reconstruction + quantiser bundle. r427:
+/// planes are `u16` at [`Self::bit_depth`], chroma at the
+/// [`Self::subsampling_x`] / [`Self::subsampling_y`] extents (empty
+/// when [`Self::num_planes`] is 1).
 pub(crate) struct ReconState {
-    pub(crate) y: Vec<u8>,
-    pub(crate) u: Vec<u8>,
-    pub(crate) v: Vec<u8>,
+    pub(crate) y: Vec<u16>,
+    pub(crate) u: Vec<u16>,
+    pub(crate) v: Vec<u16>,
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) chroma_w: usize,
     pub(crate) chroma_h: usize,
+    /// §5.5.2 `BitDepth` (8 / 10 / 12).
+    pub(crate) bit_depth: u8,
+    /// §5.5.2 `subsampling_x` (0 or 1).
+    pub(crate) subsampling_x: u8,
+    /// §5.5.2 `subsampling_y`.
+    pub(crate) subsampling_y: u8,
+    /// §5.5.2 `NumPlanes` (1 or 3).
+    pub(crate) num_planes: u8,
     pub(crate) mi_rows: u32,
     pub(crate) mi_cols: u32,
     pub(crate) lossless: bool,
@@ -710,12 +845,23 @@ pub(crate) struct ReconState {
 }
 
 impl ReconState {
-    pub(crate) fn plane(&self, plane: usize) -> (&[u8], usize, usize) {
+    pub(crate) fn plane(&self, plane: usize) -> (&[u16], usize, usize) {
         match plane {
             0 => (&self.y, self.width, self.height),
             1 => (&self.u, self.chroma_w, self.chroma_h),
             _ => (&self.v, self.chroma_w, self.chroma_h),
         }
+    }
+
+    /// r427 — chroma-space origin of the mi cell `(r, c)` per the
+    /// §5.11.5 `(MiRow >> subsampling_y, MiCol >> subsampling_x)`
+    /// derivation, in samples.
+    #[inline]
+    pub(crate) fn chroma_origin(&self, r: u32, c: u32) -> (usize, usize) {
+        (
+            ((r >> self.subsampling_y) as usize) * 4,
+            ((c >> self.subsampling_x) as usize) * 4,
+        )
     }
 }
 
@@ -723,16 +869,17 @@ impl ReconState {
 // §7.11.2 exact-mirror intra prediction (r410).
 // ---------------------------------------------------------------------
 
-/// §7.11.2.1 neighbour-array derivation against a `u8` running plane —
-/// the encoder twin of the decode walker's `AboveRow[]` / `LeftCol[]`
+/// §7.11.2.1 neighbour-array derivation against a `u16` running plane
+/// — the encoder twin of the decode walker's `AboveRow[]` / `LeftCol[]`
 /// build (head-extended representation: spec index `k` at offset
 /// `k + 2`, the `-1` corner at offset 1). `have_above` / `have_left`
 /// are the §5.11.35 `(AvailU || y > 0)` / `(AvailL || x > 0)` values,
 /// which for a single-tile whole-frame walk collapse to `start_y > 0`
-/// / `start_x > 0`.
+/// / `start_x > 0`. r427: the no-neighbour fills are the §7.11.2.2
+/// depth-scaled `(1 << (BitDepth - 1)) ± 1` constants.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn build_tu_neighbours(
-    plane_buf: &[u8],
+    plane_buf: &[u16],
     pw: usize,
     ph: usize,
     start_x: usize,
@@ -741,14 +888,14 @@ pub(crate) fn build_tu_neighbours(
     h: usize,
     have_above_right: bool,
     have_below_left: bool,
+    bit_depth: u8,
 ) -> (Vec<u16>, Vec<u16>, bool, bool) {
     let have_above = start_y > 0;
     let have_left = start_x > 0;
     let max_x = pw - 1;
     let max_y = ph - 1;
-    let read =
-        |yy: usize, xx: usize| -> u16 { plane_buf[yy.min(max_y) * pw + xx.min(max_x)] as u16 };
-    let half: u16 = 1 << 7;
+    let read = |yy: usize, xx: usize| -> u16 { plane_buf[yy.min(max_y) * pw + xx.min(max_x)] };
+    let half: u16 = 1 << (bit_depth - 1);
     let corner: u16 = if have_above && have_left {
         read(start_y - 1, start_x - 1)
     } else if have_above {
@@ -820,7 +967,8 @@ fn predict_mode_from_neighbours(
     left_ext: &[u16],
     have_above: bool,
     have_left: bool,
-) -> Option<Vec<u8>> {
+    bit_depth: u8,
+) -> Option<Vec<u16>> {
     let span = w + h;
     let above_row = &above_ext[2..2 + span];
     let left_col = &left_ext[2..2 + span];
@@ -836,7 +984,7 @@ fn predict_mode_from_neighbours(
             log2_h,
             w,
             h,
-            8,
+            bit_depth,
             above_row,
             left_col,
             &mut pred,
@@ -876,7 +1024,7 @@ fn predict_mode_from_neighbours(
     if !ok {
         return None;
     }
-    Some(pred.into_iter().map(|v| v as u8).collect())
+    Some(pred)
 }
 
 /// §7.11.2.3 recursive (filter-intra) prediction over pre-built
@@ -888,10 +1036,12 @@ pub(crate) fn predict_filter_intra_from_neighbours(
     h: usize,
     above_ext: &[u16],
     left_ext: &[u16],
-) -> Option<Vec<u8>> {
+    bit_depth: u8,
+) -> Option<Vec<u16>> {
     let mut pred = vec![0u16; w * h];
-    crate::cdf::predict_intra_recursive(w, h, fim, 8, above_ext, left_ext, &mut pred).ok()?;
-    Some(pred.into_iter().map(|v| v as u8).collect())
+    crate::cdf::predict_intra_recursive(w, h, fim, bit_depth, above_ext, left_ext, &mut pred)
+        .ok()?;
+    Some(pred)
 }
 
 /// One-TU §7.11.2 prediction from the running plane: neighbour build
@@ -909,14 +1059,31 @@ fn predict_tu(
     mode: usize,
     angle_delta: i32,
     fim: Option<usize>,
-) -> Vec<u8> {
+) -> Vec<u16> {
     let (buf, pw, ph) = recon.plane(plane);
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, plane, start_x, start_y, w, h);
-    let (above_ext, left_ext, have_above, have_left) =
-        build_tu_neighbours(buf, pw, ph, start_x, start_y, w, h, avail_ar, avail_bl);
+    let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
+        buf,
+        pw,
+        ph,
+        start_x,
+        start_y,
+        w,
+        h,
+        avail_ar,
+        avail_bl,
+        recon.bit_depth,
+    );
     if let Some(f) = fim.filter(|_| plane == 0) {
-        return predict_filter_intra_from_neighbours(f, w, h, &above_ext, &left_ext)
-            .expect("filter-intra kernel domain holds for coded TU sizes");
+        return predict_filter_intra_from_neighbours(
+            f,
+            w,
+            h,
+            &above_ext,
+            &left_ext,
+            recon.bit_depth,
+        )
+        .expect("filter-intra kernel domain holds for coded TU sizes");
     }
     predict_mode_from_neighbours(
         mode,
@@ -927,6 +1094,7 @@ fn predict_tu(
         &left_ext,
         have_above,
         have_left,
+        recon.bit_depth,
     )
     .expect("supported intra mode always predicts")
 }
@@ -947,11 +1115,14 @@ fn round2_signed(x: i64, n: u32) -> i64 {
 /// at chroma-space `(start_x, start_y)`. `max_luma_w` / `max_luma_h`
 /// are the §5.11.35 `MaxLumaW` / `MaxLumaH` extents (the current
 /// block's luma right/bottom edge — the last luma TU coded before the
-/// chroma TUs).
+/// chroma TUs). r427: general `(subX, subY)` — the §7.11.5 `L[]`
+/// build sums the `(1 + subY) × (1 + subX)` collocated luma cell and
+/// scales by `t << (3 - subX - subY)`; the output clamp is
+/// `Clip1(BitDepth)`.
 #[allow(clippy::too_many_arguments)]
 fn cfl_layer(
-    dc_pred: &[u8],
-    recon_y: &[u8],
+    dc_pred: &[u16],
+    recon_y: &[u16],
     luma_w: usize,
     start_x: usize,
     start_y: usize,
@@ -960,20 +1131,28 @@ fn cfl_layer(
     alpha: i8,
     max_luma_w: usize,
     max_luma_h: usize,
-) -> Vec<u8> {
-    let clamp_x = max_luma_w.saturating_sub(2);
-    let clamp_y = max_luma_h.saturating_sub(2);
+    sub_x: u8,
+    sub_y: u8,
+    bit_depth: u8,
+) -> Vec<u16> {
+    let (sub_x, sub_y) = (u32::from(sub_x), u32::from(sub_y));
+    // §7.11.5: `lumaX = Min( lumaX, MaxLumaW - (1 << subX) )` (and the
+    // Y twin).
+    let clamp_x = max_luma_w.saturating_sub(1 << sub_x);
+    let clamp_y = max_luma_h.saturating_sub(1 << sub_y);
     let mut l = vec![0i64; w * h];
     let mut luma_sum: i64 = 0;
     for i in 0..h {
-        let luma_y = ((start_y + i) << 1).min(clamp_y);
+        let luma_y = ((start_y + i) << sub_y).min(clamp_y);
         for j in 0..w {
-            let luma_x = ((start_x + j) << 1).min(clamp_x);
-            let t = recon_y[luma_y * luma_w + luma_x] as i64
-                + recon_y[luma_y * luma_w + luma_x + 1] as i64
-                + recon_y[(luma_y + 1) * luma_w + luma_x] as i64
-                + recon_y[(luma_y + 1) * luma_w + luma_x + 1] as i64;
-            let v = t << 1;
+            let luma_x = ((start_x + j) << sub_x).min(clamp_x);
+            let mut t = 0i64;
+            for dy in 0..=sub_y as usize {
+                for dx in 0..=sub_x as usize {
+                    t += i64::from(recon_y[(luma_y + dy) * luma_w + luma_x + dx]);
+                }
+            }
+            let v = t << (3 - sub_x - sub_y);
             l[i * w + j] = v;
             luma_sum += v;
         }
@@ -981,10 +1160,11 @@ fn cfl_layer(
     let log2_w = w.trailing_zeros();
     let log2_h = h.trailing_zeros();
     let luma_avg = round2_signed(luma_sum, log2_w + log2_h);
-    let mut out = vec![0u8; w * h];
+    let max_val = (1i64 << bit_depth) - 1;
+    let mut out = vec![0u16; w * h];
     for k in 0..w * h {
         let scaled = round2_signed((alpha as i64) * (l[k] - luma_avg), 6);
-        out[k] = ((dc_pred[k] as i64) + scaled).clamp(0, 255) as u8;
+        out[k] = (i64::from(dc_pred[k]) + scaled).clamp(0, max_val) as u16;
     }
     out
 }
@@ -1044,13 +1224,13 @@ pub(crate) fn step3_flips(tx_type: usize) -> (bool, bool) {
 /// row-major otherwise), zero-padded to `Tx_Width * Tx_Height`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx(
-    input_plane: &[u8],
-    recon_plane: &mut [u8],
+    input_plane: &[u16],
+    recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
     col0: usize,
     tx_sz: usize,
-    pred: &[u8],
+    pred: &[u16],
     plane: u8,
     lossless: bool,
     tx_type: usize,
@@ -1084,13 +1264,13 @@ pub(crate) fn residual_tx(
 /// the exact pre-r425 path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_avail(
-    input_plane: &[u8],
-    recon_plane: &mut [u8],
+    input_plane: &[u16],
+    recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
     col0: usize,
     tx_sz: usize,
-    pred: &[u8],
+    pred: &[u16],
     plane: u8,
     lossless: bool,
     tx_type: usize,
@@ -1105,7 +1285,7 @@ pub(crate) fn residual_tx_avail(
     for i in 0..ah {
         for j in 0..aw {
             residual[i * w + j] =
-                input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * w + j] as i64;
+                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
         }
     }
     let coeffs = if lossless {
@@ -1119,8 +1299,10 @@ pub(crate) fn residual_tx_avail(
     let dense = forward_quantize(&coeffs, tx_sz, plane, 0, tx_type, 15, qp);
     let quant = repack_compact(dense, w, h);
     let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, 15, qp);
-    let res_back = inverse_transform_2d(&dequant, tx_sz, tx_type, 8, lossless);
+    let res_back =
+        inverse_transform_2d(&dequant, tx_sz, tx_type, u32::from(qp.bit_depth), lossless);
     let (flip_ud, flip_lr) = step3_flips(tx_type);
+    let max_val = (1i64 << qp.bit_depth) - 1;
     for i in 0..h {
         let yy = if flip_ud { h - 1 - i } else { i };
         for j in 0..w {
@@ -1128,8 +1310,8 @@ pub(crate) fn residual_tx_avail(
             if yy >= ah || xx >= aw {
                 continue;
             }
-            let p = pred[yy * w + xx] as i64 + res_back[i * w + j];
-            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
+            let p = i64::from(pred[yy * w + xx]) + res_back[i * w + j];
+            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, max_val) as u16;
         }
     }
     quant
@@ -1158,13 +1340,13 @@ pub(crate) fn residual_tx_avail(
 /// residual is zero. Fully-on-screen TUs pass the full TU extent.
 #[allow(clippy::too_many_arguments)]
 fn residual_tx_search_luma_avail(
-    input_plane: &[u8],
-    recon_plane: &mut [u8],
+    input_plane: &[u16],
+    recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
     col0: usize,
     tx_sz: usize,
-    pred: &[u8],
+    pred: &[u16],
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
     avail_w: usize,
@@ -1173,11 +1355,12 @@ fn residual_tx_search_luma_avail(
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
     let (aw, ah) = (avail_w.min(w), avail_h.min(h));
+    let max_val = (1i64 << qp.bit_depth) - 1;
     let mut residual = vec![0i64; w * h];
     for i in 0..ah {
         for j in 0..aw {
             residual[i * w + j] =
-                input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * w + j] as i64;
+                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
         }
     }
     let set = intra_tx_type_set(
@@ -1202,12 +1385,12 @@ fn residual_tx_search_luma_avail(
         let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
         let all_zero = quant.iter().all(|&q| q == 0);
         let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
-        let res_back = inverse_transform_2d(&dequant, tx_sz, t, 8, false);
+        let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
         let mut d = 0u64;
         for i in 0..ah {
             for j in 0..aw {
-                let rec = (pred[i * w + j] as i64 + res_back[i * w + j]).clamp(0, 255);
-                let diff = input_plane[(row0 + i) * pw + (col0 + j)] as i64 - rec;
+                let rec = (i64::from(pred[i * w + j]) + res_back[i * w + j]).clamp(0, max_val);
+                let diff = i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - rec;
                 d += (diff * diff) as u64;
             }
         }
@@ -1252,8 +1435,8 @@ fn residual_tx_search_luma_avail(
     }
     for i in 0..ah {
         for j in 0..aw {
-            let p = pred[i * w + j] as i64 + res_back[i * w + j];
-            recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
+            let p = i64::from(pred[i * w + j]) + res_back[i * w + j];
+            recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, max_val) as u16;
         }
     }
     Ok((quant, label))
@@ -1286,7 +1469,7 @@ fn angle_delta_candidates(mode: usize, n: usize) -> core::ops::RangeInclusive<i3
 /// the block's first luma TU will observe.
 fn pick_y_mode(
     recon: &ReconState,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     row0: usize,
     col0: usize,
     bw: usize,
@@ -1307,13 +1490,14 @@ fn pick_y_mode(
         bh,
         avail_ar,
         avail_bl,
+        recon.bit_depth,
     );
-    let ssd_of = |pred: &[u8]| -> u64 {
+    let ssd_of = |pred: &[u16]| -> u64 {
         let mut ssd = 0u64;
         for i in 0..ah {
             for j in 0..aw {
-                let d =
-                    input.y[(row0 + i) * recon.width + (col0 + j)] as i64 - pred[i * bw + j] as i64;
+                let d = i64::from(input.y[(row0 + i) * recon.width + (col0 + j)])
+                    - i64::from(pred[i * bw + j]);
                 ssd += (d * d) as u64;
             }
         }
@@ -1324,7 +1508,15 @@ fn pick_y_mode(
     for mode in 0..INTRA_MODES {
         for delta in angle_delta_candidates(mode, bw.min(bh)) {
             let Some(pred) = predict_mode_from_neighbours(
-                mode, delta, bw, bh, &above_ext, &left_ext, have_above, have_left,
+                mode,
+                delta,
+                bw,
+                bh,
+                &above_ext,
+                &left_ext,
+                have_above,
+                have_left,
+                recon.bit_depth,
             ) else {
                 continue;
             };
@@ -1339,9 +1531,14 @@ fn pick_y_mode(
     // y_mode is DC_PRED and this driver never codes palette).
     if bw.max(bh) <= 32 {
         for fim in 0..crate::cdf::INTRA_FILTER_MODES {
-            let Some(pred) =
-                predict_filter_intra_from_neighbours(fim, bw, bh, &above_ext, &left_ext)
-            else {
+            let Some(pred) = predict_filter_intra_from_neighbours(
+                fim,
+                bw,
+                bh,
+                &above_ext,
+                &left_ext,
+                recon.bit_depth,
+            ) else {
                 continue;
             };
             let ssd = ssd_of(&pred);
@@ -1360,7 +1557,7 @@ fn pick_y_mode(
 #[allow(clippy::too_many_arguments)]
 fn pick_uv_mode(
     recon: &ReconState,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     crow0: usize,
     ccol0: usize,
     cbw: usize,
@@ -1385,6 +1582,7 @@ fn pick_uv_mode(
         cbh,
         ar_u,
         bl_u,
+        recon.bit_depth,
     );
     let (ar_v, bl_v) = tu_corner_avail(&recon.bd, 2, ccol0, crow0, cbw, cbh);
     let (above_v, left_v, ha_v, hl_v) = build_tu_neighbours(
@@ -1397,19 +1595,20 @@ fn pick_uv_mode(
         cbh,
         ar_v,
         bl_v,
+        recon.bit_depth,
     );
     // r425 — clipped blocks score on-screen chroma only.
     let (caw, cah) = (
         cbw.min(recon.chroma_w - ccol0),
         cbh.min(recon.chroma_h - crow0),
     );
-    let ssd_uv = |pred_u: &[u8], pred_v: &[u8]| -> u64 {
+    let ssd_uv = |pred_u: &[u16], pred_v: &[u16]| -> u64 {
         let mut ssd = 0u64;
         for i in 0..cah {
             for j in 0..caw {
                 let idx = (crow0 + i) * pw + (ccol0 + j);
-                let du = input.u[idx] as i64 - pred_u[i * cbw + j] as i64;
-                let dv = input.v[idx] as i64 - pred_v[i * cbw + j] as i64;
+                let du = i64::from(input.u[idx]) - i64::from(pred_u[i * cbw + j]);
+                let dv = i64::from(input.v[idx]) - i64::from(pred_v[i * cbw + j]);
                 ssd += (du * du + dv * dv) as u64;
             }
         }
@@ -1419,18 +1618,34 @@ fn pick_uv_mode(
     let mut best_delta = 0i8;
     let mut best_alpha: Option<(i8, i8)> = None;
     let mut best_ssd = u64::MAX;
-    let mut dc_pred_u: Vec<u8> = Vec::new();
-    let mut dc_pred_v: Vec<u8> = Vec::new();
+    let mut dc_pred_u: Vec<u16> = Vec::new();
+    let mut dc_pred_v: Vec<u16> = Vec::new();
     for mode in 0..INTRA_MODES {
         for delta in angle_delta_candidates(mode, luma_n) {
-            let Some(pred_u) =
-                predict_mode_from_neighbours(mode, delta, cbw, cbh, &above_u, &left_u, ha_u, hl_u)
-            else {
+            let Some(pred_u) = predict_mode_from_neighbours(
+                mode,
+                delta,
+                cbw,
+                cbh,
+                &above_u,
+                &left_u,
+                ha_u,
+                hl_u,
+                recon.bit_depth,
+            ) else {
                 continue;
             };
-            let Some(pred_v) =
-                predict_mode_from_neighbours(mode, delta, cbw, cbh, &above_v, &left_v, ha_v, hl_v)
-            else {
+            let Some(pred_v) = predict_mode_from_neighbours(
+                mode,
+                delta,
+                cbw,
+                cbh,
+                &above_v,
+                &left_v,
+                ha_v,
+                hl_v,
+                recon.bit_depth,
+            ) else {
                 continue;
             };
             let ssd = ssd_uv(&pred_u, &pred_v);
@@ -1459,6 +1674,9 @@ fn pick_uv_mode(
                 au,
                 max_luma_w,
                 max_luma_h,
+                recon.subsampling_x,
+                recon.subsampling_y,
+                recon.bit_depth,
             );
             let pred_v = cfl_layer(
                 &dc_pred_v,
@@ -1471,6 +1689,9 @@ fn pick_uv_mode(
                 av,
                 max_luma_w,
                 max_luma_h,
+                recon.subsampling_x,
+                recon.subsampling_y,
+                recon.bit_depth,
             );
             let ssd = ssd_uv(&pred_u, &pred_v);
             if ssd < best_ssd {
@@ -1528,7 +1749,7 @@ pub(crate) fn encode_leaf_sq(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     // r421 — `Some((twin, params))` prices the leaf-level elections
     // (tx-depth ladder, §5.11.46 palette combos, §5.11.7 intra-bc)
@@ -1551,7 +1772,7 @@ pub(crate) fn encode_leaf_sq_seg(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
     segment_override: Option<u8>,
@@ -1783,7 +2004,7 @@ pub(crate) struct PaletteCandY {
 /// are a follow-up arc).
 #[cfg(test)]
 fn palette_candidate_y(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -1803,7 +2024,7 @@ fn palette_candidate_y(
 /// palette-predicted §5.11.39 residual chain) settles the `k` choice
 /// the `SSE + λ·entry-cost` proxy used to make alone.
 fn palette_candidates_y(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -1811,6 +2032,12 @@ fn palette_candidates_y(
     max_cands: usize,
 ) -> Vec<PaletteCandY> {
     use crate::cdf::PALETTE_COLORS;
+    // r427 — the palette search stays 8-bit 4:2:0 (the dense 256-bin
+    // histogram below indexes by sample value); the general drivers
+    // never open the §5.9.5 gate outside that pairing.
+    if recon.bit_depth != 8 || recon.subsampling_x != 1 || recon.subsampling_y != 1 {
+        return Vec::new();
+    }
     // §5.11.46 outer gate — r425: rectangular shapes join the squares
     // (`MiSize >= BLOCK_8X8 && Block_Width <= 64 && Block_Height <=
     // 64`; this driver keeps both dims >= 8 — its rect leaves come
@@ -2020,7 +2247,7 @@ pub(crate) struct PaletteCandUv {
 /// subsampled block — §5.11.49 codes ONE shared `ColorMapUV` for both
 /// chroma planes.
 fn palette_candidates_uv(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -2028,6 +2255,10 @@ fn palette_candidates_uv(
     max_cands: usize,
 ) -> Vec<PaletteCandUv> {
     use crate::cdf::PALETTE_COLORS;
+    // r427 — same 8-bit 4:2:0 scope as the luma twin.
+    if recon.bit_depth != 8 || recon.subsampling_x != 1 || recon.subsampling_y != 1 {
+        return Vec::new();
+    }
     // §5.11.46 outer gate — r425: rectangular shapes join the squares
     // (both dims `8..=64` for this driver). Every such leaf has
     // chroma under 4:2:0.
@@ -2053,7 +2284,7 @@ fn palette_candidates_uv(
     for i in 0..os_ch {
         for j in 0..os_cw {
             let off = (crow0 + i) * cw + (ccol0 + j);
-            let p = (u16::from(input.u[off]), u16::from(input.v[off]));
+            let p = (input.u[off], input.v[off]);
             *weights.entry(p).or_insert(0) += 1;
             if weights.len() > kmeans_distinct_bound(os_cw * os_ch).max(PALETTE_COLORS) {
                 return Vec::new();
@@ -2289,12 +2520,12 @@ pub(crate) fn intrabc_dv_valid(
 ///
 /// Content without a provable copy source keeps the gate closed —
 /// the per-leaf `use_intrabc` S() is pure overhead there.
-fn intrabc_beneficial(input: &Yuv420Frame) -> bool {
+fn intrabc_beneficial(input: &YuvFrame) -> bool {
     let (w, h) = (input.width as usize, input.height as usize);
     let cw = w / 2;
     let mi_rows = 2 * ((h as u32 + 7) >> 3);
     let mi_cols = 2 * ((w as u32 + 7) >> 3);
-    let fnv = |hash: &mut u64, v: u8| {
+    let fnv = |hash: &mut u64, v: u16| {
         *hash ^= u64::from(v);
         *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
     };
@@ -2408,7 +2639,7 @@ const INTRABC_GATE_CELL_FRACTION: usize = 64;
 /// of the block extent, leftward / upward / diagonal). Returns `None`
 /// when no candidate passes §6.10.24 validity.
 fn intrabc_best_dv(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -2480,7 +2711,7 @@ fn encode_intrabc_leaf(
     mi_c: u32,
     b_size: usize,
     dv: (i32, i32),
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     // r424 — running per-TU twin fork threading (the intrabc arm
     // prices the §5.11.48 INTER-set candidates exactly like an inter
@@ -2531,7 +2762,7 @@ fn encode_intrabc_leaf(
         let mut tx = 0usize;
         while tx < n {
             let (tr, tc) = (row0 + ty, col0 + tx);
-            let mut pred = vec![0u8; ltw * lth];
+            let mut pred = vec![0u16; ltw * lth];
             for i in 0..lth {
                 for j in 0..ltw {
                     pred[i * ltw + j] = recon.y[(src_row0 + ty + i) * width + src_col0 + tx + j];
@@ -2579,17 +2810,23 @@ fn encode_intrabc_leaf(
         ty += lth;
     }
 
-    // --- Chroma (always `HasChroma` at the square >= 8x8 shapes). ---
-    let cn = n / 2;
-    let (crow0, ccol0) = (row0 / 2, col0 / 2);
+    // --- Chroma (always `HasChroma` at the square >= 8x8 shapes;
+    // r427: subsampling-derived extents — the intrabc election is
+    // 8-bit-4:2:0-gated today, but the walk is format-general). ---
+    let (ssx, ssy) = (
+        u32::from(recon.subsampling_x),
+        u32::from(recon.subsampling_y),
+    );
+    let (cn_w, cn_h) = (n >> ssx, n >> ssy);
+    let (crow0, ccol0) = (row0 >> ssy, col0 >> ssx);
     let (csrc_row0, csrc_col0) = (
-        ((row0 as i32 + dv_r) / 2) as usize,
-        ((col0 as i32 + dv_c) / 2) as usize,
+        ((row0 as i32 + dv_r) >> ssy) as usize,
+        ((col0 as i32 + dv_c) >> ssx) as usize,
     );
     let chroma_tx = if lossless {
         TX_4X4
     } else {
-        get_tx_size(1, luma_tx, b_size, 1, 1).unwrap_or(TX_4X4)
+        get_tx_size(1, luma_tx, b_size, recon.subsampling_x, recon.subsampling_y).unwrap_or(TX_4X4)
     };
     let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
     let chroma_set = inter_tx_type_set(
@@ -2598,11 +2835,11 @@ fn encode_intrabc_leaf(
         false,
     );
     let cw = recon.chroma_w;
-    for plane in 1..=2usize {
+    for plane in 1..usize::from(recon.num_planes) {
         let mut ty = 0usize;
-        while ty < cn {
+        while ty < cn_h {
             let mut tx = 0usize;
-            while tx < cn {
+            while tx < cn_w {
                 let (tr, tc) = (crow0 + ty, ccol0 + tx);
                 // §5.11.40 inter-chroma TxType inheritance from the
                 // subsampling-lifted luma cell, filtered by the
@@ -2610,8 +2847,8 @@ fn encode_intrabc_leaf(
                 let chroma_tt = if lossless || TX_SIZE_SQR_UP[chroma_tx] > crate::cdf::TX_32X32 {
                     DCT_DCT
                 } else {
-                    let lifted_x = ((tc >> 2) << 3).saturating_sub(col0);
-                    let lifted_y = ((tr >> 2) << 3).saturating_sub(row0);
+                    let lifted_x = ((tc >> 2) << (2 + ssx)).saturating_sub(col0);
+                    let lifted_y = ((tr >> 2) << (2 + ssy)).saturating_sub(row0);
                     let luma_tt =
                         tu_type_grid[(lifted_y / lth) * tu_cols + lifted_x / ltw] as usize;
                     if is_tx_type_in_set(true, chroma_set, luma_tt) {
@@ -2620,8 +2857,8 @@ fn encode_intrabc_leaf(
                         DCT_DCT
                     }
                 };
-                let src_plane: &[u8] = if plane == 1 { &recon.u } else { &recon.v };
-                let mut pred = vec![0u8; ctw * cth];
+                let src_plane: &[u16] = if plane == 1 { &recon.u } else { &recon.v };
+                let mut pred = vec![0u16; ctw * cth];
                 for i in 0..cth {
                     for j in 0..ctw {
                         pred[i * ctw + j] =
@@ -2694,7 +2931,7 @@ pub(crate) fn encode_leaf_with_tx(
     mi_c: u32,
     b_size: usize,
     luma_tx: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     palette_y: Option<&PaletteCandY>,
     palette_uv: Option<&PaletteCandUv>,
@@ -2763,11 +3000,11 @@ pub(crate) fn encode_leaf_with_tx(
                 Some(p) => {
                     // §7.11.4 `predict_palette` over this TU's
                     // footprint: map indices → palette colours.
-                    let mut buf = vec![0u8; ltw * lth];
+                    let mut buf = vec![0u16; ltw * lth];
                     for i in 0..lth {
                         for j in 0..ltw {
                             let idx = p.map[(ty + i) * bw + (tx + j)] as usize;
-                            buf[i * ltw + j] = p.colors[idx] as u8;
+                            buf[i * ltw + j] = p.colors[idx];
                         }
                     }
                     buf
@@ -2833,22 +3070,33 @@ pub(crate) fn encode_leaf_with_tx(
     }
 
     // --- Chroma on §5.11.5 HasChroma leaves ---
-    // 4:2:0: every leaf at BLOCK_8X8+ has chroma; a BLOCK_4X4 leaf
-    // only when both mi coords are odd (the SE cell of its 8×8 area).
-    let has_chroma = if b_size >= BLOCK_8X8 {
-        true
-    } else {
-        (mi_r & 1) != 0 && (mi_c & 1) != 0
-    };
+    // r427 general derivation (the §5.11.5 prologue): a `bw4 == 1` /
+    // `bh4 == 1` block on a subsampled axis only carries chroma from
+    // its odd mi coordinate (the last cell covering the chroma unit);
+    // monochrome never has chroma. Under 4:2:0 this reduces to the
+    // historical "BLOCK_4X4 needs both coords odd" rule.
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let bh4 = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+    let chroma_y_edge = bh4 == 1 && recon.subsampling_y != 0 && (mi_r & 1) == 0;
+    let chroma_x_edge = bw4 == 1 && recon.subsampling_x != 0 && (mi_c & 1) == 0;
+    let has_chroma = recon.num_planes > 1 && !chroma_y_edge && !chroma_x_edge;
     let mut uv_mode: Option<u8> = None;
     let mut angle_delta_uv = 0i8;
     let mut cfl_alpha: Option<(i8, i8)> = None;
     if has_chroma {
-        let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
+        let (crow0, ccol0) = recon.chroma_origin(mi_r, mi_c);
         // §5.11.35 MaxLumaW / MaxLumaH: the block's own luma extent
         // (the last luma TU coded above ends the block).
         let max_luma_w = col0 + bw;
         let max_luma_h = row0 + bh;
+        // §5.11.38 chroma residual block for this leaf.
+        let plane_sz = crate::cdf::get_plane_residual_size(
+            b_size,
+            1,
+            recon.subsampling_x,
+            recon.subsampling_y,
+        )
+        .unwrap_or(BLOCK_4X4);
         // §8.3.2 cfl_allowed: on the lossless arm CFL is only allowed
         // when the subsampled chroma residual block is 4×4
         // (`get_plane_residual_size(MiSize, 1) == BLOCK_4X4`); on the
@@ -2860,23 +3108,22 @@ pub(crate) fn encode_leaf_with_tx(
         let cfl_allowed = if os_w < bw || os_h < bh {
             false
         } else if lossless {
-            bw <= 8 && bh <= 8
+            plane_sz == BLOCK_4X4
         } else {
             bw.max(bh) <= 32
         };
         let chroma_tx = if lossless {
             TX_4X4
         } else {
-            get_tx_size(1, luma_tx, b_size, 1, 1).unwrap_or(TX_4X4)
+            get_tx_size(1, luma_tx, b_size, recon.subsampling_x, recon.subsampling_y)
+                .unwrap_or(TX_4X4)
         };
         let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
         // Chroma extent of this leaf's residual grid (§5.11.38
-        // subsampled plane size; BLOCK_4X4 leaves keep the full 4×4).
-        let (cbw, cbh) = if b_size >= BLOCK_8X8 {
-            (bw / 2, bh / 2)
-        } else {
-            (4, 4)
-        };
+        // subsampled plane size — sub-subsampled shapes round up to
+        // the 4×4 floor).
+        let cbw = NUM_4X4_BLOCKS_WIDE[plane_sz] * 4;
+        let cbh = crate::cdf::NUM_4X4_BLOCKS_HIGH[plane_sz] * 4;
         // §5.11.46 UV palette arm (r418): the coded `uv_mode` is
         // DC_PRED (the UV palette gate) and CFL is off; each chroma
         // TU predicts from the §7.11.4 palette map instead.
@@ -2901,7 +3148,7 @@ pub(crate) fn encode_leaf_with_tx(
         let is_cfl = m as usize == UV_CFL_PRED;
         let chroma_tx_type = chroma_tx_type_for(m, chroma_tx, lossless);
         let cw = recon.chroma_w;
-        for plane in 1..=2usize {
+        for plane in 1..usize::from(recon.num_planes) {
             let alpha_p = match (is_cfl, plane, alpha) {
                 (true, 1, Some((au, _))) => Some(au),
                 (true, 2, Some((_, av))) => Some(av),
@@ -2927,11 +3174,11 @@ pub(crate) fn encode_leaf_with_tx(
                         // §7.11.4 `predict_palette` over this TU's
                         // footprint on the shared `ColorMapUV`.
                         let colors = if plane == 1 { &p.colors_u } else { &p.colors_v };
-                        let mut buf = vec![0u8; ctw * cth];
+                        let mut buf = vec![0u16; ctw * cth];
                         for i in 0..cth {
                             for j in 0..ctw {
                                 let idx = p.map[(ty + i) * cbw + (tx + j)] as usize;
-                                buf[i * ctw + j] = colors[idx] as u8;
+                                buf[i * ctw + j] = colors[idx];
                             }
                         }
                         buf
@@ -2948,6 +3195,9 @@ pub(crate) fn encode_leaf_with_tx(
                             alpha_p.unwrap_or(0),
                             max_luma_w,
                             max_luma_h,
+                            recon.subsampling_x,
+                            recon.subsampling_y,
+                            recon.bit_depth,
                         )
                     } else {
                         predict_tu(
@@ -3073,9 +3323,11 @@ pub(crate) fn encode_leaf_with_tx(
 pub(crate) struct RegionSnapshot {
     w: usize,
     h: usize,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+    cw: usize,
+    ch: usize,
+    y: Vec<u16>,
+    u: Vec<u16>,
+    v: Vec<u16>,
     bd: BlockDecodedMirror,
 }
 
@@ -3098,14 +3350,22 @@ pub(crate) fn save_region_wh(
     // r425 — frame-edge-straddling nodes snapshot the on-screen
     // intersection only (there is nothing else to save or restore).
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
-    let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
+    let (crow0, ccol0) = recon.chroma_origin(r, c);
     let w = (w4 * 4).min(recon.width - col0);
     let h = (h4 * 4).min(recon.height - row0);
-    let cw = (w4 * 2).min(recon.chroma_w - ccol0);
-    let ch = (h4 * 2).min(recon.chroma_h - crow0);
-    let mut y = vec![0u8; w * h];
-    let mut u = vec![0u8; cw * ch];
-    let mut v = vec![0u8; cw * ch];
+    // r427 — chroma extents at the subsampled shape; monochrome
+    // snapshots no chroma.
+    let (cw, ch) = if recon.num_planes > 1 {
+        (
+            ((w4 * 4) >> recon.subsampling_x).min(recon.chroma_w - ccol0),
+            ((h4 * 4) >> recon.subsampling_y).min(recon.chroma_h - crow0),
+        )
+    } else {
+        (0, 0)
+    };
+    let mut y = vec![0u16; w * h];
+    let mut u = vec![0u16; cw * ch];
+    let mut v = vec![0u16; cw * ch];
     for i in 0..h {
         y[i * w..(i + 1) * w].copy_from_slice(&recon.y[(row0 + i) * recon.width + col0..][..w]);
     }
@@ -3118,6 +3378,8 @@ pub(crate) fn save_region_wh(
     RegionSnapshot {
         w,
         h,
+        cw,
+        ch,
         y,
         u,
         v,
@@ -3127,9 +3389,9 @@ pub(crate) fn save_region_wh(
 
 pub(crate) fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot) {
     let (w, h) = (snap.w, snap.h);
-    let (cw, ch) = (w / 2, h / 2);
+    let (cw, ch) = (snap.cw, snap.ch);
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
-    let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
+    let (crow0, ccol0) = recon.chroma_origin(r, c);
     for i in 0..h {
         recon.y[(row0 + i) * recon.width + col0..][..w].copy_from_slice(&snap.y[i * w..][..w]);
     }
@@ -3146,7 +3408,7 @@ pub(crate) fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &Regi
 /// reconstruction against the input over one square node's region.
 pub(crate) fn region_distortion(
     recon: &ReconState,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     r: u32,
     c: u32,
     n4: usize,
@@ -3157,41 +3419,71 @@ pub(crate) fn region_distortion(
 /// r412 — rectangular twin of [`region_distortion`].
 pub(crate) fn region_distortion_wh(
     recon: &ReconState,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     r: u32,
     c: u32,
     w4: usize,
     h4: usize,
 ) -> u64 {
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
-    let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
+    let (crow0, ccol0) = recon.chroma_origin(r, c);
     // r425 — straddling nodes score their on-screen intersection.
     let w = (w4 * 4).min(recon.width - col0);
     let h = (h4 * 4).min(recon.height - row0);
-    let cw = (w4 * 2).min(recon.chroma_w - ccol0);
-    let ch = (h4 * 2).min(recon.chroma_h - crow0);
+    let (cw, ch) = if recon.num_planes > 1 {
+        (
+            ((w4 * 4) >> recon.subsampling_x).min(recon.chroma_w - ccol0),
+            ((h4 * 4) >> recon.subsampling_y).min(recon.chroma_h - crow0),
+        )
+    } else {
+        (0, 0)
+    };
     let mut ssd = 0u64;
     for i in 0..h {
         for j in 0..w {
             let idx = (row0 + i) * recon.width + (col0 + j);
-            let d = recon.y[idx] as i64 - input.y[idx] as i64;
+            let d = i64::from(recon.y[idx]) - i64::from(input.y[idx]);
             ssd += (d * d) as u64;
         }
     }
     for i in 0..ch {
         for j in 0..cw {
             let idx = (crow0 + i) * recon.chroma_w + (ccol0 + j);
-            let du = recon.u[idx] as i64 - input.u[idx] as i64;
-            let dv = recon.v[idx] as i64 - input.v[idx] as i64;
+            let du = i64::from(recon.u[idx]) - i64::from(input.u[idx]);
+            let dv = i64::from(recon.v[idx]) - i64::from(input.v[idx]);
             ssd += (du * du + dv * dv) as u64;
         }
     }
     ssd
 }
 
-/// q-scaled Lagrange multiplier for the `D + λ·R` decisions.
+/// r427 — §5.11.38 partition-admissibility gate: "It is a
+/// requirement of bitstream conformance that
+/// `get_plane_residual_size( subSize, 1 )` is not equal to
+/// BLOCK_INVALID every time subSize is computed" (the note: UV blocks
+/// must keep aspect ratios within 1:4..4:1 — under 4:2:2 every tall
+/// luma shape like 32×64 or 4×16 subsamples to an out-of-range chroma
+/// shape). The search must never elect such a subSize; monochrome
+/// streams compute no chroma size and are unconstrained.
+pub(crate) fn chroma_partition_ok(recon: &ReconState, sub_size: usize) -> bool {
+    recon.num_planes == 1
+        || crate::cdf::get_plane_residual_size(
+            sub_size,
+            1,
+            recon.subsampling_x,
+            recon.subsampling_y,
+        )
+        .is_some()
+}
+
+/// q-scaled Lagrange multiplier for the `D + λ·R` decisions. r427:
+/// the SSD distortions scale with `2^(2·(BitDepth - 8))` at matched
+/// relative error (and so do the squared §7.12.2 step sizes for a
+/// given `q_index`), so λ carries the same factor — 8-bit behaviour
+/// is bit-identical to the historical constant.
 pub(crate) fn lambda_for(qp: &QuantizerParams) -> u64 {
-    1 + (qp.base_q_idx as u64 * qp.base_q_idx as u64) / 32
+    let l8 = 1 + (qp.base_q_idx as u64 * qp.base_q_idx as u64) / 32;
+    l8 << (2 * u32::from(qp.bit_depth.saturating_sub(8)))
 }
 
 /// Crude rate proxy for one leaf: a fixed per-leaf mode/skip cost
@@ -3278,7 +3570,7 @@ fn encode_key_leaf(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
     seg: Option<&KeySegDemand<'_>>,
@@ -3296,7 +3588,7 @@ fn encode_key_leaf(
     let ll_seg = seg.expect("demanded implies seg").ll_seg;
     let saved_qp = recon.qp;
     let saved_lossless = recon.lossless;
-    recon.qp = QuantizerParams::neutral(0, 8);
+    recon.qp = QuantizerParams::neutral(0, recon.bit_depth);
     recon.lossless = true;
     let out = encode_leaf_sq_seg(r, c, b_size, input, recon, pricing, Some(ll_seg));
     recon.qp = saved_qp;
@@ -3329,7 +3621,7 @@ fn build_search_tree(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     twin: &mut RateTwin,
     params: &SyntaxFrameParams,
@@ -3381,7 +3673,9 @@ fn build_search_tree(
         let before = save_region_wh(recon, r, c, n4 as usize, n4 as usize);
         let mut rect_best: Option<(SyntaxNode, RegionSnapshot, u64, RateTwin, u64)> = None;
         if let Some(part) = rect_part {
-            if let Some(psub) = crate::cdf::partition_subsize(part, b_size) {
+            if let Some(psub) = crate::cdf::partition_subsize(part, b_size)
+                .filter(|&p| chroma_partition_ok(recon, p))
+            {
                 let mut twin_s = twin.clone();
                 let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
                 let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
@@ -3514,6 +3808,11 @@ fn build_search_tree(
             let Some(psub) = crate::cdf::partition_subsize(part, b_size) else {
                 continue;
             };
+            // r427 — §5.11.38 admissibility (4:2:2 forbids the tall
+            // rect shapes; see `chroma_partition_ok`).
+            if !chroma_partition_ok(recon, psub) {
+                continue;
+            }
             let cells: [(u32, u32); 2] = if part == crate::cdf::PARTITION_HORZ {
                 [(r, c), (r + half, c)]
             } else {
@@ -3630,6 +3929,12 @@ mod tests {
     use super::*;
     use crate::cdf::PALETTE_COLORS;
 
+    /// 8-bit view of a `u16` recon plane for byte-comparisons against
+    /// the spec driver's 8-bit output surface.
+    fn plane8(p: &[u16]) -> Vec<u8> {
+        p.iter().map(|&s| s as u8).collect()
+    }
+
     /// r421 — fresh-frame search context (rate twin + frame params)
     /// for driving [`build_search_tree`] directly: §8.3.1 default
     /// CDFs at the recon's quantiser, a whole-frame single-tile write
@@ -3686,10 +3991,10 @@ mod tests {
     /// noise) with flat chroma — exactly representable by a §5.11.46
     /// palette on every square leaf, while every §7.11.2 neighbour
     /// mode leaves a large residual.
-    fn dither4(w: u32, h: u32, seed: u32) -> Yuv420Frame {
-        const COLORS: [u8; 4] = [16, 80, 160, 240];
+    fn dither4(w: u32, h: u32, seed: u32) -> YuvFrame {
+        const COLORS: [u16; 4] = [16, 80, 160, 240];
         let (wu, hu) = (w as usize, h as usize);
-        let mut f = Yuv420Frame::filled(w, h, 128);
+        let mut f = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 128);
         let mut state = 0x1234_5678u32 ^ seed;
         let mut next = move || {
             state ^= state << 13;
@@ -3729,9 +4034,9 @@ mod tests {
         let input = dither4(128, 64, 77);
         let (mi_rows, mi_cols) = (16u32, 32u32);
         let mut recon = ReconState {
-            y: vec![0u8; 128 * 64],
-            u: vec![0u8; 64 * 32],
-            v: vec![0u8; 64 * 32],
+            y: vec![0u16; 128 * 64],
+            u: vec![0u16; 64 * 32],
+            v: vec![0u16; 64 * 32],
             width: 128,
             height: 64,
             chroma_w: 64,
@@ -3742,7 +4047,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut writer = SymbolWriter::new(false);
@@ -3858,9 +4167,9 @@ mod tests {
         for q in [60u8, 0] {
             let input = dither4(64, 64, 40 + u32::from(q));
             let mut recon = ReconState {
-                y: vec![0u8; 64 * 64],
-                u: vec![0u8; 32 * 32],
-                v: vec![0u8; 32 * 32],
+                y: vec![0u16; 64 * 64],
+                u: vec![0u16; 32 * 32],
+                v: vec![0u16; 32 * 32],
                 width: 64,
                 height: 64,
                 chroma_w: 32,
@@ -3871,7 +4180,11 @@ mod tests {
                 allow_screen_content_tools: true,
                 allow_intrabc: false,
                 qp: QuantizerParams::neutral(q, 8),
-                bd: BlockDecodedMirror::new(),
+                bit_depth: 8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                num_planes: 3,
+                bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
             recon.bd.clear_for_sb(0, 0, 16, 16);
@@ -3936,12 +4249,12 @@ mod tests {
             check_sorted(&tree);
 
             // Full-stream conformance through the spec driver.
-            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "q={q}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "q={q}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "q={q}: V");
             if q == 0 {
                 assert_eq!(enc.recon_y, input.y, "lossless palette arm must be exact");
             }
@@ -3969,9 +4282,9 @@ mod tests {
             }
         }
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -3982,7 +4295,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         recon.bd.clear_for_sb(0, 0, 16, 16);
@@ -4013,12 +4330,12 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        let enc = encode_key_frame_yuv_with_q(&input, 60).unwrap();
         let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].planes[0], enc.recon_y, "luma");
-        assert_eq!(frames[0].planes[1], enc.recon_u, "U");
-        assert_eq!(frames[0].planes[2], enc.recon_v, "V");
+        assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "luma");
+        assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "U");
+        assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "V");
     }
 
     /// r418 — the §5.11.7 intra-block-copy arm must actually be
@@ -4032,9 +4349,9 @@ mod tests {
     #[test]
     fn r418_search_selects_intrabc_on_tiled_content() {
         // One 64x64 xorshift noise tile, repeated over 3x3 superblocks.
-        let mut tile_y = [0u8; 64 * 64];
-        let mut tile_u = [0u8; 32 * 32];
-        let mut tile_v = [0u8; 32 * 32];
+        let mut tile_y = [0u16; 64 * 64];
+        let mut tile_u = [0u16; 32 * 32];
+        let mut tile_v = [0u16; 32 * 32];
         let mut state = 0x00C0_FFEEu32;
         let mut next = move || {
             state ^= state << 13;
@@ -4043,16 +4360,16 @@ mod tests {
             state
         };
         for p in tile_y.iter_mut() {
-            *p = (next() & 0xFF) as u8;
+            *p = (next() & 0xFF) as u16;
         }
         for p in tile_u.iter_mut() {
-            *p = (next() & 0xFF) as u8;
+            *p = (next() & 0xFF) as u16;
         }
         for p in tile_v.iter_mut() {
-            *p = (next() & 0xFF) as u8;
+            *p = (next() & 0xFF) as u16;
         }
         let (w, h) = (192u32, 192u32);
-        let mut input = Yuv420Frame::filled(w, h, 0);
+        let mut input = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 0);
         for i in 0..192usize {
             for j in 0..192usize {
                 input.y[i * 192 + j] = tile_y[(i % 64) * 64 + (j % 64)];
@@ -4066,16 +4383,16 @@ mod tests {
         }
 
         for q in [60u8, 0] {
-            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
             assert!(
                 enc.fh.allow_intrabc,
                 "q={q}: duplicate-tile scan must open the §5.9.20 gate"
             );
             // Tree-level witness over the same driver state.
             let mut recon = ReconState {
-                y: vec![0u8; 192 * 192],
-                u: vec![0u8; 96 * 96],
-                v: vec![0u8; 96 * 96],
+                y: vec![0u16; 192 * 192],
+                u: vec![0u16; 96 * 96],
+                v: vec![0u16; 96 * 96],
                 width: 192,
                 height: 192,
                 chroma_w: 96,
@@ -4086,7 +4403,11 @@ mod tests {
                 allow_screen_content_tools: true,
                 allow_intrabc: true,
                 qp: QuantizerParams::neutral(q, 8),
-                bd: BlockDecodedMirror::new(),
+                bit_depth: 8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                num_planes: 3,
+                bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
             let (mut ibc, mut other) = (0u32, 0u32);
@@ -4117,9 +4438,9 @@ mod tests {
             // Full-stream conformance through the spec driver.
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "q={q}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "q={q}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "q={q}: V");
             if q == 0 {
                 assert_eq!(enc.recon_y, input.y, "lossless intrabc arm must be exact");
                 assert_eq!(enc.recon_u, input.u);
@@ -4144,15 +4465,15 @@ mod tests {
         let (w, h) = (256usize, 192usize);
         // Distinct flat background per superblock: kills the r418
         // duplicate-superblock tier AND flat-cell false matches.
-        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let mut input = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         for i in 0..h {
             for j in 0..w {
                 let sb = (i / 64) * 4 + j / 64;
-                input.y[i * w + j] = 60 + 3 * sb as u8;
+                input.y[i * w + j] = 60 + 3 * sb as u16;
             }
         }
         // One 16×16 xorshift noise glyph...
-        let mut glyph = [0u8; 16 * 16];
+        let mut glyph = [0u16; 16 * 16];
         let mut state = 0x0BAD_CAFEu32;
         let mut next = move || {
             state ^= state << 13;
@@ -4161,7 +4482,7 @@ mod tests {
             state
         };
         for p in glyph.iter_mut() {
-            *p = (next() & 0xFF) as u8;
+            *p = (next() & 0xFF) as u16;
         }
         // ... stamped at one early source and four late destinations.
         // Sources sit in superblocks 0..=1; every destination's
@@ -4192,7 +4513,7 @@ mod tests {
             let sb = (sy / 64) * 4 + sx / 64;
             for i in 0..16 {
                 for j in 0..16 {
-                    bg_only.y[(sy + i) * w + sx + j] = 60 + 3 * sb as u8;
+                    bg_only.y[(sy + i) * w + sx + j] = 60 + 3 * sb as u16;
                 }
             }
         }
@@ -4206,15 +4527,15 @@ mod tests {
         );
 
         for q in [60u8, 0] {
-            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
             assert!(enc.fh.allow_intrabc, "q={q}: glyph tier gate");
 
             // Tree-level witness with an armed index, mirroring the
             // driver's staircase maintenance.
             let mut recon = ReconState {
-                y: vec![0u8; w * h],
-                u: vec![0u8; (w / 2) * (h / 2)],
-                v: vec![0u8; (w / 2) * (h / 2)],
+                y: vec![0u16; w * h],
+                u: vec![0u16; (w / 2) * (h / 2)],
+                v: vec![0u16; (w / 2) * (h / 2)],
                 width: w,
                 height: h,
                 chroma_w: w / 2,
@@ -4225,7 +4546,11 @@ mod tests {
                 allow_screen_content_tools: true,
                 allow_intrabc: true,
                 qp: QuantizerParams::neutral(q, 8),
-                bd: BlockDecodedMirror::new(),
+                bit_depth: 8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                num_planes: 3,
+                bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
             };
             let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -4274,9 +4599,9 @@ mod tests {
             // Full-stream conformance through the spec driver.
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "q={q}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "q={q}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "q={q}: V");
             if q == 0 {
                 assert_eq!(enc.recon_y, input.y, "lossless glyph copies must be exact");
             }
@@ -4295,9 +4620,9 @@ mod tests {
     #[test]
     fn r425_rect_palette_leaf_elected_on_split_content() {
         let (w, h) = (64usize, 64usize);
-        const LEFT: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
-        const RIGHT: [u8; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
-        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        const LEFT: [u16; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
+        const RIGHT: [u16; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
+        let mut input = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         let mut state = 0x5EED_0425u32;
         let mut next = move || {
             state ^= state << 13;
@@ -4314,9 +4639,9 @@ mod tests {
 
         for q in [60u8, 0] {
             let mut recon = ReconState {
-                y: vec![0u8; w * h],
-                u: vec![0u8; (w / 2) * (h / 2)],
-                v: vec![0u8; (w / 2) * (h / 2)],
+                y: vec![0u16; w * h],
+                u: vec![0u16; (w / 2) * (h / 2)],
+                v: vec![0u16; (w / 2) * (h / 2)],
                 width: w,
                 height: h,
                 chroma_w: w / 2,
@@ -4327,7 +4652,11 @@ mod tests {
                 allow_screen_content_tools: true,
                 allow_intrabc: false,
                 qp: QuantizerParams::neutral(q, 8),
-                bd: BlockDecodedMirror::new(),
+                bit_depth: 8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                num_planes: 3,
+                bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
             let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -4364,12 +4693,12 @@ mod tests {
             // Full-stream conformance through the public API + spec
             // driver (the emitting pass walks the same elected rect
             // shapes).
-            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "q={q}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "q={q}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "q={q}: V");
             if q == 0 {
                 assert_eq!(enc.recon_y, input.y, "lossless rect palette must be exact");
             }
@@ -4389,7 +4718,7 @@ mod tests {
     #[test]
     fn r425_clipped_palette_leaf_on_bottom_edge() {
         let (w, h) = (64usize, 80usize);
-        let mut input = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let mut input = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         let mut state = 0xC11B_0425u32;
         let mut next = move || {
             state ^= state << 13;
@@ -4403,9 +4732,9 @@ mod tests {
 
         for q in [60u8, 0] {
             let mut recon = ReconState {
-                y: vec![0u8; w * h],
-                u: vec![0u8; (w / 2) * (h / 2)],
-                v: vec![0u8; (w / 2) * (h / 2)],
+                y: vec![0u16; w * h],
+                u: vec![0u16; (w / 2) * (h / 2)],
+                v: vec![0u16; (w / 2) * (h / 2)],
                 width: w,
                 height: h,
                 chroma_w: w / 2,
@@ -4416,7 +4745,11 @@ mod tests {
                 allow_screen_content_tools: true,
                 allow_intrabc: false,
                 qp: QuantizerParams::neutral(q, 8),
-                bd: BlockDecodedMirror::new(),
+                bit_depth: 8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                num_planes: 3,
+                bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
             let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -4454,12 +4787,12 @@ mod tests {
 
             // Full-stream conformance through the public API + spec
             // driver.
-            let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+            let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].planes[0], enc.recon_y, "q={q}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "q={q}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "q={q}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "q={q}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "q={q}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "q={q}: V");
             if q == 0 {
                 assert_eq!(
                     enc.recon_y, input.y,
@@ -4478,13 +4811,13 @@ mod tests {
     /// the public driver (content-adaptive intrabc gate + armed hash
     /// index), `hash = false` leaves the r425 DV index inert (the
     /// r418-r424 geometric search). Returns (tile bytes, luma SSD).
-    fn scc_tile_encode(input: &Yuv420Frame, q: u8, screen: bool, hash: bool) -> (usize, u64) {
+    fn scc_tile_encode(input: &YuvFrame, q: u8, screen: bool, hash: bool) -> (usize, u64) {
         let (w, h) = (input.width as usize, input.height as usize);
         let allow_intrabc = screen && intrabc_beneficial(input);
         let mut recon = ReconState {
-            y: vec![0u8; w * h],
-            u: vec![0u8; (w / 2) * (h / 2)],
-            v: vec![0u8; (w / 2) * (h / 2)],
+            y: vec![0u16; w * h],
+            u: vec![0u16; (w / 2) * (h / 2)],
+            v: vec![0u16; (w / 2) * (h / 2)],
             width: w,
             height: h,
             chroma_w: w / 2,
@@ -4495,7 +4828,11 @@ mod tests {
             allow_screen_content_tools: screen,
             allow_intrabc,
             qp: QuantizerParams::neutral(q, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: if hash && allow_intrabc {
                 crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h)
             } else {
@@ -4561,8 +4898,8 @@ mod tests {
     /// 8×8 bit-pattern glyphs laid out in text lines — the canonical
     /// repeated-glyph screen content (palette-exact blocks, intrabc
     /// sources at arbitrary offsets).
-    fn scc_glyph_text(w: usize, h: usize, seed: u32) -> Yuv420Frame {
-        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+    fn scc_glyph_text(w: usize, h: usize, seed: u32) -> YuvFrame {
+        let mut f = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         for p in f.y.iter_mut() {
             *p = 235;
         }
@@ -4601,8 +4938,8 @@ mod tests {
 
     /// UI-panel content: flat regions, a title bar, hairline borders,
     /// a 2-colour dither texture pane and a repeated 16×16 icon.
-    fn scc_ui_panel(w: usize, h: usize, seed: u32) -> Yuv420Frame {
-        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+    fn scc_ui_panel(w: usize, h: usize, seed: u32) -> YuvFrame {
+        let mut f = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         let mut state = seed | 1;
         let mut next = move || {
             state ^= state << 13;
@@ -4649,12 +4986,12 @@ mod tests {
 
     /// Text lines over a smooth diagonal gradient — the mixed case
     /// (screen tools must pay only where they win).
-    fn scc_text_over_gradient(w: usize, h: usize, seed: u32) -> Yuv420Frame {
+    fn scc_text_over_gradient(w: usize, h: usize, seed: u32) -> YuvFrame {
         let mut f = scc_glyph_text(w, h, seed);
         for i in 0..h {
             for j in 0..w {
                 if f.y[i * w + j] == 235 {
-                    f.y[i * w + j] = (48 + (i + j) * 160 / (w + h)) as u8;
+                    f.y[i * w + j] = (48 + (i + j) * 160 / (w + h)) as u16;
                 }
             }
         }
@@ -4742,8 +5079,8 @@ mod tests {
     /// band (rect VERT palette territory), and a full-width 2-colour
     /// dither footer over the clipped bottom superblock row (144 =
     /// 2×64 + 16 — the `split_or_horz` clipped-palette arm).
-    fn scc_pin_page(w: usize, h: usize) -> Yuv420Frame {
-        let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+    fn scc_pin_page(w: usize, h: usize) -> YuvFrame {
+        let mut f = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         for p in f.y.iter_mut() {
             *p = 235;
         }
@@ -4757,11 +5094,11 @@ mod tests {
         // Six "anti-aliased" glyphs: dense multi-value 8×8 patterns
         // (deliberately NOT palette-representable — the exact-copy
         // arms are the only cheap coding for a repeat).
-        let glyphs: Vec<[u8; 64]> = (0..6)
+        let glyphs: Vec<[u16; 64]> = (0..6)
             .map(|_| {
-                let mut g = [0u8; 64];
+                let mut g = [0u16; 64];
                 for p in g.iter_mut() {
-                    *p = (next() & 0xFF) as u8;
+                    *p = (next() & 0xFF) as u16;
                 }
                 g
             })
@@ -4795,8 +5132,8 @@ mod tests {
         // Two-strip band: cols w-64..w of the second superblock row
         // (rect VERT palette territory — two disjoint 8-colour
         // dithers).
-        const LEFT: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
-        const RIGHT: [u8; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
+        const LEFT: [u16; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
+        const RIGHT: [u16; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
         let band_c = w - 64;
         for i in 64..footer_top.min(128) {
             for j in band_c..w {
@@ -4826,9 +5163,9 @@ mod tests {
         let allow_intrabc = intrabc_beneficial(&input);
         assert!(allow_intrabc, "the glyph page must open the §5.9.20 gate");
         let mut recon = ReconState {
-            y: vec![0u8; w * h],
-            u: vec![0u8; (w / 2) * (h / 2)],
-            v: vec![0u8; (w / 2) * (h / 2)],
+            y: vec![0u16; w * h],
+            u: vec![0u16; (w / 2) * (h / 2)],
+            v: vec![0u16; (w / 2) * (h / 2)],
             width: w,
             height: h,
             chroma_w: w / 2,
@@ -4839,7 +5176,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc,
             qp: QuantizerParams::neutral(q, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
         };
         let (mut twin, params) = search_ctx_for_tests(&recon);
@@ -4900,12 +5241,12 @@ mod tests {
         );
 
         // Public-API stream conformance through the spec driver.
-        let enc = encode_key_frame_yuv420_with_q(&input, q).unwrap();
+        let enc = encode_key_frame_yuv_with_q(&input, q).unwrap();
         let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].planes[0], enc.recon_y, "luma");
-        assert_eq!(frames[0].planes[1], enc.recon_u, "U");
-        assert_eq!(frames[0].planes[2], enc.recon_v, "V");
+        assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "luma");
+        assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "U");
+        assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "V");
     }
 
     /// Env-gated pin generation twin (`OXIDEAV_AV1_SCC_FIXTURE_DIR`):
@@ -4920,16 +5261,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Pin A — KEY screen page.
         let input = scc_pin_page(256, 144);
-        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        let enc = encode_key_frame_yuv_with_q(&input, 60).unwrap();
         std::fs::write(
             format!("{dir}/self-kf-256x144-q60-screen-rect.ivf"),
             &enc.ivf_bytes,
         )
         .unwrap();
         let mut yuv = Vec::new();
-        yuv.extend_from_slice(&enc.recon_y);
-        yuv.extend_from_slice(&enc.recon_u);
-        yuv.extend_from_slice(&enc.recon_v);
+        yuv.extend_from_slice(&plane8(&enc.recon_y));
+        yuv.extend_from_slice(&plane8(&enc.recon_u));
+        yuv.extend_from_slice(&plane8(&enc.recon_v));
         std::fs::write(format!("{dir}/self-kf-256x144-q60-screen-rect.yuv"), &yuv).unwrap();
 
         // Pin B — 3-frame GOP: the page scrolls up 8 px per frame
@@ -4938,8 +5279,8 @@ mod tests {
         // re-coding of the changed regions.
         let (w, h) = (192usize, 112usize);
         let page = scc_pin_page(w, h + 16);
-        let frame_at = |scroll: usize| -> Yuv420Frame {
-            let mut f = Yuv420Frame::filled(w as u32, h as u32, 128);
+        let frame_at = |scroll: usize| -> YuvFrame {
+            let mut f = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
             for i in 0..h {
                 for j in 0..w {
                     f.y[i * w + j] = page.y[(i + scroll) * w + j];
@@ -4947,9 +5288,8 @@ mod tests {
             }
             f
         };
-        let gop: Vec<Yuv420Frame> = vec![frame_at(0), frame_at(8), frame_at(16)];
-        let enc =
-            crate::encoder::inter_frame::encode_gop_yuv420_with_q(&gop, 60).expect("gop encode");
+        let gop: Vec<YuvFrame> = vec![frame_at(0), frame_at(8), frame_at(16)];
+        let enc = crate::encoder::inter_frame::encode_gop_yuv_with_q(&gop, 60).expect("gop encode");
         std::fs::write(
             format!("{dir}/self-gop-192x112-q60-screen-scroll.ivf"),
             &enc.ivf_bytes,
@@ -4957,9 +5297,9 @@ mod tests {
         .unwrap();
         let mut yuv = Vec::new();
         for fr in &enc.recon {
-            yuv.extend_from_slice(&fr.y);
-            yuv.extend_from_slice(&fr.u);
-            yuv.extend_from_slice(&fr.v);
+            yuv.extend_from_slice(&plane8(&fr.y));
+            yuv.extend_from_slice(&plane8(&fr.u));
+            yuv.extend_from_slice(&plane8(&fr.v));
         }
         std::fs::write(
             format!("{dir}/self-gop-192x112-q60-screen-scroll.yuv"),
@@ -4977,8 +5317,8 @@ mod tests {
     /// canonical form and the stream round-trips byte-exact.
     #[test]
     fn r418_search_selects_kmeans_palette_on_jittered_dither() {
-        const COLORS: [u8; 4] = [16, 80, 160, 240];
-        let mut input = Yuv420Frame::filled(64, 64, 128);
+        const COLORS: [u16; 4] = [16, 80, 160, 240];
+        let mut input = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 128);
         let mut state = 0x0A11_CE55u32;
         let mut next = move || {
             state ^= state << 13;
@@ -4990,7 +5330,7 @@ mod tests {
             let r = next();
             let base = COLORS[(r & 3) as usize];
             let jitter = ((r >> 2) % 3) as i32 - 1;
-            *p = (i32::from(base) + jitter).clamp(0, 255) as u8;
+            *p = (i32::from(base) + jitter).clamp(0, 255) as u16;
         }
         // Distinct count per 64x64 exceeds PALETTE_COLORS (4 groups x
         // 3 jitter levels = 12).
@@ -5001,9 +5341,9 @@ mod tests {
         assert!(seen.iter().filter(|&&b| b).count() > PALETTE_COLORS);
 
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -5014,7 +5354,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         recon.bd.clear_for_sb(0, 0, 16, 16);
@@ -5039,12 +5383,12 @@ mod tests {
              (got PALETTE={pal} OTHER={other})"
         );
 
-        let enc = encode_key_frame_yuv420_with_q(&input, 60).unwrap();
+        let enc = encode_key_frame_yuv_with_q(&input, 60).unwrap();
         let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].planes[0], enc.recon_y);
-        assert_eq!(frames[0].planes[1], enc.recon_u);
-        assert_eq!(frames[0].planes[2], enc.recon_v);
+        assert_eq!(frames[0].planes[0], plane8(&enc.recon_y));
+        assert_eq!(frames[0].planes[1], plane8(&enc.recon_u));
+        assert_eq!(frames[0].planes[2], plane8(&enc.recon_v));
     }
 
     /// r418 conformance-fixture twins: deterministic screen-content
@@ -5057,8 +5401,8 @@ mod tests {
     #[test]
     fn r418_screen_and_palette_fixture_streams() {
         // --- self-kf-192x192-q60-screen ---
-        const COLORS: [u8; 4] = [12, 92, 172, 244];
-        let mut tile = vec![0u8; 64 * 64];
+        const COLORS: [u16; 4] = [12, 92, 172, 244];
+        let mut tile = vec![0u16; 64 * 64];
         let mut state = 0x5EED_0001u32;
         let mut next = move || {
             state ^= state << 13;
@@ -5069,7 +5413,7 @@ mod tests {
         for p in tile.iter_mut() {
             *p = COLORS[(next() & 3) as usize];
         }
-        let mut screen = Yuv420Frame::filled(192, 192, 128);
+        let mut screen = YuvFrame::filled(192, 192, 8, ChromaFormat::Yuv420, 128);
         for i in 0..192usize {
             for j in 0..192usize {
                 screen.y[i * 192 + j] = tile[(i % 64) * 64 + (j % 64)];
@@ -5082,13 +5426,13 @@ mod tests {
                 screen.v[i * 96 + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
             }
         }
-        let enc_screen = encode_key_frame_yuv420_with_q(&screen, 60).unwrap();
+        let enc_screen = encode_key_frame_yuv_with_q(&screen, 60).unwrap();
         assert!(enc_screen.fh.allow_intrabc);
         assert!(enc_screen.fh.allow_screen_content_tools);
 
         // --- self-kf-96x80-q100-palette (k = 8 luma dither + chroma
         // checker pairs) ---
-        const COLORS8: [u8; 8] = [8, 40, 80, 120, 160, 200, 230, 250];
+        const COLORS8: [u16; 8] = [8, 40, 80, 120, 160, 200, 230, 250];
         let mut state8 = 0x1234_5678u32 ^ 0x2C9;
         let mut next8 = move || {
             state8 ^= state8 << 13;
@@ -5096,7 +5440,7 @@ mod tests {
             state8 ^= state8 << 5;
             state8
         };
-        let mut pal = Yuv420Frame::filled(96, 80, 128);
+        let mut pal = YuvFrame::filled(96, 80, 8, ChromaFormat::Yuv420, 128);
         for i in 0..80usize {
             for j in 0..96usize {
                 pal.y[i * 96 + j] = COLORS8[(next8() as usize) % 8];
@@ -5109,7 +5453,7 @@ mod tests {
                 pal.v[i * 48 + j] = if ((i / 4) & 1) == par { 108 } else { 152 };
             }
         }
-        let enc_pal = encode_key_frame_yuv420_with_q(&pal, 100).unwrap();
+        let enc_pal = encode_key_frame_yuv_with_q(&pal, 100).unwrap();
         assert!(!enc_pal.fh.allow_intrabc, "no duplicate 64x64 tile pair");
 
         for (name, enc) in [
@@ -5118,16 +5462,16 @@ mod tests {
         ] {
             let frames = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(frames.len(), 1, "{name}");
-            assert_eq!(frames[0].planes[0], enc.recon_y, "{name}: luma");
-            assert_eq!(frames[0].planes[1], enc.recon_u, "{name}: U");
-            assert_eq!(frames[0].planes[2], enc.recon_v, "{name}: V");
+            assert_eq!(frames[0].planes[0], plane8(&enc.recon_y), "{name}: luma");
+            assert_eq!(frames[0].planes[1], plane8(&enc.recon_u), "{name}: U");
+            assert_eq!(frames[0].planes[2], plane8(&enc.recon_v), "{name}: V");
             if let Ok(dir) = std::env::var("OXIDEAV_AV1_SCREEN_FIXDIR") {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(format!("{dir}/{name}.ivf"), &enc.ivf_bytes).unwrap();
                 let mut yuv = Vec::new();
-                yuv.extend_from_slice(&enc.recon_y);
-                yuv.extend_from_slice(&enc.recon_u);
-                yuv.extend_from_slice(&enc.recon_v);
+                yuv.extend_from_slice(&plane8(&enc.recon_y));
+                yuv.extend_from_slice(&plane8(&enc.recon_u));
+                yuv.extend_from_slice(&plane8(&enc.recon_v));
                 std::fs::write(format!("{dir}/{name}.yuv"), &yuv).unwrap();
             }
         }
@@ -5164,11 +5508,11 @@ mod tests {
     /// yield no candidate.
     #[test]
     fn r418_palette_candidate_gates() {
-        let flat = Yuv420Frame::filled(64, 64, 77);
+        let flat = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 77);
         let recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -5179,23 +5523,27 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(60, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         assert!(
             palette_candidate_y(&flat, &recon, 0, 0, BLOCK_64X64).is_none(),
             "1 distinct colour: no palette candidate"
         );
-        let mut many = Yuv420Frame::filled(64, 64, 0);
+        let mut many = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         for (i, p) in many.y.iter_mut().enumerate() {
-            *p = (i % 251) as u8;
+            *p = (i % 251) as u16;
         }
         assert!(
             palette_candidate_y(&many, &recon, 0, 0, BLOCK_64X64).is_none(),
             "> PALETTE_COLORS distinct colours: no candidate (r418 scope)"
         );
         let two = {
-            let mut f = Yuv420Frame::filled(64, 64, 0);
+            let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
             for (i, p) in f.y.iter_mut().enumerate() {
                 *p = if (i / 3) % 2 == 0 { 10 } else { 200 };
             }

@@ -80,12 +80,12 @@ pub(crate) struct MotionSample {
 }
 
 /// 16×16-block motion pre-pass of `input_y` against `ref_y` (both
-/// `width * height`, row-major, 8-bit). Returns one sample per fully
+/// `width * height`, row-major, any coded depth). Returns one sample per fully
 /// inside block. Estimation-only — the committed prediction never
 /// uses these vectors, so the search here is free to be cheap.
 pub(crate) fn collect_motion_samples(
-    input_y: &[u8],
-    ref_y: &[u8],
+    input_y: &[u16],
+    ref_y: &[u16],
     width: usize,
     height: usize,
 ) -> Vec<MotionSample> {
@@ -142,15 +142,15 @@ pub(crate) fn collect_motion_samples(
     // alike, so the coarse SAD landscape keeps one broad basin at the
     // true motion.
     let (hw, hh) = (width / 2, height / 2);
-    let downsample = |p: &[u8]| -> Vec<u16> {
+    let downsample = |p: &[u16]| -> Vec<u16> {
         let mut d = vec![0u16; hw * hh];
         for r in 0..hh {
             for c in 0..hw {
-                let s = u16::from(p[(2 * r) * width + 2 * c])
-                    + u16::from(p[(2 * r) * width + 2 * c + 1])
-                    + u16::from(p[(2 * r + 1) * width + 2 * c])
-                    + u16::from(p[(2 * r + 1) * width + 2 * c + 1]);
-                d[r * hw + c] = (s + 2) >> 2;
+                let s = u32::from(p[(2 * r) * width + 2 * c])
+                    + u32::from(p[(2 * r) * width + 2 * c + 1])
+                    + u32::from(p[(2 * r + 1) * width + 2 * c])
+                    + u32::from(p[(2 * r + 1) * width + 2 * c + 1]);
+                d[r * hw + c] = ((s + 2) >> 2) as u16;
             }
         }
         d
@@ -735,17 +735,17 @@ mod tests {
             x = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
             ((x >> 32) & 0xFF) as u32
         };
-        let tex = |r: i64, c: i64| -> u8 {
+        let tex = |r: i64, c: i64| -> u16 {
             let mut acc = 0u32;
             for dr in -2..=2i64 {
                 for dc in -2..=2i64 {
                     acc += hash(r + dr, c + dc);
                 }
             }
-            (acc / 25) as u8
+            (acc / 25) as u16
         };
-        let mut refp = vec![0u8; w * h];
-        let mut cur = vec![0u8; w * h];
+        let mut refp = vec![0u16; w * h];
+        let mut cur = vec![0u16; w * h];
         for r in 0..h as i64 {
             for c in 0..w as i64 {
                 refp[(r * w as i64 + c) as usize] = tex(r, c);

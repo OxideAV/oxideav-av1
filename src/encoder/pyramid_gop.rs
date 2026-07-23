@@ -99,14 +99,15 @@ use std::rc::Rc;
 use crate::cdf::QuantizerParams;
 use crate::encoder::frame_obu::write_frame_header_obu;
 use crate::encoder::inter_frame::{
-    encode_inter_frame_generic, EncodedGop, GopFrameRecon, InterFrameConfig, RefSlotCarry,
-    SavedMotionField, GOP_MAX_FRAMES,
+    encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv, GopFrameReconYuv,
+    InterFrameConfig, RefSlotCarry, SavedMotionField, GOP_MAX_FRAMES,
 };
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::lambda_for;
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::pixel_driver_dyn::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Frame};
 use crate::encoder::rate_twin::RateModel;
+use crate::encoder::yuv_frame::YuvFrame;
 use crate::frame_header::{FrameHeader, FrameType, PRIMARY_REF_NONE};
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
@@ -154,6 +155,15 @@ impl Default for PyramidTuning {
 #[derive(Debug, Clone)]
 pub struct TunedPyramidGop {
     pub gop: EncodedGop,
+    pub chunk_lengths: Vec<usize>,
+    pub primary_elections: Vec<(u32, u8)>,
+}
+
+/// r427 (hidden) — general-format sibling of [`TunedPyramidGop`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TunedPyramidGopYuv {
+    pub gop: EncodedGopYuv,
     pub chunk_lengths: Vec<usize>,
     pub primary_elections: Vec<(u32, u8)>,
 }
@@ -382,7 +392,7 @@ struct PyramidSession {
     slot_hints: [u32; 8],
     slot_display: [usize; 8],
     anchor_slot: usize,
-    recons: Vec<Option<GopFrameRecon>>,
+    recons: Vec<Option<GopFrameReconYuv>>,
     temporal_units: Vec<Vec<u8>>,
     chunk_lengths: Vec<usize>,
     primary_elections: Vec<(u32, u8)>,
@@ -390,17 +400,19 @@ struct PyramidSession {
 
 impl PyramidSession {
     /// Encode the KEY frame and seed every §7.20 slot with its state.
-    fn new(frames: &[Yuv420Frame], base_q: u8, tuning: PyramidTuning) -> Result<Self, Error> {
+    fn new(frames: &[YuvFrame], base_q: u8, tuning: PyramidTuning) -> Result<Self, Error> {
         let n = frames.len();
         let (width, height) = (frames[0].width, frames[0].height);
-        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv420_with_q_carry(
+        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry(
             &frames[0],
             base_q,
             tuning.model,
+            &[],
+            None,
         )?;
         let seq = key.seq.clone();
-        let mut recons: Vec<Option<GopFrameRecon>> = (0..n).map(|_| None).collect();
-        recons[0] = Some(GopFrameRecon {
+        let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
+        recons[0] = Some(GopFrameReconYuv {
             y: key.recon_y,
             u: key.recon_u,
             v: key.recon_v,
@@ -438,7 +450,7 @@ impl PyramidSession {
 
     /// Encode one mini-GOP of `l` frames starting at display `pos`
     /// (anchor at `pos - 1`).
-    fn encode_chunk(&mut self, frames: &[Yuv420Frame], pos: usize, l: usize) -> Result<(), Error> {
+    fn encode_chunk(&mut self, frames: &[YuvFrame], pos: usize, l: usize) -> Result<(), Error> {
         let (steps, alt_slot) = plan_mini_gop(pos, l, self.anchor_slot);
         // §7.5 bitstream conformance: each temporal unit must carry
         // EXACTLY ONE shown frame — decoded-not-shown pyramid frames
@@ -470,7 +482,7 @@ impl PyramidSession {
                             displays.len() - 1
                         });
                     }
-                    let refs: Vec<&GopFrameRecon> = displays
+                    let refs: Vec<&GopFrameReconYuv> = displays
                         .iter()
                         .map(|&d| self.recons[d].as_ref().expect("slot holds a coded frame"))
                         .collect();
@@ -564,7 +576,7 @@ impl PyramidSession {
 
     /// Squared-error distortion of the committed reconstructions over
     /// display positions `range` (all three planes).
-    fn distortion_over(&self, frames: &[Yuv420Frame], range: core::ops::Range<usize>) -> u64 {
+    fn distortion_over(&self, frames: &[YuvFrame], range: core::ops::Range<usize>) -> u64 {
         let mut d = 0u64;
         for pos in range {
             let rc = self.recons[pos].as_ref().expect("range coded");
@@ -585,7 +597,7 @@ impl PyramidSession {
     /// IVF v0 wrap + [`EncodedGop`] assembly. Each temporal unit shows
     /// exactly one frame and the units are emitted in display order,
     /// so the record index IS the display PTS.
-    fn finish(self, width: u32, height: u32) -> Result<TunedPyramidGop, Error> {
+    fn finish(self, width: u32, height: u32) -> Result<TunedPyramidGopYuv, Error> {
         let mut ivf_bytes: Vec<u8> = Vec::new();
         {
             let cursor = std::io::Cursor::new(&mut ivf_bytes);
@@ -598,8 +610,8 @@ impl PyramidSession {
             iw.patch_frame_count()
                 .map_err(|_| Error::PartitionWalkOutOfRange)?;
         }
-        Ok(TunedPyramidGop {
-            gop: EncodedGop {
+        Ok(TunedPyramidGopYuv {
+            gop: EncodedGopYuv {
                 ivf_bytes,
                 temporal_units: self.temporal_units,
                 recon: self
@@ -616,15 +628,15 @@ impl PyramidSession {
 }
 
 /// Shared input validation for the GOP drivers.
-fn validate_gop_input(frames: &[Yuv420Frame]) -> Result<(u32, u32), Error> {
+fn validate_gop_input(frames: &[YuvFrame]) -> Result<(u32, u32), Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
     let (width, height) = (frames[0].width, frames[0].height);
-    if frames
-        .iter()
-        .any(|f| f.width != width || f.height != height)
-    {
+    let (bit_depth, format) = (frames[0].bit_depth, frames[0].format);
+    if frames.iter().any(|f| {
+        f.width != width || f.height != height || f.bit_depth != bit_depth || f.format != format
+    }) {
         return Err(Error::PartitionWalkOutOfRange);
     }
     Ok((width, height))
@@ -690,6 +702,33 @@ pub fn encode_pyramid_gop_yuv420_with_q_tuned(
     base_q_idx: u8,
     tuning: PyramidTuning,
 ) -> Result<TunedPyramidGop, Error> {
+    let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
+    let t = encode_pyramid_gop_yuv_with_q_tuned(&wide, base_q_idx, tuning)?;
+    Ok(TunedPyramidGop {
+        gop: narrow_gop_8bit(t.gop),
+        chunk_lengths: t.chunk_lengths,
+        primary_elections: t.primary_elections,
+    })
+}
+
+/// r427 — encode a KEY + B-pyramid GOP at any conformant (bit depth,
+/// chroma format) pairing: the general-format sibling of
+/// [`encode_pyramid_gop_yuv420_with_q`].
+pub fn encode_pyramid_gop_yuv_with_q(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+) -> Result<EncodedGopYuv, Error> {
+    encode_pyramid_gop_yuv_with_q_tuned(frames, base_q_idx, PyramidTuning::default()).map(|t| t.gop)
+}
+
+/// r427 — the general-format pyramid core (fixed maximal chunking at
+/// `tuning.max_mini_gop`).
+#[doc(hidden)]
+pub fn encode_pyramid_gop_yuv_with_q_tuned(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    tuning: PyramidTuning,
+) -> Result<TunedPyramidGopYuv, Error> {
     let (width, height) = validate_gop_input(frames)?;
     if tuning.max_mini_gop == 0 || tuning.max_mini_gop > 32 {
         return Err(Error::PartitionWalkOutOfRange);
@@ -731,6 +770,18 @@ impl Default for AdaptiveTuning {
     }
 }
 
+/// r427 (hidden) — general-format sibling of [`TunedAdaptiveGop`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TunedAdaptiveGopYuv {
+    pub gop: EncodedGopYuv,
+    pub chunk_lengths: Vec<usize>,
+    pub mc_mads: Vec<f64>,
+    pub cuts: Vec<bool>,
+    pub elections: Vec<(usize, usize, usize, usize)>,
+    pub primary_elections: Vec<(u32, u8)>,
+}
+
 /// r424 (hidden) — [`EncodedGop`] plus the adaptive election traces.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -752,17 +803,17 @@ pub struct TunedAdaptiveGop {
 }
 
 /// Half-resolution luma (2×2 box filter) for the motion probe.
-fn half_res_luma(f: &Yuv420Frame) -> (Vec<u8>, usize, usize) {
+fn half_res_luma(f: &YuvFrame) -> (Vec<u16>, usize, usize) {
     let (w, h) = (f.width as usize, f.height as usize);
     let (hw, hh) = (w / 2, h / 2);
-    let mut out = vec![0u8; hw * hh];
+    let mut out = vec![0u16; hw * hh];
     for i in 0..hh {
         for j in 0..hw {
             let s = u32::from(f.y[(2 * i) * w + 2 * j])
                 + u32::from(f.y[(2 * i) * w + 2 * j + 1])
                 + u32::from(f.y[(2 * i + 1) * w + 2 * j])
                 + u32::from(f.y[(2 * i + 1) * w + 2 * j + 1]);
-            out[i * hw + j] = ((s + 2) / 4) as u8;
+            out[i * hw + j] = ((s + 2) / 4) as u16;
         }
     }
     (out, hw, hh)
@@ -773,7 +824,7 @@ fn half_res_luma(f: &Yuv420Frame) -> (Vec<u8>, usize, usize) {
 /// up to ±3 half-resolution samples (±6 full-resolution) per axis —
 /// a cheap predictability measure that stays small under pure
 /// translation and large across scene cuts / noise.
-fn mc_mad(prev: &[u8], cur: &[u8], w: usize, h: usize) -> f64 {
+fn mc_mad(prev: &[u16], cur: &[u16], w: usize, h: usize) -> f64 {
     let mut best = f64::INFINITY;
     for dy in -3i32..=3 {
         for dx in -3i32..=3 {
@@ -842,6 +893,38 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
     base_q_idx: u8,
     tuning: AdaptiveTuning,
 ) -> Result<TunedAdaptiveGop, Error> {
+    let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
+    let t = encode_adaptive_gop_yuv_with_q_tuned(&wide, base_q_idx, tuning)?;
+    Ok(TunedAdaptiveGop {
+        gop: narrow_gop_8bit(t.gop),
+        chunk_lengths: t.chunk_lengths,
+        mc_mads: t.mc_mads,
+        cuts: t.cuts,
+        elections: t.elections,
+        primary_elections: t.primary_elections,
+    })
+}
+
+/// r427 — encode a KEY + adaptive mini-GOP stream at any conformant
+/// (bit depth, chroma format) pairing: the general-format sibling of
+/// [`encode_adaptive_gop_yuv420_with_q`].
+pub fn encode_adaptive_gop_yuv_with_q(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+) -> Result<EncodedGopYuv, Error> {
+    encode_adaptive_gop_yuv_with_q_tuned(frames, base_q_idx, AdaptiveTuning::default())
+        .map(|t| t.gop)
+}
+
+/// r427 — the general-format adaptive core. The motion-probe MAD is
+/// normalized to 8-bit units (`>> (BitDepth - 8)`) so the class
+/// thresholds hold at every depth.
+#[doc(hidden)]
+pub fn encode_adaptive_gop_yuv_with_q_tuned(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    tuning: AdaptiveTuning,
+) -> Result<TunedAdaptiveGopYuv, Error> {
     let (width, height) = validate_gop_input(frames)?;
     if tuning.pyramid.max_mini_gop == 0 || tuning.pyramid.max_mini_gop > 32 {
         return Err(Error::PartitionWalkOutOfRange);
@@ -849,17 +932,18 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
     let n = frames.len();
 
     // Per-transition motion probe (`mc_mads[k]`: frame k -> k+1).
-    let halves: Vec<(Vec<u8>, usize, usize)> = frames.iter().map(half_res_luma).collect();
+    let halves: Vec<(Vec<u16>, usize, usize)> = frames.iter().map(half_res_luma).collect();
+    let depth_scale = f64::from(1u32 << (frames[0].bit_depth - 8));
     let mc_mads: Vec<f64> = (0..n.saturating_sub(1))
         .map(|k| {
             let (p, w, h) = &halves[k];
             let (c, _, _) = &halves[k + 1];
-            mc_mad(p, c, *w, *h)
+            mc_mad(p, c, *w, *h) / depth_scale
         })
         .collect();
     let cuts: Vec<bool> = mc_mads.iter().map(|&m| m > CUT_MC_MAD).collect();
 
-    let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, 8));
+    let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, frames[0].bit_depth));
     let mut session = PyramidSession::new(frames, base_q_idx, tuning.pyramid)?;
     let mut elections: Vec<(usize, usize, usize, usize)> = Vec::new();
 
@@ -915,7 +999,7 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
     }
 
     let tuned = session.finish(width, height)?;
-    Ok(TunedAdaptiveGop {
+    Ok(TunedAdaptiveGopYuv {
         gop: tuned.gop,
         chunk_lengths: tuned.chunk_lengths,
         mc_mads,
@@ -976,33 +1060,40 @@ fn show_existing_obu(seq: &SequenceHeader, map_idx: u8) -> ObuFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::yuv_frame::ChromaFormat;
+
+    /// 8-bit view of a `u16` recon plane for byte-comparisons against
+    /// the spec driver's 8-bit output surface.
+    fn plane8(p: &[u16]) -> Vec<u8> {
+        p.iter().map(|&s| s as u8).collect()
+    }
 
     /// Deterministic textured frame with translation `(sy, sx)` — the
     /// shared GOP-test generator.
-    fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> Yuv420Frame {
+    fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> YuvFrame {
         let (wu, hu) = (w as usize, h as usize);
         let s = seed as usize;
-        let mut f = Yuv420Frame::filled(w, h, 0);
+        let mut f = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 0);
         for i in 0..hu {
             for j in 0..wu {
                 let (si, sj) = (i + shift_y, j + shift_x);
-                f.y[i * wu + j] = ((si * 5 + sj * 3 + (si / 16) * (sj / 16) + s) % 256) as u8;
+                f.y[i * wu + j] = ((si * 5 + sj * 3 + (si / 16) * (sj / 16) + s) % 256) as u16;
             }
         }
         let (cw, ch) = (wu / 2, hu / 2);
         for i in 0..ch {
             for j in 0..cw {
                 let (si, sj) = (i + shift_y / 2, j + shift_x / 2);
-                f.u[i * cw + j] = ((128 + si * 2 + sj + s) % 256) as u8;
-                f.v[i * cw + j] = ((64 + si + sj * 2 + s) % 256) as u8;
+                f.u[i * cw + j] = ((128 + si * 2 + sj + s) % 256) as u16;
+                f.v[i * cw + j] = ((64 + si + sj * 2 + s) % 256) as u16;
             }
         }
         f
     }
 
-    fn assert_pyramid_round_trip(frames: &[Yuv420Frame], q: u8) -> EncodedGop {
+    fn assert_pyramid_round_trip(frames: &[YuvFrame], q: u8) -> EncodedGopYuv {
         let (w, h) = (frames[0].width, frames[0].height);
-        let enc = encode_pyramid_gop_yuv420_with_q(frames, q)
+        let enc = encode_pyramid_gop_yuv_with_q(frames, q)
             .unwrap_or_else(|e| panic!("{w}x{h} q={q}: pyramid encode failed: {e:?}"));
         assert_eq!(enc.recon.len(), frames.len());
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes)
@@ -1015,13 +1106,29 @@ mod tests {
         for (idx, f) in decoded.iter().enumerate() {
             assert_eq!((f.width, f.height), (w, h));
             let rc = &enc.recon[idx];
-            assert_eq!(f.planes[0], rc.y, "{w}x{h} q={q} display {idx}: luma");
-            assert_eq!(f.planes[1], rc.u, "{w}x{h} q={q} display {idx}: U");
-            assert_eq!(f.planes[2], rc.v, "{w}x{h} q={q} display {idx}: V");
+            assert_eq!(
+                f.planes[0],
+                plane8(&rc.y),
+                "{w}x{h} q={q} display {idx}: luma"
+            );
+            assert_eq!(f.planes[1], plane8(&rc.u), "{w}x{h} q={q} display {idx}: U");
+            assert_eq!(f.planes[2], plane8(&rc.v), "{w}x{h} q={q} display {idx}: V");
             if q == 0 {
-                assert_eq!(f.planes[0], frames[idx].y, "lossless {idx}: luma != input");
-                assert_eq!(f.planes[1], frames[idx].u, "lossless {idx}: U != input");
-                assert_eq!(f.planes[2], frames[idx].v, "lossless {idx}: V != input");
+                assert_eq!(
+                    f.planes[0],
+                    plane8(&frames[idx].y),
+                    "lossless {idx}: luma != input"
+                );
+                assert_eq!(
+                    f.planes[1],
+                    plane8(&frames[idx].u),
+                    "lossless {idx}: U != input"
+                );
+                assert_eq!(
+                    f.planes[2],
+                    plane8(&frames[idx].v),
+                    "lossless {idx}: V != input"
+                );
             }
         }
         enc
@@ -1031,7 +1138,7 @@ mod tests {
     /// two show_existing units, lossy.
     #[test]
     fn r415_pyramid_len5_lossy_round_trips() {
-        let frames: Vec<Yuv420Frame> = (0..5)
+        let frames: Vec<YuvFrame> = (0..5)
             .map(|k| moving_gradient(64, 64, 2 * k, 3 * k, 11))
             .collect();
         let enc = assert_pyramid_round_trip(&frames, 60);
@@ -1044,7 +1151,7 @@ mod tests {
     /// ALT + B + SEF.
     #[test]
     fn r415_pyramid_len3_lossless_round_trips() {
-        let frames: Vec<Yuv420Frame> = (0..3)
+        let frames: Vec<YuvFrame> = (0..3)
             .map(|k| moving_gradient(64, 64, 3 * k, 5 * k, 9))
             .collect();
         let enc = assert_pyramid_round_trip(&frames, 0);
@@ -1060,7 +1167,7 @@ mod tests {
     /// election live.
     #[test]
     fn r424_pyramid_len9_three_levels_round_trips() {
-        let frames: Vec<Yuv420Frame> = (0..9)
+        let frames: Vec<YuvFrame> = (0..9)
             .map(|k| moving_gradient(64, 64, 2 * k, 3 * k, 23))
             .collect();
         let enc = assert_pyramid_round_trip(&frames, 60);
@@ -1117,7 +1224,7 @@ mod tests {
     #[test]
     fn r424_adaptive_scene_cut_round_trips() {
         let n = 9usize;
-        let frames: Vec<Yuv420Frame> = (0..n)
+        let frames: Vec<YuvFrame> = (0..n)
             .map(|k| {
                 if k >= n / 2 {
                     // Different texture family after the cut.
@@ -1127,7 +1234,7 @@ mod tests {
                 }
             })
             .collect();
-        let tuned = encode_adaptive_gop_yuv420_with_q_tuned(&frames, 60, AdaptiveTuning::default())
+        let tuned = encode_adaptive_gop_yuv_with_q_tuned(&frames, 60, AdaptiveTuning::default())
             .expect("adaptive encode");
         assert!(
             tuned.cuts.iter().any(|&c| c),
@@ -1138,7 +1245,11 @@ mod tests {
             .expect("spec driver accepts adaptive stream");
         assert_eq!(decoded.len(), n);
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], tuned.gop.recon[idx].y, "display {idx} luma");
+            assert_eq!(
+                f.planes[0],
+                plane8(&tuned.gop.recon[idx].y),
+                "display {idx} luma"
+            );
         }
     }
 }

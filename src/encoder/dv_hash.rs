@@ -72,7 +72,7 @@ const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 
 #[inline]
-fn fnv_mix(mut hash: u64, v: u8) -> u64 {
+fn fnv_mix(mut hash: u64, v: u16) -> u64 {
     hash ^= u64::from(v);
     hash = hash.wrapping_mul(FNV_PRIME);
     hash
@@ -80,7 +80,7 @@ fn fnv_mix(mut hash: u64, v: u8) -> u64 {
 
 /// FNV-1a over an 8×8 raster block. Returns `(hash, uniform)`.
 #[inline]
-fn hash8(plane: &[u8], stride: usize, y: usize, x: usize) -> (u64, bool) {
+fn hash8(plane: &[u16], stride: usize, y: usize, x: usize) -> (u64, bool) {
     let first = plane[y * stride + x];
     let mut hash = FNV_BASIS;
     let mut uniform = true;
@@ -105,7 +105,7 @@ fn compose4(q: [(u64, bool); 4]) -> (u64, bool) {
     for &(qh, qu) in &q {
         uniform &= qu && qh == q[0].0;
         for b in qh.to_le_bytes() {
-            hash = fnv_mix(hash, b);
+            hash = fnv_mix(hash, u16::from(b));
         }
     }
     (hash, uniform)
@@ -116,7 +116,7 @@ fn compose4(q: [(u64, bool); 4]) -> (u64, bool) {
 /// `size` MUST be in [`DV_HASH_SIZES`] and the block fully inside the
 /// plane. Returns `(hash, uniform)`.
 pub(crate) fn hash_block_direct(
-    plane: &[u8],
+    plane: &[u16],
     stride: usize,
     y: usize,
     x: usize,
@@ -153,7 +153,7 @@ pub(crate) struct DvHashIndex {
 impl DvHashIndex {
     /// Build the index over a `width`×`height` input luma plane.
     /// Falls back to the inert state above [`MAX_INDEXED_AREA`].
-    pub(crate) fn build(plane: &[u8], width: usize, height: usize) -> Self {
+    pub(crate) fn build(plane: &[u16], width: usize, height: usize) -> Self {
         let mut out = DvHashIndex::default();
         if width < 8 || height < 8 || width * height > MAX_INDEXED_AREA {
             return out;
@@ -242,7 +242,7 @@ impl DvHashIndex {
 mod tests {
     use super::*;
 
-    fn pattern_plane(w: usize, h: usize, seed: u32) -> Vec<u8> {
+    fn pattern_plane(w: usize, h: usize, seed: u32) -> Vec<u16> {
         let mut state = seed | 1;
         let mut next = move || {
             state ^= state << 13;
@@ -250,7 +250,7 @@ mod tests {
             state ^= state << 5;
             state
         };
-        (0..w * h).map(|_| (next() & 0xff) as u8).collect()
+        (0..w * h).map(|_| (next() & 0xff) as u16).collect()
     }
 
     /// The grid-composed build and the direct probe recursion must
@@ -291,14 +291,14 @@ mod tests {
     #[test]
     fn uniform_suppression() {
         let (w, h) = (128, 128);
-        let mut plane = vec![77u8; w * h];
+        let mut plane = vec![77u16; w * h];
         let (_, uniform) = hash_block_direct(&plane, w, 0, 0, 64);
         assert!(uniform);
         plane[63 * w + 63] = 78;
         let (_, uniform) = hash_block_direct(&plane, w, 0, 0, 64);
         assert!(!uniform);
         // A fully-flat frame indexes nothing.
-        let flat = vec![13u8; w * h];
+        let flat = vec![13u16; w * h];
         let idx = DvHashIndex::build(&flat, w, h);
         assert!(idx.is_empty());
     }
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn off_stride_positions_indexed() {
         let (w, h) = (256, 128);
-        let mut plane = vec![0u8; w * h];
+        let mut plane = vec![0u16; w * h];
         let glyph = pattern_plane(8, 8, 0x1357);
         for i in 0..8 {
             for j in 0..8 {
@@ -328,10 +328,10 @@ mod tests {
     fn bucket_cap_and_nearest_order() {
         let (w, h) = (448, 192);
         // Tile a non-uniform 8x8 glyph everywhere: one giant bucket.
-        let mut plane = vec![0u8; w * h];
+        let mut plane = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
-                plane[y * w + x] = ((x % 8) * 8 + (y % 8)) as u8;
+                plane[y * w + x] = ((x % 8) * 8 + (y % 8)) as u16;
             }
         }
         let idx = DvHashIndex::build(&plane, w, h);

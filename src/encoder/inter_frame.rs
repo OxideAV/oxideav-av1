@@ -73,7 +73,7 @@ use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
     encode_leaf_sq, lambda_for, leaf_rate, region_distortion, region_distortion_wh, residual_tx,
     restore_region, save_region, save_region_wh, tu_bd_stamp, BlockDecodedMirror, ReconState,
-    RegionSnapshot, KEY_FRAME_MAX_DIM,
+    RegionSnapshot,
 };
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
@@ -86,6 +86,7 @@ use crate::encoder::pixel_driver_dyn::{
 use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
+use crate::encoder::yuv_frame::YuvFrame;
 use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
 use crate::inter_pred::{
     reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
@@ -107,6 +108,45 @@ pub struct GopFrameRecon {
     pub u: Vec<u8>,
     /// Cr plane.
     pub v: Vec<u8>,
+}
+
+/// r427 — general-format sibling of [`GopFrameRecon`]: `u16` planes
+/// at the stream's bit depth, chroma at the subsampled extent (empty
+/// on the monochrome arm).
+#[derive(Debug, Clone)]
+pub struct GopFrameReconYuv {
+    /// Luma plane.
+    pub y: Vec<u16>,
+    /// Cb plane.
+    pub u: Vec<u16>,
+    /// Cr plane.
+    pub v: Vec<u16>,
+}
+
+/// r427 — result of [`encode_gop_yuv_with_q`]: the general-format
+/// sibling of [`EncodedGop`].
+#[derive(Debug, Clone)]
+pub struct EncodedGopYuv {
+    /// Complete IVF v0 file (header + one record per frame).
+    pub ivf_bytes: Vec<u8>,
+    /// The bare §7.5 temporal units, one per frame.
+    pub temporal_units: Vec<Vec<u8>>,
+    /// Per-frame encoder reconstruction — the decoded output equals
+    /// these sample-for-sample (and the inputs too at `base_q_idx ==
+    /// 0`).
+    pub recon: Vec<GopFrameReconYuv>,
+    /// The emitted sequence header descriptor.
+    pub seq: SequenceHeader,
+}
+
+/// r427 (hidden) — [`EncodedGopYuv`] plus the per-P-frame election
+/// outcomes: the general-format sibling of [`TunedGop`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TunedGopYuv {
+    pub gop: EncodedGopYuv,
+    pub seg_temporal_updates: Vec<bool>,
+    pub p_segment_maps: Vec<Vec<i32>>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -145,6 +185,27 @@ pub struct TunedGop {
 
 /// GOP length bound (KEY + P-frames).
 pub const GOP_MAX_FRAMES: usize = 64;
+
+/// r427 — narrow a general-format GOP result back to the 8-bit
+/// [`EncodedGop`] shape (caller guarantees an 8-bit stream — the
+/// legacy 4:2:0 entry points).
+pub(crate) fn narrow_gop_8bit(g: EncodedGopYuv) -> EncodedGop {
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    EncodedGop {
+        ivf_bytes: g.ivf_bytes,
+        temporal_units: g.temporal_units,
+        recon: g
+            .recon
+            .into_iter()
+            .map(|r| GopFrameRecon {
+                y: narrow(r.y),
+                u: narrow(r.u),
+                v: narrow(r.v),
+            })
+            .collect(),
+        seq: g.seq,
+    }
+}
 
 /// r413 — one §7.20 slot's stored motion-field payload on the encode
 /// side (the §7.19 `SavedMvs` / `SavedRefFrames` filter output plus
@@ -624,6 +685,66 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
     extras: Option<&SegExtras>,
     tuning: GopTuning,
 ) -> Result<TunedGop, Error> {
+    let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
+    let t = encode_gop_yuv_seg_extras_tuned(
+        &wide,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        extras,
+        tuning,
+    )?;
+    Ok(TunedGop {
+        gop: narrow_gop_8bit(t.gop),
+        seg_temporal_updates: t.seg_temporal_updates,
+        p_segment_maps: t.p_segment_maps,
+    })
+}
+
+/// r427 — general-format lossless GOP encode: see
+/// [`encode_gop_yuv_with_q`].
+pub fn encode_gop_yuv(frames: &[YuvFrame]) -> Result<EncodedGopYuv, Error> {
+    encode_gop_yuv_with_q(frames, 0)
+}
+
+/// r427 — encode a KEY + P GOP at any conformant (bit depth, chroma
+/// format) pairing: the general-format sibling of
+/// [`encode_gop_yuv420_with_q`] (whose 8-bit 4:2:0 arm now routes
+/// through this driver). Every frame must carry the same dimensions,
+/// bit depth and chroma format.
+///
+/// ## Errors
+///
+/// Same conditions as [`encode_gop_yuv420_with_q`] plus per-frame
+/// [`YuvFrame::validate`] failures and cross-frame format mismatches
+/// — [`Error::PartitionWalkOutOfRange`].
+pub fn encode_gop_yuv_with_q(frames: &[YuvFrame], base_q_idx: u8) -> Result<EncodedGopYuv, Error> {
+    encode_gop_yuv_seg_extras_tuned(
+        frames,
+        base_q_idx,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning::default(),
+    )
+    .map(|t| t.gop)
+}
+
+/// r427 — the general-format GOP core: every entry point above
+/// funnels here.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gop_yuv_seg_extras_tuned(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+    extras: Option<&SegExtras>,
+    tuning: GopTuning,
+) -> Result<TunedGopYuv, Error> {
     if let Some(x) = extras {
         let ll = seg_lossless_array(base_q_idx, alt_q);
         if alt_q.is_empty()
@@ -659,10 +780,10 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         }
     }
     let (width, height) = (frames[0].width, frames[0].height);
-    if frames
-        .iter()
-        .any(|f| f.width != width || f.height != height)
-    {
+    let (bit_depth, format) = (frames[0].bit_depth, frames[0].format);
+    if frames.iter().any(|f| {
+        f.width != width || f.height != height || f.bit_depth != bit_depth || f.format != format
+    }) {
         return Err(Error::PartitionWalkOutOfRange);
     }
 
@@ -679,22 +800,16 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         // same grid the fh builder below derives).
         build_exact_mask(regions, width, height, height / 4, width / 4)
     });
-    let (key, key_carry) = if let Some(mask) = key_mask.as_deref() {
-        crate::encoder::key_frame::encode_key_frame_yuv420_with_q_seg_carry(
-            &frames[0],
-            base_q_idx,
-            model,
-            alt_q,
-            Some(mask),
-        )?
-    } else {
-        crate::encoder::key_frame::encode_key_frame_yuv420_with_q_carry(
-            &frames[0], base_q_idx, model,
-        )?
-    };
+    let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry(
+        &frames[0],
+        base_q_idx,
+        model,
+        if key_mask.is_some() { alt_q } else { &[] },
+        key_mask.as_deref(),
+    )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
-    let mut recon = vec![GopFrameRecon {
+    let mut recon = vec![GopFrameReconYuv {
         y: key.recon_y,
         u: key.recon_u,
         v: key.recon_v,
@@ -743,7 +858,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         } else {
             None
         };
-        let (tu, rc, saved_mf, carry, aux) = encode_p_frame_yuv420(
+        let (tu, rc, saved_mf, carry, aux) = encode_p_frame_yuv(
             input,
             prev,
             prevprev,
@@ -785,8 +900,8 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
             .map_err(|_| Error::PartitionWalkOutOfRange)?;
     }
 
-    Ok(TunedGop {
-        gop: EncodedGop {
+    Ok(TunedGopYuv {
+        gop: EncodedGopYuv {
             ivf_bytes,
             temporal_units,
             recon,
@@ -861,7 +976,7 @@ pub(crate) struct InterFrameConfig<'a> {
     pub compound_pairs: Vec<[i8; 2]>,
     /// The distinct reference reconstructions + the §7.20 slot map
     /// onto them — see [`PSearchCtx::slot_to_plane`].
-    pub refs: Vec<&'a GopFrameRecon>,
+    pub refs: Vec<&'a GopFrameReconYuv>,
     pub slot_to_plane: [usize; 8],
     /// r423 — §5.9.2 `primary_ref_frame`: the ordinal into
     /// `ref_frame_idx[]` whose slot's saved state (CDFs, segment map,
@@ -1123,8 +1238,8 @@ pub(crate) fn seg_lossless_array(
 /// `p_index` (see [`gop_ref_hints`] for the rotation).
 #[cfg(test)]
 fn p_frame_config<'a>(
-    prev: &'a GopFrameRecon,
-    prevprev: &'a GopFrameRecon,
+    prev: &'a GopFrameReconYuv,
+    prevprev: &'a GopFrameReconYuv,
     p_index: u32,
 ) -> InterFrameConfig<'a> {
     p_frame_config_primary(prev, prevprev, p_index, None)
@@ -1137,8 +1252,8 @@ fn p_frame_config<'a>(
 /// `None` keeps `PRIMARY_REF_NONE` (the pre-r423 shape, and the A/B
 /// baseline).
 fn p_frame_config_primary<'a>(
-    prev: &'a GopFrameRecon,
-    prevprev: &'a GopFrameRecon,
+    prev: &'a GopFrameReconYuv,
+    prevprev: &'a GopFrameReconYuv,
     p_index: u32,
     primary_carry: Option<&'a RefSlotCarry>,
 ) -> InterFrameConfig<'a> {
@@ -1187,7 +1302,7 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     alt_q: &[i16],
 ) -> FrameHeader {
     // The refs are irrelevant to the header — reuse a dummy pair.
-    let dummy = GopFrameRecon {
+    let dummy = GopFrameReconYuv {
         y: Vec::new(),
         u: Vec::new(),
         v: Vec::new(),
@@ -1202,10 +1317,10 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
 /// Returns the §7.5 temporal unit (TD + `OBU_FRAME`) and this frame's
 /// reconstruction.
 #[allow(clippy::too_many_arguments)]
-fn encode_p_frame_yuv420(
-    input: &Yuv420Frame,
-    prev: &GopFrameRecon,
-    prevprev: &GopFrameRecon,
+fn encode_p_frame_yuv(
+    input: &YuvFrame,
+    prev: &GopFrameReconYuv,
+    prevprev: &GopFrameReconYuv,
     seq: &SequenceHeader,
     base_q_idx: u8,
     p_index: u32,
@@ -1221,7 +1336,7 @@ fn encode_p_frame_yuv420(
 ) -> Result<
     (
         Vec<u8>,
-        GopFrameRecon,
+        GopFrameReconYuv,
         SavedMotionField,
         RefSlotCarry,
         InterFrameAux,
@@ -1262,7 +1377,7 @@ fn encode_p_frame_yuv420(
 /// decoded-not-shown frames with the next shown one).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_inter_frame_generic(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     seq: &SequenceHeader,
     base_q_idx: u8,
     cfg: &InterFrameConfig<'_>,
@@ -1272,7 +1387,7 @@ pub(crate) fn encode_inter_frame_generic(
 ) -> Result<
     (
         ObuFrame,
-        GopFrameRecon,
+        GopFrameReconYuv,
         SavedMotionField,
         RefSlotCarry,
         InterFrameAux,
@@ -1287,7 +1402,7 @@ pub(crate) fn encode_inter_frame_generic(
 /// baseline the measurement harness A/Bs against).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_inter_frame_generic_gm(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     seq: &SequenceHeader,
     base_q_idx: u8,
     cfg: &InterFrameConfig<'_>,
@@ -1298,22 +1413,14 @@ pub(crate) fn encode_inter_frame_generic_gm(
 ) -> Result<
     (
         ObuFrame,
-        GopFrameRecon,
+        GopFrameReconYuv,
         SavedMotionField,
         RefSlotCarry,
         InterFrameAux,
     ),
     Error,
 > {
-    if input.width < 8
-        || input.height < 8
-        || input.width > KEY_FRAME_MAX_DIM
-        || input.height > KEY_FRAME_MAX_DIM
-        || input.width % 8 != 0
-        || input.height % 8 != 0
-    {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
+    input.validate()?;
     // r423 — a primary-reference election requires the §7.20 carry of
     // the elected slot and a valid ordinal (`0..7`).
     if cfg.primary_ref_frame != PRIMARY_REF_NONE
@@ -1321,10 +1428,14 @@ pub(crate) fn encode_inter_frame_generic_gm(
     {
         return Err(Error::PartitionWalkOutOfRange);
     }
+    let bit_depth = input.bit_depth;
+    let (ssx, ssy) = input.format.subsampling();
+    let mono = input.format == crate::encoder::yuv_frame::ChromaFormat::Monochrome;
+    let num_planes = input.format.num_planes();
     let width = input.width as usize;
     let height = input.height as usize;
-    let chroma_w = width / 2;
-    let chroma_h = height / 2;
+    let chroma_w = input.chroma_width() as usize;
+    let chroma_h = input.chroma_height() as usize;
     for reference in &cfg.refs {
         if reference.y.len() != width * height
             || reference.u.len() != chroma_w * chroma_h
@@ -1335,13 +1446,18 @@ pub(crate) fn encode_inter_frame_generic_gm(
     }
 
     let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
+    // r427 — the §5.11.46 palette election inside inter frames stays
+    // 8-bit-4:2:0-scoped, like the KEY driver.
+    fh.allow_screen_content_tools = fh.allow_screen_content_tools
+        && bit_depth == 8
+        && input.format == crate::encoder::yuv_frame::ChromaFormat::Yuv420;
     let fs = fh
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
     let lossless = base_q_idx == 0;
-    let mut qp = QuantizerParams::neutral(base_q_idx, 8);
+    let mut qp = QuantizerParams::neutral(base_q_idx, bit_depth);
     if !alt_q.is_empty() {
         // §7.12.2 get_qindex inputs — the write-side §5.11.47 guard
         // and the §5.11.39 quantiser chain both key off these.
@@ -1558,9 +1674,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
             .saturating_sub(1)
             .max(if x.any() { x.top_segment() } else { 0 }) as u8;
     let params = SyntaxFrameParams {
-        subsampling_x: 1,
-        subsampling_y: 1,
-        num_planes: 3,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        num_planes,
         seg_id_pre_skip,
         segmentation_enabled: !alt_q.is_empty(),
         seg_ref_frame: x.ref_frame,
@@ -1580,11 +1696,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
         delta_q_res: 0,
         delta_lf_present: false,
         delta_lf_multi: false,
-        mono_chrome: false,
+        mono_chrome: mono,
         delta_lf_res: 0,
         allow_screen_content_tools: fh.allow_screen_content_tools,
         enable_filter_intra: seq.enable_filter_intra,
-        bit_depth: 8,
+        bit_depth,
         tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
@@ -1592,13 +1708,17 @@ pub(crate) fn encode_inter_frame_generic_gm(
     };
 
     let mut recon = ReconState {
-        y: vec![0u8; width * height],
-        u: vec![0u8; chroma_w * chroma_h],
-        v: vec![0u8; chroma_w * chroma_h],
+        y: vec![0u16; width * height],
+        u: vec![0u16; chroma_w * chroma_h],
+        v: vec![0u16; chroma_w * chroma_h],
         width,
         height,
         chroma_w,
         chroma_h,
+        bit_depth,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        num_planes,
         mi_rows,
         mi_cols,
         lossless,
@@ -1606,7 +1726,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         // §5.9.20: intra-block-copy is intra-frame-only.
         allow_intrabc: false,
         qp,
-        bd: BlockDecodedMirror::new(),
+        bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
         dv_hash: Default::default(),
     };
     let mut ictx = PSearchCtx::with_refs(
@@ -1622,6 +1742,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
         ip,
         base_q_idx,
         alt_q,
+        bit_depth,
+        ssx,
+        ssy,
+        num_planes,
     )?;
     // r426 — arm the §5.9.14 inter-override features (ladder item 8):
     // requires the segmentation carrier (non-empty alt_q), raw
@@ -2000,7 +2124,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
 
     Ok((
         frame_obu,
-        GopFrameRecon {
+        GopFrameReconYuv {
             y: recon.y,
             u: recon.u,
             v: recon.v,
@@ -2045,6 +2169,16 @@ struct PSearchCtx {
     mi_cols: u32,
     luma_w: u32,
     luma_h: u32,
+    /// r427 — stream §5.5.2 `BitDepth` (threads the §7.11.2 /
+    /// §7.11.3 clip + rounding parameters of the decoder kernels the
+    /// search predicts through).
+    bit_depth: u8,
+    /// §5.5.2 `subsampling_x` (0 or 1).
+    subsampling_x: u8,
+    /// §5.5.2 `subsampling_y`.
+    subsampling_y: u8,
+    /// §5.5.2 `NumPlanes` (1 or 3).
+    num_planes: u8,
     /// r415 — the DISTINCT reference reconstructions this frame reads,
     /// widened to the §7.11.3.4 sample type (one entry per distinct
     /// coded frame; [`Self::slot_to_plane`] maps §7.20 slots onto
@@ -2167,8 +2301,8 @@ impl PSearchCtx {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        prev: &GopFrameRecon,
-        prevprev: &GopFrameRecon,
+        prev: &GopFrameReconYuv,
+        prevprev: &GopFrameReconYuv,
         mi_rows: u32,
         mi_cols: u32,
         width: usize,
@@ -2197,6 +2331,10 @@ impl PSearchCtx {
             ip,
             base_q_idx,
             seg_alt_q,
+            8,
+            1,
+            1,
+            3,
         )
     }
 
@@ -2207,7 +2345,7 @@ impl PSearchCtx {
     /// field docs).
     #[allow(clippy::too_many_arguments)]
     fn with_refs(
-        refs: &[&GopFrameRecon],
+        refs: &[&GopFrameReconYuv],
         slot_to_plane: [usize; 8],
         ref_frame_idx: [u8; 7],
         single_refs: Vec<i8>,
@@ -2219,6 +2357,10 @@ impl PSearchCtx {
         ip: SyntaxInterFrameParams,
         base_q_idx: u8,
         seg_alt_q: &[i16],
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        num_planes: u8,
     ) -> Result<Self, Error> {
         if refs.is_empty()
             || slot_to_plane.iter().any(|&p| p >= refs.len())
@@ -2230,7 +2372,6 @@ impl PSearchCtx {
             return Err(Error::PartitionWalkOutOfRange);
         }
         let cells = (mi_rows as usize) * (mi_cols as usize);
-        let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
         // r422 — the §5.9.24 model state comes from the shared inter
         // bundle (identity unless the frame-level election committed
         // a model), so the §7.11.3 warp context of `predict_leaf`
@@ -2262,9 +2403,13 @@ impl PSearchCtx {
             mi_cols,
             luma_w: width as u32,
             luma_h: height as u32,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            num_planes,
             ref_planes: refs
                 .iter()
-                .map(|r| [widen(&r.y), widen(&r.u), widen(&r.v)])
+                .map(|r| [r.y.clone(), r.u.clone(), r.v.clone()])
                 .collect(),
             slot_to_plane,
             ref_frame_idx,
@@ -2298,11 +2443,18 @@ impl PSearchCtx {
             interintra_wedge_indices: vec![0u8; cells],
             local_warp: vec![0i32; cells * 6],
             local_warp_valid: vec![0u8; cells],
-            scratch: [
-                vec![0u16; width * height],
-                vec![0u16; (width / 2) * (height / 2)],
-                vec![0u16; (width / 2) * (height / 2)],
-            ],
+            scratch: {
+                let (cw, ch) = if num_planes > 1 {
+                    (width >> subsampling_x, height >> subsampling_y)
+                } else {
+                    (0, 0)
+                };
+                [
+                    vec![0u16; width * height],
+                    vec![0u16; cw * ch],
+                    vec![0u16; cw * ch],
+                ]
+            },
             gm_types: gm_types_u8,
             gm_flat,
             ref_hints: {
@@ -2334,13 +2486,7 @@ impl PSearchCtx {
     /// Any deterministic rule is conformant — the map is simply what
     /// the encoder codes; this one makes every segment reachable on
     /// textured content.
-    fn segment_for_block(
-        &self,
-        input: &Yuv420Frame,
-        mi_row: u32,
-        mi_col: u32,
-        b_size: usize,
-    ) -> u8 {
+    fn segment_for_block(&self, input: &YuvFrame, mi_row: u32, mi_col: u32, b_size: usize) -> u8 {
         if self.seg_alt_q.is_empty() {
             return 0;
         }
@@ -2379,7 +2525,7 @@ impl PSearchCtx {
 
     /// r413 — the activity metric behind [`Self::segment_for_block`]:
     /// the input block's luma mean-absolute-deviation.
-    fn block_activity(&self, input: &Yuv420Frame, mi_row: u32, mi_col: u32, b_size: usize) -> u64 {
+    fn block_activity(&self, input: &YuvFrame, mi_row: u32, mi_col: u32, b_size: usize) -> u64 {
         let (bw, bh) = (
             NUM_4X4_BLOCKS_WIDE[b_size] * 4,
             NUM_4X4_BLOCKS_HIGH[b_size] * 4,
@@ -2442,7 +2588,7 @@ impl PSearchCtx {
     /// alphabet ends. Pure gate: it only bounds which leaves PAY for
     /// the extra lossless trial; the election itself is twin bits +
     /// distortion.
-    fn synthetic_leaf(&self, input: &Yuv420Frame, mi_row: u32, mi_col: u32, b_size: usize) -> bool {
+    fn synthetic_leaf(&self, input: &YuvFrame, mi_row: u32, mi_col: u32, b_size: usize) -> bool {
         let (bw, bh) = (
             NUM_4X4_BLOCKS_WIDE[b_size] * 4,
             NUM_4X4_BLOCKS_HIGH[b_size] * 4,
@@ -3004,8 +3150,12 @@ impl PSearchCtx {
             // chroma fix-ups).
             let avail_u = mi_row > 0;
             let avail_l = mi_col > 0;
-            for plane in 0..3usize {
-                let (sub_x, sub_y): (u8, u8) = if plane > 0 { (1, 1) } else { (0, 0) };
+            for plane in 0..usize::from(self.num_planes) {
+                let (sub_x, sub_y): (u8, u8) = if plane > 0 {
+                    (self.subsampling_x, self.subsampling_y)
+                } else {
+                    (0, 0)
+                };
                 let plane_sz =
                     crate::cdf::get_plane_residual_size(b_size, plane as u8, sub_x, sub_y)
                         .ok_or(Error::PartitionWalkOutOfRange)?;
@@ -3022,9 +3172,7 @@ impl PSearchCtx {
                 let (have_ar, have_bl) =
                     super::key_frame::tu_corner_avail(&t.neigh.bd, plane, base_x, base_y, w, h);
                 let (buf, pw, ph) = t.neigh.plane(plane);
-                let read = |yy: u32, xx: u32| -> u16 {
-                    u16::from(buf[(yy as usize) * pw + (xx as usize)])
-                };
+                let read = |yy: u32, xx: u32| -> u16 { buf[(yy as usize) * pw + (xx as usize)] };
                 let out = &mut self.scratch[plane];
                 // §7.11.2.4 step-4 pre-pass inputs: inert on the II
                 // mode set (no directional D-mode reachable — V/H ride
@@ -3043,7 +3191,7 @@ impl PSearchCtx {
                     tx_sz,
                     mode,
                     /* angle_delta = */ 0,
-                    /* bit_depth = */ 8,
+                    self.bit_depth,
                     avail_u,
                     avail_l,
                     have_ar,
@@ -3062,6 +3210,10 @@ impl PSearchCtx {
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
+        // r427 — format scalars (copied out before the field split).
+        let bit_depth = self.bit_depth;
+        let (ssx, ssy) = (self.subsampling_x, self.subsampling_y);
+        let num_planes = usize::from(self.num_planes);
         let PSearchCtx {
             ref_planes,
             compound_types,
@@ -3109,7 +3261,7 @@ impl PSearchCtx {
             ref_planes,
             &slot_to_plane,
             1,
-            (luma_w as usize) / 2,
+            (luma_w as usize) >> ssx,
             luma_w,
             luma_h,
         );
@@ -3117,7 +3269,7 @@ impl PSearchCtx {
             ref_planes,
             &slot_to_plane,
             2,
-            (luma_w as usize) / 2,
+            (luma_w as usize) >> ssx,
             luma_w,
             luma_h,
         );
@@ -3140,7 +3292,7 @@ impl PSearchCtx {
             order_hints_by_ref: ref_hints,
             mi_rows,
             mi_cols,
-            bit_depth: 8,
+            bit_depth,
             // §7.11.3.1 step-7 warp context — identity global motion;
             // r419: a `WARPED_CAUSAL` trial carries its §7.11.3.8 fit
             // in the per-cell slices stamped above (SIMPLE / OBMC
@@ -3179,29 +3331,29 @@ impl PSearchCtx {
             },
             PlaneReconContext {
                 plane: 1,
-                subsampling_x: 1,
-                subsampling_y: 1,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
                 frame_store: &store_u,
                 frame_width: luma_w,
                 frame_height: luma_h,
                 curr: s1,
-                curr_stride: (luma_w as usize) / 2,
+                curr_stride: (luma_w as usize) >> ssx,
             },
             PlaneReconContext {
                 plane: 2,
-                subsampling_x: 1,
-                subsampling_y: 1,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
                 frame_store: &store_v,
                 frame_width: luma_w,
                 frame_height: luma_h,
                 curr: s2,
-                curr_stride: (luma_w as usize) / 2,
+                curr_stride: (luma_w as usize) >> ssx,
             },
         ];
         reconstruct_inter_leaf_at(
             &grid,
             &ref_frame_idx,
-            &mut planes,
+            &mut planes[..num_planes],
             mi_row as usize,
             mi_col as usize,
         )
@@ -3242,7 +3394,7 @@ fn make_store<'a>(
 /// `bw × bh` are the (possibly rectangular) luma block dimensions.
 #[allow(clippy::too_many_arguments)]
 fn motion_search_luma(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     ref_y: &[u16],
     width: usize,
     height: usize,
@@ -3301,7 +3453,7 @@ fn motion_search_luma(
 /// the kernel's actual prediction plus a small magnitude bias.
 #[allow(clippy::too_many_arguments)]
 fn refine_mv_subpel(
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     ictx: &mut PSearchCtx,
     mi_r: u32,
     mi_c: u32,
@@ -3368,7 +3520,7 @@ fn encode_inter_leaf(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
     // r421 — `Some((twin, params))` prices the leaf-level elections
@@ -3396,7 +3548,7 @@ fn encode_inter_leaf_base(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
@@ -3458,27 +3610,35 @@ fn encode_inter_leaf_base(
     )?;
     let (bw, bh) = (bw4 * 4, bh4 * 4);
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
-    let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
-    let (cbw, cbh) = (bw / 2, bh / 2);
+    // r427 — subsampling-derived chroma stitch footprint (empty on
+    // the monochrome arm).
+    let (crow0, ccol0) = recon.chroma_origin(mi_r, mi_c);
+    let (cbw, cbh) = if recon.num_planes > 1 {
+        (bw >> recon.subsampling_x, bh >> recon.subsampling_y)
+    } else {
+        (0, 0)
+    };
     let width = recon.width;
     let cw = recon.chroma_w;
     for i in 0..bh {
         for j in 0..bw {
             recon.y[(row0 + i) * width + (col0 + j)] =
-                ictx.scratch[0][(row0 + i) * width + (col0 + j)] as u8;
+                ictx.scratch[0][(row0 + i) * width + (col0 + j)];
         }
     }
     for i in 0..cbh {
         for j in 0..cbw {
             recon.u[(crow0 + i) * cw + (ccol0 + j)] =
-                ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)];
             recon.v[(crow0 + i) * cw + (ccol0 + j)] =
-                ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)];
         }
     }
     tu_bd_stamp(&mut recon.bd, 0, col0, row0, bw, bh);
-    tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
-    tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+    if recon.num_planes > 1 {
+        tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
+        tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+    }
 
     let mut sm_leaf = SyntaxBlock::skip_leaf(0, None);
     // §5.11.19/§5.11.20: skip leaves inherit the segment pred cascade
@@ -3649,7 +3809,7 @@ fn seg_extras_trials(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
@@ -3731,27 +3891,34 @@ fn seg_extras_trials(
             // the scratch prediction into the recon planes.
             let (bw, bh) = (bw4 * 4, bh4 * 4);
             let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
-            let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
-            let (cbw, cbh) = (bw / 2, bh / 2);
+            // r427 — subsampling-derived chroma stitch footprint.
+            let (crow0, ccol0) = recon.chroma_origin(mi_r, mi_c);
+            let (cbw, cbh) = if recon.num_planes > 1 {
+                (bw >> recon.subsampling_x, bh >> recon.subsampling_y)
+            } else {
+                (0, 0)
+            };
             let width = recon.width;
             let cw = recon.chroma_w;
             for i in 0..bh {
                 for j in 0..bw {
                     recon.y[(row0 + i) * width + (col0 + j)] =
-                        ictx.scratch[0][(row0 + i) * width + (col0 + j)] as u8;
+                        ictx.scratch[0][(row0 + i) * width + (col0 + j)];
                 }
             }
             for i in 0..cbh {
                 for j in 0..cbw {
                     recon.u[(crow0 + i) * cw + (ccol0 + j)] =
-                        ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                        ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)];
                     recon.v[(crow0 + i) * cw + (ccol0 + j)] =
-                        ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)] as u8;
+                        ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)];
                 }
             }
             tu_bd_stamp(&mut recon.bd, 0, col0, row0, bw, bh);
-            tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
-            tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+            if recon.num_planes > 1 {
+                tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
+                tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+            }
             let mut l = SyntaxBlock::skip_leaf(0, None);
             l.segment_id = s as u8;
             l.inter = Some(SyntaxInterBlock {
@@ -3843,7 +4010,7 @@ fn encode_inter_leaf_modes(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
@@ -4858,13 +5025,13 @@ fn transform_tree_tu_order(
 /// heuristic and the `RateModel::Heuristic` baseline).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_search_luma_inter(
-    input_plane: &[u8],
-    recon_plane: &mut [u8],
+    input_plane: &[u16],
+    recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
     col0: usize,
     tx_sz: usize,
-    pred: &[u8],
+    pred: &[u16],
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
 ) -> Result<(Vec<i32>, u8), Error> {
@@ -4876,6 +5043,7 @@ pub(crate) fn residual_tx_search_luma_inter(
 
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
+    let max_val = (1i64 << qp.bit_depth) - 1;
     let mut residual = vec![0i64; w * h];
     for i in 0..h {
         for j in 0..w {
@@ -4907,7 +5075,7 @@ pub(crate) fn residual_tx_search_luma_inter(
         let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
         let all_zero = quant.iter().all(|&q| q == 0);
         let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
-        let res_back = inverse_transform_2d(&dequant, tx_sz, t, 8, false);
+        let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
         // §7.12.3 step-3 destination remap (FLIPADST family).
         let (flip_ud, flip_lr) = crate::encoder::key_frame::step3_flips(t);
         let mut d = 0u64;
@@ -4915,7 +5083,7 @@ pub(crate) fn residual_tx_search_luma_inter(
             let yy = if flip_ud { h - 1 - i } else { i };
             for j in 0..w {
                 let xx = if flip_lr { w - 1 - j } else { j };
-                let rec = (i64::from(pred[yy * w + xx]) + res_back[i * w + j]).clamp(0, 255);
+                let rec = (i64::from(pred[yy * w + xx]) + res_back[i * w + j]).clamp(0, max_val);
                 let diff = i64::from(input_plane[(row0 + yy) * pw + (col0 + xx)]) - rec;
                 d += (diff * diff) as u64;
             }
@@ -4967,7 +5135,7 @@ pub(crate) fn residual_tx_search_luma_inter(
         for j in 0..w {
             let xx = if flip_lr { w - 1 - j } else { j };
             let p = i64::from(pred[yy * w + xx]) + res_back[i * w + j];
-            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
+            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, max_val) as u16;
         }
     }
     Ok((quant, label))
@@ -5000,7 +5168,7 @@ fn encode_inter_leaf_residual(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &PSearchCtx,
     ref_frame: [i8; 2],
@@ -5094,10 +5262,10 @@ fn encode_inter_leaf_residual(
     let mut tu_type_grid = vec![DCT_DCT as u8; tu_cols * (bh / lth)];
     for &(tx, ty) in &tu_order {
         let (tr, tc) = (row0 + ty, col0 + tx);
-        let mut pred = vec![0u8; ltw * lth];
+        let mut pred = vec![0u16; ltw * lth];
         for i in 0..lth {
             for j in 0..ltw {
-                pred[i * ltw + j] = ictx.scratch[0][(tr + i) * width + (tc + j)] as u8;
+                pred[i * ltw + j] = ictx.scratch[0][(tr + i) * width + (tc + j)];
             }
         }
         let (q, tt) = if lossless {
@@ -5152,16 +5320,23 @@ fn encode_inter_leaf_residual(
     // block's committed `TxSize` — on the §5.11.16 var-tx arm that is
     // the recursion's last terminal-else `txSz` (the uniform TU size
     // here).
-    let has_chroma = (bh4 != 1 || (mi_r & 1) == 1) && (bw4 != 1 || (mi_c & 1) == 1);
-    let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
-    let (cbw, cbh) = match crate::cdf::get_plane_residual_size(b_size, 1, 1, 1) {
+    let has_chroma = recon.num_planes > 1
+        && (bh4 != 1 || recon.subsampling_y == 0 || (mi_r & 1) == 1)
+        && (bw4 != 1 || recon.subsampling_x == 0 || (mi_c & 1) == 1);
+    let (crow0, ccol0) = recon.chroma_origin(mi_r, mi_c);
+    let (cbw, cbh) = match crate::cdf::get_plane_residual_size(
+        b_size,
+        1,
+        recon.subsampling_x,
+        recon.subsampling_y,
+    ) {
         Some(psz) => (NUM_4X4_BLOCKS_WIDE[psz] * 4, NUM_4X4_BLOCKS_HIGH[psz] * 4),
         None => (0, 0),
     };
     let chroma_tx = if lossless {
         TX_4X4
     } else {
-        get_tx_size(1, luma_tx, b_size, 1, 1).unwrap_or(TX_4X4)
+        get_tx_size(1, luma_tx, b_size, recon.subsampling_x, recon.subsampling_y).unwrap_or(TX_4X4)
     };
     let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
     // §5.11.48 inter set at the CHROMA TX size — the §5.11.40
@@ -5172,7 +5347,11 @@ fn encode_inter_leaf_residual(
         false,
     );
     let cw = recon.chroma_w;
-    for plane in 1..=2usize {
+    let (lift_x_sh, lift_y_sh) = (
+        2 + u32::from(recon.subsampling_x),
+        2 + u32::from(recon.subsampling_y),
+    );
+    for plane in 1..usize::from(recon.num_planes) {
         if !has_chroma {
             break;
         }
@@ -5191,8 +5370,8 @@ fn encode_inter_leaf_residual(
                 let chroma_tt = if lossless || TX_SIZE_SQR_UP[chroma_tx] > crate::cdf::TX_32X32 {
                     DCT_DCT
                 } else {
-                    let lifted_x = ((tc >> 2) << 3).saturating_sub(col0);
-                    let lifted_y = ((tr >> 2) << 3).saturating_sub(row0);
+                    let lifted_x = ((tc >> 2) << lift_x_sh).saturating_sub(col0);
+                    let lifted_y = ((tr >> 2) << lift_y_sh).saturating_sub(row0);
                     let luma_tt =
                         tu_type_grid[(lifted_y / lth) * tu_cols + lifted_x / ltw] as usize;
                     if crate::cdf::is_tx_type_in_set(true, chroma_set, luma_tt) {
@@ -5201,10 +5380,10 @@ fn encode_inter_leaf_residual(
                         DCT_DCT
                     }
                 };
-                let mut pred = vec![0u8; ctw * cth];
+                let mut pred = vec![0u16; ctw * cth];
                 for i in 0..cth {
                     for j in 0..ctw {
-                        pred[i * ctw + j] = ictx.scratch[plane][(tr + i) * cw + (tc + j)] as u8;
+                        pred[i * ctw + j] = ictx.scratch[plane][(tr + i) * cw + (tc + j)];
                     }
                 }
                 let plane_buf = if plane == 1 {
@@ -5387,7 +5566,7 @@ fn encode_intra_candidate(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &PSearchCtx,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
@@ -5452,7 +5631,7 @@ fn build_p_search_tree(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &Yuv420Frame,
+    input: &YuvFrame,
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
     twin: &mut RateTwin,
@@ -5762,6 +5941,13 @@ fn build_p_search_tree(
         if b_size == BLOCK_8X8 && !matches!(part, PARTITION_HORZ | PARTITION_VERT) {
             continue;
         }
+        // r427 — §5.11.38 admissibility: under 4:2:2 the tall shapes
+        // (VERT 32×64, VERT_4 4×16 strips, ...) subsample to
+        // BLOCK_INVALID chroma and must never be elected (see
+        // `key_frame::chroma_partition_ok`).
+        if !crate::encoder::key_frame::chroma_partition_ok(recon, psub) {
+            continue;
+        }
         // §5.11.4 sub-block geometry per partition, in dispatch order.
         let cells: Vec<(u32, u32, usize)> = match part {
             PARTITION_HORZ => vec![(r, c, psub), (r + half, c, psub)],
@@ -5957,7 +6143,20 @@ fn build_p_search_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::key_frame::encode_key_frame_yuv420_with_q;
+    use crate::encoder::yuv_frame::ChromaFormat;
+
+    /// 8-bit view of a `u16` recon plane for byte-comparisons against
+    /// the spec driver's 8-bit output surface.
+    fn plane8(p: &[u16]) -> Vec<u8> {
+        p.iter().map(|&s| s as u8).collect()
+    }
+
+    /// Test shims over the r427 general GOP core (the historical
+    /// per-surface entry shapes, YuvFrame inputs).
+    fn gop_seg_yuv(frames: &[YuvFrame], q: u8, alt_q: &[i16]) -> Result<EncodedGopYuv, Error> {
+        encode_gop_yuv_seg_extras_tuned(frames, q, alt_q, &[], false, None, GopTuning::default())
+            .map(|t| t.gop)
+    }
 
     /// r421 — persistent per-tile search state for the module tests: a
     /// fresh rate-twin source (§8.3.1 default CDFs at the recon's
@@ -6035,7 +6234,7 @@ mod tests {
         ts: &mut TestTileState,
         r: u32,
         c: u32,
-        input: &Yuv420Frame,
+        input: &YuvFrame,
         recon: &mut ReconState,
         ictx: &mut PSearchCtx,
     ) -> Result<SyntaxNode, Error> {
@@ -6075,7 +6274,7 @@ mod tests {
         r: u32,
         c: u32,
         b_size: usize,
-        input: &Yuv420Frame,
+        input: &YuvFrame,
         recon: &mut ReconState,
         ictx: &mut PSearchCtx,
     ) -> Result<SyntaxNode, Error> {
@@ -6087,22 +6286,22 @@ mod tests {
     /// Deterministic textured frame with translation `(sy, sx)` — the
     /// `gop_inter_conformance.rs` generator, duplicated here so the
     /// module test can drive the search internals directly.
-    fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> Yuv420Frame {
+    fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> YuvFrame {
         let (wu, hu) = (w as usize, h as usize);
         let s = seed as usize;
-        let mut f = Yuv420Frame::filled(w, h, 0);
+        let mut f = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 0);
         for i in 0..hu {
             for j in 0..wu {
                 let (si, sj) = (i + shift_y, j + shift_x);
-                f.y[i * wu + j] = ((si * 5 + sj * 3 + (si / 16) * (sj / 16) + s) % 256) as u8;
+                f.y[i * wu + j] = ((si * 5 + sj * 3 + (si / 16) * (sj / 16) + s) % 256) as u16;
             }
         }
         let (cw, ch) = (wu / 2, hu / 2);
         for i in 0..ch {
             for j in 0..cw {
                 let (si, sj) = (i + shift_y / 2, j + shift_x / 2);
-                f.u[i * cw + j] = ((128 + si * 2 + sj + s) % 256) as u8;
-                f.v[i * cw + j] = ((64 + si + sj * 2 + s) % 256) as u8;
+                f.u[i * cw + j] = ((128 + si * 2 + sj + s) % 256) as u16;
+                f.v[i * cw + j] = ((64 + si + sj * 2 + s) % 256) as u16;
             }
         }
         f
@@ -6156,8 +6355,8 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 7);
         let f1 = moving_gradient(64, 64, 3, 5, 7);
         let base_q_idx = 60u8;
-        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
-        let reference = GopFrameRecon {
+        let key = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameReconYuv {
             y: key.recon_y,
             u: key.recon_u,
             v: key.recon_v,
@@ -6167,9 +6366,9 @@ mod tests {
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let qp = QuantizerParams::neutral(base_q_idx, 8);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6180,7 +6379,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp,
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6234,14 +6437,14 @@ mod tests {
         use crate::inter_pred::EIGHTTAP_SHARP;
         let f0 = moving_gradient(64, 64, 0, 0, 77);
         let base_q_idx = 90u8;
-        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
-        let reference = GopFrameRecon {
+        let key = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameReconYuv {
             y: key.recon_y,
             u: key.recon_u,
             v: key.recon_v,
         };
         // Target frame = SHARP half-pel interpolation of the reference.
-        let mut f1 = Yuv420Frame::filled(64, 64, 0);
+        let mut f1 = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             let mut probe = PSearchCtx::new(
@@ -6272,22 +6475,22 @@ mod tests {
                 )
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in f1.u.iter_mut().zip(probe.scratch[1].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in f1.v.iter_mut().zip(probe.scratch[2].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
         }
         let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6298,7 +6501,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6365,12 +6572,12 @@ mod tests {
         // Frame k: rows [0, 16) shift right by 4k, rows [16, ..)
         // shift left by 4k — the boundary bisects the top 32x32
         // quadrants at their halfway row.
-        let band = |k: usize| -> Yuv420Frame {
+        let band = |k: usize| -> YuvFrame {
             let (w, h) = (64usize, 64usize);
-            let mut f = Yuv420Frame::filled(64, 64, 0);
-            let tex = |x: i64, y: i64| -> u8 {
+            let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+            let tex = |x: i64, y: i64| -> u16 {
                 let (xu, yu) = ((x + 512) as usize, (y + 512) as usize);
-                ((xu * 7 + yu * 3 + (xu / 8) * (yu / 8) * 5) % 256) as u8
+                ((xu * 7 + yu * 3 + (xu / 8) * (yu / 8) * 5) % 256) as u16
             };
             for i in 0..h {
                 // The two bands slide in opposite directions over the
@@ -6389,18 +6596,19 @@ mod tests {
                 let s: i64 = if i < 8 { 2 * k as i64 } else { -2 * (k as i64) };
                 for j in 0..cw {
                     let x = ((j as i64 - s) + 512) as usize;
-                    f.u[i * cw + j] = ((128 + x * 2 + i) % 256) as u8;
-                    f.v[i * cw + j] = ((64 + x + i * 2) % 256) as u8;
+                    f.u[i * cw + j] = ((128 + x * 2 + i) % 256) as u16;
+                    f.v[i * cw + j] = ((64 + x + i * 2) % 256) as u16;
                 }
             }
             f
         };
-        let frames: Vec<Yuv420Frame> = (0..3).map(band).collect();
+        let frames: Vec<YuvFrame> = (0..3).map(band).collect();
         let base_q_idx = 60u8;
 
         // Tree inspection on the P-frame search.
-        let key = encode_key_frame_yuv420_with_q(&frames[0], base_q_idx).unwrap();
-        let reference = GopFrameRecon {
+        let key =
+            crate::encoder::key_frame::encode_key_frame_yuv_with_q(&frames[0], base_q_idx).unwrap();
+        let reference = GopFrameReconYuv {
             y: key.recon_y.clone(),
             u: key.recon_u.clone(),
             v: key.recon_v.clone(),
@@ -6409,9 +6617,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6422,7 +6630,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6468,13 +6680,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), frames.len());
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(f.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -6489,7 +6701,7 @@ mod tests {
     #[test]
     fn r412_p_search_selects_golden_reference_across_flash() {
         let calm = moving_gradient(64, 64, 0, 0, 5);
-        let mut flash = Yuv420Frame::filled(64, 64, 0);
+        let mut flash = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         let mut state = 0x1234_5678u32;
         let mut next = move || {
             state ^= state << 13;
@@ -6498,7 +6710,7 @@ mod tests {
             state
         };
         for v in flash.y.iter_mut() {
-            *v = (next() & 0xFF) as u8;
+            *v = (next() & 0xFF) as u16;
         }
         // frames: KEY(calm), P1(flash), P2(calm again).
         let frames = vec![calm.clone(), flash, calm];
@@ -6506,16 +6718,16 @@ mod tests {
 
         // Drive the P2 search directly: prev = P1 recon (flash),
         // prevprev = P1's prev = KEY recon (calm).
-        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, base_q_idx).unwrap();
         let prev = enc.recon[1].clone();
         let prevprev = enc.recon[0].clone();
         let fh = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, base_q_idx, 2, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6526,7 +6738,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6585,9 +6801,9 @@ mod tests {
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), frames.len());
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(f.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -6607,11 +6823,11 @@ mod tests {
         let f1 = moving_gradient(64, 64, 0, 0, 140);
         let base_q_idx = 60u8;
         // Two-frame pre-pass to obtain the deterministic recons.
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
-        let mut f2 = Yuv420Frame::filled(64, 64, 0);
-        let avg = |a: &[u8], b: &[u8], out: &mut [u8]| {
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let mut f2 = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+        let avg = |a: &[u16], b: &[u16], out: &mut [u16]| {
             for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
-                *o = (u16::from(x) + u16::from(y)).div_ceil(2) as u8;
+                *o = (u32::from(x) + u32::from(y)).div_ceil(2) as u16;
             }
         };
         avg(&pre.recon[0].y, &pre.recon[1].y, &mut f2.y);
@@ -6624,9 +6840,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6637,7 +6853,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6693,13 +6913,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f2], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f2], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(f.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -6713,7 +6933,7 @@ mod tests {
         let f = moving_gradient(64, 64, 2, 3, 21);
         let base_q_idx = 60u8;
         let frames = vec![f.clone(), f.clone(), f.clone(), f.clone()];
-        let pre = encode_gop_yuv420_with_q(&frames[..3], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&frames[..3], base_q_idx).unwrap();
 
         // Drive the P3 search directly (LAST = P2 recon, GOLDEN = P1
         // recon; `p_index = 3` ⇒ skip_mode_present per §5.9.22).
@@ -6722,9 +6942,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6735,7 +6955,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6791,13 +7015,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 4);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -6810,12 +7034,12 @@ mod tests {
     fn r413_segmentation_alt_q_gop_round_trips() {
         // Mixed content: flat left half, textured right half — the
         // MAD policy assigns different segments per leaf.
-        let mut frames: Vec<Yuv420Frame> = Vec::new();
+        let mut frames: Vec<YuvFrame> = Vec::new();
         for k in 0..3u32 {
-            let mut f = Yuv420Frame::filled(64, 64, 100);
+            let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 100);
             for i in 0..64usize {
                 for j in 32..64usize {
-                    f.y[i * 64 + j] = ((i * 17 + j * 31 + (k as usize) * 5) % 256) as u8;
+                    f.y[i * 64 + j] = ((i * 17 + j * 31 + (k as usize) * 5) % 256) as u16;
                 }
             }
             for v in f.u.iter_mut() {
@@ -6829,13 +7053,13 @@ mod tests {
         let base_q_idx = 60u8;
         let alt_q: [i16; 3] = [0, 24, 48];
 
-        let enc = encode_gop_yuv420_with_q_seg(&frames, base_q_idx, &alt_q).unwrap();
+        let enc = gop_seg_yuv(&frames, base_q_idx, &alt_q).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
 
         // Segment-diversity witness: drive the P1 search directly and
@@ -6847,9 +7071,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6868,7 +7092,11 @@ mod tests {
                 }
                 q
             },
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -6922,11 +7150,11 @@ mod tests {
         // per-segment lossless election, covered by
         // `tests/mixed_lossless.rs` — but unrepresentable su(1+8)
         // deltas, over-255 sums and base-0 segmentation still do.)
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[1, 2]).is_err());
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0]).is_err());
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0, -256]).is_err());
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 200, &[0, 100]).is_err());
-        assert!(encode_gop_yuv420_with_q_seg(&frames, 0, &[0, 10]).is_err());
+        assert!(gop_seg_yuv(&frames, 60, &[1, 2]).is_err());
+        assert!(gop_seg_yuv(&frames, 60, &[0]).is_err());
+        assert!(gop_seg_yuv(&frames, 60, &[0, -256]).is_err());
+        assert!(gop_seg_yuv(&frames, 200, &[0, 100]).is_err());
+        assert!(gop_seg_yuv(&frames, 0, &[0, 10]).is_err());
     }
 
     /// r413 — tri-motion content shaped exactly like a §5.11.4
@@ -6939,9 +7167,9 @@ mod tests {
         // Frame k: top 64x32 band shifts by (0, 2k); bottom-left
         // 32x32 by (2k, 0); bottom-right 32x32 by (2k, 2k) — the
         // HORZ_B geometry at BLOCK_64X64.
-        let gen = |k: usize| -> Yuv420Frame {
-            let mut f = Yuv420Frame::filled(64, 64, 0);
-            let tex = |i: usize, j: usize| ((i * 7 + j * 13 + (i / 8) * (j / 8)) % 256) as u8;
+        let gen = |k: usize| -> YuvFrame {
+            let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+            let tex = |i: usize, j: usize| ((i * 7 + j * 13 + (i / 8) * (j / 8)) % 256) as u16;
             for i in 0..64usize {
                 for j in 0..64usize {
                     let (si, sj) = if i < 32 {
@@ -6962,10 +7190,10 @@ mod tests {
             }
             f
         };
-        let frames: Vec<Yuv420Frame> = (0..3).map(gen).collect();
+        let frames: Vec<YuvFrame> = (0..3).map(gen).collect();
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&frames[..1], base_q_idx).unwrap();
-        let key_recon = GopFrameRecon {
+        let pre = encode_gop_yuv_with_q(&frames[..1], base_q_idx).unwrap();
+        let key_recon = GopFrameReconYuv {
             y: pre.recon[0].y.clone(),
             u: pre.recon[0].u.clone(),
             v: pre.recon[0].v.clone(),
@@ -6975,9 +7203,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -6988,7 +7216,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -7036,13 +7268,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -7055,16 +7287,16 @@ mod tests {
     /// derive the same motion field.
     #[test]
     fn r413_motion_field_estimation_projects_from_p2() {
-        let frames: Vec<Yuv420Frame> = (0..4)
+        let frames: Vec<YuvFrame> = (0..4)
             .map(|k| moving_gradient(64, 64, k * 3, k * 2, 9))
             .collect();
-        let enc = encode_gop_yuv420_with_q(&frames, 60).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, 60).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 4);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
 
         // Recompute P2's projection from a rebuilt store (KEY intra in
@@ -7073,14 +7305,14 @@ mod tests {
         let fh1 = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, 60, 1, &[]);
         let fs = fh1.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
-        let key_recon = GopFrameRecon {
+        let key_recon = GopFrameReconYuv {
             y: enc.recon[0].y.clone(),
             u: enc.recon[0].u.clone(),
             v: enc.recon[0].v.clone(),
         };
         let mf_store: [SavedMotionField; 8] =
             core::array::from_fn(|_| SavedMotionField::intra(mi_rows, mi_cols));
-        let (_, _, saved1, _, _) = encode_p_frame_yuv420(
+        let (_, _, saved1, _, _) = encode_p_frame_yuv(
             &frames[1],
             &key_recon,
             &key_recon,
@@ -7156,10 +7388,10 @@ mod tests {
     #[test]
     fn r412_predict_leaf_threads_interp_filter() {
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
-        let mut refr = GopFrameRecon {
-            y: vec![0u8; 64 * 64],
-            u: vec![128u8; 32 * 32],
-            v: vec![128u8; 32 * 32],
+        let mut refr = GopFrameReconYuv {
+            y: vec![0u16; 64 * 64],
+            u: vec![128u16; 32 * 32],
+            v: vec![128u16; 32 * 32],
         };
         for i in 0..64 {
             for j in 0..64 {
@@ -7215,10 +7447,10 @@ mod tests {
     fn r417_predict_leaf_inter_intra_blends_intra_half() {
         // Reference: flat luma 100, flat chroma 128 ⇒ the zero-MV
         // inter half is flat.
-        let refr = GopFrameRecon {
-            y: vec![100u8; 64 * 64],
-            u: vec![128u8; 32 * 32],
-            v: vec![128u8; 32 * 32],
+        let refr = GopFrameReconYuv {
+            y: vec![100u16; 64 * 64],
+            u: vec![128u16; 32 * 32],
+            v: vec![128u16; 32 * 32],
         };
         // Committed recon (the §7.11.2 neighbour source): flat luma
         // 200, flat chroma 60 ⇒ the II_V_PRED intra half is flat 200
@@ -7354,16 +7586,16 @@ mod tests {
     /// byte-exact through the spec driver.
     #[test]
     fn r412_gop_with_stack_modes_round_trips_through_spec_driver() {
-        let frames: Vec<Yuv420Frame> = (0..4)
+        let frames: Vec<YuvFrame> = (0..4)
             .map(|k| moving_gradient(96, 80, 2 * k, 4 * k, 31))
             .collect();
-        let enc = encode_gop_yuv420_with_q(&frames, 80).unwrap();
+        let enc = encode_gop_yuv_with_q(&frames, 80).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), frames.len());
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(f.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -7372,8 +7604,8 @@ mod tests {
     /// (BWDREF/ALTREF2/ALTREF, hint 2), current hint 1 — §7.8 sign
     /// bias 1 on the backward ordinals.
     fn b_frame_ctx<'a>(
-        anchor: &'a GopFrameRecon,
-        future: &'a GopFrameRecon,
+        anchor: &'a GopFrameReconYuv,
+        future: &'a GopFrameReconYuv,
         mi_rows: u32,
         mi_cols: u32,
         base_q_idx: u8,
@@ -7411,15 +7643,19 @@ mod tests {
             ip,
             base_q_idx,
             &[],
+            8,
+            1,
+            1,
+            3,
         )
         .unwrap()
     }
 
     fn fresh_recon(w: usize, h: usize, q: u8) -> ReconState {
         ReconState {
-            y: vec![0u8; w * h],
-            u: vec![0u8; (w / 2) * (h / 2)],
-            v: vec![0u8; (w / 2) * (h / 2)],
+            y: vec![0u16; w * h],
+            u: vec![0u16; (w / 2) * (h / 2)],
+            v: vec![0u16; (w / 2) * (h / 2)],
             width: w,
             height: h,
             chroma_w: w / 2,
@@ -7430,7 +7666,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(q, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         }
     }
@@ -7446,22 +7686,22 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 40);
         let f2 = moving_gradient(64, 64, 0, 0, 140);
         let base_q_idx = 60u8;
-        let k0 = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
-        let k2 = encode_key_frame_yuv420_with_q(&f2, base_q_idx).unwrap();
-        let anchor = GopFrameRecon {
+        let k0 = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
+        let k2 = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f2, base_q_idx).unwrap();
+        let anchor = GopFrameReconYuv {
             y: k0.recon_y,
             u: k0.recon_u,
             v: k0.recon_v,
         };
-        let future = GopFrameRecon {
+        let future = GopFrameReconYuv {
             y: k2.recon_y,
             u: k2.recon_u,
             v: k2.recon_v,
         };
-        let mut target = Yuv420Frame::filled(64, 64, 0);
-        let avg = |a: &[u8], b: &[u8], out: &mut [u8]| {
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+        let avg = |a: &[u16], b: &[u16], out: &mut [u16]| {
             for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
-                *o = (u16::from(x) + u16::from(y)).div_ceil(2) as u8;
+                *o = (u32::from(x) + u32::from(y)).div_ceil(2) as u16;
             }
         };
         avg(&anchor.y, &future.y, &mut target.y);
@@ -7514,14 +7754,14 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 5);
         let f2 = moving_gradient(64, 64, 9, 13, 505);
         let base_q_idx = 60u8;
-        let k0 = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
-        let k2 = encode_key_frame_yuv420_with_q(&f2, base_q_idx).unwrap();
-        let anchor = GopFrameRecon {
+        let k0 = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
+        let k2 = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f2, base_q_idx).unwrap();
+        let anchor = GopFrameReconYuv {
             y: k0.recon_y,
             u: k0.recon_u,
             v: k0.recon_v,
         };
-        let future = GopFrameRecon {
+        let future = GopFrameReconYuv {
             y: k2.recon_y,
             u: k2.recon_u,
             v: k2.recon_v,
@@ -7581,11 +7821,11 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 40);
         let f1 = moving_gradient(64, 64, 0, 0, 140);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
         // Target: per-quadrant WEDGE blend (index 7, sign 0) of the
         // two reference reconstructions, through the real kernel.
-        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             let mut probe =
@@ -7614,13 +7854,13 @@ mod tests {
                     .unwrap();
             }
             for (dst, &src) in target.y.iter_mut().zip(probe.scratch[0].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in target.u.iter_mut().zip(probe.scratch[1].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in target.v.iter_mut().zip(probe.scratch[2].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
         }
 
@@ -7684,13 +7924,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         // Env-gated fixture dump for external black-box validation /
         // corpus pinning (no-op in normal runs).
@@ -7713,7 +7953,7 @@ mod tests {
     /// the spec driver.
     #[test]
     fn r418_p_search_selects_palette_on_pasted_screen_content() {
-        const COLORS: [u8; 4] = [16, 80, 160, 240];
+        const COLORS: [u16; 4] = [16, 80, 160, 240];
         let f0 = moving_gradient(64, 64, 0, 0, 40);
         let mut f1 = moving_gradient(64, 64, 0, 0, 40);
         // Paste a 32x32 dither block (chroma pair checker) at (16, 16).
@@ -7737,7 +7977,7 @@ mod tests {
             }
         }
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
         // Direct search drive over the same driver state (LAST = f0
         // recon at p_index = 1).
@@ -7798,9 +8038,9 @@ mod tests {
         let decoded = crate::decoder::decode_av1_spec(&pre.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], pre.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], pre.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], pre.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&pre.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&pre.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&pre.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -7826,9 +8066,9 @@ mod tests {
         // anchor reconstruction by a hair and flipped it at 140).
         let f1 = moving_gradient(64, 64, 0, 0, 220);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
-        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             let mut probe =
@@ -7857,7 +8097,7 @@ mod tests {
                 let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
                 for i in 0..32usize {
                     for j in 0..32usize {
-                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j] as u8;
+                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j];
                         target.y[(row0 + i) * 64 + col0 + j] = v;
                         running.y[(row0 + i) * 64 + col0 + j] = v;
                     }
@@ -7865,8 +8105,8 @@ mod tests {
                 let (cr0, cc0) = (row0 / 2, col0 / 2);
                 for i in 0..16usize {
                     for j in 0..16usize {
-                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j] as u8;
-                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j] as u8;
+                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j];
+                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j];
                         target.u[(cr0 + i) * 32 + cc0 + j] = u;
                         target.v[(cr0 + i) * 32 + cc0 + j] = v;
                         running.u[(cr0 + i) * 32 + cc0 + j] = u;
@@ -7934,13 +8174,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
     }
 
@@ -7957,7 +8197,7 @@ mod tests {
     fn r417_search_selects_sub8_intra_in_mixed_groups() {
         let f0 = moving_gradient(64, 64, 0, 0, 71);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
         let kr = &pre.recon[0];
 
         // Target: the r416 fine-motion checkerboard (per-4×4-cell
@@ -7966,8 +8206,8 @@ mod tests {
         // of four 8×8 groups overwritten by V-replication (rows copy
         // the row directly above — vertically constant, absent from
         // the reference, near-exact under §7.11.2 V_PRED).
-        let mut f2 = Yuv420Frame::filled(64, 64, 0);
-        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+        let mut f2 = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+        let at = |p: &[u16], w: usize, h: usize, i: i64, j: i64| -> u16 {
             let ii = i.clamp(0, h as i64 - 1) as usize;
             let jj = j.clamp(0, w as i64 - 1) as usize;
             p[ii * w + jj]
@@ -8060,13 +8300,13 @@ mod tests {
         assert!(mixed, "some 2x2 group must mix intra and inter ({sub4:?})");
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f2], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f2], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         if let Ok(dir) = std::env::var("OXIDEAV_AV1_SUB8INTRA_FIXDIR") {
             std::fs::create_dir_all(&dir).unwrap();
@@ -8096,13 +8336,13 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 40);
         let f1 = moving_gradient(64, 64, 0, 0, 140);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
         // Target: per-32x32-quadrant smooth inter-intra blend of the
         // LAST reconstruction and the §7.11.2 intra half, built
         // through the real driver with the SAME incremental
         // neighbour state the sequential search walk will hold.
-        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             let mut probe =
@@ -8134,7 +8374,7 @@ mod tests {
                 let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
                 for i in 0..32usize {
                     for j in 0..32usize {
-                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j] as u8;
+                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j];
                         target.y[(row0 + i) * 64 + col0 + j] = v;
                         running.y[(row0 + i) * 64 + col0 + j] = v;
                     }
@@ -8142,8 +8382,8 @@ mod tests {
                 let (cr0, cc0) = (row0 / 2, col0 / 2);
                 for i in 0..16usize {
                     for j in 0..16usize {
-                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j] as u8;
-                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j] as u8;
+                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j];
+                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j];
                         target.u[(cr0 + i) * 32 + cc0 + j] = u;
                         target.v[(cr0 + i) * 32 + cc0 + j] = v;
                         running.u[(cr0 + i) * 32 + cc0 + j] = u;
@@ -8213,13 +8453,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         // Env-gated fixture dump for external black-box validation /
         // corpus pinning (no-op in normal runs).
@@ -8252,12 +8492,12 @@ mod tests {
         let f0 = moving_gradient(64, 64, 0, 0, 40);
         let f1 = moving_gradient(64, 64, 0, 0, 140);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
 
         // Target: the §7.11.3.15 DISTANCE blend of the two reference
         // reconstructions through the real kernel under the frame-2
         // order hints (the same hints the GOP encode derives).
-        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
         {
             let mut ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
@@ -8287,13 +8527,13 @@ mod tests {
                     .unwrap();
             }
             for (dst, &src) in target.y.iter_mut().zip(probe.scratch[0].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in target.u.iter_mut().zip(probe.scratch[1].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
             for (dst, &src) in target.v.iter_mut().zip(probe.scratch[2].iter()) {
-                *dst = src as u8;
+                *dst = src;
             }
         }
 
@@ -8358,13 +8598,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         // Env-gated fixture dump for external black-box validation /
         // corpus pinning (no-op in normal runs).
@@ -8459,13 +8699,13 @@ mod tests {
     fn r416_search_selects_sub8_split_on_fine_motion() {
         let f0 = moving_gradient(64, 64, 0, 0, 71);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
         let kr = &pre.recon[0];
 
         // Target: cell (ci, cj) reads the KEY recon shifted by
         // (0, 0) / (4, 4) on the cell-parity checkerboard.
-        let mut target = Yuv420Frame::filled(64, 64, 0);
-        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+        let at = |p: &[u16], w: usize, h: usize, i: i64, j: i64| -> u16 {
             let ii = i.clamp(0, h as i64 - 1) as usize;
             let jj = j.clamp(0, w as i64 - 1) as usize;
             p[ii * w + jj]
@@ -8492,7 +8732,7 @@ mod tests {
         ip.enable_masked_compound = true;
         ip.enable_jnt_comp = true;
         ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
-        let key_recon = GopFrameRecon {
+        let key_recon = GopFrameReconYuv {
             y: kr.y.clone(),
             u: kr.u.clone(),
             v: kr.v.clone(),
@@ -8521,13 +8761,13 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         // Env-gated fixture dump for external black-box validation /
         // corpus pinning (no-op in normal runs).
@@ -8551,11 +8791,11 @@ mod tests {
     fn r416_search_selects_sub8_strips_on_band_motion() {
         let f0 = moving_gradient(64, 64, 0, 0, 93);
         let base_q_idx = 60u8;
-        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let pre = encode_gop_yuv_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
         let kr = &pre.recon[0];
 
-        let mut target = Yuv420Frame::filled(64, 64, 0);
-        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+        let mut target = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
+        let at = |p: &[u16], w: usize, h: usize, i: i64, j: i64| -> u16 {
             let ii = i.clamp(0, h as i64 - 1) as usize;
             let jj = j.clamp(0, w as i64 - 1) as usize;
             p[ii * w + jj]
@@ -8579,7 +8819,7 @@ mod tests {
         ip.enable_masked_compound = true;
         ip.enable_jnt_comp = true;
         ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
-        let key_recon = GopFrameRecon {
+        let key_recon = GopFrameReconYuv {
             y: kr.y.clone(),
             u: kr.u.clone(),
             v: kr.v.clone(),
@@ -8629,13 +8869,13 @@ mod tests {
              (horz4={h4} horz={hz} sub8={n_sub8} 4x4={n_4x4})"
         );
 
-        let enc = encode_gop_yuv420_with_q(&[f0, target], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, target], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, fr) in decoded.iter().enumerate() {
-            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
-            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
-            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+            assert_eq!(fr.planes[0], plane8(&enc.recon[idx].y), "frame {idx} luma");
+            assert_eq!(fr.planes[1], plane8(&enc.recon[idx].u), "frame {idx} U");
+            assert_eq!(fr.planes[2], plane8(&enc.recon[idx].v), "frame {idx} V");
         }
         if let Ok(dir) = std::env::var("OXIDEAV_AV1_SUB8_FIXDIR") {
             std::fs::create_dir_all(&dir).unwrap();
@@ -8655,8 +8895,8 @@ mod tests {
     fn r415_b_search_selects_skip_mode_between_converged_references() {
         let f = moving_gradient(64, 64, 2, 3, 21);
         let base_q_idx = 60u8;
-        let k = encode_key_frame_yuv420_with_q(&f, base_q_idx).unwrap();
-        let anchor = GopFrameRecon {
+        let k = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f, base_q_idx).unwrap();
+        let anchor = GopFrameReconYuv {
             y: k.recon_y,
             u: k.recon_u,
             v: k.recon_v,
@@ -8727,12 +8967,12 @@ mod tests {
     /// §5.11.4 partition boundary aligns with it — the §7.11.3.9-10
     /// OBMC blend of the above neighbour's larger shift over a
     /// block's top band is the best model the syntax offers.
-    fn shear_pair(w: u32, h: u32, dx_top: usize, ramp0: usize, ramp1: usize) -> [Yuv420Frame; 2] {
+    fn shear_pair(w: u32, h: u32, dx_top: usize, ramp0: usize, ramp1: usize) -> [YuvFrame; 2] {
         let (wu, hu) = (w as usize, h as usize);
-        let tex = |i: usize, j: usize| -> u8 {
-            ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u8
+        let tex = |i: usize, j: usize| -> u16 {
+            ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u16
         };
-        let mut f0 = Yuv420Frame::filled(w, h, 128);
+        let mut f0 = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 128);
         for i in 0..hu {
             for j in 0..wu {
                 f0.y[i * wu + j] = tex(i, j);
@@ -8747,7 +8987,7 @@ mod tests {
                 dx_top * (ramp1 - i) / (ramp1 - ramp0)
             }
         };
-        let mut f1 = Yuv420Frame::filled(w, h, 128);
+        let mut f1 = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 128);
         for i in 0..hu {
             let dx = dx_of(i);
             for j in 0..wu {
@@ -8766,8 +9006,8 @@ mod tests {
     fn r419_p_search_selects_obmc_on_sheared_motion() {
         let [f0, f1] = shear_pair(64, 64, 8, 24, 48);
         let base_q_idx = 100u8;
-        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
-        let reference = GopFrameRecon {
+        let key = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameReconYuv {
             y: key.recon_y,
             u: key.recon_u,
             v: key.recon_v,
@@ -8776,9 +9016,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 64 * 64],
-            u: vec![0u8; 32 * 32],
-            v: vec![0u8; 32 * 32],
+            y: vec![0u16; 64 * 64],
+            u: vec![0u16; 32 * 32],
+            v: vec![0u16; 32 * 32],
             width: 64,
             height: 64,
             chroma_w: 32,
@@ -8789,7 +9029,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -8825,13 +9069,17 @@ mod tests {
 
         // Stream-level: the same content through the public GOP
         // driver decodes byte-exact in the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+            assert_eq!(
+                f.planes[0],
+                plane8(&enc.recon[idx].y),
+                "display {idx}: luma"
+            );
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "display {idx}: U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "display {idx}: V");
         }
     }
 
@@ -8840,18 +9088,18 @@ mod tests {
     /// affine motion field — per-block translational MVs vary
     /// linearly across the frame, the §7.10.4 neighbour samples fit
     /// the §7.11.3.8 least squares exactly).
-    fn zoom_pair(w: u32, h: u32, num: i64, den: i64) -> [Yuv420Frame; 2] {
+    fn zoom_pair(w: u32, h: u32, num: i64, den: i64) -> [YuvFrame; 2] {
         let (wu, hu) = (w as usize, h as usize);
         // Smooth wide-scale texture (sub-pel interpolable).
-        let tex = |y: i64, x: i64| -> u8 {
+        let tex = |y: i64, x: i64| -> u16 {
             let (y, x) = (y as f64 / 8.0, x as f64 / 8.0);
             let v = 96.0
                 + 60.0 * ((y * 0.11).sin() * (x * 0.13).cos())
                 + 40.0 * ((y * 0.05 + x * 0.07).sin());
-            v.clamp(0.0, 255.0) as u8
+            v.clamp(0.0, 255.0) as u16
         };
-        let mut f0 = Yuv420Frame::filled(w, h, 128);
-        let mut f1 = Yuv420Frame::filled(w, h, 128);
+        let mut f0 = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 128);
+        let mut f1 = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 128);
         let (cy, cx) = ((hu / 2) as i64, (wu / 2) as i64);
         for i in 0..hu {
             for j in 0..wu {
@@ -8876,12 +9124,12 @@ mod tests {
     fn r419_p_search_selects_warped_causal_on_zooming_motion() {
         let [f0, f1] = zoom_pair(96, 80, 17, 16);
         let base_q_idx = 100u8;
-        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let key = crate::encoder::key_frame::encode_key_frame_yuv_with_q(&f0, base_q_idx).unwrap();
         assert!(
             key.seq.enable_warped_motion,
             "r419: the sequence gate must be open for §5.11.27 arm B"
         );
-        let reference = GopFrameRecon {
+        let reference = GopFrameReconYuv {
             y: key.recon_y,
             u: key.recon_u,
             v: key.recon_v,
@@ -8891,9 +9139,9 @@ mod tests {
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; 96 * 80],
-            u: vec![0u8; 48 * 40],
-            v: vec![0u8; 48 * 40],
+            y: vec![0u16; 96 * 80],
+            u: vec![0u16; 48 * 40],
+            v: vec![0u16; 48 * 40],
             width: 96,
             height: 80,
             chroma_w: 48,
@@ -8904,7 +9152,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -8948,18 +9200,22 @@ mod tests {
 
         // Stream-level: the same content through the public GOP
         // driver decodes byte-exact in the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1], base_q_idx).unwrap();
+        let enc = encode_gop_yuv_with_q(&[f0, f1], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+            assert_eq!(
+                f.planes[0],
+                plane8(&enc.recon[idx].y),
+                "display {idx}: luma"
+            );
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "display {idx}: U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "display {idx}: V");
         }
     }
 
     /// Deterministic noise texture (xorshift over the seed).
-    fn noise_frame(w: u32, h: u32, seed: u32) -> Yuv420Frame {
+    fn noise_frame(w: u32, h: u32, seed: u32) -> YuvFrame {
         let mut state = 0x1357_9BDFu32 ^ seed;
         let mut next = move || {
             state ^= state << 13;
@@ -8967,15 +9223,15 @@ mod tests {
             state ^= state << 5;
             state
         };
-        let mut f = Yuv420Frame::filled(w, h, 0);
+        let mut f = YuvFrame::filled(w, h, 8, ChromaFormat::Yuv420, 0);
         for p in f.y.iter_mut() {
-            *p = (next() & 0xFF) as u8;
+            *p = (next() & 0xFF) as u16;
         }
         for p in f.u.iter_mut() {
-            *p = 96 + (next() & 0x3F) as u8;
+            *p = 96 + (next() & 0x3F) as u16;
         }
         for p in f.v.iter_mut() {
-            *p = 64 + (next() & 0x3F) as u8;
+            *p = 64 + (next() & 0x3F) as u16;
         }
         f
     }
@@ -9012,26 +9268,30 @@ mod tests {
     /// `[f0, f1]` through the public GOP driver, re-run the P-frame
     /// search tree with the same reference state, and return the
     /// intra-tool census plus the stream round-trip check.
-    fn p_frame_intra_tool_census(f0: &Yuv420Frame, f1: &Yuv420Frame, base_q_idx: u8) -> (u32, u32) {
-        let enc = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+    fn p_frame_intra_tool_census(f0: &YuvFrame, f1: &YuvFrame, base_q_idx: u8) -> (u32, u32) {
+        let enc = encode_gop_yuv_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
         assert_eq!(decoded.len(), 2);
         for (idx, f) in decoded.iter().enumerate() {
-            assert_eq!(f.planes[0], enc.recon[idx].y, "display {idx}: luma");
-            assert_eq!(f.planes[1], enc.recon[idx].u, "display {idx}: U");
-            assert_eq!(f.planes[2], enc.recon[idx].v, "display {idx}: V");
+            assert_eq!(
+                f.planes[0],
+                plane8(&enc.recon[idx].y),
+                "display {idx}: luma"
+            );
+            assert_eq!(f.planes[1], plane8(&enc.recon[idx].u), "display {idx}: U");
+            assert_eq!(f.planes[2], plane8(&enc.recon[idx].v), "display {idx}: V");
         }
         // Search-tree census with the identical reference state.
         let reference = enc.recon[0].clone();
         let (w, h) = (f0.width, f0.height);
-        let key = encode_key_frame_yuv420_with_q(f0, base_q_idx).unwrap();
+        let key = crate::encoder::key_frame::encode_key_frame_yuv_with_q(f0, base_q_idx).unwrap();
         let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, w, h, base_q_idx, 1, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
-            y: vec![0u8; (w * h) as usize],
-            u: vec![0u8; ((w / 2) * (h / 2)) as usize],
-            v: vec![0u8; ((w / 2) * (h / 2)) as usize],
+            y: vec![0u16; (w * h) as usize],
+            u: vec![0u16; ((w / 2) * (h / 2)) as usize],
+            v: vec![0u16; ((w / 2) * (h / 2)) as usize],
             width: w as usize,
             height: h as usize,
             chroma_w: (w / 2) as usize,
@@ -9042,7 +9302,11 @@ mod tests {
             allow_screen_content_tools: true,
             allow_intrabc: false,
             qp: QuantizerParams::neutral(base_q_idx, 8),
-            bd: BlockDecodedMirror::new(),
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            num_planes: 3,
+            bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
@@ -9115,16 +9379,16 @@ mod tests {
         let f0 = noise_frame(64, 64, 40);
         // Pass 1 — static GOP: the SE-quadrant neighbours' committed
         // reconstruction.
-        let enc1 = encode_gop_yuv420_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
+        let enc1 = encode_gop_yuv_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
         let rec1 = &enc1.recon[1];
         // §7.11.2 neighbour arrays for the 32×32 TU at (32, 32) —
         // the same derivation the leaf picker runs (frame corners
         // off-screen: no above-right / below-left).
         let (above_ext, left_ext, _, _) = super::super::key_frame::build_tu_neighbours(
-            &rec1.y, 64, 64, 32, 32, 32, 32, false, false,
+            &rec1.y, 64, 64, 32, 32, 32, 32, false, false, 8,
         );
         let target = super::super::key_frame::predict_filter_intra_from_neighbours(
-            /* FILTER_D157_PRED-class ordinal = */ 2, 32, 32, &above_ext, &left_ext,
+            /* FILTER_D157_PRED-class ordinal = */ 2, 32, 32, &above_ext, &left_ext, 8,
         )
         .expect("32x32 filter-intra prediction");
         // Pass 2 — the region carries exactly that prediction.
@@ -9160,11 +9424,11 @@ mod tests {
         f0.v.fill(128);
         let mut f1 = f0.clone();
         // Fresh smooth-textured luma in the SE quadrant.
-        let tex = |i: usize, j: usize| -> u8 {
+        let tex = |i: usize, j: usize| -> u16 {
             let v = 128.0
                 + 70.0 * ((i as f64) * 0.35).sin() * ((j as f64) * 0.29).cos()
                 + 30.0 * (((i + j) as f64) * 0.11).sin();
-            v.clamp(0.0, 255.0) as u8
+            v.clamp(0.0, 255.0) as u16
         };
         for i in 0..32usize {
             for j in 0..32usize {
@@ -9193,8 +9457,8 @@ mod tests {
                     + i64::from(tex(2 * i + 1, 2 * j + 1));
                 let ac = (s - mean4) / 16; // ± a quarter of the subsampled AC
                 let cell = (16 + i) * 32 + 16 + j;
-                f1.u[cell] = (128 + ac).clamp(0, 255) as u8;
-                f1.v[cell] = (128 - ac).clamp(0, 255) as u8;
+                f1.u[cell] = (128 + ac).clamp(0, 255) as u16;
+                f1.v[cell] = (128 - ac).clamp(0, 255) as u16;
             }
         }
         let (_, cfl) = p_frame_intra_tool_census(&f0, &f1, base_q_idx);
@@ -9220,22 +9484,34 @@ mod tests {
     /// external validation / fixture staging.
     #[test]
     fn r419_motion_mode_and_intra_tool_fixture_streams() {
-        let dump = |name: &str, enc: &EncodedGop| {
+        let dump = |name: &str, enc: &EncodedGopYuv| {
             let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
             assert_eq!(decoded.len(), enc.recon.len(), "{name}");
             for (idx, f) in decoded.iter().enumerate() {
-                assert_eq!(f.planes[0], enc.recon[idx].y, "{name} display {idx}: luma");
-                assert_eq!(f.planes[1], enc.recon[idx].u, "{name} display {idx}: U");
-                assert_eq!(f.planes[2], enc.recon[idx].v, "{name} display {idx}: V");
+                assert_eq!(
+                    f.planes[0],
+                    plane8(&enc.recon[idx].y),
+                    "{name} display {idx}: luma"
+                );
+                assert_eq!(
+                    f.planes[1],
+                    plane8(&enc.recon[idx].u),
+                    "{name} display {idx}: U"
+                );
+                assert_eq!(
+                    f.planes[2],
+                    plane8(&enc.recon[idx].v),
+                    "{name} display {idx}: V"
+                );
             }
             if let Ok(dir) = std::env::var("OXIDEAV_AV1_R419_FIXDIR") {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(format!("{dir}/{name}.ivf"), &enc.ivf_bytes).unwrap();
                 let mut yuv = Vec::new();
                 for rc in &enc.recon {
-                    yuv.extend_from_slice(&rc.y);
-                    yuv.extend_from_slice(&rc.u);
-                    yuv.extend_from_slice(&rc.v);
+                    yuv.extend_from_slice(&plane8(&rc.y));
+                    yuv.extend_from_slice(&plane8(&rc.u));
+                    yuv.extend_from_slice(&plane8(&rc.v));
                 }
                 std::fs::write(format!("{dir}/{name}.yuv"), &yuv).unwrap();
             }
@@ -9245,12 +9521,12 @@ mod tests {
         // OBMC witness content family — per-row shift ramp 24..48,
         // dx_top = 4k). ---
         {
-            let tex = |i: usize, j: usize| -> u8 {
-                ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u8
+            let tex = |i: usize, j: usize| -> u16 {
+                ((i * 7 + j * 11 + (i / 4) * (j / 8) + ((i * j) / 13)) % 256) as u16
             };
-            let frames: Vec<Yuv420Frame> = (0..3)
+            let frames: Vec<YuvFrame> = (0..3)
                 .map(|k| {
-                    let mut f = Yuv420Frame::filled(64, 64, 128);
+                    let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 128);
                     for i in 0..64usize {
                         let (ramp0, ramp1, top) = (24usize, 48usize, 4 * k);
                         let dx = if i < ramp0 {
@@ -9267,7 +9543,7 @@ mod tests {
                     f
                 })
                 .collect();
-            let enc = encode_gop_yuv420_with_q(&frames, 100).unwrap();
+            let enc = encode_gop_yuv_with_q(&frames, 100).unwrap();
             dump("self-gop-64x64-q100-shear-obmc", &enc);
         }
 
@@ -9275,7 +9551,7 @@ mod tests {
         // WARPED_CAUSAL witness content itself). ---
         {
             let [f0, f1] = zoom_pair(96, 80, 17, 16);
-            let enc = encode_gop_yuv420_with_q(&[f0, f1], 100).unwrap();
+            let enc = encode_gop_yuv_with_q(&[f0, f1], 100).unwrap();
             dump("self-gop-96x80-q100-zoom-warp", &enc);
         }
 
@@ -9289,13 +9565,13 @@ mod tests {
             f0.v.fill(128);
             // FI frame: SE quadrant = the §7.11.2.3 prediction of its
             // own decode-time neighbours (static pass 1).
-            let enc1 = encode_gop_yuv420_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
+            let enc1 = encode_gop_yuv_with_q(&[f0.clone(), f0.clone()], base_q_idx).unwrap();
             let rec1 = &enc1.recon[1];
             let (above_ext, left_ext, _, _) = super::super::key_frame::build_tu_neighbours(
-                &rec1.y, 64, 64, 32, 32, 32, 32, false, false,
+                &rec1.y, 64, 64, 32, 32, 32, 32, false, false, 8,
             );
             let target = super::super::key_frame::predict_filter_intra_from_neighbours(
-                2, 32, 32, &above_ext, &left_ext,
+                2, 32, 32, &above_ext, &left_ext, 8,
             )
             .expect("32x32 filter-intra prediction");
             let mut f1 = f0.clone();
@@ -9306,11 +9582,11 @@ mod tests {
             }
             // CfL frame: SE quadrant = smooth texture with
             // luma-tracking chroma at the (2, −2) grid point.
-            let tex = |i: usize, j: usize| -> u8 {
+            let tex = |i: usize, j: usize| -> u16 {
                 let v = 128.0
                     + 70.0 * ((i as f64) * 0.35).sin() * ((j as f64) * 0.29).cos()
                     + 30.0 * (((i + j) as f64) * 0.11).sin();
-                v.clamp(0.0, 255.0) as u8
+                v.clamp(0.0, 255.0) as u16
             };
             let mut f2 = f1.clone();
             for i in 0..32usize {
@@ -9336,11 +9612,11 @@ mod tests {
                         + i64::from(tex(2 * i + 1, 2 * j + 1));
                     let ac = (s - mean4) / 16;
                     let cell = (16 + i) * 32 + 16 + j;
-                    f2.u[cell] = (128 + ac).clamp(0, 255) as u8;
-                    f2.v[cell] = (128 - ac).clamp(0, 255) as u8;
+                    f2.u[cell] = (128 + ac).clamp(0, 255) as u16;
+                    f2.v[cell] = (128 - ac).clamp(0, 255) as u16;
                 }
             }
-            let enc = encode_gop_yuv420_with_q(&[f0, f1, f2], base_q_idx).unwrap();
+            let enc = encode_gop_yuv_with_q(&[f0, f1, f2], base_q_idx).unwrap();
             dump("self-gop-64x64-q60-fi-cfl", &enc);
         }
     }

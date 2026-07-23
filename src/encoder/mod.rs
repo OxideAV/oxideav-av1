@@ -299,6 +299,8 @@ pub mod tile_group_obu;
 #[doc(hidden)]
 pub mod transform_tree;
 
+pub mod yuv_frame;
+
 #[doc(hidden)]
 pub use bitwriter::BitWriter;
 #[doc(hidden)]
@@ -341,6 +343,7 @@ pub use frame_obu::write_frame_header_obu;
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model;
 #[doc(hidden)]
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model_gm;
+pub use inter_frame::{encode_gop_yuv, encode_gop_yuv_with_q, EncodedGopYuv, GopFrameReconYuv};
 pub use inter_frame::{
     encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_lossless_regions,
     encode_gop_yuv420_with_q_seg, EncodedGop, GopFrameRecon, LosslessRegion, GOP_MAX_FRAMES,
@@ -350,6 +353,8 @@ pub use inter_frame::{
     encode_gop_yuv420_with_q_seg_extras_tuned, encode_gop_yuv420_with_q_seg_lossless_tuned,
     encode_gop_yuv420_with_q_seg_tuned, GopTuning, SegExtras, TunedGop,
 };
+#[doc(hidden)]
+pub use inter_frame::{encode_gop_yuv_seg_extras_tuned, TunedGopYuv};
 #[doc(hidden)]
 pub use inter_predict::{
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,
@@ -361,6 +366,7 @@ pub use inter_predict::{
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
 #[doc(hidden)]
 pub use key_frame::encode_key_frame_yuv420_with_q_rate_model;
+pub use key_frame::{encode_key_frame_yuv, encode_key_frame_yuv_with_q, EncodedKeyFrameYuv};
 pub use key_frame::{
     encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
 };
@@ -406,12 +412,18 @@ pub use pyramid_gop::encode_pyramid_gop_yuv420_with_q_rate_model;
 pub use pyramid_gop::{
     encode_adaptive_gop_yuv420_with_q, encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q,
 };
+pub use pyramid_gop::{encode_adaptive_gop_yuv_with_q, encode_pyramid_gop_yuv_with_q};
 // r424 — deep-pyramid / adaptive-mini-GOP tuning surfaces, exposed
 // (hidden) for the measurement harnesses.
 #[doc(hidden)]
 pub use pyramid_gop::{
     encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
     AdaptiveTuning, PyramidTuning, TunedAdaptiveGop, TunedPyramidGop,
+};
+#[doc(hidden)]
+pub use pyramid_gop::{
+    encode_adaptive_gop_yuv_with_q_tuned, encode_pyramid_gop_yuv_with_q_tuned, TunedAdaptiveGopYuv,
+    TunedPyramidGopYuv,
 };
 #[doc(hidden)]
 pub use rate_twin::RateModel;
@@ -428,3 +440,7 @@ pub use tile_group_obu::{
 };
 #[doc(hidden)]
 pub use transform_tree::{write_block_tx_size, write_var_tx_size, VarTxNode, VarTxNodeKind};
+
+pub use yuv_frame::{
+    build_intra_only_seq_yuv, color_config_for, elect_seq_profile, ChromaFormat, YuvFrame,
+};
