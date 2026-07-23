@@ -9281,3 +9281,60 @@ fn self_encoded_delta_q_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r428 self-encoded CDEF fixture — the corpus's first self-encoded
+// stream with the sequence enable_cdef gate OPEN and non-zero elected
+// §5.9.19 strengths: the decoder must run the full §7.15 pipeline
+// (direction search, primary/secondary taps, constrain at the coded
+// damping) over the §5.11.56 cdef_idx anchors and the 8x8 skip
+// conjunction, with P-frames motion-compensating against the filtered
+// §7.20 store.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_96X80_Q140_CDEF_IVF: &str = concat!(
+    "444b4946000020004156303160005000190000000100000004000000000000006a0200000000",
+    "00000000000012000a0a0000000335f9e5dfc80232d9041600246000001025f0d61c3154299e",
+    "44c8820b01956aa37dd53a9255fa431af4b65137f93ef34c5f3d7dfc12a1547439bae190277a",
+    "7a33022c0aafd3c3483b0d595f0274cd8742267c13b8ca8ed040ab72b68cf08c3753d87fdbf6",
+    "394ec45cd1ae48dd3173b34e228ecd989fcd4e0f561831b8432a6478d8e495c36a31f5c4935c",
+    "a06622db5195b273b8dab169c549879d7bf223b989160713d54bed525a42a25364ac349bf87f",
+    "25c696a478bc2b9b2916cc9ba3fb74240dcacea9b79adefc7bc03bd89e7e6d811eaa6175beae",
+    "8a4e62709aad63c2bd109a9d8f544714329367efc8ce8017827ddab9e8536e5a3900ef7408a7",
+    "d7b26d5b383835eda3b77aa6412353ce435f9a425e5cf70d69f5d9e3b692e33faeeffa83c6d7",
+    "921c3eda1e20d6f3be55d8520f88ae888a61416b4007d6653f5b20f1df2355e54125cfeee9ff",
+    "e8b6e6a538117f1d3b9f0c72f78414909946c994bff53475f4f4852be71ac1dbe83296cec82a",
+    "10f1a8e62d7a9969ea9f994e38bed8cfe0dd301b69db74b51ff6e726f83f60cad42c1dc191f5",
+    "12b103bdadc379abbdf2c155aa4818646f3e4fd084ddbf704191a04b4a3abcf5ff7967954be6",
+    "8b3f91021319fc8baef55c0a83a7045c453b63d4224265cf15975665c609548419fe3817ad9d",
+    "c7f7ba4fa9c53d7fce904ef8f513b974067ea106d1fca2eee6e543b3af8c83a62316c7b99c41",
+    "0b814dbc8191a262dc87963e0d0a328889bc910a85dfeb010d0ea7d68c033c74443afca96fa7",
+    "014586f718206d3f16154843b561fa2565260ff50a1a255bd19171ad18c9f65eae000e33bf4e",
+    "cd8b28d4d4907aa0d8f3b4b11f0d58206d000000010000000000000012003269320100224824",
+    "bd230000008f33e000de3bf7fdb896581bb8eecfa5a4c0c20854e4bd86e1d943430dd973d7ca",
+    "cfd37b01af3f70cca2ddbb6ec37ed94e4956c33ee5ffd24d83a3c1200163a4b565a871ecc367",
+    "5c457562918828e6f1a1fb7fa8189cf4df0bad1c8ca2086d0000000200000000000000120032",
+    "693202004001003d230000000000f000dd9320a1c4bc9d40102e8a66f6b4dfac6e242d82ab8f",
+    "c859195cea9c057acc0b39bc218c51a505c4ce5e99646f4fcc80fa36f0d403af9c9055e9473d",
+    "6f2522d1b320999ea810199e95d5681f62e3c039049b5892808723e3b4305700000003000000",
+    "00000000120032533203002248249d230000000000f000d8b6945a3230c2f944ccc485c3f567",
+    "f99ef0ddd68d6c58a04a7eeb75b6b194464897527034726b67d419f1b4d6168c388fe6bbff86",
+    "63966258021c92ec5f3f31d8fc3320",
+);
+
+/// r428: the corpus's first self-encoded **CDEF-filtered** stream —
+/// sequence `enable_cdef = 1`, coded §5.9.19 strengths elected per
+/// frame by the encoder's source-scored search, §7.15 applied on the
+/// reconstruction path so the reference feedback is filtered. Digest
+/// = byte-identical output of THREE independent black-box reference
+/// decoders (notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q140-cdef/`).
+#[test]
+fn self_encoded_cdef_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q140-cdef",
+        SELF_GOP_96X80_Q140_CDEF_IVF,
+        "920b04a2ac49bd856d3e9327b4d392d741fde1eacc9c4e00a371035dd4e121ce",
+        4,
+    );
+}
