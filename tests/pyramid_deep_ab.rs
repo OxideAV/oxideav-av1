@@ -163,6 +163,9 @@ fn baseline_tuning() -> PyramidTuning {
         max_mini_gop: 4,
         layer_q_offsets: false,
         primary_ref: false,
+        // r428 — both A/B arms ride the same MV-precision arm so the
+        // pyramid-depth axis stays the only variable.
+        high_precision_mv: true,
     }
 }
 

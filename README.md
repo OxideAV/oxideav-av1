@@ -926,6 +926,24 @@ the estimator packed x-first for every class, so TRANSLATION
 GLOBALMV predictions ran on a swapped vector (conformant, never
 elected).
 
+### High-precision MVs: the eighth-pel arm (r428)
+
+r428 opens encoder-election ladder item 1. Every conformance-grade
+inter driver arms §5.9.2 `allow_high_precision_mv`: the sub-pel
+refinement adds an eighth-pel (±1 in 1/8-luma units) pass through
+the real §7.11.3.4 kernels, the §7.10.2 stacks run the §7.10.2.10
+no-op precision arm, and every §5.11.32 difference component codes
+the `mv_hp` cascade at exact twin-priced bits. The header flag is
+elected per frame by EXACT realized bits: the committed trees replay
+under the quarter-pel arm (self-validating — an odd committed
+component or a rounded-away derivation errors the replay out) and
+the smaller tile wins, with ties preferring the conservative
+quarter-pel wire shape. Measured on the 18-config A/B sweep
+(`tests/hp_mv_ab.rs`): **−1.1% bytes at +0.33 dB mean** vs the
+quarter-pel baseline. Pinned: `self-gop-96x80-q60-hpmv` — the
+corpus's first `allow_high_precision_mv = 1` stream, byte-identical
+through three independent black-box reference decoders (corpus 106).
+
 ### Not yet supported
 
 - The historical intra `encode_av1` mirror paths emit non-conformant

@@ -133,6 +133,12 @@ pub struct PyramidTuning {
     /// election through the pyramid. `false` keeps `PRIMARY_REF_NONE`
     /// per-frame default state on every frame (the r423 baseline).
     pub primary_ref: bool,
+    /// r428 — §5.9.2 `allow_high_precision_mv` arm: eighth-pel MV
+    /// search + wire precision, with the per-frame exact-bytes
+    /// replay election back to the quarter-pel arm. `false` keeps
+    /// the pre-r428 quarter-pel shape on every frame (the A/B
+    /// baseline).
+    pub high_precision_mv: bool,
 }
 
 impl Default for PyramidTuning {
@@ -142,6 +148,7 @@ impl Default for PyramidTuning {
             max_mini_gop: 16,
             layer_q_offsets: true,
             primary_ref: true,
+            high_precision_mv: true,
         }
     }
 }
@@ -527,6 +534,7 @@ impl PyramidSession {
                         exact_mask: None,
                         auto_lossless: false,
                         seg_extras: None,
+                        high_precision_mv: self.tuning.high_precision_mv,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(

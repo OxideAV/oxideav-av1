@@ -152,6 +152,9 @@ pub struct TunedGopYuv {
     pub gop: EncodedGopYuv,
     pub seg_temporal_updates: Vec<bool>,
     pub p_segment_maps: Vec<Vec<i32>>,
+    /// r428 — each P-frame's elected §5.9.2 `allow_high_precision_mv`
+    /// header flag (index 0 is the first P-frame).
+    pub hp_mv_elections: Vec<bool>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -186,6 +189,9 @@ pub struct TunedGop {
     /// locate the per-segment-lossless blocks without re-deriving the
     /// election.
     pub p_segment_maps: Vec<Vec<i32>>,
+    /// r428 — each P-frame's elected §5.9.2 `allow_high_precision_mv`
+    /// header flag (index 0 is the first P-frame).
+    pub hp_mv_elections: Vec<bool>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -277,6 +283,10 @@ pub(crate) struct RefSlotCarry {
 pub(crate) struct InterFrameAux {
     pub(crate) seg_temporal: bool,
     pub(crate) primary_ref: u8,
+    /// r428 — the elected §5.9.2 `allow_high_precision_mv` header
+    /// flag (the eighth-pel search arm may still be flipped back to
+    /// quarter-pel by the exact-bytes replay election).
+    pub(crate) hp_mv: bool,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -524,6 +534,12 @@ pub struct GopTuning {
     /// Inert while `primary_ref` is off (the temporal arm requires
     /// real `PrevSegmentIds` state).
     pub temporal_seg: bool,
+    /// r428 — §5.9.2 `allow_high_precision_mv` arm: eighth-pel MV
+    /// search + wire precision, with the per-frame exact-bytes
+    /// replay election back to the quarter-pel arm. `false` keeps
+    /// the pre-r428 quarter-pel shape on every frame (the A/B
+    /// baseline).
+    pub high_precision_mv: bool,
 }
 
 impl Default for GopTuning {
@@ -533,6 +549,7 @@ impl Default for GopTuning {
             global_motion: true,
             primary_ref: true,
             temporal_seg: true,
+            high_precision_mv: true,
         }
     }
 }
@@ -704,6 +721,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         gop: narrow_gop_8bit(t.gop),
         seg_temporal_updates: t.seg_temporal_updates,
         p_segment_maps: t.p_segment_maps,
+        hp_mv_elections: t.hp_mv_elections,
     })
 }
 
@@ -851,6 +869,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         core::array::from_fn(|_| key_carry.clone());
     let mut seg_temporal_updates: Vec<bool> = Vec::new();
     let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
+    let mut hp_mv_elections: Vec<bool> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -879,10 +898,12 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             exact_mask.as_deref(),
             auto_detect,
             extras,
+            tuning.high_precision_mv,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
         seg_temporal_updates.push(aux.seg_temporal);
+        hp_mv_elections.push(aux.hp_mv);
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
@@ -914,6 +935,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         },
         seg_temporal_updates,
         p_segment_maps,
+        hp_mv_elections,
     })
 }
 
@@ -1025,6 +1047,15 @@ pub(crate) struct InterFrameConfig<'a> {
     /// segment. `Some` requires a non-empty `alt_q` table (the
     /// segmentation-enabled carrier) and flips `SegIdPreSkip` to 1.
     pub seg_extras: Option<&'a SegExtras>,
+    /// r428 — §5.9.2 `allow_high_precision_mv` arm: `true` searches
+    /// and writes under eighth-pel MV precision (the sub-pel
+    /// refinement adds a ±1-in-1/8-units pass and every §5.11.32 MV
+    /// difference codes the `mv_hp` cascade), then the per-frame
+    /// exact-bytes election below may still flip the header flag to
+    /// the quarter-pel arm when the identical committed trees replay
+    /// smaller. `false` keeps the pre-r428 quarter-pel search + wire
+    /// shape unconditionally (the A/B baseline).
+    pub high_precision_mv: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1101,7 +1132,11 @@ fn build_inter_frame_fh(
         last_frame_idx: None,
         gold_frame_idx: None,
         ref_frame_idx: cfg.ref_frame_idx,
-        allow_high_precision_mv: false,
+        // r428 — the eighth-pel arm (§5.9.2; force_integer_mv is 0 on
+        // every header this builder emits, so the f(1) is always
+        // coded). The per-frame exact-bytes election may flip this
+        // back to 0 after the tile is priced.
+        allow_high_precision_mv: cfg.high_precision_mv,
         interpolation_filter: InterpolationFilter::Switchable,
         // r419: §5.9.2 `is_motion_mode_switchable = 1` — every
         // §5.11.27-eligible leaf codes the `use_obmc` /
@@ -1294,6 +1329,7 @@ fn p_frame_config_primary<'a>(
         exact_mask: None,
         auto_lossless: false,
         seg_extras: None,
+        high_precision_mv: true,
     }
 }
 
@@ -1338,6 +1374,7 @@ fn encode_p_frame_yuv(
     exact_mask: Option<&[bool]>,
     auto_lossless: bool,
     seg_extras: Option<&SegExtras>,
+    high_precision_mv: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1353,6 +1390,7 @@ fn encode_p_frame_yuv(
     cfg.exact_mask = exact_mask;
     cfg.auto_lossless = auto_lossless;
     cfg.seg_extras = seg_extras;
+    cfg.high_precision_mv = high_precision_mv;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -1479,6 +1517,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let mut ip = SyntaxInterFrameParams::single_ref_baseline(
         mi_rows, mi_cols, /* force_integer_mv = */ false,
     );
+    // r428 — §5.9.2 `allow_high_precision_mv`: the search mirror, the
+    // §7.10.2 stack derivations (`lower_mv_precision` becomes a
+    // no-op) and the §5.11.32 `mv_hp` write cascade all key off this.
+    ip.allow_high_precision_mv = cfg.high_precision_mv;
     // r412: SWITCHABLE frame filter — each inter leaf RD-selects its
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
@@ -1678,7 +1720,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             .len()
             .saturating_sub(1)
             .max(if x.any() { x.top_segment() } else { 0 }) as u8;
-    let params = SyntaxFrameParams {
+    let mut params = SyntaxFrameParams {
         subsampling_x: ssx,
         subsampling_y: ssy,
         num_planes,
@@ -1856,6 +1898,88 @@ pub(crate) fn encode_inter_frame_generic_gm(
         trees.push(tree);
     }
     let mut tile_bytes = writer.finish();
+
+    // r428 — §5.9.2 `allow_high_precision_mv` election by EXACT
+    // realized bits: the main pass searched and wrote under the
+    // eighth-pel arm; replay the identical committed trees under the
+    // quarter-pel arm from the same §8.3.1 frame-start CDF state and
+    // keep whichever tile is smaller. The replay self-validates: the
+    // write pass re-derives every §7.10.2 stack under the coarser
+    // arm's §7.10.2.10 `lower_mv_precision`, and any committed leaf
+    // the quarter-pel arm cannot reproduce bit-exactly (an odd
+    // component in a §5.11.32 difference, a NEAREST/NEAR/GLOBAL
+    // derivation that rounds away from the committed vector) errors
+    // the replay writer out — the frame then keeps the eighth-pel
+    // arm. A successful replay decodes to the SAME reconstruction
+    // (the trees carry every mode / vector / coefficient), so the
+    // election is purely rate; the header cost is arm-invariant (one
+    // f(1) either way). Frames carrying a non-IDENTITY §5.9.24 model
+    // skip the replay: a TRANSLATION model's §5.9.24 grid
+    // quantization is precision-dependent (the coarser header could
+    // not code the elected parameters verbatim), and the
+    // ROTZOOM/AFFINE §7.10.2.1 GlobalMvs derivation rounds
+    // differently across the arms — the elected models were fitted
+    // and validated on the eighth-pel arm.
+    let mut hp_elected = cfg.high_precision_mv;
+    let gm_all_identity = params
+        .inter
+        .as_ref()
+        .is_some_and(|i| (1..=7).all(|r| i.gm_type[r] == 0));
+    if cfg.high_precision_mv && gm_all_identity {
+        let mut alt_ip = params.inter.clone().ok_or(Error::PartitionWalkOutOfRange)?;
+        alt_ip.allow_high_precision_mv = false;
+        let mut alt_params = params.clone();
+        alt_params.inter = Some(alt_ip);
+        let replay = (|| -> Result<(Vec<u8>, TileCdfContext, PartitionSyntaxWriter), Error> {
+            let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
+            let mut alt_cdfs = frame_start_cdfs.as_ref().clone();
+            let mut alt_state = PartitionSyntaxWriter::new(
+                mi_rows,
+                mi_cols,
+                TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: mi_rows,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols,
+                },
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
+                alt_state.arm_read_deltas();
+                write_partition_tree_syntax(
+                    &mut alt_writer,
+                    &mut alt_cdfs,
+                    &mut alt_state,
+                    tree,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &alt_params,
+                )?;
+            }
+            Ok((alt_writer.finish(), alt_cdfs, alt_state))
+        })();
+        if let Ok((alt_bytes, alt_cdfs, alt_state)) = replay {
+            // `<=`: on an exact byte tie (no `mv_hp` cascade was ever
+            // coded and every derivation matched) prefer the
+            // quarter-pel arm — the conservative wire shape, and the
+            // bit-identical-to-baseline outcome the A/B control
+            // expects.
+            if alt_bytes.len() <= tile_bytes.len() {
+                hp_elected = false;
+                tile_bytes = alt_bytes;
+                cdfs = alt_cdfs;
+                state = alt_state;
+                // The later elections (temporal segment arm, primary
+                // reference) replay under the ELECTED precision arm,
+                // and the header codes it.
+                params.inter = alt_params.inter;
+                if let Some(ir) = fh.inter_refs.as_mut() {
+                    ir.allow_high_precision_mv = false;
+                }
+            }
+        }
+    }
 
     // r423 — §5.9.14 `segmentation_temporal_update` election by EXACT
     // realized bits: the main pass searched and wrote under the
@@ -2139,6 +2263,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         InterFrameAux {
             seg_temporal: seg_temporal_elected,
             primary_ref: fh.primary_ref_frame,
+            hp_mv: hp_elected,
         },
     ))
 }
@@ -3454,8 +3579,10 @@ fn motion_search_luma(
 
 /// Sub-pel MV refinement through the decoder's §7.11.3 leaf driver:
 /// a half-pel pass (±4 in 1/8 units) then a quarter-pel pass (±2)
-/// around the running best, scoring each candidate by luma SSD over
-/// the kernel's actual prediction plus a small magnitude bias.
+/// around the running best — plus, on the r428
+/// `allow_high_precision_mv` arm, an eighth-pel pass (±1) — scoring
+/// each candidate by luma SSD over the kernel's actual prediction
+/// plus a small magnitude bias.
 #[allow(clippy::too_many_arguments)]
 fn refine_mv_subpel(
     input: &YuvFrame,
@@ -3495,7 +3622,15 @@ fn refine_mv_subpel(
         Ok(ssd + ((mv[0].unsigned_abs() + mv[1].unsigned_abs()) as u64) * (bw.max(bh) as u64) / 8)
     };
     let mut best = (score(ictx, mv_int)?, mv_int);
-    for step in [4i32, 2] {
+    // §5.9.2: quarter-pel components are multiples of 2 in 1/8-luma
+    // units; the eighth-pel pass is reachable only under
+    // `allow_high_precision_mv = 1`.
+    let steps: &[i32] = if ictx.ip.allow_high_precision_mv {
+        &[4, 2, 1]
+    } else {
+        &[4, 2]
+    };
+    for &step in steps {
         let center = best.1;
         for dy in [-step, 0, step] {
             for dx in [-step, 0, step] {
@@ -7333,6 +7468,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
