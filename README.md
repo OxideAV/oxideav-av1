@@ -372,7 +372,7 @@ historical mirror drivers stay on the crate-public `encoder::*`
 entries. Streams outside the supported scope return a typed `Error`
 (commonly `Error::PartitionWalkOutOfRange`).
 
-### Conformance-grade encoding (r409, generalised r410)
+### Conformance-grade encoding (r409, generalised r410; every §6.4.1 format pairing r427)
 
 `encoder::encode_key_frame_yuv420{,_with_q}` is the
 **conformance-grade** encode path: it emits real §5.11 keyframe syntax
@@ -380,7 +380,22 @@ through the spec-faithful write side (§5.11.7 `intra_frame_mode_info`
 with the neighbour-CDF `intra_frame_y_mode`, §5.11.22 `uv_mode` +
 §5.11.45 CFL alphas, §5.11.34 per-TU residual with live §8.3.2
 contexts), assembled as IVF → TD + SH + the combined §5.10 `OBU_FRAME`.
-Scope (r410): 8-bit 4:2:0, dims multiples of 8 in [8, 4096] per axis
+r427: the general-format siblings `encoder::encode_key_frame_yuv{,_with_q}`,
+`encode_gop_yuv{,_with_q}`, `encode_pyramid_gop_yuv_with_q` and
+`encode_adaptive_gop_yuv_with_q` take a `YuvFrame` (`u16` planes +
+`bit_depth` + `ChromaFormat`) at **every §6.4.1 (bit depth, chroma
+format) pairing** — 8/10/12-bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome —
+with per-pairing §6.4.1 `seq_profile` election and §5.5.2
+`color_config` synthesis; the whole encoder pixel pipeline (recon,
+reference stores, motion search, CfL, quantiser rows, λ) runs at the
+stream depth, the §5.11.38 4:2:2 partition-admissibility rule gates
+the RD ladders, and the historical 8-bit 4:2:0 entries route through
+the same core byte-identically. 12/12 pairings round-trip KEY + inter
+through the in-tree spec driver; the 24-stream matrix (one KEY + one
+GOP per pairing) decodes byte-identical in three independent
+black-box reference decoders (72/72), and the 22 non-8-bit-4:2:0
+streams are pinned in the conformance corpus.
+Scope (r410): dims multiples of 8 in [8, 4096] per axis
 (multi-superblock beyond 64), **full square partition-tree RD search**
 — every in-frame node from BLOCK_64X64 down to BLOCK_8X8 trial-encoded
 leaf-vs-split with region/state snapshot-restore (frame-edge nodes take
