@@ -9212,3 +9212,72 @@ fn self_encoded_hp_mv_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r428 self-encoded delta-q fixture — the corpus's first stream coding
+// §5.9.17 delta_q_present = 1 with live §5.11.13 delta_q_abs symbols:
+// an absolute per-superblock CurrentQIndex plan (flats refine, texture
+// coarsens) over the §5.11.2 per-superblock lifecycle, produced by the
+// conformance-grade GOP encoder on mixed flat-ramp/panning-texture
+// content.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X128_Q100_DELTAQ_IVF: &str = concat!(
+    "444b494600002000415630318000800019000000010000000400000000000000490400000000",
+    "00000000000012000a0a0000000337ffe5dfc00232b80816002320000010d6230207266d7622",
+    "934477e9786f843163c4bff922a2c3be210d94abbf561ba2678646c4a5dd93df01b50c4a83ae",
+    "8680b0f7a8814d30f36bde43e319bd924bc287ecbf1a9061bb9f88f1b1f658df60bbe264ceb4",
+    "5864f9debf8864083ccc0e9aa0dc2f55298ee38061f1e04135f9237107634d1d775e436cb470",
+    "e6bee36aca1493bb5fba0ab82462105c8ae5c7c4985e42437b6a311c16f77c4c078dc70e3217",
+    "1a0283c0f24b4330327d12af03f0b0e40638c26476ce28099132a8789151314d635de3e1988b",
+    "95c4c69334fa4e1061e0fb86487f12e0f3bf29b89cb83674ca3be32033f2aa70f99bf4720182",
+    "5656b0cab7f629152f56f5054b5e63372b7041cd09790a747bd9236aa39842cfb0b9535be975",
+    "853f3a257a472b51c03081cbe933dae39f915769de7687cb9bf708d33384cecd1c589668f382",
+    "5516a495b9eb171096f0a5b5e74c4b5e7abb6833accf909c17db22c3b82e00e9f84d9974a08d",
+    "63620df738a65f302372047ddffccdc0cd09165210b76ad8548a51663a61befa99161e754ee8",
+    "cc3658268aee6fcdf65c1ec62babb79399936bd0f24a584210ea9ebaa22885931239466680f7",
+    "75314a53cc99f5bea80eee5c347917b8329e1caa677330aa304a82152cdeb30eef4f675df234",
+    "5c25476e74a5e10e66bba3b59b5c5409d813853d018c701895080a9147e6ee21009fd42a6e80",
+    "37c4661b2405391258a7b27cfe6e6c0c0a80c54d0982aea1a34344815d8bf21f2e12f424f5bb",
+    "b8a782df2a3f46b22bfefce7e43357f0e90045097b05a305404e762ae456c719ff53d80bbcd9",
+    "c9bb39696831a60ae80095df4f2a3f251ab16bbc5ffe2e4090c194ee1ace4a8fbc69c6075072",
+    "6062c5a4de5d40e108addc95bdc44f444c04bca151b9c738f5da0df361ce17eb06fec851f058",
+    "481a8b2f402084e9712584e27e773eca15f66e0535302a27bd1b5a31320c89590baa4b8cbbe4",
+    "30397974ed00e10aaac099b6f8e1b5201c69aba1342f9cfdd60c7dbb1cc7b593a0c2c8c5799d",
+    "5c1c4dcba40404babf2d4cc043359a2ca32369dca350ba1c9967ada6ed4d0ef0033c4a3b7ce1",
+    "299cc99c17bd34531e201b6d22857841ba7099137139b7da95a8a44796abfed9cdfa39c80775",
+    "2e5b9e01b6044d6a4a7eb76308cb14426d38cb969a010f8003ebd959c3d3129d949a5fd39fb4",
+    "1bf9d2ae6b47a0b2abf953521b0274b0ea7b96a4012ce215a20b970bdef87ef6fa63182eaac3",
+    "9f7e3f82b8efbd595cb03cd04c17949f3d98bfc71a186300b5aa2821e1564284ceda8f3390d5",
+    "25d8115bdedca4baeacd1a4212ccf5a620338d03b5e06e61759a7cccd364c0a7506d3c66461a",
+    "8a0f8311ce1eb74d4ab1738c52eebb83089e172c804d029721d03a12e03428a6edb47e052dcc",
+    "0155ab9dce1715b94c0a9a935b7ffbd1823534f7ce8ffbfb583eef5254c6a45a29871df4a980",
+    "b35f6026f69ed30733ff8791baf6e22256fd390b8cd54e996840fb3a91311764a1b256baf43b",
+    "db6d000000010000000000000012003269320100224824bd1901c0001c00c97898856a52c17c",
+    "1406e041e1d2f5d6a4b1b5f0fc954fc29caf39bbe3ed88a9ab0582fea8f97f8ebd5ebc64c3c1",
+    "9933c6f6e395ed39f22aedb7bd1a21b9b6ac86971ad93696fd1ef022d4a7a430a460a81c41e8",
+    "16779912022085d0640000000200000000000000120032603202004001003d1901c0001e00fe",
+    "7377e195e48c3efef249f760802daa8042d64c490dac6f55bb3813f5c276dff71df1f06fad93",
+    "e8d6f98e11900bed7a65d1dc62616ca8500e4cfc3086a4853713891167ba9a1110e9a3f235ce",
+    "7cdaacb8425f4e00000003000000000000001200324a320300224824bd1901c0001e00823dad",
+    "cffde5c7ce3686394fbe349b2c5f138a574a6d6eeac889dab98da14a63d5a06c2db8d50190f1",
+    "61a2238c6435d187611128d80af040515be4fad0",
+);
+
+/// r428: the corpus's first **per-superblock delta-q** stream —
+/// §5.9.17 `delta_q_present = 1` / `delta_q_res = 3` headers,
+/// §5.11.13 `delta_q_abs` symbols on each superblock's first coded
+/// block (relative running `CurrentQIndex`), §7.12.2 dequant on the
+/// `delta_q_present` arm, and the superblock-skip short-circuit.
+/// Digest = byte-identical output of THREE independent black-box
+/// reference decoders (notes under
+/// `docs/video/av1/fixtures/self-gop-128x128-q100-deltaq/`).
+#[test]
+fn self_encoded_delta_q_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x128-q100-deltaq",
+        SELF_GOP_128X128_Q100_DELTAQ_IVF,
+        "fad0de51bc1c327e5d930c9fbbb489171e01845bcb7e6672d422a38e54ef16b4",
+        4,
+    );
+}
