@@ -9160,3 +9160,55 @@ fn self_encoded_format_matrix_streams_decode_byte_exact() {
         assert_decodes_to_digest(name, ivf_hex, digest, frames);
     }
 }
+
+// ---------------------------------------------------------------------
+// r428 self-encoded high-precision-MV fixture — the corpus's first
+// stream coding §5.9.2 `allow_high_precision_mv = 1` (eighth-pel
+// motion vectors: the §5.11.32 `mv_hp` cascade on every difference
+// component and the §7.10.2.10 no-op precision arm through the
+// candidate stack), produced by the conformance-grade GOP encoder on
+// a +3/8 / +1/8 pel-per-frame pan.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_96X80_Q60_HPMV_IVF: &str = concat!(
+    "444b494600002000415630316000500019000000010000000400000000000000b30200000000",
+    "00000000000012000a0a0000000335f9e5dfc00232a205160021e0000010c3e4ae2de1004253",
+    "aa6ed6bd05ceeaa4198da41ef58966e48ec8a3ed5f39ab45541784d8cfc8ea888e5b7d11efe8",
+    "1906159a96392d635c2f7d10e3b8e689c9584e25c3850c27785a610b2ad88bad68edb4ed1861",
+    "904d617aa5661fc8c6e7ef4d4b319aa71e4835967a41713800769db69c6290c56c443cc3054a",
+    "b386c4b7195b3b65cf74dbb95a93b2c89031c24af8944601ad53dbdaa8c53b2b01c4ac61ac47",
+    "b83fd5e1b2b3fdb8807f72523fa8d71c4c7c39a69c924cf025a6ca9e54de9a576a394b1c7b06",
+    "702700e3b943c1dd464175b9ef9b586fe7da01e5a54ce78373b50dd62f190131fb33827049cf",
+    "8f6b4727214d0e1027ecbf113e5f203ae48201c036fc0eb40173a07b9f81292111d09e044dd6",
+    "a89f048be4ffe9cc3c759f18c96f259913aec55a330a8b26305a10890736b31bdea0dfe1bd6b",
+    "18e7df0e291eda5cafb4a03f5e4057d2f8a761d73cf43e18fdb480bfc3a7bb3f74ddf5bea927",
+    "cf08cbf552a9f1bcb9811bd80154e4d90a9e35e183217275d2dcd8753df403b9c4be64771927",
+    "42efc9495bb57924f2a09c7210c1b0e3fa6410dc724d1200327f2328e87db30e17534eea80a1",
+    "31cc5fcd11cff9a20f1e786b669336e827fbc8090139e1f5242d8e55d480999969ac8b8bdd39",
+    "052a7d9c2f149833969e56441e1f56f6442e45392e3882b7b750ef40acc4c58315769df1740c",
+    "9dd4e48d8d8a3208f876b864c3c2d5194f464ef87796a88b2ab7c9c8a9fa74be2fd1762e801f",
+    "ca5e7b383317856c8ba0a06921fc455796563a06b99b11fdae50de7e73f4a7144733f6699c53",
+    "bb3fa091e99b1f5d0fb8c8d8602008dea2797bffe32ff7debff322325f76cc9fda659dc02261",
+    "33ef599b98312732f1cfe608af623ded65e9075ed59f784ad6d81325d2ad822acd2b748e7e3f",
+    "78edacfdf68b42c8712d3bd5043000000001000000000000001200322c320100224824bd0f00",
+    "0000e000d9edf39c68bdb7ed56600ea7f15eb4c969b13c61cb181c32be1e1708b7f370160000",
+    "000200000000000000120032123202004001003d0f000000f0a940939ddaf015000000030000",
+    "000000000012003211320300224824bd0f000000f0a00095935c",
+);
+
+/// r428: the corpus's first **high-precision-MV** stream — §5.9.2
+/// `allow_high_precision_mv = 1` headers, odd-component (eighth-pel)
+/// NEWMV vectors through the §5.11.32 `mv_hp` cascade, and the
+/// §7.10.2.10 no-op precision arm on the candidate stack. Digest =
+/// byte-identical output of THREE independent black-box reference
+/// decoders (notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q60-hpmv/`).
+#[test]
+fn self_encoded_hp_mv_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q60-hpmv",
+        SELF_GOP_96X80_Q60_HPMV_IVF,
+        "992f819382116aa72f5ab1f4ff284c423c24744d733437ea851e803511ecc3c1",
+        4,
+    );
+}
