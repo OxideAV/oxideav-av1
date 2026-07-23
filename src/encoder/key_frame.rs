@@ -3482,7 +3482,19 @@ pub(crate) fn chroma_partition_ok(recon: &ReconState, sub_size: usize) -> bool {
 /// given `q_index`), so λ carries the same factor — 8-bit behaviour
 /// is bit-identical to the historical constant.
 pub(crate) fn lambda_for(qp: &QuantizerParams) -> u64 {
-    let l8 = 1 + (qp.base_q_idx as u64 * qp.base_q_idx as u64) / 32;
+    // r428 — on a §5.9.17 delta-q frame the leaf ladders trade rate
+    // against the SUPERBLOCK's own quantiser (`CurrentQIndex`), not
+    // the frame's: a refined superblock must value its cheaper
+    // distortion at a matching cheaper λ or the ladder just skips
+    // (finer steps cost more bits at unchanged λ), and a coarsened
+    // one must skip harder. Identity on every non-delta frame
+    // (`CurrentQIndex == base_q_idx` there).
+    let q = if qp.delta_q_present {
+        u64::from(qp.current_q_index)
+    } else {
+        u64::from(qp.base_q_idx)
+    };
+    let l8 = 1 + q * q / 32;
     l8 << (2 * u32::from(qp.bit_depth.saturating_sub(8)))
 }
 

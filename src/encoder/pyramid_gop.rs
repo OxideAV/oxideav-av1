@@ -139,6 +139,11 @@ pub struct PyramidTuning {
     /// the pre-r428 quarter-pel shape on every frame (the A/B
     /// baseline).
     pub high_precision_mv: bool,
+    /// r428 — §5.9.17 per-superblock delta-q election on unsegmented
+    /// lossy frames (complexity-probe plan + frame-level exact-bytes
+    /// arm election). `false` keeps the single-quantiser shape on
+    /// every frame (the A/B baseline).
+    pub delta_q: bool,
 }
 
 impl Default for PyramidTuning {
@@ -149,6 +154,7 @@ impl Default for PyramidTuning {
             layer_q_offsets: true,
             primary_ref: true,
             high_precision_mv: true,
+            delta_q: true,
         }
     }
 }
@@ -535,6 +541,7 @@ impl PyramidSession {
                         auto_lossless: false,
                         seg_extras: None,
                         high_precision_mv: self.tuning.high_precision_mv,
+                        delta_q: self.tuning.delta_q,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(

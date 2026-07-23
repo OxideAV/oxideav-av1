@@ -155,6 +155,9 @@ pub struct TunedGopYuv {
     /// r428 — each P-frame's elected §5.9.2 `allow_high_precision_mv`
     /// header flag (index 0 is the first P-frame).
     pub hp_mv_elections: Vec<bool>,
+    /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
+    /// flag (index 0 is the first P-frame).
+    pub delta_q_elections: Vec<bool>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -192,6 +195,9 @@ pub struct TunedGop {
     /// r428 — each P-frame's elected §5.9.2 `allow_high_precision_mv`
     /// header flag (index 0 is the first P-frame).
     pub hp_mv_elections: Vec<bool>,
+    /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
+    /// flag (index 0 is the first P-frame).
+    pub delta_q_elections: Vec<bool>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -287,10 +293,66 @@ pub(crate) struct InterFrameAux {
     /// flag (the eighth-pel search arm may still be flipped back to
     /// quarter-pel by the exact-bytes replay election).
     pub(crate) hp_mv: bool,
+    /// r428 — the elected §5.9.17 `delta_q_present` header flag (the
+    /// per-superblock delta-q arm won the frame-level joint-objective
+    /// election over the single-quantiser arm).
+    pub(crate) delta_q: bool,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
 const SEARCH_RANGE: i32 = 16;
+
+/// r428 — §5.9.17 `delta_q_res` this encoder codes on delta-q-elected
+/// frames: reduced units scale by `1 << 3 = 8` quantiser-index steps,
+/// keeping the per-superblock §5.11.13 symbols in the cheap
+/// `|reduced| <= 2` literal range while covering a ±16 index swing.
+const DELTA_Q_RES: u8 = 3;
+
+/// r428 — the §5.9.17 complexity probe: map per-superblock source
+/// luma activity (variance over the superblock's samples) to reduced
+/// §5.11.13 delta units. Textured superblocks (activity well above
+/// the frame median) coarsen (`+units` — masking hides the extra
+/// quantisation), flat superblocks (well below) refine (`-units` —
+/// banding shows first where nothing masks it); the mapping is
+/// `round( ln2( activity / median ) / 2 )` clamped to `[-2, 2]`.
+/// Returns `None` when every superblock lands on zero (flat spread —
+/// the delta arm would only add wire cost). Encoder heuristic, free
+/// choice: the plan is simply what the frame-level exact election
+/// scores against the single-quantiser arm.
+fn delta_q_plan_units(input: &YuvFrame, mi_rows: u32, mi_cols: u32) -> Option<Vec<i32>> {
+    let w = input.width as usize;
+    let h = input.height as usize;
+    let sbs = sb_grid_origins(mi_rows, mi_cols);
+    let mut acts: Vec<f64> = Vec::with_capacity(sbs.len());
+    for &(sb_r, sb_c) in &sbs {
+        let y0 = (sb_r as usize) * 4;
+        let x0 = (sb_c as usize) * 4;
+        let y1 = (y0 + 64).min(h);
+        let x1 = (x0 + 64).min(w);
+        let n = ((y1 - y0) * (x1 - x0)) as u64;
+        let mut sum = 0u64;
+        let mut sum2 = 0u128;
+        for r in y0..y1 {
+            for c in x0..x1 {
+                let v = u64::from(input.y[r * w + c]);
+                sum += v;
+                sum2 += u128::from(v * v);
+            }
+        }
+        let mean = sum as f64 / n as f64;
+        let var = (sum2 as f64 / n as f64) - mean * mean;
+        acts.push(var.max(0.0));
+    }
+    // Geometric-mean reference: activity spread maps SYMMETRICALLY
+    // (textured superblocks coarsen and pay for the flats'
+    // refinement, keeping the armed frame's rate near the baseline).
+    let log_mean = acts.iter().map(|&a| a.max(1.0).log2()).sum::<f64>() / acts.len() as f64;
+    let units: Vec<i32> = acts
+        .iter()
+        .map(|&a| (((a.max(1.0).log2() - log_mean) * 0.5).round() as i32).clamp(-2, 2))
+        .collect();
+    units.iter().any(|&u| u != 0).then_some(units)
+}
 
 /// r415 — one leaf's committed §5.11.29 compound selection for the
 /// prediction driver ([`PSearchCtx::predict_leaf`] stamps it into the
@@ -540,6 +602,11 @@ pub struct GopTuning {
     /// the pre-r428 quarter-pel shape on every frame (the A/B
     /// baseline).
     pub high_precision_mv: bool,
+    /// r428 — §5.9.17 per-superblock delta-q election on unsegmented
+    /// lossy frames (complexity-probe plan + frame-level exact-bytes
+    /// arm election). `false` keeps the single-quantiser shape on
+    /// every frame (the A/B baseline).
+    pub delta_q: bool,
 }
 
 impl Default for GopTuning {
@@ -550,6 +617,7 @@ impl Default for GopTuning {
             primary_ref: true,
             temporal_seg: true,
             high_precision_mv: true,
+            delta_q: true,
         }
     }
 }
@@ -722,6 +790,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         seg_temporal_updates: t.seg_temporal_updates,
         p_segment_maps: t.p_segment_maps,
         hp_mv_elections: t.hp_mv_elections,
+        delta_q_elections: t.delta_q_elections,
     })
 }
 
@@ -870,6 +939,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
     let mut seg_temporal_updates: Vec<bool> = Vec::new();
     let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
     let mut hp_mv_elections: Vec<bool> = Vec::new();
+    let mut delta_q_elections: Vec<bool> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -899,11 +969,13 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             auto_detect,
             extras,
             tuning.high_precision_mv,
+            tuning.delta_q,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
         seg_temporal_updates.push(aux.seg_temporal);
         hp_mv_elections.push(aux.hp_mv);
+        delta_q_elections.push(aux.delta_q);
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
@@ -936,6 +1008,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         seg_temporal_updates,
         p_segment_maps,
         hp_mv_elections,
+        delta_q_elections,
     })
 }
 
@@ -1056,6 +1129,14 @@ pub(crate) struct InterFrameConfig<'a> {
     /// smaller. `false` keeps the pre-r428 quarter-pel search + wire
     /// shape unconditionally (the A/B baseline).
     pub high_precision_mv: bool,
+    /// r428 — §5.9.17 per-superblock delta-q arm: when the complexity
+    /// probe finds real activity spread on an UNSEGMENTED lossy
+    /// frame, a second full search runs under a per-superblock
+    /// `CurrentQIndex` plan (§5.11.13 deltas on the wire) and the
+    /// frame-level exact-realized-bytes election keeps whichever arm
+    /// scores better under `D + λ·R`. `false` keeps the pre-r428
+    /// single-quantiser shape unconditionally (the A/B baseline).
+    pub delta_q: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1330,6 +1411,7 @@ fn p_frame_config_primary<'a>(
         auto_lossless: false,
         seg_extras: None,
         high_precision_mv: true,
+        delta_q: true,
     }
 }
 
@@ -1375,6 +1457,7 @@ fn encode_p_frame_yuv(
     auto_lossless: bool,
     seg_extras: Option<&SegExtras>,
     high_precision_mv: bool,
+    delta_q: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1391,6 +1474,7 @@ fn encode_p_frame_yuv(
     cfg.auto_lossless = auto_lossless;
     cfg.seg_extras = seg_extras;
     cfg.high_precision_mv = high_precision_mv;
+    cfg.delta_q = delta_q;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -1754,78 +1838,6 @@ pub(crate) fn encode_inter_frame_generic_gm(
         inter: Some(ip.clone()),
     };
 
-    let mut recon = ReconState {
-        y: vec![0u16; width * height],
-        u: vec![0u16; chroma_w * chroma_h],
-        v: vec![0u16; chroma_w * chroma_h],
-        width,
-        height,
-        chroma_w,
-        chroma_h,
-        bit_depth,
-        subsampling_x: ssx,
-        subsampling_y: ssy,
-        num_planes,
-        mi_rows,
-        mi_cols,
-        lossless,
-        allow_screen_content_tools: fh.allow_screen_content_tools,
-        // §5.9.20: intra-block-copy is intra-frame-only.
-        allow_intrabc: false,
-        qp,
-        bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
-        dv_hash: Default::default(),
-    };
-    let mut ictx = PSearchCtx::with_refs(
-        &cfg.refs,
-        cfg.slot_to_plane,
-        cfg.ref_frame_idx,
-        cfg.single_refs.clone(),
-        cfg.compound_pairs.clone(),
-        mi_rows,
-        mi_cols,
-        width,
-        height,
-        ip,
-        base_q_idx,
-        alt_q,
-        bit_depth,
-        ssx,
-        ssy,
-        num_planes,
-    )?;
-    // r426 — arm the §5.9.14 inter-override features (ladder item 8):
-    // requires the segmentation carrier (non-empty alt_q), raw
-    // RefFrame data within the ladder, and flips SegIdPreSkip.
-    if let Some(x) = cfg.seg_extras {
-        if alt_q.is_empty()
-            || x.ref_frame
-                .iter()
-                .flatten()
-                .any(|rf| !cfg.single_refs.contains(rf))
-        {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        ictx.extras = Some(*x);
-        ictx.seg_id_pre_skip = x.any();
-    }
-    // r426 — arm the exactness-demand / auto-lossless election. Both
-    // require a lossless segment in the table, and the mask must
-    // cover the mi grid exactly.
-    if cfg.exact_mask.is_some() || cfg.auto_lossless {
-        if ictx.lossless_seg.is_none() {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        if let Some(mask) = cfg.exact_mask {
-            if mask.len() != (mi_rows as usize) * (mi_cols as usize) {
-                return Err(Error::PartitionWalkOutOfRange);
-            }
-            ictx.exact_mask = Some(mask.to_vec());
-        }
-        ictx.auto_lossless = cfg.auto_lossless;
-    }
-
-    let mut writer = SymbolWriter::new(fh.disable_cdf_update);
     // §8.3.1 frame-start CDF state (mirroring the decode driver):
     // with a primary reference, §6.8.21 `load_cdfs( ref_frame_idx[
     // primary_ref_frame ] )` — the slot's §7.20-saved frame-end state
@@ -1844,60 +1856,339 @@ pub(crate) fn encode_inter_frame_generic_gm(
             Box::new(c)
         }
     };
-    let mut cdfs = frame_start_cdfs.as_ref().clone();
-    let mut state = PartitionSyntaxWriter::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
-    .ok_or(Error::PartitionWalkOutOfRange)?;
 
-    // r423 — the committed per-superblock syntax trees are retained:
-    // the §5.9.14 `temporal_update` election below replays them
-    // bit-exactly under the opposite segment-id coding arm.
-    let mut trees: Vec<SyntaxNode> = Vec::new();
-    for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
-        recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
-        // r421 — arm the §5.11.2 delta lifecycle on the live state AND
-        // the rate twin's fork, so both enter the superblock identically.
-        state.arm_read_deltas();
-        let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
-        twin.arm_read_deltas();
-        let (tree, _cost) = build_p_search_tree(
-            sb_r,
-            sb_c,
-            BLOCK_64X64,
-            input,
-            &mut recon,
-            &mut ictx,
-            &mut twin,
-            &params,
-            model,
-        )?;
-        write_partition_tree_syntax(
-            &mut writer,
-            &mut cdfs,
-            &mut state,
-            &tree,
-            sb_r,
-            sb_c,
-            BLOCK_64X64,
-            &params,
-        )?;
-        // r421 anti-desync invariant: the search committed EXACTLY the
-        // symbols the writer just emitted.
-        debug_assert!(
-            twin.matches(&cdfs, &writer),
-            "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
-        );
-        trees.push(tree);
+    // r428 — §5.9.17 delta-q plan: on an UNSEGMENTED lossy frame with
+    // the config arm open, the complexity probe maps per-superblock
+    // source-luma activity to reduced §5.11.13 delta units (`None`
+    // when the spread is flat — the single-quantiser arm is then the
+    // only arm searched).
+    let delta_plan: Option<Vec<i32>> = if cfg.delta_q && alt_q.is_empty() && !lossless {
+        delta_q_plan_units(input, mi_rows, mi_cols)
+    } else {
+        None
+    };
+
+    /// One frame-search arm's complete artifact set (everything the
+    /// OBU assembly + the post-tile exact-bytes elections consume).
+    struct FrameArm {
+        tile: Vec<u8>,
+        cdfs: TileCdfContext,
+        state: PartitionSyntaxWriter,
+        trees: Vec<SyntaxNode>,
+        recon: ReconState,
+        ictx: PSearchCtx,
     }
-    let mut tile_bytes = writer.finish();
+
+    // One full search + tile write under `arm_params` (and, when
+    // `plan` is set, the per-superblock §5.11.13 `CurrentQIndex`
+    // walk). Each arm builds its own reconstruction / search context
+    // / writer state from the shared frame-start snapshot, so arms
+    // are exactly comparable and the winner's artifacts flow into the
+    // unchanged post-tile pipeline.
+    let run_arm = |arm_params: &SyntaxFrameParams,
+                   plan: Option<&[i32]>|
+     -> Result<FrameArm, Error> {
+        let mut recon = ReconState {
+            y: vec![0u16; width * height],
+            u: vec![0u16; chroma_w * chroma_h],
+            v: vec![0u16; chroma_w * chroma_h],
+            width,
+            height,
+            chroma_w,
+            chroma_h,
+            bit_depth,
+            subsampling_x: ssx,
+            subsampling_y: ssy,
+            num_planes,
+            mi_rows,
+            mi_cols,
+            lossless,
+            allow_screen_content_tools: fh.allow_screen_content_tools,
+            // §5.9.20: intra-block-copy is intra-frame-only.
+            allow_intrabc: false,
+            qp: arm_params.quant,
+            bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
+            dv_hash: Default::default(),
+        };
+        let mut ictx = PSearchCtx::with_refs(
+            &cfg.refs,
+            cfg.slot_to_plane,
+            cfg.ref_frame_idx,
+            cfg.single_refs.clone(),
+            cfg.compound_pairs.clone(),
+            mi_rows,
+            mi_cols,
+            width,
+            height,
+            ip.clone(),
+            base_q_idx,
+            alt_q,
+            bit_depth,
+            ssx,
+            ssy,
+            num_planes,
+        )?;
+        // r426 — arm the §5.9.14 inter-override features (ladder item
+        // 8): requires the segmentation carrier (non-empty alt_q), raw
+        // RefFrame data within the ladder, and flips SegIdPreSkip.
+        if let Some(x) = cfg.seg_extras {
+            if alt_q.is_empty()
+                || x.ref_frame
+                    .iter()
+                    .flatten()
+                    .any(|rf| !cfg.single_refs.contains(rf))
+            {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            ictx.extras = Some(*x);
+            ictx.seg_id_pre_skip = x.any();
+        }
+        // r426 — arm the exactness-demand / auto-lossless election.
+        // Both require a lossless segment in the table, and the mask
+        // must cover the mi grid exactly.
+        if cfg.exact_mask.is_some() || cfg.auto_lossless {
+            if ictx.lossless_seg.is_none() {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            if let Some(mask) = cfg.exact_mask {
+                if mask.len() != (mi_rows as usize) * (mi_cols as usize) {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                ictx.exact_mask = Some(mask.to_vec());
+            }
+            ictx.auto_lossless = cfg.auto_lossless;
+        }
+
+        let mut writer = SymbolWriter::new(fh.disable_cdf_update);
+        let mut cdfs = frame_start_cdfs.as_ref().clone();
+        let mut state = PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+
+        // r423 — the committed per-superblock syntax trees are
+        // retained: the post-tile elections replay them bit-exactly
+        // under alternative header arms.
+        let mut trees: Vec<SyntaxNode> = Vec::new();
+        for (sb_index, (sb_r, sb_c)) in sb_grid_origins(mi_rows, mi_cols).into_iter().enumerate() {
+            recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            // r428 — §5.11.13 `CurrentQIndex` walk: apply the plan
+            // step BEFORE the superblock's search so every trial
+            // quantises (and the twin prices the first block's delta
+            // symbol) at the target index. The step is computed so
+            // the §7.12.2 `Clip3( 1, 255, _ )` never truncates —
+            // encoder and decoder land on the identical index.
+            let prev_q = recon.qp.current_q_index;
+            if let Some(p) = plan {
+                // The plan is ABSOLUTE (offset from `base_q_idx`);
+                // the §5.11.13 symbol codes the RELATIVE step from
+                // the running index. Units are computed so the
+                // §7.12.2 `Clip3( 1, 255, _ )` never truncates —
+                // encoder and decoder land on the identical index.
+                let step = 1i32 << arm_params.delta_q_res;
+                let want = (i32::from(base_q_idx) + p[sb_index] * step).clamp(1, 255);
+                let units = (want - i32::from(prev_q)) / step;
+                recon.qp.current_q_index = (i32::from(prev_q) + units * step) as u8;
+                ictx.delta_q_units = units;
+            }
+            // r421 — arm the §5.11.2 delta lifecycle on the live state
+            // AND the rate twin's fork, so both enter the superblock
+            // identically.
+            state.arm_read_deltas();
+            let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+            twin.arm_read_deltas();
+            let (tree, _cost) = build_p_search_tree(
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                input,
+                &mut recon,
+                &mut ictx,
+                &mut twin,
+                arm_params,
+                model,
+            )?;
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &tree,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                arm_params,
+            )?;
+            // r421 anti-desync invariant: the search committed EXACTLY
+            // the symbols the writer just emitted.
+            debug_assert!(
+                twin.matches(&cdfs, &writer),
+                "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+            );
+            // r428 — realized `CurrentQIndex`: a full-superblock skip
+            // leaf takes the §5.11.13 short-circuit arm (no delta on
+            // the wire), so the decoder's running index never moves —
+            // mirror that for the next superblock's step.
+            if plan.is_some() {
+                if let SyntaxNode::Leaf(b) = &tree {
+                    if b.skip == 1 {
+                        recon.qp.current_q_index = prev_q;
+                    }
+                }
+            }
+            trees.push(tree);
+        }
+        Ok(FrameArm {
+            tile: writer.finish(),
+            cdfs,
+            state,
+            trees,
+            recon,
+            ictx,
+        })
+    };
+
+    // r428 — §5.9.17 delta-q election by EXACT realized bytes +
+    // masking-weighted distortion: both arms are complete frame
+    // encodes (their trees decode to different reconstructions —
+    // replays cannot compare them), so the election runs the
+    // encoder's frame-level adaptive-quantisation objective
+    // `Dw·256 + λ·R_bits256` over realized (header + tile) bytes.
+    // `Dw` weights each superblock's squared error by `2^-units`
+    // from the SAME probe plan on both arms (a flat superblock's
+    // error counts up to 4×: banding shows first where nothing masks
+    // it; a textured superblock's counts down to ¼: masking hides
+    // it). Under UNWEIGHTED SSE a per-superblock quantiser deviation
+    // can essentially never win at fixed λ (convexity of the R(D)
+    // curve — the frame quantiser IS the λ-matched point), so the
+    // weighted objective is what makes delta-q a real tool; the A/B
+    // harness reports the resulting plain-PSNR/bytes trade honestly.
+    let mut arm = run_arm(&params, None)?;
+    let mut delta_q_elected = false;
+    if let Some(plan) = &delta_plan {
+        let mut qp_d = qp;
+        qp_d.delta_q_present = true;
+        qp_d.current_q_index = base_q_idx;
+        let mut params_d = params.clone();
+        params_d.read_deltas = true;
+        params_d.delta_q_res = DELTA_Q_RES;
+        params_d.quant = qp_d;
+        let cand = run_arm(&params_d, Some(plan))?;
+        let mut fh_d = fh.clone();
+        fh_d.delta_q_params = Some(crate::uncompressed_header_tail::DeltaQParams {
+            delta_q_present: true,
+            delta_q_res: DELTA_Q_RES,
+        });
+        let lambda = lambda_for(&qp);
+        let prev_gm_score: Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]> =
+            if fh.primary_ref_frame != PRIMARY_REF_NONE {
+                cfg.primary_carry.map(|c| c.gm_params)
+            } else {
+                None
+            };
+        let header_len = |fh_arm: &FrameHeader| -> usize {
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                fh_arm,
+                seq,
+                prev_gm_score.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        // Plan-derived masking weights, applied identically to both
+        // arms: per superblock, `sse << -units` (flat, `units < 0`)
+        // or `sse >> units` (textured, `units > 0`).
+        let weighted_sse = |rc: &ReconState| -> u64 {
+            let mut d = 0u64;
+            for (sb_index, &(sb_r, sb_c)) in sb_grid_origins(mi_rows, mi_cols).iter().enumerate() {
+                let units = plan[sb_index];
+                let y0 = (sb_r as usize) * 4;
+                let x0 = (sb_c as usize) * 4;
+                let y1 = (y0 + 64).min(height);
+                let x1 = (x0 + 64).min(width);
+                let mut sse = 0u64;
+                for r in y0..y1 {
+                    for c in x0..x1 {
+                        let diff =
+                            i64::from(rc.y[r * width + c]) - i64::from(input.y[r * width + c]);
+                        sse += (diff * diff) as u64;
+                    }
+                }
+                if num_planes > 1 {
+                    let (cy0, cx0) = (y0 >> ssy, x0 >> ssx);
+                    let (cy1, cx1) = (
+                        (y1 + usize::from(ssy)) >> ssy,
+                        (x1 + usize::from(ssx)) >> ssx,
+                    );
+                    for r in cy0..cy1.min(chroma_h) {
+                        for c in cx0..cx1.min(chroma_w) {
+                            let du = i64::from(rc.u[r * chroma_w + c])
+                                - i64::from(input.u[r * chroma_w + c]);
+                            let dv = i64::from(rc.v[r * chroma_w + c])
+                                - i64::from(input.v[r * chroma_w + c]);
+                            sse += (du * du + dv * dv) as u64;
+                        }
+                    }
+                }
+                // Variance-normalising weight `~ ref_activity /
+                // activity == 2^(-2·units)` (units ≈ ½·log2 of the
+                // activity ratio): each superblock's error counts
+                // relative to what its own content masks — the
+                // classic adaptive-quantisation objective.
+                d += if units >= 0 {
+                    sse >> (2 * units)
+                } else {
+                    sse << (-2 * units)
+                };
+            }
+            d
+        };
+        let score_base = score256(
+            weighted_sse(&arm.recon),
+            lambda,
+            ((header_len(&fh) + arm.tile.len()) as u64) * 8 * 256,
+        );
+        let score_delta = score256(
+            weighted_sse(&cand.recon),
+            lambda,
+            ((header_len(&fh_d) + cand.tile.len()) as u64) * 8 * 256,
+        );
+        if std::env::var_os("OXIDEAV_AV1_DQ_DEBUG").is_some() {
+            eprintln!(
+                "dq-frame oh={} plan={:?} base: tile {} B Dw {} score {} | delta: tile {} B Dw {} score {}",
+                cfg.order_hint,
+                plan,
+                arm.tile.len(),
+                weighted_sse(&arm.recon),
+                score_base,
+                cand.tile.len(),
+                weighted_sse(&cand.recon),
+                score_delta,
+            );
+        }
+        if score_delta < score_base {
+            delta_q_elected = true;
+            arm = cand;
+            fh = fh_d;
+            params = params_d;
+        }
+    }
+    let FrameArm {
+        tile: mut tile_bytes,
+        mut cdfs,
+        mut state,
+        trees,
+        recon,
+        ictx,
+    } = arm;
 
     // r428 — §5.9.2 `allow_high_precision_mv` election by EXACT
     // realized bits: the main pass searched and wrote under the
@@ -2264,6 +2555,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             seg_temporal: seg_temporal_elected,
             primary_ref: fh.primary_ref_frame,
             hp_mv: hp_elected,
+            delta_q: delta_q_elected,
         },
     ))
 }
@@ -2422,6 +2714,13 @@ struct PSearchCtx {
     /// The §5.9 inter bundle shared with the write pass — the
     /// `find_mv_stack` argument set.
     ip: SyntaxInterFrameParams,
+    /// r428 — the CURRENT superblock's §5.11.13 delta-q plan value in
+    /// reduced units (`0` = delta-q off or a no-delta superblock).
+    /// Every committed leaf carries it in `reduced_delta_q_index`
+    /// (the §5.11.2 lifecycle codes only the FIRST block's value;
+    /// full-superblock skip leaves carry 0 — the §5.11.13
+    /// short-circuit arm never codes a delta).
+    delta_q_units: i32,
 }
 
 impl PSearchCtx {
@@ -2607,6 +2906,7 @@ impl PSearchCtx {
             no_scaled: [false; 8],
             mirror,
             ip,
+            delta_q_units: 0,
         })
     }
 
@@ -3672,13 +3972,40 @@ fn encode_inter_leaf(
     // r426 — ladder item 8: the §5.9.14 inter-override feature-segment
     // trials (SEG_LVL_SKIP / SEG_LVL_GLOBALMV / SEG_LVL_REF_FRAME)
     // against the fully-searched winner, on >= 8x8 leaves.
-    if ictx.extras.is_some()
+    let mut leaf = if ictx.extras.is_some()
         && crate::cdf::block_width(b_size) >= 8
         && crate::cdf::block_height(b_size) >= 8
     {
-        return seg_extras_trials(mi_r, mi_c, b_size, input, recon, ictx, pricing, leaf);
-    }
+        seg_extras_trials(mi_r, mi_c, b_size, input, recon, ictx, pricing, leaf)?
+    } else {
+        leaf
+    };
+    stamp_delta_q(&mut leaf, b_size, ictx, pricing);
     Ok(leaf)
+}
+
+/// r428 — stamp the current superblock's §5.11.13 delta-q plan value
+/// into a committed leaf. Only the block the §5.11.2 lifecycle still
+/// has PENDING codes the value (the twin fork the leaf is built
+/// against carries the authoritative bit — the same fork the block
+/// is committed into, so build-time state == write-time state), and
+/// a full-superblock skip leaf takes the §5.11.13 short-circuit arm
+/// (zero bits — the writer validates the field is 0 there).
+fn stamp_delta_q(
+    leaf: &mut SyntaxBlock,
+    b_size: usize,
+    ictx: &PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) {
+    if ictx.delta_q_units == 0 {
+        return;
+    }
+    let pending = pricing.is_some_and(|(twin, _)| twin.deltas_pending());
+    leaf.reduced_delta_q_index = if pending && !(b_size == BLOCK_64X64 && leaf.skip == 1) {
+        ictx.delta_q_units
+    } else {
+        0
+    };
 }
 
 /// The pre-r426 [`encode_inter_leaf`] body: the fully-searched leaf
@@ -5725,6 +6052,7 @@ fn encode_intra_candidate(
                 leaf.tx_size = None;
             }
         }
+        stamp_delta_q(&mut leaf, b_size, ictx, pricing);
         return Ok(leaf);
     }
     let ll_seg = ictx
@@ -5756,6 +6084,7 @@ fn encode_intra_candidate(
     if leaf.skip == 1 && !ictx.seg_id_pre_skip {
         leaf.segment_id = ictx.segment_pred(r, c);
     }
+    stamp_delta_q(&mut leaf, b_size, ictx, pricing);
     Ok(leaf)
 }
 
@@ -7468,6 +7797,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
         )
         .unwrap();

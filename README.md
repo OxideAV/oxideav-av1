@@ -944,6 +944,25 @@ quarter-pel baseline. Pinned: `self-gop-96x80-q60-hpmv` — the
 corpus's first `allow_high_precision_mv = 1` stream, byte-identical
 through three independent black-box reference decoders (corpus 106).
 
+### Per-superblock delta-q: elected adaptive quantisation (r428)
+
+r428 closes encoder-election ladder item 2. Unsegmented lossy inter
+frames probe per-superblock source activity into an absolute
+§5.9.17 `CurrentQIndex` plan (flats refine, texture coarsens;
+`delta_q_res = 3`), run a second full search under it — per-SB λ
+tracks the running index, the twin forks thread the §5.11.2
+lifecycle so exactly each superblock's first coded block carries the
+§5.11.13 symbol, full-SB skip leaves honour the short-circuit arm —
+and elect the better arm per frame by exact realized bytes under a
+masking-weighted (variance-normalising) joint objective. Measured
+(`tests/delta_q_ab.rs`): the banding-prone flat region gains
+**+0.72 dB at −3.0% bytes** (128×128 q100) with the plain-PSNR trade
+reported honestly; the uniform-spread control stays bit-identical.
+Pinned: `self-gop-128x128-q100-deltaq` — the corpus's first
+`delta_q_present = 1` stream, byte-identical through three
+independent black-box reference decoders (corpus 107). KEY-frame
+delta-q and the segmentation × delta-q pairing stay open.
+
 ### Not yet supported
 
 - The historical intra `encode_av1` mirror paths emit non-conformant

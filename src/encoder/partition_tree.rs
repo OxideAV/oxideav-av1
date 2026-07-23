@@ -1261,6 +1261,15 @@ impl PartitionSyntaxWriter {
         })
     }
 
+    /// r428 — whether the §5.11.2 per-superblock delta lifecycle bit
+    /// is still pending (the next coded block is the one that writes
+    /// the §5.11.13 deltas). The search consults its twin fork's copy
+    /// so committed leaves carry the delta value on exactly the block
+    /// the writer will code it from.
+    pub fn deltas_pending(&self) -> bool {
+        self.write_deltas_pending
+    }
+
     /// §5.11.2 `ReadDeltas = delta_q_present` — re-arm the write-side
     /// delta lifecycle at a superblock entry (the §5.11.7 line-11
     /// clear happens inside [`write_block_syntax`] after the first

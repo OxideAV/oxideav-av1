@@ -100,6 +100,14 @@ impl RateTwin {
         self.state.arm_read_deltas();
     }
 
+    /// r428 — the fork's §5.11.2 delta lifecycle bit: `true` while
+    /// the next block committed into THIS fork is the one that codes
+    /// the §5.11.13 deltas. The search's leaf builders consult it so
+    /// exactly that block carries the superblock's delta value.
+    pub fn deltas_pending(&self) -> bool {
+        self.state.deltas_pending()
+    }
+
     /// Commit the subtree rooted at `(r, c, b_size)` into the twin —
     /// advancing CDFs, neighbour mirror and `range` exactly as the
     /// emitting pass will — and return its exact cost in 1/256-bit
