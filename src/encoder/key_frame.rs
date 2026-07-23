@@ -1,10 +1,9 @@
 //! Conformance-grade intra KEY-frame encoder (r409, generalised r410).
 //!
-//! Unlike the historical encoder-mirror drivers in
-//! [`super::pixel_driver`] / [`super::pixel_driver_dyn`] (whose leaf
-//! syntax codes `y_mode` with the §5.11.22 non-keyframe CDFs and is
-//! therefore decodable only by this crate's matching mirror decoder),
-//! this driver emits the REAL §5.11 keyframe syntax through the
+//! Unlike the historical encoder-mirror drivers (retired in r428;
+//! their leaf syntax coded `y_mode` with the §5.11.22 non-keyframe
+//! CDFs and was therefore decodable only by this crate's matching —
+//! also retired — mirror decoder), this driver emits the REAL §5.11 keyframe syntax through the
 //! spec-faithful write side ([`super::write_partition_tree_syntax`],
 //! whose output the decode walker
 //! [`crate::cdf::PartitionWalker::decode_partition_syntax`] replays
@@ -117,14 +116,14 @@ use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
     write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxNode,
 };
-use crate::encoder::pixel_driver_dyn::{
-    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
-};
 use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
 use crate::encoder::yuv_frame::{build_intra_only_seq_yuv, ChromaFormat, YuvFrame};
+use crate::encoder::yuv_frame::{
+    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
+};
 use crate::frame_header::FrameHeader;
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;

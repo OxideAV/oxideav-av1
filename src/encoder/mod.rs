@@ -162,7 +162,7 @@
 //! `q_index = 0` lattice and within one quantization step elsewhere.
 //!
 //! Arc 17 (round 223) extends the pixel driver to **4:2:0 YUV input**
-//! via [`pixel_driver::encode_intra_frame_yuv`]. The chroma walk mirrors
+//! via the (r428-retired) mirror pixel driver. The chroma walk mirrors
 //! the luma side: DC_PRED from the running reconstructed chroma plane,
 //! forward WHT (lossless arm), forward quantize, write_coefficients per
 //! plane. Per §5.11.5 `HasChroma` at 4:2:0 / BLOCK_4X4 the chroma
@@ -183,7 +183,7 @@
 //! halving is shared between forward and inverse so the round-trip is
 //! exact regardless of parity). Unlike the integer-approximated DCT,
 //! the WHT is a **pure integer butterfly** ⇒ **bit-exact round-trip
-//! for any integer input**. [`pixel_driver::encode_intra_frame_y`] now
+//! for any integer input**. The (r428-retired) mirror pixel driver then
 //! routes through the forward WHT on the §5.9.2 `CodedLossless` arm
 //! (`base_q_idx == 0 && DeltaQ?? all zero`), unlocking pixel-perfect
 //! roundtrip on arbitrary inputs at `base_q_idx = 0`.
@@ -282,10 +282,6 @@ pub mod obu;
 pub mod partition;
 #[doc(hidden)]
 pub mod partition_tree;
-#[doc(hidden)]
-pub mod pixel_driver;
-#[doc(hidden)]
-pub mod pixel_driver_dyn;
 #[doc(hidden)]
 pub mod pyramid_gop;
 pub(crate) mod rate_twin;
@@ -386,25 +382,14 @@ pub use partition_tree::{
     PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients, SyntaxBlock, SyntaxFrameParams,
     SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, SyntaxPalette, VarTxSyntaxTree,
 };
+// r428 — the encoder-mirror emit arms are retired (see the r428
+// CHANGELOG entry); the shared frame/sequence scaffolding they
+// housed lives in [`yuv_frame`] now.
+pub use yuv_frame::Yuv420Frame;
 #[doc(hidden)]
-pub use pixel_driver::{
-    dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,
-    EncodedFrameYuv, Yuv420Frame16x16, CELLS_HIGH, CELLS_WIDE, CHROMA_CELLS_HIGH,
-    CHROMA_CELLS_WIDE, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
-};
-pub use pixel_driver_dyn::Yuv420Frame;
-#[doc(hidden)]
-pub use pixel_driver_dyn::{
-    build_intra_only_y_8bit_fh, build_intra_only_y_8bit_fh_with_q, build_intra_only_y_8bit_seq,
+pub use yuv_frame::{
     build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_fh_with_q,
-    build_intra_only_yuv420_8bit_seq, dispatch_order_leaves, encode_intra_frame_y_dyn,
-    encode_intra_frame_y_dyn_multi_sb, encode_intra_frame_y_dyn_multi_sb_with_q,
-    encode_intra_frame_y_dyn_with_q, encode_intra_frame_yuv_dyn,
-    encode_intra_frame_yuv_dyn_multi_sb, encode_intra_frame_yuv_dyn_multi_sb_with_q,
-    encode_intra_frame_yuv_dyn_with_q, root_super_block, sb_grid_dispatch_order_leaves,
-    sb_grid_origins, EncodedFrameDyn, EncodedFrameDynY, EncodedFrameDynYMultiSb,
-    EncodedFrameDynYuvMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420FrameMultiSb, MAX_DIM,
-    MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
+    build_intra_only_yuv420_8bit_seq, sb_grid_origins, MAX_DIM, MIN_DIM, SB_SIZE4_64,
 };
 // r421 — rate-model selector, exposed (hidden) so the sweep harnesses
 // can A/B the twin-priced elections against the heuristic baseline.

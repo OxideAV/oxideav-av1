@@ -176,12 +176,14 @@ conformance corpus.
 
 ### What decodes / encodes (intra pixel pipeline)
 
-The `decode_av1(bytes) -> Vec<Frame>` encoder-MIRROR path (the first
-of the public entry's two decode paths; the second is the spec-driver
-fallback described above) and the crate-public mirror encoders
-(`encoder::encode_intra_frame_yuv_dyn` and friends — NOT the public
-`encode_av1`, which is conformance-grade as of r409) cover a
-constrained intra-only profile:
+(HISTORICAL until r428 — the encoder-mirror surface described in this
+section's first paragraph was retired in r428: the mirror emit arms,
+`decode_av1`'s mirror-acceptance arm, and the historical `Frame`
+variants are gone; `decode_av1` rides the spec-faithful driver
+exclusively and `encode_av1` has been conformance-grade since r409.
+The reconstruction-layer notes below describe decoder modules that
+remain fully live.) The retired constrained intra-only profile
+covered:
 
 - 4:2:0 8-bit YUV or 8-bit monochrome.
 - Intra-only key frames, single tile per frame.
@@ -983,18 +985,30 @@ with non-zero §5.9.19 strengths, byte-identical through three
 independent black-box reference decoders (corpus 108). Per-64×64
 `cdef_bits > 0` election and the segmentation pairing stay open.
 
+### Mirror-path retirement (r428)
+
+The historical encoder-mirror surface is GONE: the fixed-16×16 and
+dyn-extent intra mirror encoders (whose non-conformant streams only
+the matching writer-inverse decode arm could read), `decode_av1`'s
+mirror-acceptance arm, and the historical `Frame::Yuv420_16x16` /
+`Frame::Yuv420Dyn` / `Frame::YDyn` variants (the enum is
+`#[non_exhaustive]`; only `Frame::Spec` remains). Every stream —
+including everything `encode_av1` emits — decodes through the
+spec-faithful driver. The shared SH/FH scaffolding the mirror module
+housed (`Yuv420Frame`, the intra-only header builders,
+`sb_grid_origins`) moved to `encoder::yuv_frame`. The public-API
+round-trip gate (`tests/encode_decode_pixel_roundtrip.rs`) was
+rewritten onto the conformance-grade encoders over the same
+dimension / quantiser / content axes.
+
 ### Not yet supported
 
-- The historical intra `encode_av1` mirror paths emit non-conformant
-  streams (kept for their bit-exact self round-trip through
-  `decode_av1`'s mirror arm); conformance-grade encoding lives on
-  `encoder::encode_key_frame_yuv420` /
-  `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
-  `encoder::encode_gop_yuv420_with_q_lossless_regions` /
-  `encoder::encode_pyramid_gop_yuv420{,_with_q}` /
-  `encoder::encode_adaptive_gop_yuv420_with_q`. The remaining ladder
-  axis is item 7 (chroma subsampling / bit-depth generalisation of
-  the conformance-grade encoder).
+- Conformance-grade encoding lives on
+  `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
+  `encoder::encode_gop_yuv{420,}{,_with_q,...}` /
+  `encoder::encode_pyramid_gop_yuv{420,}_with_q` /
+  `encoder::encode_adaptive_gop_yuv{420,}_with_q` — every §6.4.1
+  (bit depth, chroma format) pairing.
 
 ## Module layout
 

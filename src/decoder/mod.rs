@@ -1,86 +1,82 @@
-//! Decoder side of the crate — round 224 (arc 18).
+//! Decoder side of the crate.
 //!
-//! Arc 18 is the **integration arc** that wires the existing
-//! decoder modules (`obu`, `sequence_header`, `frame_header`,
-//! `parse_tile_group_obu_body`, the §5.11.39 `coefficients()` reader
-//! on [`crate::PartitionWalker`], the §7.13 inverse-transform driver
-//! [`crate::transform::inverse_transform_2d`], the §7.12.3 step-1
-//! dequantizer [`crate::dequantize_step1`], and the §7.11.2.5
-//! DC_PRED leaf [`crate::predict_intra_dc_pred`]) into a single
-//! pixel-out entry point: [`decode_av1`], the inverse of
-//! [`crate::encoder::encode_intra_frame_yuv`].
+//! One decode surface remains as of r428: the **spec-faithful frame
+//! driver** ([`decode_av1_spec`] / [`SpecDecodeSession`]), the
+//! conformance-corpus-validated decoder that wires the parsing
+//! modules (`obu`, `sequence_header`, `frame_header`,
+//! `tile_group_obu`), the §5.11 `PartitionWalker` syntax walk, the
+//! §7.11/§7.12/§7.13 reconstruction chain, and the full §7.4 post
+//! chain (deblock, CDEF, superres, loop restoration, film grain)
+//! into a pixel-out entry point.
 //!
-//! ## Scope (arc 18)
+//! ## The r428 mirror-path retirement
 //!
-//! Matches the encoder pixel-driver's hard scope exactly: a 16×16
-//! 4:2:0 YUV intra-only frame at `base_q_idx = 0` (lossless WHT
-//! arm), BLOCK_4X4 leaves, TX_4X4 DCT_DCT default scan, no
-//! segmentation, no QM, no in-loop filters (`enable_cdef = 0`,
-//! `enable_restoration = 0`, `loop_filter_level = 0`,
-//! `enable_superres = 0`, `apply_grain = 0`). Under this combination
-//! the §7.14 / §7.15 / §7.16 / §7.17 / §7.18.3 post-processing
-//! passes are all no-ops, so the decoder can skip directly from
-//! `compute_prediction` + `residual` reconstruction into the output
-//! frame buffer.
-//!
-//! The `Frame` output ([`Frame::Yuv420_16x16`]) mirrors the
-//! encoder's [`crate::encoder::pixel_driver::Yuv420Frame16x16`] in
-//! shape. Encoder → `decode_av1` → pixel-equality is the first
-//! full encode-decode roundtrip exercise via the public API.
-//!
-//! ## What this arc does NOT do
-//!
-//!   * Decode arbitrary AV1 streams on the MIRROR path. Frame sizes
-//!     other than 16×16, base_q_idx > 0, partition shapes other than
-//!     the BLOCK_16X16 → BLOCK_8X8 → BLOCK_4X4 split tree, inter
-//!     frames, multi-tile frames, and the in-loop filter stack are
-//!     out of the mirror driver's scope. As of r409 the public
-//!     [`decode_av1`] entry no longer REJECTS such streams: it falls
-//!     back to the spec-faithful [`decode_av1_spec`] frame driver and
-//!     surfaces each shown frame as [`pixel_driver::Frame::Spec`] —
-//!     full public-API parity with the internal spec driver (see
-//!     [`pixel_driver::decode_av1`]'s path-ordering contract).
-//!   * In-loop post-processing. The §7.14 / §7.15 / §7.16 / §7.17 /
-//!     §7.18.3 passes are no-ops on the lossless arc-18 frame's
-//!     parameter set (`loop_filter_level = 0`, `enable_cdef = 0`,
-//!     etc.); subsequent arcs will exercise them.
-//!   * Run the §5.11.4 `PartitionWalker::decode_partition_syntax`
-//!     driver. The walker's full §5.11.5 dispatch reads many more
-//!     side bits (CDEF / delta-q / delta-lf / segment-id / skip-mode
-//!     / mode-info ctx walks) than the encoder's arc-15..17 leaf
-//!     writer emits — the two surfaces are intentionally minimal
-//!     here. The arc-18 driver re-implements the matching minimal
-//!     dispatch shape against the encoder's leaf writer. The full
-//!     walker is wired for richer streams in a follow-up arc once
-//!     the encoder grows the matching side-bit emissions.
-//!
-//! ## Spec provenance
-//!
-//! `docs/video/av1/av1-spec.txt`:
-//!   * §5.3.1 — Open Bitstream Unit framing.
-//!   * §5.5.1 / §5.9.1 / §5.11.1 — SH / FH / TileGroup OBU bodies.
-//!   * §5.11.4 — `decode_partition()` recursion (mirrored shape).
-//!   * §5.11.5 — `decode_block()` per-leaf reads (intra arm).
-//!   * §5.11.11 — `read_skip()`.
-//!   * §5.11.22 — `y_mode()` / `uv_mode()`.
-//!   * §5.11.39 — `coefficients()`.
-//!   * §7.11.2.5 — DC_PRED sample generation.
-//!   * §7.12.3 — `dequantize_step1`.
-//!   * §7.13 — Inverse transform.
+//! Until r428 a second surface existed: the "encoder-mirror" decode
+//! path, the exact writer-inverse of this crate's HISTORICAL
+//! constrained intra encoders (fixed 16×16 and dyn-extent drivers
+//! from the early encoder arcs). Those encoders emitted
+//! NON-conformant streams — their leaves coded `y_mode` with the
+//! §5.11.22 non-keyframe CDFs on intra frames — so their streams
+//! could only be decoded by inverting the writer bug-for-bug, and
+//! [`decode_av1`] tried that mirror arm first. The conformance-grade
+//! encoders (r409 onward) made the mirror emit arms redundant:
+//! `encode_av1` has produced spec-conformant streams ever since, and
+//! every corpus stream rides the spec driver. r428 retires the whole
+//! mirror surface — emit arms, mirror decode arm, and the historical
+//! `Frame::Yuv420_16x16` / `Frame::Yuv420Dyn` / `Frame::YDyn`
+//! variants (the [`Frame`] enum is `#[non_exhaustive]`, so match
+//! sites already carried a wildcard arm). Every stream now decodes
+//! through the spec driver and surfaces as [`Frame::Spec`].
 
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod frame_driver;
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
-pub mod pixel_driver;
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
-pub mod pixel_driver_dyn;
 
 pub use frame_driver::{decode_av1_spec, SpecFrame};
 #[doc(hidden)]
 pub use frame_driver::{decode_frame_spec, SpecDecodeSession};
-pub use pixel_driver::{decode_av1, Frame};
-#[doc(hidden)]
-pub use pixel_driver::{decode_temporal_unit, TemporalUnitResult};
+
+use crate::Error;
+
+/// One decoded (shown) frame surfaced by [`decode_av1`].
+///
+/// As of the r428 mirror-path retirement every stream decodes through
+/// the spec-faithful driver, so [`Frame::Spec`] is the only variant
+/// constructed. The enum stays `#[non_exhaustive]` (as it has been
+/// since its introduction), so downstream match sites are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Frame {
+    /// A frame decoded through the spec-faithful driver
+    /// ([`decode_av1_spec`]): intra + inter GOPs,
+    /// `show_existing_frame`, 4:2:0 / 4:2:2 / 4:4:4 / monochrome
+    /// layouts, 8/10/12-bit output, multi-tile frames, film grain,
+    /// superres, loop restoration — see [`SpecFrame`] for the plane
+    /// layout contract (cropped extents, per-plane dims, 10/12-bit as
+    /// little-endian 2-byte samples).
+    Spec(SpecFrame),
+}
+
+/// Decode an AV1 IVF v0 buffer.
+///
+/// Every stream rides the spec-faithful driver
+/// ([`decode_av1_spec`] — the conformance-corpus-validated decoder);
+/// each SHOWN frame surfaces as [`Frame::Spec`]. The historical
+/// encoder-mirror acceptance arm was retired in r428 (see the module
+/// docs) — the non-conformant streams it accepted could only be
+/// produced by this crate's own retired mirror emit arms, never by
+/// the conformance-grade encoders behind [`crate::encode_av1`].
+///
+/// Returns one [`Frame`] per shown frame, in output order.
+///
+/// ## Errors
+///
+/// * Buffer ends mid-IVF-header or mid-frame — [`Error::UnexpectedEnd`].
+/// * Any spec-driver parse/decode failure — the driver's typed
+///   [`Error`].
+pub fn decode_av1(input: &[u8]) -> Result<Vec<Frame>, Error> {
+    Ok(decode_av1_spec(input)?
+        .into_iter()
+        .map(Frame::Spec)
+        .collect())
+}

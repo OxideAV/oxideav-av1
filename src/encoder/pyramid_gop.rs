@@ -105,9 +105,9 @@ use crate::encoder::inter_frame::{
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::lambda_for;
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
-use crate::encoder::pixel_driver_dyn::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Frame};
 use crate::encoder::rate_twin::RateModel;
 use crate::encoder::yuv_frame::YuvFrame;
+use crate::encoder::yuv_frame::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Frame};
 use crate::frame_header::{FrameHeader, FrameType, PRIMARY_REF_NONE};
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;

@@ -2,8 +2,8 @@
 //! over the §5.11 `PartitionWalker` syntax walk.
 //!
 //! This is the decode path for **real encoder-produced bitstreams** (as
-//! opposed to the encoder-mirror drivers in [`super::pixel_driver`] /
-//! [`super::pixel_driver_dyn`], which accept only this crate's own
+//! opposed to the encoder-mirror drivers retired in r428, which
+//! accepted only this crate's own
 //! constrained encoder output). It wires the crate's spec modules end to
 //! end for one frame:
 //!

@@ -541,7 +541,7 @@ fn write_encode_block_leaf(
         write_intra_uv_mode(writer, cdfs, block.y_mode, uv_mode, cfl_allowed)?;
         // §5.11.22 line 8: `if ( UVMode == UV_CFL_PRED ) read_cfl_alphas()`
         // — r231. The encoder's CFL picker (in
-        // [`crate::encoder::pixel_driver`]) committed to a specific
+        // the retired encoder-mirror pixel driver) committed to a specific
         // (CflAlphaU, CflAlphaV) when it chose UV_CFL_PRED; replay it
         // here through `write_cfl_alphas` so the decoder reads the
         // same scalars.

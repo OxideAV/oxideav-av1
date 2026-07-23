@@ -2565,44 +2565,28 @@ impl std::error::Error for Error {}
 
 /// Decode an AV1 IVF v0 buffer into a vector of decoded [`decoder::Frame`]s.
 ///
-/// As of round 409 this entry is at **full parity with the internal
-/// spec-faithful frame driver** ([`decoder::decode_av1_spec`], the
-/// conformance-corpus-validated decoder): every stream that driver
-/// decodes byte-exact decodes identically here. Two paths compose the
-/// accepted scope, tried in order (see
-/// [`decoder::pixel_driver::decode_av1`] for the full contract):
+/// Every stream rides the **spec-faithful frame driver**
+/// ([`decoder::decode_av1_spec`], the conformance-corpus-validated
+/// decoder): the full intra feature surface (lossy quant at every
+/// coded TX size, lossless, palette, CfL, filter-intra, directional
+/// prediction with edge filter/upsample, intra block copy), inter
+/// GOPs (single and compound references, warped motion, OBMC,
+/// jnt-comp, skip mode, segmentation, scaled references, global
+/// motion, temporal MV projection, `show_existing_frame` incl. the
+/// §7.21 KEY reload), 4:2:0 / 4:2:2 / 4:4:4 / monochrome layouts,
+/// 8/10/12-bit output, multi-tile and 128×128-superblock frames,
+/// delta-q, quantizer matrices, and the whole §7.4 post chain
+/// (deblock, CDEF, superres, loop restoration, film grain). Each
+/// SHOWN frame surfaces as [`decoder::Frame::Spec`] carrying a
+/// [`decoder::SpecFrame`] (cropped extents, per-plane dims, 10/12-bit
+/// as little-endian 2-byte samples).
 ///
-/// 1. **Encoder-mirror path** — streams from this crate's own
-///    historical constrained intra encoders
-///    ([`crate::encoder::encode_intra_frame_yuv`] fixed 16×16,
-///    [`crate::encoder::encode_intra_frame_yuv_dyn`] /
-///    [`crate::encoder::encode_intra_frame_y_dyn`] and the multi-SB
-///    variants: 4:2:0 or monochrome 8-bit, `(w, h)` ∈ `[8, 128]`
-///    multiples of 8, `base_q_idx` 0 (lossless, bit-exact roundtrip)
-///    or `> 0` (lossy self-consistency), 13-mode intra + CfL,
-///    single tile, no in-loop filters). These streams are not
-///    spec-conformant, so they ride the exact writer-inverse driver
-///    and surface the historical [`decoder::Frame::Yuv420_16x16`] /
-///    [`decoder::Frame::Yuv420Dyn`] / [`decoder::Frame::YDyn`]
-///    variants — byte-identical to the pre-r409 behaviour.
-/// 2. **Spec-faithful path** — anything the mirror path rejects is
-///    re-decoded through [`decoder::decode_av1_spec`]: the full intra
-///    feature surface (lossy quant at every coded TX size, lossless,
-///    palette, CfL, filter-intra, directional prediction with edge
-///    filter/upsample, intra block copy), inter GOPs (single and
-///    compound references, warped motion, OBMC, jnt-comp, skip mode,
-///    segmentation, scaled references, global motion, temporal MV
-///    projection, `show_existing_frame` incl. the §7.21 KEY reload),
-///    4:2:0 / 4:2:2 / 4:4:4 / monochrome layouts, 8/10/12-bit output,
-///    multi-tile and 128×128-superblock frames, delta-q, quantizer
-///    matrices, and the whole §7.4 post chain (deblock, CDEF,
-///    superres, loop restoration, film grain). Each SHOWN frame
-///    surfaces as [`decoder::Frame::Spec`] carrying a
-///    [`decoder::SpecFrame`] (cropped extents, per-plane dims,
-///    10/12-bit as little-endian 2-byte samples).
+/// The historical encoder-mirror acceptance arm (which claimed the
+/// NON-conformant streams of this crate's retired early intra
+/// encoders, pre-r409) was removed in r428 together with the mirror
+/// emit arms — see [`decoder`] for the retirement contract.
 ///
-/// Streams both paths reject surface the spec driver's typed
-/// [`Error`].
+/// Rejected streams surface the spec driver's typed [`Error`].
 pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
     decoder::decode_av1(bytes)
 }

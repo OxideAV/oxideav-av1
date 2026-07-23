@@ -85,13 +85,13 @@ use crate::encoder::partition_tree::{
     write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
     SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree,
 };
-use crate::encoder::pixel_driver_dyn::{
-    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
-};
 use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
 use crate::encoder::yuv_frame::YuvFrame;
+use crate::encoder::yuv_frame::{
+    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
+};
 use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
 use crate::inter_pred::{
     reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,

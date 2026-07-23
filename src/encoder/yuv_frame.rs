@@ -21,8 +21,16 @@
 //! widens those inputs into this representation so the whole encoder
 //! pipeline runs on one sample type.
 
-use crate::encoder::pixel_driver_dyn::{build_intra_only_yuv420_8bit_seq, Yuv420Frame};
-use crate::sequence_header::{ColorConfig, SequenceHeader, CSP_UNKNOWN};
+use crate::frame_header::{FrameHeader, FrameSize, FrameType, ALL_FRAMES_PUB, PRIMARY_REF_NONE};
+use crate::sequence_header::{
+    ColorConfig, OperatingPoint, SequenceHeader, CP_UNSPECIFIED, CSP_UNKNOWN, MC_UNSPECIFIED,
+    SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, TC_UNSPECIFIED,
+};
+use crate::tile_info::TileInfo;
+use crate::uncompressed_header_tail::{
+    CdefParams, DeltaLfParams, DeltaQParams, FilmGrainParams, FrameRestorationType,
+    GlobalMotionParams, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, TxMode,
+};
 use crate::Error;
 
 /// §6.4.2 chroma layout selector: the `(subsampling_x, subsampling_y,
@@ -245,6 +253,392 @@ pub fn build_intra_only_seq_yuv(
     seq.seq_profile = elect_seq_profile(bit_depth, format)?;
     seq.color_config = color_config_for(bit_depth, format);
     Ok(seq)
+}
+
+// ----------------------------------------------------------------------
+// r428 — shared frame/sequence scaffolding relocated from the retired
+// encoder-mirror `pixel_driver_dyn` module: the legacy 8-bit 4:2:0
+// input carrier and the minimal SH / FH synthesis every
+// conformance-grade driver seeds its headers from. The mirror emit
+// arms themselves are gone (see the r428 CHANGELOG entry); these
+// items were always the conformance encoders' property.
+// ----------------------------------------------------------------------
+
+/// Historical lower dimension bound of the legacy dyn driver; the
+/// conformance-grade encoders share the same floor (dimensions are
+/// multiples of 8).
+pub const MIN_DIM: u32 = 8;
+
+/// Historical upper dimension bound of the legacy dyn driver
+/// ([`Yuv420Frame::validate`] keeps enforcing it for back-compat; the
+/// conformance-grade encoders accept up to
+/// [`crate::encoder::key_frame::KEY_FRAME_MAX_DIM`] via
+/// [`YuvFrame::validate`]).
+pub const MAX_DIM: u32 = 64;
+
+/// §5.11.1 superblock step in 4×4 units at the 64×64 superblock size.
+pub const SB_SIZE4_64: u32 = 16;
+
+/// Dynamic-extent 4:2:0 8-bit YUV input — the historical input type
+/// of the 8-bit `*_yuv420` encoder entry points. Plane data is
+/// Vec-backed so the same struct admits any allowed (width, height)
+/// combination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Yuv420Frame {
+    /// Luma width in pixels.
+    pub width: u32,
+    /// Luma height in pixels.
+    pub height: u32,
+    /// Luma plane (`Y`), row-major, length `width * height`.
+    pub y: Vec<u8>,
+    /// First chroma plane (`U` / `Cb`) at half horizontal + vertical
+    /// resolution; length `(width / 2) * (height / 2)`.
+    pub u: Vec<u8>,
+    /// Second chroma plane (`V` / `Cr`); same shape as `u`.
+    pub v: Vec<u8>,
+}
+
+impl Yuv420Frame {
+    /// All-`fill` input. Useful for tests + as the default
+    /// constructor; every plane is set to the same value.
+    #[must_use]
+    pub fn filled(width: u32, height: u32, fill: u8) -> Self {
+        let cw = width / 2;
+        let ch = height / 2;
+        Self {
+            width,
+            height,
+            y: vec![fill; (width * height) as usize],
+            u: vec![fill; (cw * ch) as usize],
+            v: vec![fill; (cw * ch) as usize],
+        }
+    }
+
+    /// Chroma plane width — `width / 2` per the 4:2:0 sampling pattern.
+    #[must_use]
+    pub fn chroma_width(&self) -> u32 {
+        self.width / 2
+    }
+
+    /// Chroma plane height — `height / 2` per the 4:2:0 sampling
+    /// pattern.
+    #[must_use]
+    pub fn chroma_height(&self) -> u32 {
+        self.height / 2
+    }
+
+    /// Validate the input's dimensions + plane lengths against the
+    /// HISTORICAL dyn-driver bounds (`[8, 64]` multiples of 8) —
+    /// kept byte-for-byte for API stability. The conformance-grade
+    /// entry points do NOT consult this; they validate the widened
+    /// [`YuvFrame`] instead (up to
+    /// [`crate::encoder::key_frame::KEY_FRAME_MAX_DIM`]).
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.width < MIN_DIM
+            || self.height < MIN_DIM
+            || self.width > MAX_DIM
+            || self.height > MAX_DIM
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.width % MIN_DIM != 0 || self.height % MIN_DIM != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let expected_y = (self.width * self.height) as usize;
+        let expected_uv = (self.chroma_width() * self.chroma_height()) as usize;
+        if self.y.len() != expected_y || self.u.len() != expected_uv || self.v.len() != expected_uv
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// §5.5.1 `OrderHintBits` every encoder-built sequence header carries
+/// (r413): `order_hint_bits_minus_1 = 6`. Seven bits give a modulus of
+/// 128 — [`crate::encoder::inter_frame::GOP_MAX_FRAMES`] = 64 output
+/// hints per GOP never wrap, so §7.4 `get_relative_dist` orders every
+/// in-GOP pair correctly.
+pub const ENCODER_ORDER_HINT_BITS: u8 = 7;
+
+/// Build the minimal 4:2:0 8-bit `SequenceHeader` for a frame whose
+/// maximum extent is `(max_width, max_height)`. The resulting
+/// `sequence_header_obu()` payload accepts a frame of any
+/// width × height ≤ `(max_width, max_height)` — the per-frame size is
+/// carried by the FrameHeader's `frame_size`.
+#[must_use]
+pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> SequenceHeader {
+    debug_assert!((1..=0xFFFF).contains(&max_width));
+    debug_assert!((1..=0xFFFF).contains(&max_height));
+    let max_w_minus_1 = max_width - 1;
+    let max_h_minus_1 = max_height - 1;
+    // §5.5.1 frame_width_bits_minus_1 must be wide enough to fit
+    // `max_frame_width_minus_1`. The minimum bit count is
+    // `bits_to_represent(max_w_minus_1) - 1`. Use 0..=15.
+    let bits_for = |v: u32| -> u8 {
+        if v == 0 {
+            0
+        } else {
+            (32 - v.leading_zeros() - 1) as u8
+        }
+    };
+    let frame_width_bits_minus_1 = bits_for(max_w_minus_1);
+    let frame_height_bits_minus_1 = bits_for(max_h_minus_1);
+
+    SequenceHeader {
+        seq_profile: 0,
+        still_picture: false,
+        reduced_still_picture_header: false,
+        timing_info_present_flag: false,
+        timing_info: None,
+        decoder_model_info_present_flag: false,
+        decoder_model_info: None,
+        initial_display_delay_present_flag: false,
+        operating_points_cnt_minus_1: 0,
+        operating_points: vec![OperatingPoint {
+            operating_point_idc: 0,
+            seq_level_idx: 0,
+            seq_tier: 0,
+            decoder_model_present_for_this_op: false,
+            operating_parameters_info: None,
+            initial_display_delay_present_for_this_op: false,
+            initial_display_delay_minus_1: None,
+        }],
+        frame_width_bits_minus_1,
+        frame_height_bits_minus_1,
+        max_frame_width_minus_1: max_w_minus_1,
+        max_frame_height_minus_1: max_h_minus_1,
+        frame_id_numbers_present_flag: false,
+        delta_frame_id_length_minus_2: 0,
+        additional_frame_id_length_minus_1: 0,
+        // use_128x128_superblock = false ⇒ sb_size = 64 — the
+        // conformance-grade drivers walk 64×64 superblocks.
+        use_128x128_superblock: false,
+        enable_filter_intra: false,
+        enable_intra_edge_filter: false,
+        // r417: inter-intra compound rides every stream this builder
+        // seeds — single-reference 8x8..32x32 inter leaves code the
+        // §5.11.28 cascade and may select smooth / wedge inter-intra
+        // blends (intra-only frames are unaffected).
+        enable_interintra_compound: true,
+        // r415: masked compound rides every stream this builder seeds
+        // — inter GOP compound leaves code the §5.11.29
+        // `comp_group_idx` cascade and may select COMPOUND_WEDGE /
+        // COMPOUND_DIFFWTD (intra-only frames are unaffected).
+        enable_masked_compound: true,
+        // r419: warped motion rides every stream this builder seeds —
+        // inter frames code `allow_warped_motion = 1`, eligible
+        // single-reference leaves code the §5.11.27 arm-B 3-way
+        // `motion_mode` S(), and the RD ladder may commit
+        // WARPED_CAUSAL winners (intra-only frames are unaffected).
+        enable_warped_motion: true,
+        enable_dual_filter: false,
+        // r413: §5.5.1 order hints ride every stream this builder
+        // seeds (KEY-only and GOP alike) — the §5.9.22
+        // `skip_mode_params()` derivation and the §7.9 motion-field
+        // groundwork both key off `OrderHintBits > 0`. Intra-only
+        // frames simply carry `order_hint = 0`.
+        enable_order_hint: true,
+        // r416: jnt-comp rides every stream this builder seeds — inter
+        // GOP compound leaves code the §5.11.29 `compound_idx` S() and
+        // may select the §7.11.3.15 COMPOUND_DISTANCE blend
+        // (intra-only frames are unaffected).
+        enable_jnt_comp: true,
+        // r413: temporal MV prediction — GOP P-frames run §7.9
+        // motion-field estimation (`use_ref_frame_mvs = 1`); the
+        // seq-level gate must be open.
+        enable_ref_frame_mvs: true,
+        seq_force_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS,
+        seq_force_integer_mv: SELECT_INTEGER_MV,
+        order_hint_bits: ENCODER_ORDER_HINT_BITS,
+        enable_superres: false,
+        // r428 — the frame-level §5.9.19/§7.15 CDEF election needs
+        // the sequence gate open; frames that elect nothing code the
+        // all-zero strength set (identity filter, ~2 header bytes).
+        enable_cdef: true,
+        enable_restoration: false,
+        color_config: ColorConfig {
+            high_bitdepth: false,
+            twelve_bit: false,
+            bit_depth: 8,
+            mono_chrome: false,
+            num_planes: 3,
+            color_description_present_flag: false,
+            color_primaries: CP_UNSPECIFIED,
+            transfer_characteristics: TC_UNSPECIFIED,
+            matrix_coefficients: MC_UNSPECIFIED,
+            color_range: false,
+            subsampling_x: true,
+            subsampling_y: true,
+            chroma_sample_position: CSP_UNKNOWN,
+            separate_uv_delta_q: false,
+        },
+        film_grain_params_present: false,
+        bits_consumed: 0,
+    }
+}
+
+/// Build the minimal intra-only `FrameHeader` at `base_q_idx = 0`
+/// (lossless), `Only4x4` TxMode, in-loop filters disabled.
+///
+/// Equivalent to [`build_intra_only_yuv420_8bit_fh_with_q`] with
+/// `base_q_idx = 0`; kept for back-compat with historical callers.
+#[must_use]
+pub fn build_intra_only_yuv420_8bit_fh(
+    seq: &SequenceHeader,
+    width: u32,
+    height: u32,
+) -> FrameHeader {
+    build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, 0)
+}
+
+/// Build the minimal intra-only `FrameHeader` at the caller-supplied
+/// `base_q_idx`. `base_q_idx == 0` is the §5.9.2 `CodedLossless` arm
+/// (lossless WHT path on the leaf transform); `base_q_idx > 0`
+/// selects the lossy path. The conformance-grade KEY / inter drivers
+/// seed their headers from this shape and then override the fields
+/// their configuration needs.
+#[must_use]
+pub fn build_intra_only_yuv420_8bit_fh_with_q(
+    seq: &SequenceHeader,
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> FrameHeader {
+    let fs = FrameSize {
+        frame_width: width,
+        frame_height: height,
+        render_width: width,
+        render_height: height,
+        superres_denom: 8, // SUPERRES_NUM
+        upscaled_width: width,
+        mi_cols: 2 * ((width + 7) >> 3),
+        mi_rows: 2 * ((height + 7) >> 3),
+        use_superres: false,
+        coded_denom: 0,
+        render_and_frame_size_different: false,
+    };
+    let ti = TileInfo {
+        uniform_tile_spacing_flag: true,
+        tile_cols: 1,
+        tile_rows: 1,
+        tile_cols_log2: 0,
+        tile_rows_log2: 0,
+        context_update_tile_id: 0,
+        tile_size_bytes: 1,
+        mi_col_starts: vec![0, fs.mi_cols],
+        mi_row_starts: vec![0, fs.mi_rows],
+    };
+    let qp = QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc: 0,
+        diff_uv_delta: false,
+        delta_q_u_dc: 0,
+        delta_q_u_ac: 0,
+        delta_q_v_dc: 0,
+        delta_q_v_ac: 0,
+        using_qmatrix: false,
+        qm_y: 0,
+        qm_u: 0,
+        qm_v: 0,
+    };
+    FrameHeader {
+        show_existing_frame: false,
+        frame_to_show_map_idx: None,
+        display_frame_id: None,
+        frame_type: FrameType::Key,
+        frame_is_intra: true,
+        show_frame: true,
+        showable_frame: false,
+        error_resilient_mode: true,
+        disable_cdf_update: false,
+        allow_screen_content_tools: seq.seq_force_screen_content_tools != 0,
+        force_integer_mv: true,
+        current_frame_id: 0,
+        frame_size_override_flag: false,
+        order_hint: 0,
+        primary_ref_frame: PRIMARY_REF_NONE,
+        refresh_frame_flags: ALL_FRAMES_PUB,
+        ref_order_hints: None,
+        frame_size: Some(fs),
+        allow_intrabc: false,
+        disable_frame_end_update_cdf: false,
+        tile_info: Some(ti),
+        quantization_params: Some(qp),
+        segmentation_params: Some(SegmentationParams::disabled()),
+        delta_q_params: Some(DeltaQParams::default()),
+        delta_lf_params: Some(DeltaLfParams::default()),
+        loop_filter_params: Some(LoopFilterParams::short_circuit()),
+        // §5.9.19: the short-circuit shape ONLY where the parser
+        // short-circuits (CodedLossless || allow_intrabc ||
+        // !enable_cdef — this builder emits allow_intrabc = 0);
+        // otherwise the block is CODED and defaults to the all-zero
+        // strength set (identity filter) until the r428 election
+        // lands a winner.
+        cdef_params: Some(if base_q_idx == 0 || !seq.enable_cdef {
+            CdefParams::short_circuit()
+        } else {
+            CdefParams {
+                short_circuited: false,
+                ..CdefParams::short_circuit()
+            }
+        }),
+        lr_params: Some(LrParams {
+            frame_restoration_type: [FrameRestorationType::None; 3],
+            uses_lr: false,
+            uses_chroma_lr: false,
+            lr_unit_shift: 0,
+            lr_uv_shift: 0,
+            loop_restoration_size: [0; 3],
+            short_circuited: true,
+        }),
+        // §5.9.21 `read_tx_mode()`: `ONLY_4X4` is only valid under the
+        // §5.9.2 `CodedLossless` arm (`base_q_idx == 0` + all delta_q
+        // zero). For lossy quant the drivers override to
+        // `TxModeSelect`; `TxModeLargest` is the historical default.
+        tx_mode: Some(if base_q_idx == 0 {
+            TxMode::Only4x4
+        } else {
+            TxMode::TxModeLargest
+        }),
+        reference_select: Some(false),
+        skip_mode_present: Some(false),
+        skip_mode_frame: None,
+        allow_warped_motion: Some(false),
+        reduced_tx_set: Some(false),
+        global_motion_params: Some(GlobalMotionParams::identity()),
+        film_grain_params: Some(FilmGrainParams::reset()),
+        inter_refs: None,
+        bits_consumed: 0,
+    }
+}
+
+/// §5.11.1 SB-grid traversal order: every 64×64 superblock origin in
+/// 4×4-unit coordinates, row-major.
+///
+/// Equivalent to the spec's literal:
+/// ```text
+/// for (r = MiRowStart; r < MiRowEnd; r += sbSize4) {
+///     for (c = MiColStart; c < MiColEnd; c += sbSize4) {
+///         decode_partition(r, c, sbSize)
+///     }
+/// }
+/// ```
+/// with `MiRowStart = MiColStart = 0`, `MiRowEnd = mi_rows`,
+/// `MiColEnd = mi_cols`, and `sbSize4 = SB_SIZE4_64 = 16`.
+#[must_use]
+pub fn sb_grid_origins(mi_rows: u32, mi_cols: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut r = 0u32;
+    while r < mi_rows {
+        let mut c = 0u32;
+        while c < mi_cols {
+            out.push((r, c));
+            c += SB_SIZE4_64;
+        }
+        r += SB_SIZE4_64;
+    }
+    out
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Encoder-side single-reference inter (P-frame) pixel pipeline.
 //!
-//! The intra dyn driver ([`crate::encoder::pixel_driver_dyn`]) builds a
+//! The retired intra dyn mirror driver (removed in r428) built a
 //! leaf's reconstruction as `recon = pred + Q^-1( Q( T( input - pred ) ) )`
 //! where `pred` is the §7.11.2 intra prediction. The inter (§5.11.23
 //! `is_inter == 1`) arm differs in exactly one place: `pred` comes from
