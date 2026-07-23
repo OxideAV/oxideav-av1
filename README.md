@@ -1001,6 +1001,22 @@ round-trip gate (`tests/encode_decode_pixel_roundtrip.rs`) was
 rewritten onto the conformance-grade encoders over the same
 dimension / quantiser / content axes.
 
+### Annex B length-delimited bitstream (r428)
+
+The `annexb` module reads and writes the Annex B.2 packing
+(`temporal_unit_size` / `frame_unit_size` / `obu_length` nesting):
+`decoder::decode_av1_annexb` converts each temporal unit to its §5.2
+low-overhead equivalent (enforcing the Annex B.3 size-consistency
+and temporal-delimiter-placement rules) and drives the same spec
+decode session as the IVF path; `annexb::build_from_temporal_units`
+wraps this crate's own streams into Annex B framing (one frame unit
+per frame). Both arms are triple-validated: an external `--annexb`
+stream decodes byte-exact to the three-decoder reference digest, and
+the crate's own repacked KEY / GOP / pyramid streams decode
+byte-identically in all three external decoders
+(`tests/annexb_conformance.rs`; fixtures `ext-annexb-96x80` +
+`self-annexb-96x80-q80`).
+
 ### Not yet supported
 
 - Conformance-grade encoding lives on

@@ -80,3 +80,36 @@ pub fn decode_av1(input: &[u8]) -> Result<Vec<Frame>, Error> {
         .map(Frame::Spec)
         .collect())
 }
+
+/// Decode an **Annex B length-delimited** AV1 bitstream (r428).
+///
+/// The input is the raw Annex B packing (`temporal_unit_size` /
+/// `frame_unit_size` / `obu_length` `leb128` nesting per Annex B.2 —
+/// no IVF container). Each temporal unit is converted to its §5.2
+/// low-overhead equivalent by [`crate::annexb::split_temporal_units`]
+/// (enforcing the Annex B.3 consistency + temporal-delimiter
+/// placement rules) and decoded through the same
+/// [`SpecDecodeSession`] the IVF path drives — reference state and
+/// CDF carry work identically, so a stream repacked between the two
+/// formats decodes to identical pixels.
+///
+/// ## Errors
+///
+/// * [`Error::AnnexBInvalid`] / [`Error::UnexpectedEnd`] — malformed
+///   Annex B framing (see [`crate::annexb::split_temporal_units`]).
+/// * Any spec-driver parse/decode failure — the driver's typed
+///   [`Error`].
+pub fn decode_av1_annexb(input: &[u8]) -> Result<Vec<Frame>, Error> {
+    let units = crate::annexb::split_temporal_units(input)?;
+    let mut session = SpecDecodeSession::new();
+    let mut out: Vec<Frame> = Vec::new();
+    for unit in &units {
+        out.extend(
+            session
+                .decode_temporal_unit(unit)?
+                .into_iter()
+                .map(Frame::Spec),
+        );
+    }
+    Ok(out)
+}

@@ -1518,12 +1518,11 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod annexb;
 mod bitreader;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod cdef;
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
 pub mod cdf;
 pub mod decoder;
 pub mod encoder;
@@ -1971,6 +1970,12 @@ pub enum Error {
     /// implemented yet; every fixture in this round's corpus parses
     /// without ever triggering this path.
     TemporalPointInfoUnsupported,
+    /// r428 — an Annex B length-delimited bitstream violated the
+    /// Annex B.2/B.3 rules: nested sizes that do not tile their
+    /// container, an `obu_size`/`obu_length` inconsistency, or a
+    /// temporal delimiter anywhere but the first OBU of a temporal
+    /// unit's first frame unit.
+    AnnexBInvalid,
     /// Retained for API stability. The §5.9.2 `if (!FrameIsIntra ||
     /// refresh_frame_flags != allFrames) { if (error_resilient_mode &&
     /// enable_order_hint) { ... } }` ref_order_hint walk is now parsed
@@ -2448,6 +2453,10 @@ impl core::fmt::Display for Error {
             Self::InvalidIdLen => write!(
                 f,
                 "oxideav-av1: idLen (delta_frame_id_length_minus_2 + additional_frame_id_length_minus_1 + 3) exceeded 16 (§6.8.2)"
+            ),
+            Self::AnnexBInvalid => write!(
+                f,
+                "oxideav-av1: invalid Annex B length-delimited framing (Annex B.2/B.3)"
             ),
             Self::TemporalPointInfoUnsupported => write!(
                 f,
