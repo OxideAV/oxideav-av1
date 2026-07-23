@@ -963,6 +963,26 @@ Pinned: `self-gop-128x128-q100-deltaq` — the corpus's first
 independent black-box reference decoders (corpus 107). KEY-frame
 delta-q and the segmentation × delta-q pairing stay open.
 
+### Frame-level CDEF election (r428)
+
+r428 closes encoder-election ladder item 3 at frame granularity. The
+sequence `enable_cdef` gate is open on every conformance-grade
+stream: each lossy frame's committed reconstruction is filtered
+through the decoder's own §7.15 driver over the write mirror's
+§5.11.56 `cdef_idx[]` anchors and 8×8 skip conjunction, a bounded
+strength search scores candidates against the source, and a winner
+that beats the unfiltered frame lands in the header and in the
+§7.20 reference store (encoder recon stays byte-exact with the
+decoder, filter live). `cdef_bits = 0` — zero tile bits, the
+election is pure distortion. Hard-gated off on lossless / intrabc /
+exactness-demand / auto-lossless / segmented configurations.
+Measured (`tests/cdef_ab.rs`): **+0.28 dB at −1.2% bytes** on
+ringing-prone edges (96×80 q140). Pinned:
+`self-gop-96x80-q140-cdef` — the corpus's first self-encoded stream
+with non-zero §5.9.19 strengths, byte-identical through three
+independent black-box reference decoders (corpus 108). Per-64×64
+`cdef_bits > 0` election and the segmentation pairing stay open.
+
 ### Not yet supported
 
 - The historical intra `encode_av1` mirror paths emit non-conformant

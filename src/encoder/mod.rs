@@ -247,6 +247,7 @@
 pub mod bitwriter;
 #[doc(hidden)]
 pub mod block_mode_info;
+pub(crate) mod cdef_elect;
 #[doc(hidden)]
 pub mod coefficients;
 pub(crate) mod dv_hash;

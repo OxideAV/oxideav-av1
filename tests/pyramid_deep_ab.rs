@@ -167,6 +167,7 @@ fn baseline_tuning() -> PyramidTuning {
         // arms so the pyramid-depth axis stays the only variable.
         high_precision_mv: true,
         delta_q: true,
+        cdef: true,
     }
 }
 

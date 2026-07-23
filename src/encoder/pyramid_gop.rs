@@ -144,6 +144,10 @@ pub struct PyramidTuning {
     /// arm election). `false` keeps the single-quantiser shape on
     /// every frame (the A/B baseline).
     pub delta_q: bool,
+    /// r428 — frame-level §5.9.19/§7.15 CDEF election on lossy
+    /// frames (KEY + every pyramid role). `false` keeps the
+    /// all-zero-strength shape on every frame (the A/B baseline).
+    pub cdef: bool,
 }
 
 impl Default for PyramidTuning {
@@ -155,6 +159,7 @@ impl Default for PyramidTuning {
             primary_ref: true,
             high_precision_mv: true,
             delta_q: true,
+            cdef: true,
         }
     }
 }
@@ -422,6 +427,7 @@ impl PyramidSession {
             tuning.model,
             &[],
             None,
+            tuning.cdef,
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -542,6 +548,7 @@ impl PyramidSession {
                         seg_extras: None,
                         high_precision_mv: self.tuning.high_precision_mv,
                         delta_q: self.tuning.delta_q,
+                        cdef: self.tuning.cdef,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(

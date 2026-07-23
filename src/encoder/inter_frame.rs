@@ -158,6 +158,9 @@ pub struct TunedGopYuv {
     /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
     /// flag (index 0 is the first P-frame).
     pub delta_q_elections: Vec<bool>,
+    /// r428 — each P-frame's frame-level §5.9.19 CDEF election
+    /// (index 0 is the first P-frame).
+    pub cdef_elections: Vec<bool>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -198,6 +201,9 @@ pub struct TunedGop {
     /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
     /// flag (index 0 is the first P-frame).
     pub delta_q_elections: Vec<bool>,
+    /// r428 — each P-frame's frame-level §5.9.19 CDEF election
+    /// (index 0 is the first P-frame).
+    pub cdef_elections: Vec<bool>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -297,6 +303,10 @@ pub(crate) struct InterFrameAux {
     /// per-superblock delta-q arm won the frame-level joint-objective
     /// election over the single-quantiser arm).
     pub(crate) delta_q: bool,
+    /// r428 — the elected frame-level §5.9.19 CDEF strengths (`true`
+    /// when a non-zero strength set beat the unfiltered frame and
+    /// landed in the header + reconstruction).
+    pub(crate) cdef: bool,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -607,6 +617,12 @@ pub struct GopTuning {
     /// arm election). `false` keeps the single-quantiser shape on
     /// every frame (the A/B baseline).
     pub delta_q: bool,
+    /// r428 — frame-level §5.9.19/§7.15 CDEF election on lossy
+    /// frames (KEY + inter): decoder-mirror filtering on the recon
+    /// path, source-scored strength search, zero tile bits. `false`
+    /// keeps the all-zero-strength shape on every frame (the A/B
+    /// baseline).
+    pub cdef: bool,
 }
 
 impl Default for GopTuning {
@@ -618,6 +634,7 @@ impl Default for GopTuning {
             temporal_seg: true,
             high_precision_mv: true,
             delta_q: true,
+            cdef: true,
         }
     }
 }
@@ -791,6 +808,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         p_segment_maps: t.p_segment_maps,
         hp_mv_elections: t.hp_mv_elections,
         delta_q_elections: t.delta_q_elections,
+        cdef_elections: t.cdef_elections,
     })
 }
 
@@ -898,6 +916,11 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         model,
         if key_mask.is_some() { alt_q } else { &[] },
         key_mask.as_deref(),
+        // r428 scope: CDEF stays off SEGMENTED GOPs entirely (the
+        // filtered-reference perturbation destabilises the r423
+        // temporal segment-map election chain) — the pairing is left
+        // open.
+        tuning.cdef && alt_q.is_empty(),
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
@@ -940,6 +963,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
     let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
     let mut hp_mv_elections: Vec<bool> = Vec::new();
     let mut delta_q_elections: Vec<bool> = Vec::new();
+    let mut cdef_elections: Vec<bool> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -970,12 +994,14 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             extras,
             tuning.high_precision_mv,
             tuning.delta_q,
+            tuning.cdef,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
         seg_temporal_updates.push(aux.seg_temporal);
         hp_mv_elections.push(aux.hp_mv);
         delta_q_elections.push(aux.delta_q);
+        cdef_elections.push(aux.cdef);
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
@@ -1009,6 +1035,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         p_segment_maps,
         hp_mv_elections,
         delta_q_elections,
+        cdef_elections,
     })
 }
 
@@ -1137,6 +1164,16 @@ pub(crate) struct InterFrameConfig<'a> {
     /// scores better under `D + λ·R`. `false` keeps the pre-r428
     /// single-quantiser shape unconditionally (the A/B baseline).
     pub delta_q: bool,
+    /// r428 — frame-level §5.9.19/§7.15 CDEF arm: after the tile is
+    /// committed the reconstruction is filtered through the decoder's
+    /// own §7.15 driver over the write mirror's grids, a bounded
+    /// strength search scores candidates against the SOURCE, and the
+    /// winner (when it beats the unfiltered frame) lands in the
+    /// header and in the reference-store reconstruction. ZERO tile
+    /// bits at `cdef_bits = 0` — the election is pure distortion.
+    /// `false` keeps the all-zero-strength header shape (the A/B
+    /// baseline).
+    pub cdef: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1412,6 +1449,7 @@ fn p_frame_config_primary<'a>(
         seg_extras: None,
         high_precision_mv: true,
         delta_q: true,
+        cdef: true,
     }
 }
 
@@ -1458,6 +1496,7 @@ fn encode_p_frame_yuv(
     seg_extras: Option<&SegExtras>,
     high_precision_mv: bool,
     delta_q: bool,
+    cdef: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1475,6 +1514,7 @@ fn encode_p_frame_yuv(
     cfg.seg_extras = seg_extras;
     cfg.high_precision_mv = high_precision_mv;
     cfg.delta_q = delta_q;
+    cfg.cdef = cdef;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -1872,11 +1912,14 @@ pub(crate) fn encode_inter_frame_generic_gm(
     /// OBU assembly + the post-tile exact-bytes elections consume).
     struct FrameArm {
         tile: Vec<u8>,
-        cdfs: TileCdfContext,
+        // Boxed: `TileCdfContext` (and the search context) are far
+        // too large for by-value moves through closure returns on a
+        // 2 MiB test-thread stack (debug builds memcpy every move).
+        cdfs: Box<TileCdfContext>,
         state: PartitionSyntaxWriter,
         trees: Vec<SyntaxNode>,
-        recon: ReconState,
-        ictx: PSearchCtx,
+        recon: Box<ReconState>,
+        ictx: Box<PSearchCtx>,
     }
 
     // One full search + tile write under `arm_params` (and, when
@@ -1888,7 +1931,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let run_arm = |arm_params: &SyntaxFrameParams,
                    plan: Option<&[i32]>|
      -> Result<FrameArm, Error> {
-        let mut recon = ReconState {
+        let mut recon = Box::new(ReconState {
             y: vec![0u16; width * height],
             u: vec![0u16; chroma_w * chroma_h],
             v: vec![0u16; chroma_w * chroma_h],
@@ -1909,8 +1952,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
             qp: arm_params.quant,
             bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
             dv_hash: Default::default(),
-        };
-        let mut ictx = PSearchCtx::with_refs(
+        });
+        let mut ictx = Box::new(PSearchCtx::with_refs(
             &cfg.refs,
             cfg.slot_to_plane,
             cfg.ref_frame_idx,
@@ -1927,7 +1970,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             ssx,
             ssy,
             num_planes,
-        )?;
+        )?);
         // r426 — arm the §5.9.14 inter-override features (ladder item
         // 8): requires the segmentation carrier (non-empty alt_q), raw
         // RefFrame data within the ladder, and flips SegIdPreSkip.
@@ -1960,7 +2003,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         }
 
         let mut writer = SymbolWriter::new(fh.disable_cdf_update);
-        let mut cdfs = frame_start_cdfs.as_ref().clone();
+        let mut cdfs: Box<TileCdfContext> = frame_start_cdfs.clone();
         let mut state = PartitionSyntaxWriter::new(
             mi_rows,
             mi_cols,
@@ -2186,7 +2229,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         mut cdfs,
         mut state,
         trees,
-        recon,
+        mut recon,
         ictx,
     } = arm;
 
@@ -2221,35 +2264,38 @@ pub(crate) fn encode_inter_frame_generic_gm(
         alt_ip.allow_high_precision_mv = false;
         let mut alt_params = params.clone();
         alt_params.inter = Some(alt_ip);
-        let replay = (|| -> Result<(Vec<u8>, TileCdfContext, PartitionSyntaxWriter), Error> {
-            let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
-            let mut alt_cdfs = frame_start_cdfs.as_ref().clone();
-            let mut alt_state = PartitionSyntaxWriter::new(
-                mi_rows,
-                mi_cols,
-                TileGeometry {
-                    mi_row_start: 0,
-                    mi_row_end: mi_rows,
-                    mi_col_start: 0,
-                    mi_col_end: mi_cols,
-                },
-            )
-            .ok_or(Error::PartitionWalkOutOfRange)?;
-            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
-                alt_state.arm_read_deltas();
-                write_partition_tree_syntax(
-                    &mut alt_writer,
-                    &mut alt_cdfs,
-                    &mut alt_state,
-                    tree,
-                    sb_r,
-                    sb_c,
-                    BLOCK_64X64,
-                    &alt_params,
-                )?;
-            }
-            Ok((alt_writer.finish(), alt_cdfs, alt_state))
-        })();
+        let replay =
+            (|| -> Result<(Vec<u8>, Box<TileCdfContext>, PartitionSyntaxWriter), Error> {
+                let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
+                let mut alt_cdfs: Box<TileCdfContext> = frame_start_cdfs.clone();
+                let mut alt_state = PartitionSyntaxWriter::new(
+                    mi_rows,
+                    mi_cols,
+                    TileGeometry {
+                        mi_row_start: 0,
+                        mi_row_end: mi_rows,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols,
+                    },
+                )
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+                for ((sb_r, sb_c), tree) in
+                    sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees)
+                {
+                    alt_state.arm_read_deltas();
+                    write_partition_tree_syntax(
+                        &mut alt_writer,
+                        &mut alt_cdfs,
+                        &mut alt_state,
+                        tree,
+                        sb_r,
+                        sb_c,
+                        BLOCK_64X64,
+                        &alt_params,
+                    )?;
+                }
+                Ok((alt_writer.finish(), alt_cdfs, alt_state))
+            })();
         if let Ok((alt_bytes, alt_cdfs, alt_state)) = replay {
             // `<=`: on an exact byte tie (no `mv_hp` cascade was ever
             // coded and every derivation matched) prefer the
@@ -2296,7 +2342,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         let mut alt_params = params.clone();
         alt_params.inter = Some(alt_ip);
         let mut alt_writer = SymbolWriter::new(fh.disable_cdf_update);
-        let mut alt_cdfs = frame_start_cdfs.as_ref().clone();
+        let mut alt_cdfs: Box<TileCdfContext> = frame_start_cdfs.clone();
         let mut alt_state = PartitionSyntaxWriter::new(
             mi_rows,
             mi_cols,
@@ -2377,7 +2423,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         let mut best: Option<(
             u8,
             Vec<u8>,
-            TileCdfContext,
+            Box<TileCdfContext>,
             PartitionSyntaxWriter,
             Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]>,
         )> = None;
@@ -2387,14 +2433,14 @@ pub(crate) fn encode_inter_frame_generic_gm(
             {
                 return Err(Error::PartitionWalkOutOfRange);
             }
-            let mut cand_cdfs: TileCdfContext = match carry_opt {
+            let mut cand_cdfs: Box<TileCdfContext> = match carry_opt {
                 Some(carry) if *ord != PRIMARY_REF_NONE => {
-                    let mut loaded = carry.cdfs.as_ref().clone();
+                    let mut loaded = carry.cdfs.clone();
                     loaded.zero_counts();
                     loaded
                 }
                 _ => {
-                    let mut c = TileCdfContext::new_from_defaults();
+                    let mut c = Box::new(TileCdfContext::new_from_defaults());
                     c.init_coeff_cdfs(base_q_idx);
                     c
                 }
@@ -2442,6 +2488,52 @@ pub(crate) fn encode_inter_frame_generic_gm(
             cdfs = e_cdfs;
             state = e_state;
             prev_gm_for_header = e_prev;
+        }
+    }
+
+    // r428 — frame-level §5.9.19/§7.15 CDEF election: the committed
+    // reconstruction (deblock levels are 0 on every header this
+    // encoder emits, so it IS the §7.15 input) is filtered through
+    // the decoder's own driver over the write mirror's committed
+    // `cdef_idx[]` / `Skips[]` grids, a bounded strength search
+    // scores each candidate against the SOURCE, and a winner that
+    // beats the unfiltered frame lands in the header and in the
+    // reconstruction — the §7.20 reference store the decoder will
+    // hold. `cdef_bits = 0` ⇒ ZERO tile bits (the §5.11.56 literal is
+    // `L(0)`), so the election is pure distortion and composes with
+    // every tile-bytes election above.
+    // HARD gate on exactness-demand / auto-lossless frames: §7.15
+    // filters every non-skip 8×8 block regardless of its segment, so
+    // an elected strength would break the demanded regions'
+    // pixel-exactness contract even when the frame-total SSD improves.
+    // Segmented frames also stay off this arm (r428 scope): the CDEF
+    // reference perturbation destabilises the r423 temporal
+    // segment-map election chain — the pairing is left open.
+    let mut cdef_elected = false;
+    if cfg.cdef
+        && !lossless
+        && seq.enable_cdef
+        && cfg.exact_mask.is_none()
+        && !cfg.auto_lossless
+        && alt_q.is_empty()
+    {
+        if let Some(p) = crate::encoder::cdef_elect::elect_and_apply_cdef(
+            state.mirror(),
+            input,
+            &mut recon.y,
+            &mut recon.u,
+            &mut recon.v,
+            width,
+            height,
+            chroma_w,
+            chroma_h,
+            bit_depth,
+            ssx,
+            ssy,
+            num_planes,
+        ) {
+            fh.cdef_params = Some(p);
+            cdef_elected = true;
         }
     }
 
@@ -2531,7 +2623,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // `SavedGmParams` (this frame's decoded GmParams table; identity
     // rows where no model was coded).
     let carry = RefSlotCarry {
-        cdfs: Box::new(cdfs),
+        cdfs,
         segment_ids: state.mirror().segment_ids().to_vec(),
         mi_rows,
         mi_cols,
@@ -2556,6 +2648,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             primary_ref: fh.primary_ref_frame,
             hp_mv: hp_elected,
             delta_q: delta_q_elected,
+            cdef: cdef_elected,
         },
     ))
 }
@@ -7797,6 +7890,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             true,
         )

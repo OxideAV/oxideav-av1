@@ -340,7 +340,10 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         seq_force_integer_mv: SELECT_INTEGER_MV,
         order_hint_bits: ENCODER_ORDER_HINT_BITS,
         enable_superres: false,
-        enable_cdef: false,
+        // r428 — the frame-level §5.9.19/§7.15 CDEF election needs
+        // the sequence gate open; frames that elect nothing code the
+        // all-zero strength set (identity filter, ~2 header bytes).
+        enable_cdef: true,
         enable_restoration: false,
         color_config: ColorConfig {
             high_bitdepth: false,
@@ -460,7 +463,20 @@ pub fn build_intra_only_yuv420_8bit_fh_with_q(
         delta_q_params: Some(DeltaQParams::default()),
         delta_lf_params: Some(DeltaLfParams::default()),
         loop_filter_params: Some(LoopFilterParams::short_circuit()),
-        cdef_params: Some(CdefParams::short_circuit()),
+        // §5.9.19: the short-circuit shape ONLY where the parser
+        // short-circuits (CodedLossless || allow_intrabc ||
+        // !enable_cdef — this builder emits allow_intrabc = 0);
+        // otherwise the block is CODED and defaults to the all-zero
+        // strength set (identity filter) until the r428 election
+        // lands a winner.
+        cdef_params: Some(if base_q_idx == 0 || !seq.enable_cdef {
+            CdefParams::short_circuit()
+        } else {
+            CdefParams {
+                short_circuited: false,
+                ..CdefParams::short_circuit()
+            }
+        }),
         lr_params: Some(LrParams {
             frame_restoration_type: [FrameRestorationType::None; 3],
             uses_lr: false,

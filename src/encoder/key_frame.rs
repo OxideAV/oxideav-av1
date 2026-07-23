@@ -281,7 +281,8 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     exact_mask: Option<&[bool]>,
 ) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
     let wide = YuvFrame::from_yuv420_8bit(input);
-    let (k, carry) = encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask)?;
+    let (k, carry) =
+        encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask, true)?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok((
         EncodedKeyFrame {
@@ -322,7 +323,8 @@ pub fn encode_key_frame_yuv_with_q(
     input: &YuvFrame,
     base_q_idx: u8,
 ) -> Result<EncodedKeyFrameYuv, Error> {
-    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None).map(|(k, _)| k)
+    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None, true)
+        .map(|(k, _)| k)
 }
 
 /// r427 — the general-format KEY-frame core: every entry point above
@@ -334,6 +336,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     model: RateModel,
     alt_q: &[i16],
     exact_mask: Option<&[bool]>,
+    cdef: bool,
 ) -> Result<
     (
         EncodedKeyFrameYuv,
@@ -398,6 +401,12 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     // duplicate superblock — the per-leaf `use_intrabc` S() overhead
     // is only worth coding when a copy source provably exists.
     fh.allow_intrabc = fh.allow_screen_content_tools && intrabc_beneficial(input);
+    // §5.9.19: `allow_intrabc = 1` short-circuits the cdef_params
+    // block — keep the header descriptor on the parser's
+    // short-circuit shape (the r428 election is gated off there too).
+    if fh.allow_intrabc {
+        fh.cdef_params = Some(crate::uncompressed_header_tail::CdefParams::short_circuit());
+    }
     // r410: the lossy arm codes §5.9.21 `TxMode = TX_MODE_SELECT` so
     // every leaf carries the §5.11.15 `tx_depth` choice the RD search
     // makes (lossless stays on the §5.9.2 CodedLossless ONLY_4X4 arm).
@@ -562,6 +571,35 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         );
     }
     let tile_bytes = writer.finish();
+
+    // r428 — frame-level §5.9.19/§7.15 CDEF election on the KEY frame
+    // (deblock levels are 0 on this header, so the reconstruction IS
+    // the §7.15 input; `allow_intrabc = 1` closes the §5.9.19 gate —
+    // the header short-circuits there and the decoder never filters).
+    // `cdef_bits = 0` ⇒ zero tile bits; the winner (when it beats the
+    // unfiltered frame against the SOURCE) lands in the header and in
+    // the reconstruction the §7.20 `allFrames` refresh stores.
+    // (Same HARD gate as the inter driver on exactness-demand frames:
+    // §7.15 would filter the demanded region's blocks.)
+    if cdef && base_q_idx > 0 && seq.enable_cdef && !fh.allow_intrabc && exact_mask.is_none() {
+        if let Some(p) = crate::encoder::cdef_elect::elect_and_apply_cdef(
+            state.mirror(),
+            input,
+            &mut recon.y,
+            &mut recon.u,
+            &mut recon.v,
+            width,
+            height,
+            chroma_w,
+            chroma_h,
+            bit_depth,
+            ssx,
+            ssy,
+            num_planes,
+        ) {
+            fh.cdef_params = Some(p);
+        }
+    }
 
     // §5.11.1 tile-group body (single tile).
     let tile_group = TileGroupObu {
