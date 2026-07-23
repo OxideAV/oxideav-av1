@@ -8,10 +8,15 @@
 //! syntax (the r411 [`super::partition_tree`] write arm, whose output
 //! the spec decode walker replays bit-for-bit).
 //!
-//! ## Scope (r411, extended r412)
+//! ## Scope (r411, extended r412; every §6.4.1 format pairing r427)
 //!
-//! * 8-bit 4:2:0 YUV input, dimensions per the KEY-frame rules
-//!   (multiples of 8 in `[8, KEY_FRAME_MAX_DIM]`).
+//! * Any §6.4.1 (bit depth, chroma format) pairing ([`YuvFrame`] —
+//!   8 / 10 / 12-bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome; the
+//!   historical [`Yuv420Frame`] entries widen into the same core),
+//!   dimensions per the KEY-frame rules (multiples of 8 in
+//!   `[8, KEY_FRAME_MAX_DIM]`). Under 4:2:2 the §5.11.38
+//!   admissibility rule bars the tall partition shapes from the RD
+//!   ladder.
 //! * P-frame header: `error_resilient_mode = 1` (forcing
 //!   `primary_ref_frame = PRIMARY_REF_NONE` — per-frame default CDFs),
 //!   the r412 two-slot reference rotation (frame `k` refreshes slot
