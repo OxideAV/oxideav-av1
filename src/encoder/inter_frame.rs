@@ -3078,13 +3078,22 @@ impl PSearchCtx {
     /// with the frame's zero per-plane deltas (the encode-side
     /// residual chain quantises at exactly the q-index the §5.11.39
     /// reader will dequantise with).
+    ///
+    /// r429 BUG FIX — the bundle carries the FRAME's §6.4.1
+    /// `BitDepth`, not a hardcoded 8: the §7.12.2 `dc_q` / `ac_q`
+    /// lookups, the residual chain's `(1 << BitDepth) - 1` clip and
+    /// the [`lambda_for`] `4^(BitDepth-8)` distortion scale are all
+    /// depth-keyed, so an 8-bit bundle mis-quantised every non-zero
+    /// segment of a 10/12-bit GOP (encoder recon diverged from the
+    /// decoder's §7.12.3 dequantisation of the very coefficients it
+    /// wrote).
     fn seg_qp(&self, frame_qp: &QuantizerParams, segment_id: u8) -> QuantizerParams {
         if self.seg_alt_q.is_empty() || segment_id == 0 {
             return *frame_qp;
         }
         let q = (i32::from(self.base_q_idx) + i32::from(self.seg_alt_q[segment_id as usize]))
             .clamp(0, 255) as u8;
-        QuantizerParams::neutral(q, 8)
+        QuantizerParams::neutral(q, frame_qp.bit_depth)
     }
 
     /// r426 — `LosslessArray[ segment_id ]` for this GOP's frames
@@ -6156,7 +6165,10 @@ fn encode_intra_candidate(
     // lossless segment's qindex-0 configuration.
     let saved_qp = recon.qp;
     let saved_lossless = recon.lossless;
-    recon.qp = QuantizerParams::neutral(0, 8);
+    // r429 — keep the frame's real §6.4.1 `BitDepth` on the swapped-in
+    // lossless bundle (the WHT chain's clip + the intra fallback's λ
+    // are depth-keyed; see the `seg_qp` bug-fix note).
+    recon.qp = QuantizerParams::neutral(0, saved_qp.bit_depth);
     recon.lossless = true;
     let out = crate::encoder::key_frame::encode_leaf_sq_seg(
         r,

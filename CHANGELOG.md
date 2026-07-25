@@ -4,6 +4,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- BUG FIX: per-segment quantiser bundles carry the frame's real BitDepth — segmented 10/12-bit GOPs quantised segments != 0 through the 8-bit §7.12.2 rows, clipped recon at 255 and under-scaled lambda; segmented >8-bit regression suite + pinned corpus stream (109)
+
 ## [0.1.16](https://github.com/OxideAV/oxideav-av1/compare/v0.1.15...v0.1.16) - 2026-07-23
 
 ### Other

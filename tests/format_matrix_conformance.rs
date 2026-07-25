@@ -397,3 +397,93 @@ fn pyramid_round_trips_at_new_pairings() {
         }
     }
 }
+
+/// r429 regression pin — SEGMENTED GOPs above 8 bits. The r413
+/// per-segment quantiser bundle hardcoded `BitDepth = 8`, so every
+/// non-zero segment of a 10/12-bit GOP quantised through the 8-bit
+/// §7.12.2 `dc_q`/`ac_q` tables, clipped its reconstruction at 255
+/// and ran [`lambda_for`]'s distortion scale 4^(BitDepth-8) too low —
+/// the encoder reconstruction diverged from the decoder's §7.12.3
+/// dequantisation of the coefficients it wrote. This test drives the
+/// activity-segmented GOP core at 10-bit 4:2:0, 12-bit 4:2:0 and
+/// 10-bit 4:4:4, requires that non-zero segments were actually
+/// committed (else the regression is vacuous), and holds the spec
+/// driver byte-exact against the encoder reconstruction.
+#[test]
+fn segmented_gop_round_trips_above_8bit() {
+    use oxideav_av1::encoder::{encode_gop_yuv_seg_extras_tuned, GopTuning};
+    for &(bd, fmt) in &[
+        (10u8, ChromaFormat::Yuv420),
+        (12u8, ChromaFormat::Yuv420),
+        (10u8, ChromaFormat::Yuv444),
+    ] {
+        let frames: Vec<YuvFrame> = (0..3)
+            .map(|k| textured(96, 80, bd, fmt, 2 * k, 3 * k))
+            .collect();
+        let tuned = encode_gop_yuv_seg_extras_tuned(
+            &frames,
+            100,
+            &[0, 48, -40],
+            &[],
+            false,
+            None,
+            GopTuning::default(),
+        )
+        .unwrap_or_else(|e| panic!("bd={bd} {fmt:?}: segmented encode failed: {e:?}"));
+        assert!(
+            tuned
+                .p_segment_maps
+                .iter()
+                .any(|map| map.iter().any(|&s| s > 0)),
+            "bd={bd} {fmt:?}: no P-frame committed a non-zero segment — regression vacuous"
+        );
+        let enc = &tuned.gop;
+        let decoded = decode_av1_spec(&enc.ivf_bytes)
+            .unwrap_or_else(|e| panic!("bd={bd} {fmt:?}: spec driver rejected: {e:?}"));
+        assert_eq!(decoded.len(), frames.len());
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.bit_depth, bd);
+            assert_eq!(
+                f.planes[0],
+                plane_bytes(bd, &enc.recon[idx].y),
+                "bd={bd} {fmt:?} frame {idx}: luma"
+            );
+            assert_eq!(
+                f.planes[1],
+                plane_bytes(bd, &enc.recon[idx].u),
+                "bd={bd} {fmt:?} frame {idx}: U"
+            );
+            assert_eq!(
+                f.planes[2],
+                plane_bytes(bd, &enc.recon[idx].v),
+                "bd={bd} {fmt:?} frame {idx}: V"
+            );
+        }
+        // External black-box validation of these exact streams runs
+        // during the round via this dump flow; the winner is pinned in
+        // fixture_conformance.rs.
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_R429_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let tag = format!(
+                "{}bit-{}",
+                bd,
+                match fmt {
+                    ChromaFormat::Yuv444 => "444",
+                    _ => "420",
+                }
+            );
+            std::fs::write(
+                format!("{dir}/self-gop-96x80-q100-seg-{tag}.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+            let mut yuv = Vec::new();
+            for rc in &enc.recon {
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.y));
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.u));
+                yuv.extend_from_slice(&plane_bytes(bd, &rc.v));
+            }
+            std::fs::write(format!("{dir}/self-gop-96x80-q100-seg-{tag}.yuv"), &yuv).unwrap();
+        }
+    }
+}

@@ -9338,3 +9338,71 @@ fn self_encoded_cdef_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r429 self-encoded segmented high-bit-depth fixture — the corpus's
+// first stream pairing §5.9.14 SEG_LVL_ALT_Q segmentation with a
+// BitDepth above 8: the decoder must key the §7.12.2 dc_q/ac_q lookups
+// of every per-segment qindex to the 10-bit rows and Clip1(10) the
+// reconstruction (the r429 seg_qp bug-fix territory — an 8-bit-keyed
+// encoder diverges from these very bytes).
+// ---------------------------------------------------------------------
+
+const SELF_GOP_96X80_Q100_SEG_10BIT_420_IVF: &str = concat!(
+    "444b4946000020004156303160005000190000000100000003000000000000008f0300000000",
+    "00000000000012000a0a0000000335f9e5dfca0232fe0610008c800000000040ccc43d593b0f",
+    "e62fa3ff9bac66cde22a55275e6abbc1102d01d08338a35ff0c69b78bb9736cf11ee2a231de3",
+    "5ace5ed6fb24a9ecbf73fffffffff5d46b3ca4162e50b1452c7aa816b117ece1134a5d634482",
+    "0000000000000000236c2e0582c98474be9c8871ab40f2d9f99f93c97ffffffffffffffeca63",
+    "26dd3ffffff3bcc3bfffffff4d9a47919dd9fb39904756f3dd3e731974bb6818d61a72446535",
+    "5330084800000000000001bd9201c6a58ef3e46a58f1012c95bd2ad0b024948edc124924b28d",
+    "e0000378421e85bf620e6327738ff32640a5f4e7c7a002b5ed550fd1b69ff13f97ffffffffff",
+    "fffffefb97c7316ca05af977e963f621b0a09c95e96e0000000000000085f580924923c64249",
+    "37d71fef7d733332afd74cf67b10c77b0e623feeb3bafabc2846c3d6413701d5990afd10b13b",
+    "e002051fc08537f56869be60acb7fe2343c882c133ffd7ff80104846a0007ddb5dffb87d9378",
+    "3c46800000000000000002a3fa42decf11d4849d43e1f16b8af458f47212fa25b4c73ad696dc",
+    "1c2fd255ab088380eb984ab093e174e2a110b123e4544c200deff2ca28dcd174e56ae73552e2",
+    "b03a464fcb53348067486bf1b48e0b59b0da1d550afc60ec60027ac498547cca3c508fea8263",
+    "20c29dbe0001747fd7b0d2e02c639fec3cac8226d134dfe3616f83bdcaea5dccb4b2004df656",
+    "2471995320fd5f7b8d8e377b85c526b12fffffffff322735efd1ff33c21f195238b4e97e1f17",
+    "bd4b800000000001bf9b75aaa6efd6bbdb5608765a5c1ee50cc8432b2e14aa6129a093978c54",
+    "68ef6c3400d20a8e5d955dd69eecfc601acd3d1bc061b6ddaa0c32b7c25fa383a92dd072379f",
+    "05737a1b57718e9263bbf6c254c4f35623b6811e46859b821ee1cc72c9f74687c57bc52b37b4",
+    "2b6e9c7ed4518e844328543cc118e9955c15a4a8c3097ac8e0f4c6730714a8e45b50fd32756d",
+    "0c761acd228b3323b56d553d722f7265ffac8dc5cadfa4ed127c36fc5c443fed6130df880000",
+    "00000003207f933bf01d66680f0b7a31c5ddc93e7f881a1b5f62fd2e20d74a0cb076aedb9567",
+    "50a0c945b307774a22fe64f0bd6052c45424531bb162138c57c422b13db427d88ad74b672d4b",
+    "bc65b90bcf9a5f88524d22da10b84b765cbba3a4b2b26e7042f9801537d03ed05e18c1d77e61",
+    "52d06f67a39536f30d395f3e9aa37aadb7ca567247d1820b3e3d74f9c8f64b2b58c8aa495e97",
+    "6cfa6984f82f0100000100000000000000120032aa023002004490497a3206c00023001ec000",
+    "00000000000000000700b72e0a73388036310a41dfbd2508f21c56d5b6c6f625ada32246773c",
+    "da295dd7dffb20e04d038b2ff284e531bab3468591027d16a73b5e822ee723ad13b6ec551d10",
+    "f33518c7acbc60be65966d7677d934bced38954372429f38cdefe23685c31360642b0c1780f6",
+    "a1f0673b035d0d2fe14986b30dc3f79ea08161f5b8bf50e17c121bd24bd3b7b77777819a37d7",
+    "5faa79350db0feabd299d4778405b8d9322ba22c34fb27cc567572fe9fa230662861843bfdac",
+    "188d906c2802619c7d52912900f258c1a0c13ef90f27cd2875fe9a1f3632c2f636b6df8d5260",
+    "8ca4d7ffc9d71cf7392287bdd3cee1d473237a2811c6fc76666940dee9fbc2b3b326a34d4646",
+    "c169c8c72892d92411a5bbd3dd59fc74d90000000200000000000000120032d4013004008002",
+    "007a3206c00023001ec0000000000000000000078000e7a3070465205c301e7d8c61ee3a8111",
+    "6e07b737310daf5d57679ee54668b96ec9d35558ead0ea7f8e805d68dab56b27cb46243a4cd4",
+    "d1c2f8d735d97993f295e7d348a4f31f62fda2ecea08994b0fe02f24e3c6a16feac8d69cded2",
+    "18c4b52fbf657a1504efd114dea4ab64154856b35340d35d9c8d8349db5e7c5df03088c33816",
+    "4f6622767497421c9e91f4cb7be4014579a3ead127d0996ecd33b6af3aec8eca224d614299a2",
+    "8db88f934deef9950ea3559f0e0027c240",
+);
+
+/// r429: segmented 10-bit 4:2:0 GOP (KEY + 2 P, `base_q_idx = 100`,
+/// `alt_q = [0, 48, -40]`, activity-elected per-block segments) —
+/// pins the per-segment quantiser at the frame's real bit depth.
+/// Digest = byte-identical output of THREE independent black-box
+/// reference decoders (notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q100-seg-10bit-420/`).
+#[test]
+fn self_encoded_segmented_10bit_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q100-seg-10bit-420",
+        SELF_GOP_96X80_Q100_SEG_10BIT_420_IVF,
+        "d58f7d496cd2026add1426848644052d1987e04de6a87330d7cbae437976491b",
+        3,
+    );
+}
