@@ -4,6 +4,7 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- loop restoration: §5.9.20/§5.11.57/§7.17 election — per-64x64-unit Wiener (alternating-LS fit) + self-guided (probe-based projection fit over all 16 Sgr sets) mirrored on the encoder recon path, exact subexp-bit pricing, tile re-emission with the read_lr interleave, exact-realized-bytes settlement; `lr` tuning knob + A/B harness (+0.32 dB at ~2 B/frame on detail content); pinned corpus stream (111)
 - per-64x64 CDEF strengths: cdef_bits > 0 election (multi-set §5.9.19 headers, §5.11.56 per-unit strength-id literals via tile re-emission, exact-bit plan pricing + exact-realized-bytes settlement); `cdef_units` tuning knob + A/B harness; pinned corpus stream (110)
 - BUG FIX: per-segment quantiser bundles carry the frame's real BitDepth — segmented 10/12-bit GOPs quantised segments != 0 through the 8-bit §7.12.2 rows, clipped recon at 255 and under-scaled lambda; segmented >8-bit regression suite + pinned corpus stream (109)
 

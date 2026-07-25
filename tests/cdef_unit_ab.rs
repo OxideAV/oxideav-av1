@@ -142,6 +142,11 @@ fn encode_arm(frames: &[Yuv420Frame], q: u8, cdef_units: bool) -> EncodedGop {
         None,
         GopTuning {
             cdef_units,
+            // The r429 loop-restoration stage runs AFTER CDEF and
+            // elects independently per arm — hold it off so this
+            // harness isolates the CDEF axis (the KEY plan-inclusion
+            // argument needs the frame to end at the CDEF stage).
+            lr: false,
             ..GopTuning::default()
         },
     )

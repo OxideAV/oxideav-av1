@@ -456,7 +456,10 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         // the sequence gate open; frames that elect nothing code the
         // all-zero strength set (identity filter, ~2 header bytes).
         enable_cdef: true,
-        enable_restoration: false,
+        // r429 — the §5.9.20/§7.17 loop-restoration election needs
+        // the sequence gate open; frames that elect nothing code the
+        // all-RESTORE_NONE lr_params block (2 bits per plane).
+        enable_restoration: true,
         color_config: ColorConfig {
             high_bitdepth: false,
             twelve_bit: false,
@@ -583,6 +586,11 @@ pub fn build_intra_only_yuv420_8bit_fh_with_q(
                 ..CdefParams::short_circuit()
             }
         }),
+        // §5.9.20: the short-circuit shape ONLY where the parser
+        // short-circuits (AllLossless || allow_intrabc ||
+        // !enable_restoration — this builder emits allow_intrabc =
+        // 0); otherwise the block is CODED and defaults to
+        // all-RESTORE_NONE until the r429 election lands a winner.
         lr_params: Some(LrParams {
             frame_restoration_type: [FrameRestorationType::None; 3],
             uses_lr: false,
@@ -590,7 +598,7 @@ pub fn build_intra_only_yuv420_8bit_fh_with_q(
             lr_unit_shift: 0,
             lr_uv_shift: 0,
             loop_restoration_size: [0; 3],
-            short_circuited: true,
+            short_circuited: base_q_idx == 0 || !seq.enable_restoration,
         }),
         // §5.9.21 `read_tx_mode()`: `ONLY_4X4` is only valid under the
         // §5.9.2 `CodedLossless` arm (`base_q_idx == 0` + all delta_q

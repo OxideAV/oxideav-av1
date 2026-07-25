@@ -276,6 +276,7 @@ pub mod ivf;
 pub mod key_frame;
 #[doc(hidden)]
 pub mod loop_restoration_write;
+pub(crate) mod lr_elect;
 #[doc(hidden)]
 pub mod obu;
 #[doc(hidden)]

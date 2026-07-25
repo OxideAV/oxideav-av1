@@ -161,6 +161,9 @@ pub struct TunedGopYuv {
     /// r428 — each P-frame's frame-level §5.9.19 CDEF election
     /// (index 0 is the first P-frame).
     pub cdef_elections: Vec<bool>,
+    /// r429 — each P-frame's §5.9.20 loop-restoration election
+    /// (index 0 is the first P-frame).
+    pub lr_elections: Vec<bool>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -204,6 +207,9 @@ pub struct TunedGop {
     /// r428 — each P-frame's frame-level §5.9.19 CDEF election
     /// (index 0 is the first P-frame).
     pub cdef_elections: Vec<bool>,
+    /// r429 — each P-frame's §5.9.20 loop-restoration election
+    /// (index 0 is the first P-frame).
+    pub lr_elections: Vec<bool>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -307,6 +313,10 @@ pub(crate) struct InterFrameAux {
     /// when a non-zero strength set beat the unfiltered frame and
     /// landed in the header + reconstruction).
     pub(crate) cdef: bool,
+    /// r429 — the elected §5.9.20 loop-restoration plan (`true` when
+    /// a per-unit Wiener/self-guided plan won the exact-bytes
+    /// settlement and landed in the header + reconstruction).
+    pub(crate) lr: bool,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -630,6 +640,12 @@ pub struct GopTuning {
     /// election at the r428 frame-level arm (the A/B baseline).
     /// Inert while [`Self::cdef`] is off.
     pub cdef_units: bool,
+    /// r429 — §5.9.20/§7.17 loop-restoration election on lossy
+    /// frames: per-64×64-unit Wiener / self-guided filters fitted on
+    /// the encoder recon path, §5.11.57 unit payloads in the tile,
+    /// exact-realized-bytes settlement. `false` keeps the
+    /// all-RESTORE_NONE shape on every frame (the A/B baseline).
+    pub lr: bool,
 }
 
 impl Default for GopTuning {
@@ -643,6 +659,7 @@ impl Default for GopTuning {
             delta_q: true,
             cdef: true,
             cdef_units: true,
+            lr: true,
         }
     }
 }
@@ -817,6 +834,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         hp_mv_elections: t.hp_mv_elections,
         delta_q_elections: t.delta_q_elections,
         cdef_elections: t.cdef_elections,
+        lr_elections: t.lr_elections,
     })
 }
 
@@ -930,6 +948,8 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         // open.
         tuning.cdef && alt_q.is_empty(),
         tuning.cdef_units,
+        // r429 scope: LR mirrors the CDEF segmented-GOP gate.
+        tuning.lr && alt_q.is_empty(),
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
@@ -973,6 +993,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
     let mut hp_mv_elections: Vec<bool> = Vec::new();
     let mut delta_q_elections: Vec<bool> = Vec::new();
     let mut cdef_elections: Vec<bool> = Vec::new();
+    let mut lr_elections: Vec<bool> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -1005,6 +1026,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             tuning.delta_q,
             tuning.cdef,
             tuning.cdef_units,
+            tuning.lr,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1012,6 +1034,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         hp_mv_elections.push(aux.hp_mv);
         delta_q_elections.push(aux.delta_q);
         cdef_elections.push(aux.cdef);
+        lr_elections.push(aux.lr);
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
@@ -1046,6 +1069,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         hp_mv_elections,
         delta_q_elections,
         cdef_elections,
+        lr_elections,
     })
 }
 
@@ -1189,6 +1213,9 @@ pub(crate) struct InterFrameConfig<'a> {
     /// the election at the frame-level arm. Inert while
     /// [`Self::cdef`] is off.
     pub cdef_units: bool,
+    /// r429 — §5.9.20/§7.17 loop-restoration election (see
+    /// [`GopTuning::lr`]).
+    pub lr: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1466,6 +1493,7 @@ fn p_frame_config_primary<'a>(
         delta_q: true,
         cdef: true,
         cdef_units: true,
+        lr: true,
     }
 }
 
@@ -1514,6 +1542,7 @@ fn encode_p_frame_yuv(
     delta_q: bool,
     cdef: bool,
     cdef_units: bool,
+    lr: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1533,6 +1562,7 @@ fn encode_p_frame_yuv(
     cfg.delta_q = delta_q;
     cfg.cdef = cdef;
     cfg.cdef_units = cdef_units;
+    cfg.lr = lr;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2246,7 +2276,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         tile: mut tile_bytes,
         mut cdfs,
         mut state,
-        trees,
+        mut trees,
         mut recon,
         ictx,
     } = arm;
@@ -2532,6 +2562,46 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // Segmented frames also stay off this arm (r428 scope): the CDEF
     // reference perturbation destabilises the r423 temporal
     // segment-map election chain — the pairing is left open.
+    // r429 — the elected frame-start CDF state, rebuilt on demand for
+    // the CDEF / LR tile re-emissions: the primary-ref election may
+    // have swapped the ordinal — reproduce its §8.3.1 start state
+    // exactly as the candidate loop did (§6.8.21 `load_cdfs` of the
+    // carried slot, or the per-frame defaults).
+    let start_cdfs_for = |ord: u8| -> Box<TileCdfContext> {
+        if ord == cfg.primary_ref_frame {
+            frame_start_cdfs.clone()
+        } else {
+            match cfg
+                .alt_primaries
+                .iter()
+                .find(|(o, _)| *o == ord)
+                .and_then(|(_, c)| *c)
+            {
+                Some(carry) => {
+                    let mut loaded = carry.cdfs.clone();
+                    loaded.zero_counts();
+                    loaded
+                }
+                None => {
+                    let mut c = Box::new(TileCdfContext::new_from_defaults());
+                    c.init_coeff_cdfs(base_q_idx);
+                    c
+                }
+            }
+        }
+    };
+    // r429 — loop restoration needs the PRE-CDEF reconstruction
+    // (§7.17 reads `CurrFrame` at stripe boundaries): snapshot before
+    // the CDEF election below overwrites it.
+    let lr_armed = cfg.lr
+        && !lossless
+        && seq.enable_restoration
+        && cfg.exact_mask.is_none()
+        && !cfg.auto_lossless
+        && alt_q.is_empty();
+    let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
+        lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
+    let mut committed_cdef_bits: u32 = 0;
     let mut cdef_elected = false;
     if cfg.cdef
         && !lossless
@@ -2576,33 +2646,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
             if election.best.params.cdef_bits > 0 {
                 let plan = &election.best;
-                // The elected frame-start CDF state: the primary-ref
-                // election may have swapped the ordinal — rebuild its
-                // §8.3.1 start state exactly as the candidate loop
-                // did (§6.8.21 `load_cdfs` of the carried slot, or
-                // the per-frame defaults).
-                let re_start: Box<TileCdfContext> = if fh.primary_ref_frame == cfg.primary_ref_frame
-                {
-                    frame_start_cdfs.clone()
-                } else {
-                    match cfg
-                        .alt_primaries
-                        .iter()
-                        .find(|(ord, _)| *ord == fh.primary_ref_frame)
-                        .and_then(|(ord, c)| c.map(|c| (*ord, c)))
-                    {
-                        Some((_, carry)) => {
-                            let mut loaded = carry.cdfs.clone();
-                            loaded.zero_counts();
-                            loaded
-                        }
-                        None => {
-                            let mut c = Box::new(TileCdfContext::new_from_defaults());
-                            c.init_coeff_cdfs(base_q_idx);
-                            c
-                        }
-                    }
-                };
+                let re_start: Box<TileCdfContext> = start_cdfs_for(fh.primary_ref_frame);
                 // The elected params: hp updated `params.inter` in
                 // place; the temporal-seg arm swapped the tile without
                 // touching `params`, so mirror its flag here.
@@ -2611,7 +2655,6 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     ip.segmentation_temporal_update = seg_temporal_elected;
                 }
                 re_params.cdef_bits = u32::from(plan.params.cdef_bits);
-                let mut trees = trees;
                 for (tree, &idx) in trees.iter_mut().zip(plan.unit_idx.iter()) {
                     tree.stamp_cdef_idx(idx.max(0));
                 }
@@ -2666,6 +2709,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     tile_bytes = re_tile;
                     cdfs = re_cdfs;
                     state = re_state;
+                    committed_cdef_bits = u32::from(plan.params.cdef_bits);
                     debug_assert!(
                         {
                             let grid = state.mirror().cdef_idx();
@@ -2680,8 +2724,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     adopted = Some(election.best);
                 } else {
                     // The per-unit arm lost the settlement: the
-                    // original tile stands (the stamped tree ids are
-                    // inert at `cdef_bits = 0` — `L(0)` literals).
+                    // original tile stands. Re-stamp the trees to id
+                    // 0 — a later re-emission (the LR election)
+                    // replays them at `cdef_bits = 0`, whose §5.11.56
+                    // range check rejects any stamped id > 0.
+                    for tree in trees.iter_mut() {
+                        tree.stamp_cdef_idx(0);
+                    }
                     adopted = election.frame_level;
                 }
             } else {
@@ -2705,6 +2754,152 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 );
                 fh.cdef_params = Some(plan.params);
                 cdef_elected = true;
+            }
+        }
+    }
+
+    // r429 — §5.9.20/§5.11.57/§7.17 loop-restoration election: the
+    // LAST in-loop stage runs on the post-CDEF reconstruction. The
+    // election fits per-64×64-unit Wiener / self-guided candidates
+    // through the decoder's own §7.17 kernels, then the tile is
+    // RE-EMITTED with the §5.11.57 `write_lr` interleave (one window
+    // per superblock, under the ELECTED frame-start CDF state, params
+    // and §5.11.56 CDEF literals of the committed tile) and LR-on vs
+    // LR-off settles on EXACT realized bytes. On adoption the plan is
+    // applied through the §7.17 frame driver — the §7.20 reference
+    // store the following frames predict from is the RESTORED frame,
+    // exactly like the decoder's.
+    let mut lr_elected = false;
+    if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
+        let price_cdfs = start_cdfs_for(fh.primary_ref_frame);
+        if let Some(plan) =
+            crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
+                input,
+                curr_y: pcy,
+                curr_u: pcu,
+                curr_v: pcv,
+                cdef_y: &recon.y,
+                cdef_u: &recon.u,
+                cdef_v: &recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                num_planes,
+                mi_rows,
+                mi_cols,
+                lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
+                price_cdfs: &price_cdfs,
+                disable_cdf_update: fh.disable_cdf_update,
+            })
+        {
+            let mut re_params = params.clone();
+            if let Some(ip) = re_params.inter.as_mut() {
+                ip.segmentation_temporal_update = seg_temporal_elected;
+            }
+            re_params.cdef_bits = committed_cdef_bits;
+            let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
+            let mut re_cdfs = start_cdfs_for(fh.primary_ref_frame);
+            let mut re_state = PartitionSyntaxWriter::new(
+                mi_rows,
+                mi_cols,
+                TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: mi_rows,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols,
+                },
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            let mut lr_write_state = crate::encoder::loop_restoration_write::LrWriteState::new();
+            let mut re_ok = true;
+            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
+                re_state.arm_read_deltas();
+                if crate::encoder::loop_restoration_write::write_lr(
+                    &mut re_writer,
+                    &mut re_cdfs,
+                    &mut lr_write_state,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &plan.write_params,
+                    &plan.units,
+                )
+                .is_err()
+                {
+                    re_ok = false;
+                    break;
+                }
+                write_partition_tree_syntax(
+                    &mut re_writer,
+                    &mut re_cdfs,
+                    &mut re_state,
+                    tree,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &re_params,
+                )?;
+            }
+            if re_ok {
+                let re_tile = re_writer.finish();
+                let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
+                let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
+                    let mut fh_c = fh.clone();
+                    fh_c.lr_params = Some(*lrp);
+                    let mut bw = crate::encoder::bitwriter::BitWriter::new();
+                    crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                        &mut bw,
+                        &fh_c,
+                        seq,
+                        prev_gm_for_header.as_ref(),
+                    );
+                    bw.byte_align();
+                    bw.finish().len()
+                };
+                let off_hdr = lr_header_len(
+                    fh.lr_params
+                        .as_ref()
+                        .expect("lossy inter header carries lr_params"),
+                );
+                let on_score = plan.d * 256
+                    + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_tile.len()) as u64);
+                let off_score =
+                    plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64);
+                if on_score < off_score {
+                    tile_bytes = re_tile;
+                    cdfs = re_cdfs;
+                    state = re_state;
+                    let applied_d = crate::encoder::lr_elect::apply_lr_plan(
+                        &plan,
+                        input,
+                        pcy,
+                        pcu,
+                        pcv,
+                        &mut recon.y,
+                        &mut recon.u,
+                        &mut recon.v,
+                        width,
+                        height,
+                        chroma_w,
+                        chroma_h,
+                        bit_depth,
+                        ssx,
+                        ssy,
+                        num_planes,
+                        mi_rows,
+                        mi_cols,
+                    );
+                    debug_assert_eq!(
+                        applied_d, plan.d,
+                        "applied §7.17 SSD diverged from the elected plan"
+                    );
+                    fh.lr_params = Some(plan.header);
+                    lr_elected = true;
+                }
             }
         }
     }
@@ -2821,6 +3016,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             hp_mv: hp_elected,
             delta_q: delta_q_elected,
             cdef: cdef_elected,
+            lr: lr_elected,
         },
     ))
 }
@@ -8074,6 +8270,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             true,
             true,

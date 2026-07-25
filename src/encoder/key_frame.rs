@@ -280,8 +280,9 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
     exact_mask: Option<&[bool]>,
 ) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
     let wide = YuvFrame::from_yuv420_8bit(input);
-    let (k, carry) =
-        encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask, true, true)?;
+    let (k, carry) = encode_key_frame_yuv_seg_carry(
+        &wide, base_q_idx, model, alt_q, exact_mask, true, true, true,
+    )?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok((
         EncodedKeyFrame {
@@ -322,13 +323,23 @@ pub fn encode_key_frame_yuv_with_q(
     input: &YuvFrame,
     base_q_idx: u8,
 ) -> Result<EncodedKeyFrameYuv, Error> {
-    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None, true, true)
-        .map(|(k, _)| k)
+    encode_key_frame_yuv_seg_carry(
+        input,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+    )
+    .map(|(k, _)| k)
 }
 
 /// r427 — the general-format KEY-frame core: every entry point above
 /// funnels here. `alt_q` / `exact_mask` carry the r426 §5.9.14
 /// SEG_LVL_ALT_Q + exactness-demand configuration.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_key_frame_yuv_seg_carry(
     input: &YuvFrame,
     base_q_idx: u8,
@@ -337,6 +348,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     exact_mask: Option<&[bool]>,
     cdef: bool,
     cdef_units: bool,
+    lr: bool,
 ) -> Result<
     (
         EncodedKeyFrameYuv,
@@ -406,6 +418,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     // short-circuit shape (the r428 election is gated off there too).
     if fh.allow_intrabc {
         fh.cdef_params = Some(crate::uncompressed_header_tail::CdefParams::short_circuit());
+        // §5.9.20: `allow_intrabc = 1` short-circuits lr_params too.
+        fh.lr_params = Some(crate::uncompressed_header_tail::LrParams::short_circuit());
     }
     // r410: the lossy arm codes §5.9.21 `TxMode = TX_MODE_SELECT` so
     // every leaf carries the §5.11.15 `tx_depth` choice the RD search
@@ -594,6 +608,16 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     // the reconstruction the §7.20 `allFrames` refresh stores.
     // (Same HARD gate as the inter driver on exactness-demand frames:
     // §7.15 would filter the demanded region's blocks.)
+    // r429 — loop restoration needs the PRE-CDEF reconstruction
+    // (§7.17 reads `CurrFrame` at stripe boundaries): snapshot before
+    // the CDEF election below overwrites it.
+    let lr_armed =
+        lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
+    let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
+        lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
+    // The §5.9.19 `cdef_bits` the FINAL committed tile was emitted
+    // under (the LR re-emission below must replay the same literals).
+    let mut committed_cdef_bits: u32 = 0;
     if cdef && base_q_idx > 0 && seq.enable_cdef && !fh.allow_intrabc && exact_mask.is_none() {
         if let Some(election) =
             crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
@@ -683,6 +707,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                     tile_bytes = re_tile;
                     cdfs = re_cdfs;
                     state = re_state;
+                    committed_cdef_bits = u32::from(plan.params.cdef_bits);
                     // The re-emitted mirror's §5.11.56 grid must equal
                     // the plan (the decoder will derive ITS grid from
                     // these bytes; the filter below runs on the plan's
@@ -701,8 +726,13 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                     adopted = Some(election.best);
                 } else {
                     // The per-unit arm lost the settlement: the
-                    // original tile stands (the stamped tree ids are
-                    // inert at `cdef_bits = 0` — `L(0)` literals).
+                    // original tile stands. Re-stamp the trees to id
+                    // 0 — a later re-emission (the LR election)
+                    // replays them at `cdef_bits = 0`, whose §5.11.56
+                    // range check rejects any stamped id > 0.
+                    for tree in trees.iter_mut() {
+                        tree.stamp_cdef_idx(0);
+                    }
                     adopted = election.frame_level;
                 }
             } else {
@@ -725,6 +755,138 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                     num_planes,
                 );
                 fh.cdef_params = Some(plan.params);
+            }
+        }
+    }
+
+    // r429 — §5.9.20/§5.11.57/§7.17 loop-restoration election: the
+    // LAST in-loop stage runs on the post-CDEF reconstruction. The
+    // election fits per-64×64-unit Wiener / self-guided candidates
+    // through the decoder's own §7.17 kernels, then the tile is
+    // RE-EMITTED with the §5.11.57 `write_lr` interleave (one window
+    // per superblock, the same §5.11.56 CDEF literals as the
+    // committed tile) and LR-on vs LR-off settles on EXACT realized
+    // bytes. On adoption the plan is applied through the §7.17 frame
+    // driver, so the stored reference planes equal the decoder's
+    // byte-for-byte.
+    if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
+        let price_cdfs = {
+            let mut c = TileCdfContext::new_from_defaults();
+            c.init_coeff_cdfs(base_q_idx);
+            c
+        };
+        if let Some(plan) =
+            crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
+                input,
+                curr_y: pcy,
+                curr_u: pcu,
+                curr_v: pcv,
+                cdef_y: &recon.y,
+                cdef_u: &recon.u,
+                cdef_v: &recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                num_planes,
+                mi_rows,
+                mi_cols,
+                lambda: lambda_for(&recon.qp),
+                price_cdfs: &price_cdfs,
+                disable_cdf_update: fh.disable_cdf_update,
+            })
+        {
+            let mut lr_params_w = params.clone();
+            lr_params_w.cdef_bits = committed_cdef_bits;
+            let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
+            let mut re_cdfs = TileCdfContext::new_from_defaults();
+            re_cdfs.init_coeff_cdfs(base_q_idx);
+            let mut re_state = PartitionSyntaxWriter::new(
+                mi_rows,
+                mi_cols,
+                TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: mi_rows,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols,
+                },
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            let mut lr_write_state = crate::encoder::loop_restoration_write::LrWriteState::new();
+            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
+                re_state.arm_read_deltas();
+                crate::encoder::loop_restoration_write::write_lr(
+                    &mut re_writer,
+                    &mut re_cdfs,
+                    &mut lr_write_state,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &plan.write_params,
+                    &plan.units,
+                )?;
+                write_partition_tree_syntax(
+                    &mut re_writer,
+                    &mut re_cdfs,
+                    &mut re_state,
+                    tree,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &lr_params_w,
+                )?;
+            }
+            let re_tile = re_writer.finish();
+            let lambda = lambda_for(&recon.qp);
+            let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
+                let mut fh_c = fh.clone();
+                fh_c.lr_params = Some(*lrp);
+                let mut bw = crate::encoder::bitwriter::BitWriter::new();
+                encode_uncompressed_header(&mut bw, &fh_c, &seq);
+                bw.byte_align();
+                bw.finish().len()
+            };
+            let off_hdr = lr_header_len(
+                fh.lr_params
+                    .as_ref()
+                    .expect("lossy KEY header carries lr_params"),
+            );
+            let on_score = plan.d * 256
+                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_tile.len()) as u64);
+            let off_score =
+                plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64);
+            if on_score < off_score {
+                tile_bytes = re_tile;
+                cdfs = re_cdfs;
+                state = re_state;
+                let applied_d = crate::encoder::lr_elect::apply_lr_plan(
+                    &plan,
+                    input,
+                    pcy,
+                    pcu,
+                    pcv,
+                    &mut recon.y,
+                    &mut recon.u,
+                    &mut recon.v,
+                    width,
+                    height,
+                    chroma_w,
+                    chroma_h,
+                    bit_depth,
+                    ssx,
+                    ssy,
+                    num_planes,
+                    mi_rows,
+                    mi_cols,
+                );
+                debug_assert_eq!(
+                    applied_d, plan.d,
+                    "applied §7.17 SSD diverged from the elected plan"
+                );
+                fh.lr_params = Some(plan.header);
             }
         }
     }

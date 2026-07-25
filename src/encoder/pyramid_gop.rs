@@ -153,6 +153,10 @@ pub struct PyramidTuning {
     /// the election at the frame-level arm. Inert while
     /// [`Self::cdef`] is off.
     pub cdef_units: bool,
+    /// r429 — §5.9.20/§7.17 loop-restoration election (see the GOP
+    /// tuning's field of the same name). `false` keeps the
+    /// all-RESTORE_NONE shape on every frame (the A/B baseline).
+    pub lr: bool,
 }
 
 impl Default for PyramidTuning {
@@ -166,6 +170,7 @@ impl Default for PyramidTuning {
             delta_q: true,
             cdef: true,
             cdef_units: true,
+            lr: true,
         }
     }
 }
@@ -435,6 +440,7 @@ impl PyramidSession {
             None,
             tuning.cdef,
             tuning.cdef_units,
+            tuning.lr,
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -557,6 +563,7 @@ impl PyramidSession {
                         delta_q: self.tuning.delta_q,
                         cdef: self.tuning.cdef,
                         cdef_units: self.tuning.cdef_units,
+                        lr: self.tuning.lr,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(
