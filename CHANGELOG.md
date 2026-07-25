@@ -4,6 +4,7 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- per-64x64 CDEF strengths: cdef_bits > 0 election (multi-set §5.9.19 headers, §5.11.56 per-unit strength-id literals via tile re-emission, exact-bit plan pricing + exact-realized-bytes settlement); `cdef_units` tuning knob + A/B harness; pinned corpus stream (110)
 - BUG FIX: per-segment quantiser bundles carry the frame's real BitDepth — segmented 10/12-bit GOPs quantised segments != 0 through the 8-bit §7.12.2 rows, clipped recon at 255 and under-scaled lambda; segmented >8-bit regression suite + pinned corpus stream (109)
 
 ## [0.1.16](https://github.com/OxideAV/oxideav-av1/compare/v0.1.15...v0.1.16) - 2026-07-23

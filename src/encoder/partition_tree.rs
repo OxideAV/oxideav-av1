@@ -1090,6 +1090,41 @@ impl SyntaxNode {
             SyntaxNode::Horz4(b) | SyntaxNode::Vert4(b) => b,
         }
     }
+
+    /// r429 — stamp this superblock tree's §5.11.56 `cdef_idx` onto
+    /// every leaf. The 64×64 superblocks of this encoder's tile walk
+    /// coincide with the §5.11.56 CDEF units, so a unit's strength id
+    /// is a per-tree constant: the write arm codes the `L(cdef_bits)`
+    /// literal at the unit's first eligible block and every later
+    /// leaf is anchor-silent (`cdef_idx[ r ][ c ] != -1`).
+    pub fn stamp_cdef_idx(&mut self, idx: i8) {
+        match self {
+            SyntaxNode::Leaf(b) => b.cdef_idx = idx,
+            SyntaxNode::Split(q) => {
+                for n in q.iter_mut() {
+                    n.stamp_cdef_idx(idx);
+                }
+            }
+            SyntaxNode::Horz(b) | SyntaxNode::Vert(b) => {
+                for blk in b.iter_mut() {
+                    blk.cdef_idx = idx;
+                }
+            }
+            SyntaxNode::HorzA(b)
+            | SyntaxNode::HorzB(b)
+            | SyntaxNode::VertA(b)
+            | SyntaxNode::VertB(b) => {
+                for blk in b.iter_mut() {
+                    blk.cdef_idx = idx;
+                }
+            }
+            SyntaxNode::Horz4(b) | SyntaxNode::Vert4(b) => {
+                for blk in b.iter_mut() {
+                    blk.cdef_idx = idx;
+                }
+            }
+        }
+    }
 }
 
 /// Frame- / sequence-level scalars the §5.11.5 syntax walk threads

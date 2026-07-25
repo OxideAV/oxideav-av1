@@ -168,6 +168,7 @@ fn baseline_tuning() -> PyramidTuning {
         high_precision_mv: true,
         delta_q: true,
         cdef: true,
+        cdef_units: true,
     }
 }
 

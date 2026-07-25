@@ -281,7 +281,7 @@ pub(crate) fn encode_key_frame_yuv420_with_q_seg_carry(
 ) -> Result<(EncodedKeyFrame, crate::encoder::inter_frame::RefSlotCarry), Error> {
     let wide = YuvFrame::from_yuv420_8bit(input);
     let (k, carry) =
-        encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask, true)?;
+        encode_key_frame_yuv_seg_carry(&wide, base_q_idx, model, alt_q, exact_mask, true, true)?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok((
         EncodedKeyFrame {
@@ -322,7 +322,7 @@ pub fn encode_key_frame_yuv_with_q(
     input: &YuvFrame,
     base_q_idx: u8,
 ) -> Result<EncodedKeyFrameYuv, Error> {
-    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None, true)
+    encode_key_frame_yuv_seg_carry(input, base_q_idx, RateModel::Twin, &[], None, true, true)
         .map(|(k, _)| k)
 }
 
@@ -336,6 +336,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     alt_q: &[i16],
     exact_mask: Option<&[bool]>,
     cdef: bool,
+    cdef_units: bool,
 ) -> Result<
     (
         EncodedKeyFrameYuv,
@@ -528,6 +529,9 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     )
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
+    // r429 — the committed trees are retained: the per-unit CDEF
+    // election re-emits the tile with §5.11.56 strength ids stamped.
+    let mut trees: Vec<crate::encoder::partition_tree::SyntaxNode> = Vec::new();
     for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
         recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
         // r421 — arm the §5.11.2 delta lifecycle on the live state AND
@@ -568,35 +572,160 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
             twin.matches(&cdfs, &writer),
             "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
         );
+        trees.push(tree);
     }
-    let tile_bytes = writer.finish();
+    let mut tile_bytes = writer.finish();
 
-    // r428 — frame-level §5.9.19/§7.15 CDEF election on the KEY frame
+    // r428/r429 — §5.9.19/§7.15 CDEF election on the KEY frame
     // (deblock levels are 0 on this header, so the reconstruction IS
     // the §7.15 input; `allow_intrabc = 1` closes the §5.9.19 gate —
     // the header short-circuits there and the decoder never filters).
-    // `cdef_bits = 0` ⇒ zero tile bits; the winner (when it beats the
-    // unfiltered frame against the SOURCE) lands in the header and in
+    // r429 extends the r428 frame-level arm to `cdef_bits > 0`: the
+    // election may propose per-64×64 strength ids, in which case the
+    // tile is RE-EMITTED from the committed trees with the §5.11.56
+    // `L(cdef_bits)` literals stamped (the fresh writer replays the
+    // identical symbols from the identical §8.3.1 frame-start state —
+    // only the equiprobable literals move the coder) and the final
+    // arm settles on EXACT realized bytes: `D·256 + λ·8·256·(header +
+    // tile)` for the per-unit arm vs the frame-level / unfiltered
+    // fallback (the plan-stage bit prices are exact, but emission is
+    // byte-aligned — same doctrine as the hp / temporal-seg /
+    // primary-ref elections). The winner lands in the header and in
     // the reconstruction the §7.20 `allFrames` refresh stores.
     // (Same HARD gate as the inter driver on exactness-demand frames:
     // §7.15 would filter the demanded region's blocks.)
     if cdef && base_q_idx > 0 && seq.enable_cdef && !fh.allow_intrabc && exact_mask.is_none() {
-        if let Some(p) = crate::encoder::cdef_elect::elect_and_apply_cdef(
-            state.mirror(),
-            input,
-            &mut recon.y,
-            &mut recon.u,
-            &mut recon.v,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-            bit_depth,
-            ssx,
-            ssy,
-            num_planes,
-        ) {
-            fh.cdef_params = Some(p);
+        if let Some(election) =
+            crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
+                mirror: state.mirror(),
+                input,
+                recon_y: &recon.y,
+                recon_u: &recon.u,
+                recon_v: &recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                num_planes,
+                lambda: lambda_for(&recon.qp),
+                max_bits: if cdef_units { 3 } else { 0 },
+            })
+        {
+            let lambda = lambda_for(&recon.qp);
+            let header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
+                let mut fh_c = fh.clone();
+                fh_c.cdef_params = Some(*cdef_params);
+                let mut bw = crate::encoder::bitwriter::BitWriter::new();
+                encode_uncompressed_header(&mut bw, &fh_c, &seq);
+                bw.byte_align();
+                bw.finish().len()
+            };
+            let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
+            if election.best.params.cdef_bits > 0 {
+                let plan = &election.best;
+                let mut cdef_params_w = params.clone();
+                cdef_params_w.cdef_bits = u32::from(plan.params.cdef_bits);
+                for (tree, &idx) in trees.iter_mut().zip(plan.unit_idx.iter()) {
+                    tree.stamp_cdef_idx(idx.max(0));
+                }
+                let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
+                let mut re_cdfs = TileCdfContext::new_from_defaults();
+                re_cdfs.init_coeff_cdfs(base_q_idx);
+                let mut re_state = PartitionSyntaxWriter::new(
+                    mi_rows,
+                    mi_cols,
+                    TileGeometry {
+                        mi_row_start: 0,
+                        mi_row_end: mi_rows,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols,
+                    },
+                )
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+                for ((sb_r, sb_c), tree) in
+                    sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees)
+                {
+                    re_state.arm_read_deltas();
+                    write_partition_tree_syntax(
+                        &mut re_writer,
+                        &mut re_cdfs,
+                        &mut re_state,
+                        tree,
+                        sb_r,
+                        sb_c,
+                        BLOCK_64X64,
+                        &cdef_params_w,
+                    )?;
+                }
+                let re_tile = re_writer.finish();
+                // Exact-bytes settlement: per-unit vs the fallback arm
+                // (frame-level when it beats unfiltered, else the
+                // unfiltered default header) on the SAME `D + λ·R`
+                // scale the leaf ladders use.
+                let unit_score = plan.d * 256
+                    + lambda * 8 * 256 * ((header_len(&plan.params) + re_tile.len()) as u64);
+                let (fb_d, fb_hdr) = match &election.frame_level {
+                    Some(p) => (p.d, header_len(&p.params)),
+                    None => (
+                        election.base_d,
+                        header_len(
+                            fh.cdef_params
+                                .as_ref()
+                                .expect("lossy KEY header carries cdef params"),
+                        ),
+                    ),
+                };
+                let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
+                if unit_score < fb_score {
+                    tile_bytes = re_tile;
+                    cdfs = re_cdfs;
+                    state = re_state;
+                    // The re-emitted mirror's §5.11.56 grid must equal
+                    // the plan (the decoder will derive ITS grid from
+                    // these bytes; the filter below runs on the plan's
+                    // grid).
+                    debug_assert!(
+                        {
+                            let grid = state.mirror().cdef_idx();
+                            let sb_cols_dbg = mi_cols.div_ceil(16);
+                            plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
+                                let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
+                                grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
+                            })
+                        },
+                        "re-emitted cdef_idx grid diverged from the elected plan"
+                    );
+                    adopted = Some(election.best);
+                } else {
+                    // The per-unit arm lost the settlement: the
+                    // original tile stands (the stamped tree ids are
+                    // inert at `cdef_bits = 0` — `L(0)` literals).
+                    adopted = election.frame_level;
+                }
+            } else {
+                adopted = Some(election.best);
+            }
+            if let Some(plan) = adopted {
+                crate::encoder::cdef_elect::apply_cdef_plan(
+                    state.mirror(),
+                    &plan,
+                    &mut recon.y,
+                    &mut recon.u,
+                    &mut recon.v,
+                    width,
+                    height,
+                    chroma_w,
+                    chroma_h,
+                    bit_depth,
+                    ssx,
+                    ssy,
+                    num_planes,
+                );
+                fh.cdef_params = Some(plan.params);
+            }
         }
     }
 

@@ -148,6 +148,11 @@ pub struct PyramidTuning {
     /// frames (KEY + every pyramid role). `false` keeps the
     /// all-zero-strength shape on every frame (the A/B baseline).
     pub cdef: bool,
+    /// r429 — allow `cdef_bits > 0` (per-64×64 §5.11.56 strength
+    /// ids; tile re-emitted with the exact literals). `false` caps
+    /// the election at the frame-level arm. Inert while
+    /// [`Self::cdef`] is off.
+    pub cdef_units: bool,
 }
 
 impl Default for PyramidTuning {
@@ -160,6 +165,7 @@ impl Default for PyramidTuning {
             high_precision_mv: true,
             delta_q: true,
             cdef: true,
+            cdef_units: true,
         }
     }
 }
@@ -428,6 +434,7 @@ impl PyramidSession {
             &[],
             None,
             tuning.cdef,
+            tuning.cdef_units,
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -549,6 +556,7 @@ impl PyramidSession {
                         high_precision_mv: self.tuning.high_precision_mv,
                         delta_q: self.tuning.delta_q,
                         cdef: self.tuning.cdef,
+                        cdef_units: self.tuning.cdef_units,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(

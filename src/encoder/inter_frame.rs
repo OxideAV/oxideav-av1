@@ -623,6 +623,13 @@ pub struct GopTuning {
     /// keeps the all-zero-strength shape on every frame (the A/B
     /// baseline).
     pub cdef: bool,
+    /// r429 — per-64×64 §5.11.56 CDEF strength ids: allow the
+    /// election to propose `cdef_bits > 0` (up to 8 §5.9.19 strength
+    /// sets, one id literal per unit, tile re-emitted with the exact
+    /// `L(cdef_bits)` bits priced against λ). `false` caps the
+    /// election at the r428 frame-level arm (the A/B baseline).
+    /// Inert while [`Self::cdef`] is off.
+    pub cdef_units: bool,
 }
 
 impl Default for GopTuning {
@@ -635,6 +642,7 @@ impl Default for GopTuning {
             high_precision_mv: true,
             delta_q: true,
             cdef: true,
+            cdef_units: true,
         }
     }
 }
@@ -921,6 +929,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         // temporal segment-map election chain) — the pairing is left
         // open.
         tuning.cdef && alt_q.is_empty(),
+        tuning.cdef_units,
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
@@ -995,6 +1004,7 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             tuning.high_precision_mv,
             tuning.delta_q,
             tuning.cdef,
+            tuning.cdef_units,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1174,6 +1184,11 @@ pub(crate) struct InterFrameConfig<'a> {
     /// `false` keeps the all-zero-strength header shape (the A/B
     /// baseline).
     pub cdef: bool,
+    /// r429 — allow `cdef_bits > 0` (per-64×64 §5.11.56 strength
+    /// ids; tile re-emitted with the exact literals). `false` caps
+    /// the election at the frame-level arm. Inert while
+    /// [`Self::cdef`] is off.
+    pub cdef_units: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1450,6 +1465,7 @@ fn p_frame_config_primary<'a>(
         high_precision_mv: true,
         delta_q: true,
         cdef: true,
+        cdef_units: true,
     }
 }
 
@@ -1497,6 +1513,7 @@ fn encode_p_frame_yuv(
     high_precision_mv: bool,
     delta_q: bool,
     cdef: bool,
+    cdef_units: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1515,6 +1532,7 @@ fn encode_p_frame_yuv(
     cfg.high_precision_mv = high_precision_mv;
     cfg.delta_q = delta_q;
     cfg.cdef = cdef;
+    cfg.cdef_units = cdef_units;
     let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2491,17 +2509,22 @@ pub(crate) fn encode_inter_frame_generic_gm(
         }
     }
 
-    // r428 — frame-level §5.9.19/§7.15 CDEF election: the committed
+    // r428/r429 — §5.9.19/§7.15 CDEF election: the committed
     // reconstruction (deblock levels are 0 on every header this
     // encoder emits, so it IS the §7.15 input) is filtered through
     // the decoder's own driver over the write mirror's committed
     // `cdef_idx[]` / `Skips[]` grids, a bounded strength search
     // scores each candidate against the SOURCE, and a winner that
-    // beats the unfiltered frame lands in the header and in the
-    // reconstruction — the §7.20 reference store the decoder will
-    // hold. `cdef_bits = 0` ⇒ ZERO tile bits (the §5.11.56 literal is
-    // `L(0)`), so the election is pure distortion and composes with
-    // every tile-bytes election above.
+    // beats the unfiltered frame under `D + λ·R` lands in the header
+    // and in the reconstruction — the §7.20 reference store the
+    // decoder will hold.
+    // r429 extends the r428 frame-level arm (`cdef_bits = 0`, zero
+    // tile bits) to per-64×64 strength ids: when the per-unit arm
+    // wins, the tile is RE-EMITTED from the committed trees with the
+    // §5.11.56 `L(cdef_bits)` literals stamped — from the ELECTED
+    // frame-start CDF state (hp / temporal-seg / primary-ref
+    // elections above all replay from it) and the ELECTED params, so
+    // only the equiprobable literals move the coder.
     // HARD gate on exactness-demand / auto-lossless frames: §7.15
     // filters every non-skip 8×8 block regardless of its segment, so
     // an elected strength would break the demanded regions'
@@ -2517,23 +2540,172 @@ pub(crate) fn encode_inter_frame_generic_gm(
         && !cfg.auto_lossless
         && alt_q.is_empty()
     {
-        if let Some(p) = crate::encoder::cdef_elect::elect_and_apply_cdef(
-            state.mirror(),
-            input,
-            &mut recon.y,
-            &mut recon.u,
-            &mut recon.v,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-            bit_depth,
-            ssx,
-            ssy,
-            num_planes,
-        ) {
-            fh.cdef_params = Some(p);
-            cdef_elected = true;
+        if let Some(election) =
+            crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
+                mirror: state.mirror(),
+                input,
+                recon_y: &recon.y,
+                recon_u: &recon.u,
+                recon_v: &recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                num_planes,
+                lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
+                max_bits: if cfg.cdef_units { 3 } else { 0 },
+            })
+        {
+            let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
+            let cdef_header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
+                let mut fh_c = fh.clone();
+                fh_c.cdef_params = Some(*cdef_params);
+                let mut bw = crate::encoder::bitwriter::BitWriter::new();
+                crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                    &mut bw,
+                    &fh_c,
+                    seq,
+                    prev_gm_for_header.as_ref(),
+                );
+                bw.byte_align();
+                bw.finish().len()
+            };
+            let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
+            if election.best.params.cdef_bits > 0 {
+                let plan = &election.best;
+                // The elected frame-start CDF state: the primary-ref
+                // election may have swapped the ordinal — rebuild its
+                // §8.3.1 start state exactly as the candidate loop
+                // did (§6.8.21 `load_cdfs` of the carried slot, or
+                // the per-frame defaults).
+                let re_start: Box<TileCdfContext> = if fh.primary_ref_frame == cfg.primary_ref_frame
+                {
+                    frame_start_cdfs.clone()
+                } else {
+                    match cfg
+                        .alt_primaries
+                        .iter()
+                        .find(|(ord, _)| *ord == fh.primary_ref_frame)
+                        .and_then(|(ord, c)| c.map(|c| (*ord, c)))
+                    {
+                        Some((_, carry)) => {
+                            let mut loaded = carry.cdfs.clone();
+                            loaded.zero_counts();
+                            loaded
+                        }
+                        None => {
+                            let mut c = Box::new(TileCdfContext::new_from_defaults());
+                            c.init_coeff_cdfs(base_q_idx);
+                            c
+                        }
+                    }
+                };
+                // The elected params: hp updated `params.inter` in
+                // place; the temporal-seg arm swapped the tile without
+                // touching `params`, so mirror its flag here.
+                let mut re_params = params.clone();
+                if let Some(ip) = re_params.inter.as_mut() {
+                    ip.segmentation_temporal_update = seg_temporal_elected;
+                }
+                re_params.cdef_bits = u32::from(plan.params.cdef_bits);
+                let mut trees = trees;
+                for (tree, &idx) in trees.iter_mut().zip(plan.unit_idx.iter()) {
+                    tree.stamp_cdef_idx(idx.max(0));
+                }
+                let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
+                let mut re_cdfs = re_start;
+                let mut re_state = PartitionSyntaxWriter::new(
+                    mi_rows,
+                    mi_cols,
+                    TileGeometry {
+                        mi_row_start: 0,
+                        mi_row_end: mi_rows,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols,
+                    },
+                )
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+                for ((sb_r, sb_c), tree) in
+                    sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees)
+                {
+                    re_state.arm_read_deltas();
+                    write_partition_tree_syntax(
+                        &mut re_writer,
+                        &mut re_cdfs,
+                        &mut re_state,
+                        tree,
+                        sb_r,
+                        sb_c,
+                        BLOCK_64X64,
+                        &re_params,
+                    )?;
+                }
+                let re_tile = re_writer.finish();
+                // Exact-bytes settlement: per-unit vs the fallback arm
+                // (frame-level when it beats unfiltered, else the
+                // unfiltered default header) on the SAME `D + λ·R`
+                // scale the leaf ladders use.
+                let unit_score = plan.d * 256
+                    + lambda * 8 * 256 * ((cdef_header_len(&plan.params) + re_tile.len()) as u64);
+                let (fb_d, fb_hdr) = match &election.frame_level {
+                    Some(p) => (p.d, cdef_header_len(&p.params)),
+                    None => (
+                        election.base_d,
+                        cdef_header_len(
+                            fh.cdef_params
+                                .as_ref()
+                                .expect("lossy inter header carries cdef params"),
+                        ),
+                    ),
+                };
+                let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
+                if unit_score < fb_score {
+                    tile_bytes = re_tile;
+                    cdfs = re_cdfs;
+                    state = re_state;
+                    debug_assert!(
+                        {
+                            let grid = state.mirror().cdef_idx();
+                            let sb_cols_dbg = mi_cols.div_ceil(16);
+                            plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
+                                let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
+                                grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
+                            })
+                        },
+                        "re-emitted cdef_idx grid diverged from the elected plan"
+                    );
+                    adopted = Some(election.best);
+                } else {
+                    // The per-unit arm lost the settlement: the
+                    // original tile stands (the stamped tree ids are
+                    // inert at `cdef_bits = 0` — `L(0)` literals).
+                    adopted = election.frame_level;
+                }
+            } else {
+                adopted = Some(election.best);
+            }
+            if let Some(plan) = adopted {
+                crate::encoder::cdef_elect::apply_cdef_plan(
+                    state.mirror(),
+                    &plan,
+                    &mut recon.y,
+                    &mut recon.u,
+                    &mut recon.v,
+                    width,
+                    height,
+                    chroma_w,
+                    chroma_h,
+                    bit_depth,
+                    ssx,
+                    ssy,
+                    num_planes,
+                );
+                fh.cdef_params = Some(plan.params);
+                cdef_elected = true;
+            }
         }
     }
 
@@ -7902,6 +8074,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             true,
             true,

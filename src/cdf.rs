@@ -20353,6 +20353,50 @@ impl PartitionWalker {
         cdef_frame(&ctx, src_planes, dst_planes);
     }
 
+    /// r429 — [`Self::cdef_frame_from_idx`] with the §5.11.56
+    /// `cdef_idx[]` anchors supplied by the caller instead of the
+    /// walker's own grid: `unit_idx` holds one strength id per 64×64
+    /// unit in raster order (`ceil(MiCols / 16)` units per row, `-1`
+    /// = the §5.11.55 sentinel — copy only). The skip grid is still
+    /// the walker's committed §5.11.11 state. This is the encoder's
+    /// per-unit CDEF *election* driver: candidate plans filter
+    /// through the identical §7.15 kernels BEFORE the tile is
+    /// re-emitted with the §5.11.56 literals that make the walker's
+    /// own grid carry the same ids.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cdef_frame_with_unit_grid(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        unit_idx: &[i8],
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+    ) {
+        use crate::cdef::{cdef_frame, CdefFrameContext};
+        let sb_cols = self.mi_cols.div_ceil(16);
+        let ctx = CdefFrameContext {
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            cdef_params,
+            cdef_idx: &|r, c| {
+                if r >= self.mi_rows || c >= self.mi_cols {
+                    return -1;
+                }
+                let unit = (r / 16) * sb_cols + (c / 16);
+                unit_idx.get(unit as usize).copied().unwrap_or(-1)
+            },
+            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
+        };
+        cdef_frame(&ctx, src_planes, dst_planes);
+    }
+
     /// §7.14 in-loop deblocking filter over the persisted §5.11 decode
     /// grids — av1-spec p.307-313.
     ///
