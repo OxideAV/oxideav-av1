@@ -9534,3 +9534,72 @@ fn self_encoded_per_unit_cdef_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r429 self-encoded loop-restoration fixture — the corpus's first
+// stream with §5.9.20 `UsesLr = 1`: per-64×64-unit §5.11.58 payloads
+// interleaved into the tile at each superblock's §5.11.57 window
+// (selection symbols + recentred-subexp Wiener taps / self-guided
+// weights with the running RefLrWiener / RefSgrXqd chain), §7.17
+// Wiener and self-guided kernels driven per unit on decode, and the
+// restored frame feeding the §7.20 reference store.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_192X128_Q140_LR_IVF: &str = concat!(
+    "444b49460000200041563031c000800019000000010000000400000000000000210500000000",
+    "00000000000012000a0a00000003b5fff2efe60132900a16002460000018300790ffb2799d24",
+    "40bbfbf4288d582410eb4d082808e9aebb5e97979260762a1f63f2cc34b19d214f8ab234be86",
+    "80a613db88429cc57c32e654529a19d6e616001f6979d89e84869a6d378cbe55771d1d034382",
+    "067bc680139a0be8806ff974bc16e061caeff596bbde8f7de00378f8d0991363b8aef2d3ab4b",
+    "6807d33263ddef076ea7b943052c7635aee590d40c09bbe3ca96f256a41dd56ec976adbbcaa2",
+    "671e42d978034178f8f2492df02e24d570258ff70dbe2c3e4f44c40a4654acdfe3d18df522c7",
+    "ac7ffc5628931f8f83b0d3e299786c470227598993147e5eb158c903e46acea44cff1384d11c",
+    "dd7982dabbca15d54476c343a7cc9e7520be938a0653688f192dd30e1f3962e75bcdc3417ca8",
+    "96ad7c1c4f96658d175cf06a9ab28a3c6431f41795e5a278401cec80a5ffd9646de445509557",
+    "7d9861986e8e8ce44a51cc7500e73d37d338bddc78b8872b3de7db7cbf842cbdeb6414afc2ea",
+    "783807b41804e2d8bdb83f53c55bb9b1747b00c89203336381d9b132a43182edcdf304999006",
+    "7523d69e09f258a1160c2283a49fbb025282cbd94ab9e7bc7e1de5bb8d3e654bfe7b77018488",
+    "f4abb63658d830916128b41ad8915afa4e43d00081973eda05e96aaac78d38a274a7b6eda15a",
+    "440e340123e87b6632934b1c6ab83f87ea9cd34e1af38848587ac4c16409c8e782acd4a89831",
+    "09e19054affeda680089301c11703f8f4824a4a232b50ea2b0898116156a554625a232c312f4",
+    "0df9a3f6d61c58b5cbe11e76a1f3770a25c7d087e69c421f9e5622e039d7c630b2515ad260dc",
+    "e1b9851dba352045bfa645924863a8ac2b1ad0d99b553f045d9ddd7dc25b1b010fac13dd978c",
+    "16b8329cc1ec38420bf58d4e9e75e57defe3333ab15a49ca6a69fbb9b7a36a7a3e5115731b2d",
+    "ba506ce2dd48ad932efcbb5d828c3d338cd1c58bb853a7271c4becd1d191f78caca4a8a49d6c",
+    "168387d3fcb9f0aa4b4747fe01383f200c9ef3788bf03e06649a51685fdc31148691b389dd78",
+    "6b704d8e615da8cffdd7ca1dbb768f8c95d082eb6120ca04ec407107bcdd0a1f5e3bff03a642",
+    "8d8edc7a8c8a8f53b80acb3041527ecb5b1bb5443aecf8e5bbb601283c5e3725878ab3f1a5c7",
+    "037cbfb4bebed01d3343083ee2595bc635876608474a6acdca77dd1f65fd254f8ba35b24a5ed",
+    "23d15be0e859184b5f6439493775e24940101ad57fa9adee8a76e230e82c8ff91487a2bb7ef4",
+    "3ceab7eb7ee22ec89fe5b61a5ec1043330c4577cd57828fc718b8828cc44a2c7202b9a0a2b21",
+    "52dfdc5cd1ee0cc44cfae7f1c5d3475f65bc5ba2f4ece284d95cae9b6faf34dd1e4a7ec730b1",
+    "b9d12c7afab777e8cfb5091d642cdd9d093e09095839e489c00807671b0b5c55da63cd08e669",
+    "17e224efe0c087e09f40edaf34ed094cbb072a96920cdd4198956cdd9ea27fdf6488d056ddc8",
+    "2a93fb9e8da6a3595d378dc3e6604914cde9d7061e04c71b896106aba9b393607e0015194e5b",
+    "f5c0c1bf23ea04833c32308bd1f46010f1173ae9cc91c3d95d7d4c7ebb4e01a4b52edcb17f88",
+    "380cbdbab5ef17da67f28e2d3acb072499902af269bd4544d4145f343a649565b06d385a51d1",
+    "1d759f73e1396dd0f3548e159dfbba631ff38d640b013219c1d558ea4d1ab90b3f0c426284ca",
+    "be493b3e875f1fe42b3e3ccc52f9406d617491766f31955e7947a0a60a4a937b1395636ed8d9",
+    "54f06d8f1bb4a8202aeb932e93618de65e34c98712c60f05dbd523a30ccb4ad3a1446e189c60",
+    "b40cfbd99300fff721f9dd170d7585028ff3d16877709a559f80803f00000001000000000000",
+    "001200323b320100224824bd23000000000003ab48ad20d29f92f0dbb9b92e65471bea2ffe3a",
+    "590dbaa7631d1be9432c6f4c381b2a3a8cad95f33b504001d31a190000000200000000000000",
+    "120032153202004001003d23000000000003d480a7109368c018000000030000000000000012",
+    "003214320300224824bd23000000000003d480a400a0b0",
+);
+
+/// r429: detail-content GOP (KEY + 3 P, 192x128, `base_q_idx = 140`)
+/// — wide-band sinusoid detail whose quantiser noise the per-unit
+/// Wiener / self-guided election measurably undoes (+0.32 dB at ~2
+/// bytes/frame). Digest = byte-identical output of THREE independent
+/// black-box reference decoders (notes under
+/// `docs/video/av1/fixtures/self-gop-192x128-q140-lr/`).
+#[test]
+fn self_encoded_loop_restoration_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-192x128-q140-lr",
+        SELF_GOP_192X128_Q140_LR_IVF,
+        "e663d082d5e1f5fd0a9784efb0627bacdfafbd88d512761aeb5e29deee7aea59",
+        4,
+    );
+}
