@@ -240,3 +240,45 @@ fn lr_beats_baseline_on_detail_content() {
         "loop restoration regressed the GOP joint score by more than 0.5%: {s_on} vs {s_off}"
     );
 }
+
+/// r429 depth-axis lock: the LR election is BitDepth-generic — a
+/// 10-bit KEY on the same detail content must elect restoration
+/// (§7.17 kernels at the 10-bit clip/rounding parameters, λ at the
+/// 4^(BitDepth-8) distortion scale) and round-trip byte-exact
+/// through the spec driver.
+#[test]
+fn lr_elects_and_round_trips_at_10bit() {
+    use oxideav_av1::encoder::{encode_key_frame_yuv_with_q, ChromaFormat, YuvFrame};
+    let (w, h) = (192u32, 128u32);
+    let mut input = YuvFrame::filled(w, h, 10, ChromaFormat::Yuv420, 0);
+    let (wu, hu) = (w as usize, h as usize);
+    for r in 0..hu {
+        for c in 0..wu {
+            let v = detail_scene(c as f64, r as f64).clamp(0.0, 255.0);
+            input.y[r * wu + c] = ((v * 4.0).round() as u16).min(1023);
+        }
+    }
+    let (cw, ch) = (
+        input.chroma_width() as usize,
+        input.chroma_height() as usize,
+    );
+    for r in 0..ch {
+        for c in 0..cw {
+            let e = detail_scene(c as f64 * 2.0, r as f64 * 2.0);
+            input.u[r * cw + c] = (((90.0 + 0.4 * e).clamp(0.0, 255.0) * 4.0) as u16).min(1023);
+            input.v[r * cw + c] = (((150.0 - 0.35 * e).clamp(0.0, 255.0) * 4.0) as u16).min(1023);
+        }
+    }
+    let k = encode_key_frame_yuv_with_q(&input, 140).expect("encode");
+    let lr = k.fh.lr_params.expect("lossy header carries lr_params");
+    assert!(
+        lr.uses_lr,
+        "10-bit detail content must elect loop restoration"
+    );
+    let decoded = decode_av1_spec(&k.ivf_bytes).expect("spec driver");
+    assert_eq!(decoded.len(), 1);
+    let le = |p: &[u16]| -> Vec<u8> { p.iter().flat_map(|&s| s.to_le_bytes()).collect() };
+    assert_eq!(decoded[0].planes[0], le(&k.recon_y), "10-bit KEY luma");
+    assert_eq!(decoded[0].planes[1], le(&k.recon_u), "10-bit KEY U");
+    assert_eq!(decoded[0].planes[2], le(&k.recon_v), "10-bit KEY V");
+}
