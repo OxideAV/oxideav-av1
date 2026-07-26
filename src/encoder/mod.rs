@@ -287,6 +287,8 @@ pub mod partition_tree;
 pub mod pyramid_gop;
 pub(crate) mod rate_twin;
 #[doc(hidden)]
+pub mod scalable_gop;
+#[doc(hidden)]
 pub mod sequence_obu;
 #[doc(hidden)]
 pub mod symbol_writer;
@@ -414,6 +416,12 @@ pub use pyramid_gop::{
 };
 #[doc(hidden)]
 pub use rate_twin::RateModel;
+// r430 — temporally scalable GOP arm (§6.7.5 operating points +
+// §5.3.3 extension headers on the wire).
+pub use scalable_gop::{
+    encode_temporal_layered_gop_yuv420_with_q, encode_temporal_layered_gop_yuv_with_q,
+    temporal_layer_of, TemporalLayeredGop, TemporalLayeredGopYuv,
+};
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 #[doc(hidden)]

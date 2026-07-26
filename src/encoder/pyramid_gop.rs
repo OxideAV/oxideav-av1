@@ -665,7 +665,7 @@ impl PyramidSession {
 }
 
 /// Shared input validation for the GOP drivers.
-fn validate_gop_input(frames: &[YuvFrame]) -> Result<(u32, u32), Error> {
+pub(crate) fn validate_gop_input(frames: &[YuvFrame]) -> Result<(u32, u32), Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
     }
