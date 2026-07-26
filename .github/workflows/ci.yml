@@ -3,6 +3,17 @@ name: CI
 # Thin shim around the OxideAV org-level reusable workflow. See
 # https://github.com/OxideAV/.github for the actual job definitions and
 # the input surface. Miri runs by default per the org-wide policy.
+#
+# Tiered since round 429: the full conformance suite (111-pin
+# triple-decode corpus + A/B harnesses) runs 4+ hours on the slower
+# hosted runners — long enough to hit hosted-runner mortality — so the
+# per-push matrix is split:
+#   * ci      — FULL suite on ubuntu + macos (complete coverage per push)
+#   * ci-win  — build + `cargo test --lib` on windows (2100+ unit tests;
+#               platform build/behaviour smoke without the corpus wall)
+# Nothing is dropped: every test still runs per-push on two platforms;
+# Windows corpus coverage is available on demand by dispatching `ci`
+# with a windows os_matrix from the Actions UI.
 
 on:
   push:
@@ -13,4 +24,12 @@ on:
 jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    with:
+      os_matrix: '["ubuntu-latest", "macos-latest"]'
+    secrets: inherit
+  ci-win:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    with:
+      os_matrix: '["windows-latest"]'
+      extra_test_args: "--lib"
     secrets: inherit
