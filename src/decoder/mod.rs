@@ -32,7 +32,7 @@
 #[doc(hidden)]
 pub mod frame_driver;
 
-pub use frame_driver::{decode_av1_spec, SpecFrame};
+pub use frame_driver::{decode_av1_spec, decode_av1_spec_at_operating_point, SpecFrame};
 #[doc(hidden)]
 pub use frame_driver::{decode_frame_spec, SpecDecodeSession};
 
@@ -76,6 +76,33 @@ pub enum Frame {
 ///   [`Error`].
 pub fn decode_av1(input: &[u8]) -> Result<Vec<Frame>, Error> {
     Ok(decode_av1_spec(input)?
+        .into_iter()
+        .map(Frame::Spec)
+        .collect())
+}
+
+/// r430 — [`decode_av1`] at an externally selected operating point
+/// (§6.7.5 `choose_operating_point()`).
+///
+/// `operating_point` indexes the sequence header's operating-point
+/// list (`0..=operating_points_cnt_minus_1`). With a non-zero
+/// `OperatingPointIdc` the §5.3.1 `drop_obu()` rule skips every OBU
+/// that carries an extension header and lies outside the point's
+/// temporal/spatial layer set, so a temporally scalable stream
+/// decodes to exactly the shown frames of the surviving layers —
+/// `operating_point = 0` reproduces [`decode_av1`] byte for byte on
+/// every stream.
+///
+/// ## Errors
+///
+/// * [`Error::OperatingPointOutOfRange`] — the index exceeds the
+///   sequence header's list.
+/// * Every [`decode_av1`] error surface otherwise.
+pub fn decode_av1_at_operating_point(
+    input: &[u8],
+    operating_point: u8,
+) -> Result<Vec<Frame>, Error> {
+    Ok(decode_av1_spec_at_operating_point(input, operating_point)?
         .into_iter()
         .map(Frame::Spec)
         .collect())

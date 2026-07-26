@@ -1200,6 +1200,33 @@ pub fn decode_av1_spec(input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
     Ok(out)
 }
 
+/// r430 — [`decode_av1_spec`] at an externally selected operating
+/// point (§6.7.5): the §5.3.1 `drop_obu()` rule skips every OBU
+/// outside the selected point's temporal/spatial layer set, so a
+/// temporally scalable stream decodes to exactly the shown frames of
+/// the surviving layers. `operating_point = 0` (the list's preferred
+/// entry) reproduces [`decode_av1_spec`] byte for byte.
+///
+/// ## Errors
+///
+/// * [`Error::OperatingPointOutOfRange`] — `operating_point` exceeds
+///   the sequence header's `operating_points_cnt_minus_1`.
+/// * Every [`decode_av1_spec`] error surface otherwise.
+pub fn decode_av1_spec_at_operating_point(
+    input: &[u8],
+    operating_point: u8,
+) -> Result<Vec<SpecFrame>, Error> {
+    let reader = IvfReader::new(input).map_err(|_| Error::UnexpectedEnd)?;
+    let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
+    let mut session = SpecDecodeSession::new();
+    session.set_operating_point(operating_point)?;
+    let mut out = Vec::new();
+    for record in records {
+        out.extend(session.decode_temporal_unit(&record.payload)?);
+    }
+    Ok(out)
+}
+
 /// Cross-packet decode session — the §7.20 reference-frame store, the
 /// cached sequence header, and the per-slot CDF / motion-field /
 /// segment-id state, held across successive temporal units so a
@@ -1212,6 +1239,16 @@ pub fn decode_av1_spec(input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
 pub struct SpecDecodeSession {
     seq: Option<SequenceHeader>,
     refs: SpecRefState,
+    /// r430 — the operating point selected by external means (the
+    /// §6.7.5 `choose_operating_point()` return value). Defaults to
+    /// `0` — the earliest (preferred) entry of the sequence header's
+    /// operating-point list.
+    chosen_op: u8,
+    /// §5.5.1 `OperatingPointIdc = operating_point_idc[
+    /// operatingPoint ]` — refreshed at every sequence-header parse.
+    /// `0` = scalability not in use (the §5.3.1 `drop_obu()` arm
+    /// never fires).
+    op_idc: u16,
 }
 
 impl Default for SpecDecodeSession {
@@ -1227,7 +1264,54 @@ impl SpecDecodeSession {
         Self {
             seq: None,
             refs: SpecRefState::new(),
+            chosen_op: 0,
+            op_idc: 0,
         }
+    }
+
+    /// r430 — select the operating point (§6.7.5) by external means.
+    ///
+    /// `operating_point` is an index into the sequence header's
+    /// operating-point list (`0..=operating_points_cnt_minus_1`; `0`
+    /// is the list's preferred entry and the session default). The
+    /// §5.5.1 `OperatingPointIdc` derivation re-runs at every
+    /// sequence-header parse, so the selection naturally applies to
+    /// each new coded video sequence; when a sequence header has
+    /// already been parsed the selection is re-derived immediately
+    /// against it.
+    ///
+    /// With a non-zero `OperatingPointIdc`, every OBU that carries an
+    /// extension header and lies outside the operating point's
+    /// temporal/spatial layer set is dropped per the §5.3.1
+    /// `drop_obu()` rule — decoding a temporally scalable stream at a
+    /// reduced operating point yields exactly the shown frames of the
+    /// selected layer subset.
+    ///
+    /// ## Errors
+    ///
+    /// [`Error::OperatingPointOutOfRange`] when a sequence header is
+    /// cached and `operating_point` exceeds its
+    /// `operating_points_cnt_minus_1` (the same reject surfaces from
+    /// [`Self::decode_temporal_unit`] at the next sequence-header
+    /// parse otherwise).
+    pub fn set_operating_point(&mut self, operating_point: u8) -> Result<(), Error> {
+        self.chosen_op = operating_point;
+        if let Some(s) = self.seq.as_ref() {
+            let idx = usize::from(operating_point);
+            if idx >= s.operating_points.len() {
+                return Err(Error::OperatingPointOutOfRange);
+            }
+            self.op_idc = s.operating_points[idx].operating_point_idc;
+        }
+        Ok(())
+    }
+
+    /// The current §5.5.1 `OperatingPointIdc` (`0` until a sequence
+    /// header with a non-zero `operating_point_idc` for the selected
+    /// operating point is parsed).
+    #[must_use]
+    pub fn operating_point_idc(&self) -> u16 {
+        self.op_idc
     }
 
     /// Decode one §7.5 temporal-unit body (a low-overhead OBU
@@ -1243,7 +1327,14 @@ impl SpecDecodeSession {
     /// decoder's scope.
     pub fn decode_temporal_unit(&mut self, payload: &[u8]) -> Result<Vec<SpecFrame>, Error> {
         let mut out = Vec::new();
-        decode_temporal_unit_spec(payload, &mut self.seq, &mut self.refs, &mut out)?;
+        decode_temporal_unit_spec(
+            payload,
+            &mut self.seq,
+            &mut self.refs,
+            &mut out,
+            self.chosen_op,
+            &mut self.op_idc,
+        )?;
         Ok(out)
     }
 
@@ -1445,14 +1536,49 @@ fn decode_temporal_unit_spec(
     seq: &mut Option<SequenceHeader>,
     refs: &mut SpecRefState,
     out: &mut Vec<SpecFrame>,
+    chosen_op: u8,
+    op_idc: &mut u16,
 ) -> Result<(), Error> {
     let mut pending_fh: Option<FrameHeader> = None;
     for desc in ObuIter::new(payload) {
         let desc = desc?;
+        // §5.3.1 `drop_obu()`: with a non-zero OperatingPointIdc,
+        // every OBU other than a sequence header or temporal
+        // delimiter that carries an extension header and lies outside
+        // the selected operating point's layer set is dropped before
+        // any payload parse:
+        //
+        //   inTemporalLayer = (OperatingPointIdc >> temporal_id) & 1
+        //   inSpatialLayer  = (OperatingPointIdc >> (spatial_id + 8)) & 1
+        if *op_idc != 0
+            && desc.extension_flag
+            && !matches!(
+                desc.obu_type,
+                ObuType::SequenceHeader | ObuType::TemporalDelimiter
+            )
+        {
+            let in_temporal = (*op_idc >> desc.temporal_id) & 1 != 0;
+            let in_spatial = (*op_idc >> (desc.spatial_id + 8)) & 1 != 0;
+            if !in_temporal || !in_spatial {
+                continue;
+            }
+        }
         match desc.obu_type {
             ObuType::TemporalDelimiter | ObuType::Padding | ObuType::Metadata => {}
             ObuType::SequenceHeader => {
-                *seq = Some(parse_sequence_header(desc.payload)?);
+                let sh = parse_sequence_header(desc.payload)?;
+                // §5.5.1: `operatingPoint = choose_operating_point()`
+                // (the session's externally-selected index, default
+                // 0); `OperatingPointIdc = operating_point_idc[
+                // operatingPoint ]`. §6.7.5: an index outside
+                // `0..=operating_points_cnt_minus_1` abandons the
+                // decoding process.
+                let idx = usize::from(chosen_op);
+                if idx >= sh.operating_points.len() {
+                    return Err(Error::OperatingPointOutOfRange);
+                }
+                *op_idc = sh.operating_points[idx].operating_point_idc;
+                *seq = Some(sh);
             }
             ObuType::FrameHeader => {
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;

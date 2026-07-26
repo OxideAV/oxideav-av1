@@ -2415,6 +2415,15 @@ pub enum Error {
     /// `neg_deinterleave` `ref >= max - 1` arm would compute
     /// `max - diff - 1` outside its `diff < max` domain.
     SegmentIdOutOfRange,
+    /// r430 — the operating point selected by external means (the
+    /// §6.7.5 `choose_operating_point()` "explicitly signaled"
+    /// note) does not exist in the sequence header's operating-point
+    /// list: the index exceeds `operating_points_cnt_minus_1`. Per
+    /// §6.7.5 a decoder must either return a value in
+    /// `0..=operating_points_cnt_minus_1` from
+    /// `choose_operating_point()` or abandon the decoding process —
+    /// this is the abandon arm for an out-of-range external request.
+    OperatingPointOutOfRange,
 }
 
 impl core::fmt::Display for Error {
@@ -2566,6 +2575,10 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-av1: §5.11.9 segment_id symbol exceeds LastActiveSegId — §6.10.8 conformance violation (corrupt or adversarial stream)"
             ),
+            Self::OperatingPointOutOfRange => write!(
+                f,
+                "oxideav-av1: requested operating point exceeds operating_points_cnt_minus_1 (§6.7.5 choose_operating_point abandon arm)"
+            ),
         }
     }
 }
@@ -2598,6 +2611,20 @@ impl std::error::Error for Error {}
 /// Rejected streams surface the spec driver's typed [`Error`].
 pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
     decoder::decode_av1(bytes)
+}
+
+/// r430 — [`decode_av1`] at an externally selected operating point
+/// (§6.7.5 `choose_operating_point()`): with a non-zero
+/// `OperatingPointIdc` the §5.3.1 `drop_obu()` rule skips every OBU
+/// carrying an extension header outside the point's temporal/spatial
+/// layer set, so a temporally scalable stream decodes to exactly the
+/// shown frames of the surviving layers. See
+/// [`decoder::decode_av1_at_operating_point`].
+pub fn decode_av1_at_operating_point(
+    bytes: &[u8],
+    operating_point: u8,
+) -> Result<Vec<decoder::Frame>, Error> {
+    decoder::decode_av1_at_operating_point(bytes, operating_point)
 }
 
 /// Encode planar 4:2:0 8-bit YUV pixels into an intra-only AV1
