@@ -640,9 +640,14 @@ fn encode_inter_tail(
 }
 
 /// §5.9.3 `get_relative_dist( a, b )` over `order_hint_bits`-wide
-/// hints (the enable gate is on the caller — this module only calls it
-/// under `seq.enable_order_hint`).
+/// hints. r430: the §5.9.3 `enable_order_hint == 0` arm (return 0)
+/// lives HERE — an order-hint-free sequence (the §7.3 camera-frame
+/// shape) passes `order_hint_bits == 0` and every distance collapses
+/// to 0, exactly the spec's derivation.
 fn relative_dist(a: u32, b: u32, order_hint_bits: u8) -> i32 {
+    if order_hint_bits == 0 {
+        return 0;
+    }
     let mut diff = a as i32 - b as i32;
     let m = 1i32 << (i32::from(order_hint_bits) - 1);
     diff = (diff & (m - 1)) - (diff & m);

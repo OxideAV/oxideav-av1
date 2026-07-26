@@ -247,6 +247,8 @@
 pub mod bitwriter;
 #[doc(hidden)]
 pub mod block_mode_info;
+#[doc(hidden)]
+pub mod camera_frame;
 pub(crate) mod cdef_elect;
 #[doc(hidden)]
 pub mod coefficients;
@@ -309,6 +311,13 @@ pub use block_mode_info::{
     write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
     write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_use_intrabc, write_y_mode,
     IntrabcArmInputs, IntrabcBlockInfo,
+};
+// r430 — §7.3 large-scale-tile camera-frame write arm (single-tile
+// camera frames; the tile-list assembly lives in
+// [`crate::tile_list`]).
+#[doc(hidden)]
+pub use camera_frame::{
+    build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420, CameraFrameEncode,
 };
 #[doc(hidden)]
 pub use coefficients::{

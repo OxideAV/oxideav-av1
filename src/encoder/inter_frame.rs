@@ -1216,6 +1216,13 @@ pub(crate) struct InterFrameConfig<'a> {
     /// r429 — §5.9.20/§7.17 loop-restoration election (see
     /// [`GopTuning::lr`]).
     pub lr: bool,
+    /// r430 — freeze the CDF state: code the frame with
+    /// `disable_cdf_update = 1` AND `disable_frame_end_update_cdf =
+    /// 1` (the §7.3 large-scale-tile camera-frame shape — every
+    /// symbol prices against the frame-start CDFs and the frame
+    /// donates no adapted state). `false` keeps the adaptive shape
+    /// every other driver uses.
+    pub freeze_cdfs: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1250,6 +1257,10 @@ fn build_inter_frame_fh(
     // the per-frame default state.
     fh.error_resilient_mode = false;
     fh.force_integer_mv = false;
+    // r430 — the §7.3 camera-frame shape freezes both CDF flags; every
+    // other driver keeps the adaptive defaults (false / false).
+    fh.disable_cdf_update = cfg.freeze_cdfs;
+    fh.disable_frame_end_update_cdf = cfg.freeze_cdfs;
     fh.primary_ref_frame = cfg.primary_ref_frame;
     fh.refresh_frame_flags = cfg.refresh_frame_flags;
     // §5.9.2 `order_hint` — the DISPLAY order (KEY = 0), `<
@@ -1306,7 +1317,10 @@ fn build_inter_frame_fh(
         // r413: §7.9 temporal MV prediction on every inter frame (the
         // first P-frame's projections are empty — every slot still
         // holds the intra KEY — which both sides derive identically).
-        use_ref_frame_mvs: true,
+        // r430: derived from the sequence gates — an order-hint-free
+        // sequence (the §7.3 camera-frame shape) infers 0 on the
+        // parse side, so the writer twin must agree.
+        use_ref_frame_mvs: seq.enable_order_hint && seq.enable_ref_frame_mvs,
     });
     // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — under
     // `PRIMARY_REF_NONE` the parser forces `update_map = 1`,
@@ -1494,6 +1508,7 @@ fn p_frame_config_primary<'a>(
         cdef: true,
         cdef_units: true,
         lr: true,
+        freeze_cdfs: false,
     }
 }
 
@@ -1801,8 +1816,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // store — the SAME shared core the decode driver runs, so the
     // §7.10.2.5 temporal scan sees identical `MotionFieldMvs` at
     // search time, at write time and at decode time.
-    ip.use_ref_frame_mvs = true;
-    {
+    // r430: mirrors the header derivation — an order-hint-free
+    // sequence codes (and infers) `use_ref_frame_mvs = 0`, so the
+    // §7.9 projection must not run (the walker keeps the invalid
+    // motion-field default on both sides).
+    ip.use_ref_frame_mvs = seq.enable_order_hint && seq.enable_ref_frame_mvs;
+    if ip.use_ref_frame_mvs {
         use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
         let ref_frame_idx = cfg.ref_frame_idx;
         let mut order_hints = [0i32; 8];

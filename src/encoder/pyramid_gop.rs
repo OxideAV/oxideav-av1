@@ -564,6 +564,7 @@ impl PyramidSession {
                         cdef: self.tuning.cdef,
                         cdef_units: self.tuning.cdef_units,
                         lr: self.tuning.lr,
+                        freeze_cdfs: false,
                     };
                     let q = self.role_q(&role);
                     let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(
