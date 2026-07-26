@@ -170,7 +170,8 @@ fn layer_count_bounds_are_enforced() {
 
 /// Local-only black-box hook: when `AV1_R430_DUMP_DIR` is set, write
 /// the three-layer fixture for external reference-decoder
-/// cross-checks (dav1d / aomdec `--oppoint`). Inert in CI (no env).
+/// cross-checks (independent decoders' operating-point
+/// selection flags). Inert in CI (no env).
 #[test]
 fn dump_three_layer_fixture_for_blackbox_when_requested() {
     let Some(dir) = std::env::var_os("AV1_R430_DUMP_DIR") else {

@@ -1017,8 +1017,67 @@ byte-identically in all three external decoders
 (`tests/annexb_conformance.rs`; fixtures `ext-annexb-96x80` +
 `self-annexb-96x80-q80`).
 
+### Scalability: operating points + temporal layers (r430)
+
+The §5.3.3 OBU extension headers the walker always parsed are now
+HONOURED end to end. Decode side: `SpecDecodeSession::
+set_operating_point` / `decode_av1_at_operating_point` select a
+§6.7.5 operating point (default: entry 0), `OperatingPointIdc`
+re-derives at every sequence-header parse per §5.5.1, and the §5.3.1
+`drop_obu()` rule skips every extension-carrying OBU outside the
+point's temporal/spatial layer set before any payload parse — a
+temporally scalable stream decodes to exactly the shown frames of
+the surviving layers (out-of-range selections surface
+`Error::OperatingPointOutOfRange`, the §6.7.5 abandon arm). Encode
+side: `encoder::encode_temporal_layered_gop_yuv{420,}_with_q` codes
+a dyadic 2..4-layer ladder in display order (zero latency, one
+temporal unit per frame, layer `t` predicting only from layers
+`<= t`, per-layer §7.20 slot policy + LAST-slot CDF carry) with the
+§6.7.5 operating-point list on the wire and extension headers on
+every frame OBU. A three-layer stream decodes byte-exact in two
+independent reference decoders at ALL THREE operating points (and a
+third on the full decode); corpus stream 112 pins the full + both
+reduced subsets (`tests/temporal_layers.rs`,
+`tests/scalability_op.rs`; fixture
+`self-gop-64x64-q72-temporal-layers`).
+
+### Large-scale-tile mode: §5.12 tile lists + §7.3 decoding (r430)
+
+AV1's second operating mode (§7.1). The `tile_list` module parses
+and writes the §5.12.1/.2 tile-list OBU under the §6.11 conformance
+bounds, and `tile_list::decode_tile_list{,_stream}` runs the §7.3.1
+ordered steps: per entry, the selected anchor (an externally
+supplied decoded frame — §6.11.2 `AnchorFrames`) is installed as
+`FrameStore[ ref_frame_idx[0] ]`, the §7.3.2 decode-camera-tile
+process decodes the entry's `coded_tile_data` (fresh symbol decoder,
+frame-start CDFs, single tile, no post-processing, no reference
+update), and the tile lands in the output frame in raster order —
+uncovered tiles stay untouched. The whole mode is gated on the
+§7.3.1 constraint list (`Error::TileListInvalid` otherwise); general
+decode sessions skip tile-list OBUs per the §7.3.1 note. The write
+arm (`encoder::encode_camera_frame_yuv420`) produces §7.3-conformant
+single-tile `W×64` camera frames through the generic inter driver
+under an order-hint-free frozen-CDF shape (`InterFrameConfig::
+freeze_cdfs`; the §5.9.3 zero-`OrderHintBits` distance arm and the
+sequence-gate-derived `use_ref_frame_mvs` landed with it); a 2×2
+output assembled from four camera tiles over four anchors decodes
+byte-identical to the per-frame encoder reconstructions, and the
+lossless arm reproduces the source exactly
+(`tests/large_scale_tile.rs`).
+
 ### Not yet supported
 
+- Large-scale-tile WRITE side is single-tile-per-frame (`W×64`
+  camera frames — already §7.3-conformant tiles); a multi-tile
+  encoder arm (`tile_cols > 1`) is the open frontier. The DECODE
+  side handles any §7.3-conformant tile grid. No black-box
+  cross-check exists for assembled tile-list output (external
+  decoders cannot take an external anchor array); the coded tiles
+  themselves ride the corpus-validated §5.11 walk.
+- Spatial-layer (multi-`spatial_id`) streams ride the same §5.3.1
+  drop rule, but no spatial-SVC encoder arm or inter-layer
+  dependency validation exists; temporal scalability is the
+  validated axis.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /

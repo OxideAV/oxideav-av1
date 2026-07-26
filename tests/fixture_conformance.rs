@@ -9603,3 +9603,126 @@ fn self_encoded_loop_restoration_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r430 self-encoded temporally scalable fixture — the corpus's first
+// stream carrying §5.3.3 OBU extension headers and a multi-entry
+// §6.7.5 operating-point list: three dyadic temporal layers in
+// display order (ladder 0 2 1 2 0 2 1 2), operating_point_idc masks
+// 0x107 / 0x103 / 0x101, extension headers on every frame OBU, and
+// the §5.3.1 drop_obu() rule carving the exact shown-frame subsets
+// at each reduced operating point.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_64X64_Q72_TEMPORAL_LAYERS_IVF: &str = concat!(
+    "444b4946000020004156303140004000190000000100000008000000000000006b0300000000",
+    "00000000000012000a0e0021070081804040abffe5dfcc023600d506160029000000679fc080",
+    "eb3f3ee386c00345fc5f5bd42abba76293657eb39e5851e7adfdfd921e387107bd13fec36191",
+    "048fc1fccf145eabd6141415205b7ec48637822e420a9b43d253ca146b90e4447d1c731d42d0",
+    "00a51d806d77aa76eb2aafbe1e12ebb6009cfafaad0b58350fe7faa096ed728b7be2885ff690",
+    "7812fa8adb2c8d72b615ae762260082013dc7e360ce44d46378a9c2e37af056c5323ec443ca5",
+    "ad24b44b48696299fae0cabc2529fd2ad058862f83dfd7557705f4bd1a6057371002acd91980",
+    "8956a5d67bb57ba46f64caae3ecc2bbbdf5c253cf235a573eb1d0064fa99bdbab4ed45c3fc7d",
+    "347f53b6bcdaaecb79df76d493be4dcb728dd5ed674489a7acd8df0b26f10c0b1d16932a3b09",
+    "13be308d4a0d5951d730df85ad58c89b3de0e4e36397a1c61b71e9e99ea854aa5587c97527e1",
+    "a9f8e3d593ea29c10608049efcb5e2f2c32f76fb0e1d805512957d63d18e350d03794822fb2c",
+    "33ffd59fa939be843f953609dd1f76c44384523049f9fad34eef79add827e5a73a8f84982f03",
+    "caf710578ded0e52c3c33c658e504b49e269f519e80417b226b32ee33eac019fbfb7623e8300",
+    "fb3b58bfbc7732e2a771cd5dd46fc909c59689c1709576f68443b5a790ce6e743617934db121",
+    "4ba523a8856c28245424725491a0bad7b6e3ccd5a629f6c8bbaf79633d3e1fb696d8182a69f3",
+    "000fde6c17174e3301223c16db34a00934783fc0b1fccc9c40b9b1a799d8cb4fca1616a7b5b3",
+    "72780ea8e451eb44de7fe990fb614f7cde20d22c695716f2866314e753f14b0633cd4f31c90f",
+    "d9dd7e576048aeea0d8fdcca3e034b22b11978a0badbf7298aa8d2e7695da894e8020677c9ac",
+    "bff7341e9da2cc74287e5e271fab91766cc8461280ed1dd244d5c1ace25c3a6f394fc27ff290",
+    "14ac70602f429b1a78533916a81960198212d9346edc9eba97cbf33f77081b8d5ea111313c88",
+    "0cf83bc55a9a9941899bcc735f850b99948e9b14470ee754c3b97394aaefe438200c13eb6113",
+    "ac3b75676dd15265bcb3d0cadaadafa31af8b25bd828b6f064b2ab2e365f0391ad96aab3a12c",
+    "6ef6a4b2a4f696fbacbd5839d51614b35050cfde7eddc16b7e76d6ede9d16ddc20bcd21fa15d",
+    "2b68bd63287a453ea5923ce39f520c9fbf87cd30425158447ca86b3ef44291e75be215ba4fb1",
+    "6962ff33d0d880520000000100000000000000120036404d3201000000001d4e0000033d940a",
+    "00d89bc79f1e1c39a24895e057cf92da8e1c65a24cef6c779e2683d844329437592f3e67750d",
+    "93a689302f77e25bdfbb53c0a85b70e94e7d31108ebc062cc068000000020000000000000012",
+    "003620633202e04000003d4c0000033cfc0a00dd25bdf2e505f7b383b703b5cfb2d385a79366",
+    "f141bd4833fee14c64ef5f435625547fbf7fe91d9e185fecca9d0a67a4699e78163f4a72c19a",
+    "218cb2ea82e62dd0b3a1ca16724fe813fe42f6a83d1f7669f565274700000003000000000000",
+    "0012003640423203000248249d4e0000033dfc0a00e28153897e9a143a33736211ae4aef77d1",
+    "f13387b6ab0485d22f4a51955e54891ec2dd13db0f99bff4ccaf064e29606aa9d104c1000000",
+    "040000000000000012003600bb013204002000003d480000033cf80a00b371066f70a2247049",
+    "b5e3910765f51bfd28e1791aa065b941f9892112140fb7c72bfc1620068b40c29ad23b8c4306",
+    "acb799557e9e24f718c8de58302cdaecfa4d2c32fb7b3a0cae6d164573fa3497027ce78b5f7f",
+    "0f59582479d5084dbe1a66a1f91820061e2aef2e65719f08140ee4b0ad8a950535332c6ab78d",
+    "027f860e1fec8ee51aea3247e5b004c9630b2feebf458fd99a72aebe3322675036be1b68085f",
+    "31dbbf0e2dd51efcc9eeec520000000500000000000000120036404d3205000000001d4e0000",
+    "033cfc0a00b3a27c96acfee931ea26171b62506e51aca4f385936f5ddaa8ac1044e2d6e9f610",
+    "7215a0902f40fd8dfba39e621913bb8c0f3c9617e3bf17a489f7ff63806c0000000600000000",
+    "00000012003620673206004000001d4c0000033cfc0a00d86bc56a0ea260d6f04d960b38d29c",
+    "6d961983fb68034f9014efc0053121b3a4fbefe09bcc76dc3e5009736bef033c07ca94f49daa",
+    "bce6d9c87f10668fa27937bac15a7d439427a0418e15a6182b81b856911a7386444580460000",
+    "00070000000000000012003640413207000248249d4e0000033cfc0a00ab3beedf733cf69fce",
+    "2210e142ca68085e92f88dada0fe727f4230d92868bdbccdc1563303b7e18b91a94d6a966063",
+    "f22f30",
+);
+
+/// r430: [`assert_decodes_to_digest`]'s operating-point sibling — the
+/// same stream decoded through
+/// [`oxideav_av1::decode_av1_at_operating_point`], digested against
+/// the black-box reference decoders' `--oppoint` output.
+fn assert_decodes_to_digest_at_op(
+    name: &str,
+    ivf_hex: &str,
+    operating_point: u8,
+    digest: &str,
+    frames_hint: usize,
+) {
+    let ivf = unhex(ivf_hex);
+    let frames = oxideav_av1::decoder::decode_av1_spec_at_operating_point(&ivf, operating_point)
+        .unwrap_or_else(|e| panic!("{name}: op {operating_point} decode rejected: {e:?}"));
+    assert_eq!(
+        frames.len(),
+        frames_hint,
+        "{name}: op {operating_point} frame count"
+    );
+    let mut got = Vec::new();
+    for f in &frames {
+        for p in &f.planes {
+            got.extend_from_slice(p);
+        }
+    }
+    assert_eq!(
+        sha256_hex(&got),
+        digest,
+        "{name}: op {operating_point} pixels differ from the independent decoders"
+    );
+}
+
+/// r430: temporally scalable GOP (KEY + 7, 64x64, `base_q_idx = 72`,
+/// three dyadic layers) — every digest is the byte-identical output
+/// of TWO independent black-box reference decoders at the SAME
+/// operating point (three for the full stream); notes under
+/// `docs/video/av1/fixtures/self-gop-64x64-q72-temporal-layers/`.
+/// Operating point 0 = all 8 shown frames; point 1 = the
+/// `temporal_id <= 1` subset (4 frames); point 2 = the base layer
+/// (2 frames) — the §5.3.1 drop_obu() rule end to end.
+#[test]
+fn self_encoded_temporal_layers_gop_decodes_byte_exact_at_every_operating_point() {
+    assert_decodes_to_digest(
+        "self-gop-64x64-q72-temporal-layers",
+        SELF_GOP_64X64_Q72_TEMPORAL_LAYERS_IVF,
+        "62235c2066f129ebf357aa25b03b2324b0171efe36469650fa9bc373a20ed212",
+        8,
+    );
+    assert_decodes_to_digest_at_op(
+        "self-gop-64x64-q72-temporal-layers",
+        SELF_GOP_64X64_Q72_TEMPORAL_LAYERS_IVF,
+        1,
+        "d86e32f7ca801662b783f23cc8792782cab6e55d0e5ccf3882fb5bd035265f8e",
+        4,
+    );
+    assert_decodes_to_digest_at_op(
+        "self-gop-64x64-q72-temporal-layers",
+        SELF_GOP_64X64_Q72_TEMPORAL_LAYERS_IVF,
+        2,
+        "244ffc57ac4a1ec2dc16f62d3afa957ff4d8e1d55fc44261b395a4d2f5c6c5c6",
+        2,
+    );
+}

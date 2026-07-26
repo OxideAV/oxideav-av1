@@ -316,7 +316,8 @@ fn operating_point_masks_honour_spatial_bits() {
 
 /// Local-only black-box hook: when `AV1_R430_DUMP_DIR` is set, write
 /// the layered fixture to disk for external reference-decoder
-/// cross-checks (dav1d / aomdec `--oppoint`). Inert in CI (no env).
+/// cross-checks (independent decoders' operating-point
+/// selection flags). Inert in CI (no env).
 #[test]
 fn dump_layered_fixture_for_blackbox_when_requested() {
     let Some(dir) = std::env::var_os("AV1_R430_DUMP_DIR") else {
