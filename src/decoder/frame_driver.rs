@@ -191,7 +191,7 @@ struct DecodedFrameInternal {
 
 /// §5.9.2 `LosslessArray[ segmentId ]` — `get_qindex( 1, segmentId ) ==
 /// 0 && DeltaQYDc == 0 && DeltaQ{U,V}{Ac,Dc} == 0` for every segment.
-fn lossless_array(
+pub(crate) fn lossless_array(
     qp: &crate::uncompressed_header_tail::QuantizationParams,
     sp: &SegmentationParams,
 ) -> [bool; MAX_SEGMENTS] {
@@ -1565,6 +1565,14 @@ fn decode_temporal_unit_spec(
         }
         match desc.obu_type {
             ObuType::TemporalDelimiter | ObuType::Padding | ObuType::Metadata => {}
+            // §7.3.1: tile-list decoding is a separate operating mode
+            // whose AnchorFrames array exists only by external means
+            // ("a decoder is recommended to support decoding of tile
+            // list OBUs, but this is not a requirement for decoder
+            // conformance") — the general driver skips them; the
+            // dedicated [`crate::tile_list::decode_tile_list`] entry
+            // decodes them against a caller-supplied anchor set.
+            ObuType::TileList => {}
             ObuType::SequenceHeader => {
                 let sh = parse_sequence_header(desc.payload)?;
                 // §5.5.1: `operatingPoint = choose_operating_point()`

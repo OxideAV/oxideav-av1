@@ -1564,6 +1564,7 @@ pub mod symbol_decoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod tile_info;
+pub mod tile_list;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod transform;
@@ -2424,6 +2425,23 @@ pub enum Error {
     /// `choose_operating_point()` or abandon the decoding process —
     /// this is the abandon arm for an out-of-range external request.
     OperatingPointOutOfRange,
+    /// r430 — a §5.12 tile-list OBU or its §7.3 large-scale-tile
+    /// decode inputs violate the spec's conformance envelope: a
+    /// malformed / oversized tile list (`tile_count_minus_1 > 511`,
+    /// `anchor_frame_idx > 127`, truncated or over-long entry bytes,
+    /// more entries than output tiles), an `anchor_tile_row` /
+    /// `anchor_tile_col` outside the frame's tile grid, an anchor
+    /// index beyond the supplied `AnchorFrames` array, an anchor
+    /// whose dimensions differ from the camera frame header's, or a
+    /// sequence / frame header outside the §7.3 bitstream-conformance
+    /// constraint list (superres / order hints / CDEF / restoration /
+    /// film grain enabled, non-INTER frame type, adaptive CDFs,
+    /// non-superblock-high tiles, non-uniform tile widths, …). Also
+    /// covers a camera frame header naming a primary reference — the
+    /// §7.3 input contract supplies anchor PIXELS only, so a header
+    /// that needs a reference's saved CDF state is undecodable from
+    /// these inputs.
+    TileListInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -2578,6 +2596,10 @@ impl core::fmt::Display for Error {
             Self::OperatingPointOutOfRange => write!(
                 f,
                 "oxideav-av1: requested operating point exceeds operating_points_cnt_minus_1 (§6.7.5 choose_operating_point abandon arm)"
+            ),
+            Self::TileListInvalid => write!(
+                f,
+                "oxideav-av1: tile-list OBU / large-scale-tile inputs violate the §5.12/§6.11/§7.3 conformance envelope"
             ),
         }
     }
