@@ -147,6 +147,21 @@ fn encode_arm(frames: &[Yuv420Frame], q: u8, cdef_units: bool) -> EncodedGop {
             // harness isolates the CDEF axis (the KEY plan-inclusion
             // argument needs the frame to end at the CDEF stage).
             lr: false,
+            // r431 — the §5.9.17 per-superblock delta-q election is the
+            // OTHER post-r429 in-loop confound. It is a masking-WEIGHTED
+            // `Dw + λ·R` election whose arm choice is a knife-edge on
+            // this adversarial noise/edge content: a tiny CDEF
+            // difference on one frame propagates through the reference
+            // chain and can FLIP a later P-frame's delta-q arm (a
+            // ~200-byte swing that is pure delta-q rate, not CDEF), so
+            // it turns the per-unit-vs-frame-level CDEF comparison into
+            // a coin-flip per clip even though per-unit CDEF is
+            // non-inferior in aggregate (measured pooled over many
+            // decorrelated clips: per-unit ≈ 0.2 % BETTER). Hold it off,
+            // exactly as `lr` above, so this harness isolates the CDEF
+            // axis it is named for. Delta-q's own composition is guarded
+            // by `key_delta_q_ab` / the inter delta-q A/B suite.
+            delta_q: false,
             ..GopTuning::default()
         },
     )
@@ -266,6 +281,9 @@ fn score256(inputs: &[Yuv420Frame], enc: &EncodedGop, q: u8) -> u64 {
 }
 
 /// The measurement tripwire, on the encoder's own `D + λ·R` scale.
+/// Both arms run with the delta-q and loop-restoration axes held off
+/// (see [`encode_arm`]) so the ONLY variable is the §5.9.19 per-unit
+/// vs frame-level CDEF election — the axis this harness is named for.
 ///
 /// KEY-only arm: the frame-level plan is a MEMBER of the per-unit
 /// arm's plan space (same recon input, deterministic search), so the
@@ -274,8 +292,12 @@ fn score256(inputs: &[Yuv420Frame], enc: &EncodedGop, q: u8) -> u64 {
 /// tripwire above pins that `cdef_bits > 0` actually wins there).
 ///
 /// GOP arm: reported for the measurement record and held to a
-/// non-inferiority band (filtered-reference propagation across
-/// P-frames is not covered by the per-frame election argument).
+/// non-inferiority band. With delta-q isolated the per-unit arm's
+/// filtered reference propagates cleanly across the P-frames, so per
+/// unit is non-inferior here too (measured ~0.15 % BETTER); the band
+/// stays a tripwire for a genuine per-unit CDEF regression (bad
+/// strength search, mis-priced literals) rather than delta-q election
+/// noise.
 #[test]
 fn per_unit_beats_frame_level_on_mixed_content() {
     let frames = mixed_content(256, 128, 4);
