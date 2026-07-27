@@ -122,7 +122,7 @@ use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
 use crate::encoder::yuv_frame::{build_intra_only_seq_yuv, ChromaFormat, YuvFrame};
 use crate::encoder::yuv_frame::{
-    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
+    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame, SB_SIZE4_64,
 };
 use crate::frame_header::FrameHeader;
 use crate::obu::ObuType;
@@ -336,6 +336,67 @@ pub fn encode_key_frame_yuv_with_q(
     .map(|(k, _)| k)
 }
 
+/// r431 — [`encode_key_frame_yuv_with_q`] with an explicitly
+/// configured §5.9.15 uniform multi-tile layout: `tile_cols_log2` /
+/// `tile_rows_log2` are the coded `TileColsLog2` / `TileRowsLog2`
+/// (the realized tile counts follow the §5.9.15 uniform-spacing
+/// derivation — e.g. a 256-wide frame at `tile_cols_log2 = 1` codes
+/// two 128-wide tile columns). `(0, 0)` reproduces the single-tile
+/// stream byte for byte.
+///
+/// Every tile is a complete §8.2 symbol partition starting from the
+/// §8.3.1 frame-start CDF state; non-last tiles carry §5.11.1
+/// `tile_size_minus_1` fields sized by the realized §6.8.14
+/// `TileSizeBytes`; tile 0 donates the §8.4 frame-end CDF state
+/// (`context_update_tile_id = 0`).
+///
+/// ## Errors
+///
+/// * The requested pair is outside the §5.9.15 legal window for the
+///   frame size (see [`crate::tile_info::TileInfo::uniform_layout`]),
+///   plus every [`encode_key_frame_yuv_with_q`] reject —
+///   [`Error::PartitionWalkOutOfRange`].
+pub fn encode_key_frame_yuv_with_q_tiles(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Result<EncodedKeyFrameYuv, Error> {
+    encode_key_frame_yuv_seg_carry_tiles(
+        input,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        (tile_cols_log2, tile_rows_log2),
+    )
+    .map(|(k, _)| k)
+}
+
+/// 8-bit 4:2:0 sibling of [`encode_key_frame_yuv_with_q_tiles`].
+pub fn encode_key_frame_yuv420_with_q_tiles(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let k = encode_key_frame_yuv_with_q_tiles(&wide, base_q_idx, tile_cols_log2, tile_rows_log2)?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
 /// r427 — the general-format KEY-frame core: every entry point above
 /// funnels here. `alt_q` / `exact_mask` carry the r426 §5.9.14
 /// SEG_LVL_ALT_Q + exactness-demand configuration.
@@ -356,6 +417,124 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     ),
     Error,
 > {
+    encode_key_frame_yuv_seg_carry_tiles(
+        input,
+        base_q_idx,
+        model,
+        alt_q,
+        exact_mask,
+        cdef,
+        cdef_units,
+        lr,
+        (0, 0),
+    )
+}
+
+/// r431 — [`encode_key_frame_yuv_seg_carry`] with an explicitly
+/// configured §5.9.15 uniform tile layout: `tiles = (TileColsLog2,
+/// TileRowsLog2)`. `(0, 0)` is the single-tile shape every pre-r431
+/// entry point produces (bit-identical — the per-tile walk collapses
+/// to the whole-frame walk). A multi-tile layout emits one §8.2
+/// symbol partition per tile (each tile starting from the §8.3.1
+/// frame-start CDF state, per-tile `clear_above_context()` /
+/// availability scoping), `tile_size_minus_1` fields on every
+/// non-last tile (§5.11.1), and the §5.9.15 trailing
+/// `context_update_tile_id` (0 — tile 0 donates the §8.4 frame-end
+/// CDF state) + `tile_size_bytes_minus_1` (minimal for the realized
+/// payloads) pair.
+///
+/// The §5.9.20 intra-block-copy election is closed on multi-tile
+/// layouts (the search's §6.10.24 hash index is frame-scoped; an
+/// encoder election, not a conformance limit). Everything else —
+/// palette, filter intra, CDEF (frame-level and per-unit), loop
+/// restoration — runs per tile exactly as in the single-tile arm.
+///
+/// ## Errors
+///
+/// * `tiles` outside the §5.9.15 legal window for the frame size
+///   (see [`TileInfo::uniform_layout`]) —
+///   [`Error::PartitionWalkOutOfRange`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+    cdef: bool,
+    cdef_units: bool,
+    lr: bool,
+    tiles: (u32, u32),
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
+    encode_key_frame_yuv_full(
+        input,
+        base_q_idx,
+        model,
+        alt_q,
+        exact_mask,
+        cdef,
+        cdef_units,
+        lr,
+        &KeyExtras {
+            tiles,
+            ..KeyExtras::default()
+        },
+    )
+}
+
+/// r431 — the spatial-scalability shape knobs on the intra driver
+/// (see [`encode_key_frame_yuv_full`]). Every field's default keeps
+/// the pre-r431 KEY shape bit-for-bit.
+#[derive(Default)]
+pub(crate) struct KeyExtras<'a> {
+    /// §5.9.15 uniform tile layout `(TileColsLog2, TileRowsLog2)`.
+    pub tiles: (u32, u32),
+    /// Code the frame under THIS sequence header instead of building
+    /// one from the input dimensions (the §6.7.5 layered-stream shape
+    /// — one sequence header spans every spatial layer, so smaller
+    /// layers code §5.9.5 `frame_size_override_flag = 1` explicit
+    /// dimensions). The caller's header must carry the same tool
+    /// gates the internal builder would set (the spatial driver
+    /// builds it through [`build_intra_only_seq_yuv`] +
+    /// `enable_filter_intra = true` at the TOP layer's dimensions).
+    pub seq_override: Option<&'a SequenceHeader>,
+    /// `Some(refresh_frame_flags)` codes the intra frame as §5.9.2
+    /// `INTRA_ONLY_FRAME` with that EXPLICIT refresh mask (a shown
+    /// KEY refreshes ALL slots — an enhancement spatial layer must
+    /// not clobber its siblings' §7.20 state; §5.9.2 bars `0xFF`
+    /// here). `error_resilient_mode` drops to 0 on this arm (the
+    /// §5.9.2 ref_order_hint block stays silent).
+    pub intra_only_refresh: Option<u8>,
+}
+
+/// r427/r431 — the general-format intra-frame core: every entry
+/// point above funnels here (KEY frames; `INTRA_ONLY` via
+/// [`KeyExtras::intra_only_refresh`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_key_frame_yuv_full(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+    cdef: bool,
+    cdef_units: bool,
+    lr: bool,
+    extras: &KeyExtras<'_>,
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
+    let tiles = extras.tiles;
     // r426 — same table validation as the P-frame entry (`alt_q[0] ==
     // 0`, su(1+8) range, no over-255 sums, no base-0 segmentation).
     if !alt_q.is_empty() {
@@ -396,23 +575,80 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     // election, not a conformance constraint.
     let sc_eligible = bit_depth == 8 && input.format == ChromaFormat::Yuv420;
 
-    let mut seq = build_intra_only_seq_yuv(input.width, input.height, bit_depth, input.format)?;
-    // r410: open the §5.11.24 filter-intra gate — the mode picker now
-    // evaluates the five §7.11.2.3 recursive modes on eligible luma
-    // blocks (the historical mirror drivers build their own sequence
-    // headers and stay unaffected).
-    seq.enable_filter_intra = true;
+    let seq = match extras.seq_override {
+        // r431 — layered-stream shape: code under the caller's shared
+        // sequence header (its dimension budget must cover this
+        // frame).
+        Some(shared) => {
+            if input.width > shared.max_frame_width_minus_1 + 1
+                || input.height > shared.max_frame_height_minus_1 + 1
+            {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            shared.clone()
+        }
+        None => {
+            let mut s =
+                build_intra_only_seq_yuv(input.width, input.height, bit_depth, input.format)?;
+            // r410: open the §5.11.24 filter-intra gate — the mode
+            // picker now evaluates the five §7.11.2.3 recursive modes
+            // on eligible luma blocks (the historical mirror drivers
+            // build their own sequence headers and stay unaffected).
+            s.enable_filter_intra = true;
+            s
+        }
+    };
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    // r431 — §5.9.5: under a shared sequence header a smaller frame
+    // codes its dimensions explicitly.
+    fh.frame_size_override_flag = extras.seq_override.is_some()
+        && (input.width != seq.max_frame_width_minus_1 + 1
+            || input.height != seq.max_frame_height_minus_1 + 1);
+    // r431 — §5.9.2 INTRA_ONLY arm: explicit refresh mask (never
+    // `allFrames` — §5.9.2 bars it), no error resilience (the
+    // ref_order_hint block stays silent; primary_ref is intra-skipped
+    // either way), showable per the `frame_type != KEY_FRAME`
+    // derivation.
+    if let Some(mask) = extras.intra_only_refresh {
+        if mask == 0xFF {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        fh.frame_type = crate::frame_header::FrameType::IntraOnly;
+        fh.refresh_frame_flags = mask;
+        fh.error_resilient_mode = false;
+        fh.showable_frame = true;
+    }
     // r427 — screen-content election is 8-bit-4:2:0-scoped (see
     // `sc_eligible` above); the §5.9.5 SELECT arm codes the header
     // bit either way.
     fh.allow_screen_content_tools = fh.allow_screen_content_tools && sc_eligible;
+    // r431 — the §5.9.15 uniform tile layout (single-tile unless the
+    // caller configured columns/rows). Derived before the intra-bc
+    // gate below: the DV hash index is frame-scoped, so the §5.9.20
+    // election closes on multi-tile layouts.
+    let (fs_mi_rows, fs_mi_cols) = {
+        let fs = fh
+            .frame_size
+            .as_ref()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        (fs.mi_rows, fs.mi_cols)
+    };
+    let mut ti = crate::tile_info::TileInfo::uniform_layout(
+        fs_mi_cols,
+        fs_mi_rows,
+        seq.use_128x128_superblock,
+        tiles.0,
+        tiles.1,
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+    let multi_tile = !ti.is_single_tile();
+    fh.tile_info = Some(ti.clone());
     // r418: open the §5.9.20 intra-block-copy gate only when the
     // content-level scan finds at least one §6.10.24-reachable exact
     // duplicate superblock — the per-leaf `use_intrabc` S() overhead
     // is only worth coding when a copy source provably exists.
-    fh.allow_intrabc = fh.allow_screen_content_tools && intrabc_beneficial(input);
+    fh.allow_intrabc = fh.allow_screen_content_tools && !multi_tile && intrabc_beneficial(input);
     // §5.9.19: `allow_intrabc = 1` short-circuits the cdef_params
     // block — keep the header descriptor on the parser's
     // short-circuit shape (the r428 election is gated off there too).
@@ -523,14 +759,41 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         },
     };
 
-    // §5.11.2 tile walk: one tile, 64×64 superblocks in raster order.
+    // §5.11.2 tile walk, 64×64 superblocks in raster order per tile
+    // (r431: tiles in tile-scan order; every pre-r431 layout is the
+    // degenerate single tile, whose walk is the whole-frame raster).
     // Per superblock: §5.11.3 `clear_block_decoded_flags`, then the
     // recursive §5.11.4 rate-distortion partition search (running the
     // mode picker + residual pipeline at every leaf in NW/NE/SW/SE
-    // dispatch order), then emit its syntax.
-    let mut writer = SymbolWriter::new(fh.disable_cdf_update);
-    let mut cdfs = TileCdfContext::new_from_defaults();
-    cdfs.init_coeff_cdfs(base_q_idx);
+    // dispatch order), then emit its syntax. Per tile: fresh §8.2
+    // `SymbolWriter`, fresh §8.3.1 frame-start CDF state, and the
+    // §5.11.2 `begin_tile` re-scope (clear_above_context, per-tile
+    // availability, delta lifecycle) on the ONE frame-scope syntax
+    // driver whose grids (`MiSizes[]`, `SegmentIds[]`, `Cdef_Idx[]`)
+    // accumulate across tiles like the decode walker's.
+    let num_tiles = ti.tile_cols * ti.tile_rows;
+    let tile_plan: Vec<(TileGeometry, Vec<(u32, u32)>)> = (0..num_tiles)
+        .map(|t| {
+            let g = ti.tile_geometry(t).expect("tile_num < NumTiles");
+            let mut origins: Vec<(u32, u32)> = Vec::new();
+            let mut r = g.mi_row_start;
+            while r < g.mi_row_end {
+                let mut c = g.mi_col_start;
+                while c < g.mi_col_end {
+                    origins.push((r, c));
+                    c += SB_SIZE4_64;
+                }
+                r += SB_SIZE4_64;
+            }
+            (g, origins)
+        })
+        .collect();
+    debug_assert_eq!(
+        tile_plan.iter().map(|(_, o)| o.len()).sum::<usize>(),
+        sb_grid_origins(mi_rows, mi_cols).len(),
+        "tile plan must cover every superblock exactly once"
+    );
+
     let mut state = PartitionSyntaxWriter::new(
         mi_rows,
         mi_cols,
@@ -545,50 +808,168 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
 
     // r429 — the committed trees are retained: the per-unit CDEF
     // election re-emits the tile with §5.11.56 strength ids stamped.
+    // r431: tile-scan order, with the superblock origin of each tree
+    // kept alongside (the CDEF unit grid is frame-raster indexed).
     let mut trees: Vec<crate::encoder::partition_tree::SyntaxNode> = Vec::new();
-    for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
-        recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
-        // r421 — arm the §5.11.2 delta lifecycle on the live state AND
-        // the rate twin's fork, so both enter the superblock identically.
-        state.arm_read_deltas();
-        let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
-        twin.arm_read_deltas();
-        let seg_demand = exact_mask.map(|mask| KeySegDemand {
-            mask,
-            ll_seg: ll_seg.expect("mask requires a lossless segment (validated above)"),
-        });
-        let (tree, _cost) = build_search_tree(
-            sb_r,
-            sb_c,
-            BLOCK_64X64,
-            input,
-            &mut recon,
-            &mut twin,
-            &params,
-            model,
-            seg_demand.as_ref(),
-        )?;
-        write_partition_tree_syntax(
-            &mut writer,
-            &mut cdfs,
-            &mut state,
-            &tree,
-            sb_r,
-            sb_c,
-            BLOCK_64X64,
-            &params,
-        )?;
-        // r421 anti-desync invariant: the search committed EXACTLY the
-        // symbols the writer just emitted, so the twin's CDFs and
-        // coder range must equal the live state — always, in both
-        // rate models (commits are model-independent).
-        debug_assert!(
-            twin.matches(&cdfs, &writer),
-            "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
-        );
-        trees.push(tree);
+    let mut tree_sb: Vec<(u32, u32)> = Vec::new();
+    let mut tile_payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
+    // The §8.4 frame-end donation: tile `context_update_tile_id`'s
+    // adapted CDFs (`save_cdfs`).
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+        if !state.begin_tile(*geo) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        recon.bd.set_tile(*geo);
+        let mut writer = SymbolWriter::new(fh.disable_cdf_update);
+        let mut tile_cdfs = TileCdfContext::new_from_defaults();
+        tile_cdfs.init_coeff_cdfs(base_q_idx);
+        for &(sb_r, sb_c) in origins {
+            recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            // r421 — arm the §5.11.2 delta lifecycle on the live state
+            // AND the rate twin's fork, so both enter the superblock
+            // identically.
+            state.arm_read_deltas();
+            let mut twin = RateTwin::snapshot(&tile_cdfs, &state, &writer);
+            twin.arm_read_deltas();
+            let seg_demand = exact_mask.map(|mask| KeySegDemand {
+                mask,
+                ll_seg: ll_seg.expect("mask requires a lossless segment (validated above)"),
+            });
+            let (tree, _cost) = build_search_tree(
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                input,
+                &mut recon,
+                &mut twin,
+                &params,
+                model,
+                seg_demand.as_ref(),
+            )?;
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut tile_cdfs,
+                &mut state,
+                &tree,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                &params,
+            )?;
+            // r421 anti-desync invariant: the search committed EXACTLY
+            // the symbols the writer just emitted, so the twin's CDFs
+            // and coder range must equal the live state — always, in
+            // both rate models (commits are model-independent).
+            debug_assert!(
+                twin.matches(&tile_cdfs, &writer),
+                "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+            );
+            trees.push(tree);
+            tree_sb.push((sb_r, sb_c));
+        }
+        tile_payloads.push(writer.finish());
+        if tile_idx as u32 == ti.context_update_tile_id {
+            cdfs = tile_cdfs;
+        }
     }
-    let mut tile_bytes = writer.finish();
+
+    // §5.11.1 assembled tile-group body length — what the exact-bytes
+    // elections below price (for a single tile this IS the tile
+    // payload, byte for byte; multi-tile adds the flag byte + the
+    // `le(TileSizeBytes)` size fields).
+    let (layout_cols_log2, layout_rows_log2, ctx_update_id) = (
+        ti.tile_cols_log2,
+        ti.tile_rows_log2,
+        ti.context_update_tile_id,
+    );
+    let assemble = move |payloads: &[Vec<u8>]| -> Result<Vec<u8>, Error> {
+        let tsb = min_tile_size_bytes(payloads);
+        write_tile_group_obu(&TileGroupObu::whole_frame(
+            num_tiles,
+            layout_cols_log2,
+            layout_rows_log2,
+            tsb,
+            payloads.iter().cloned().map(TilePayload::new).collect(),
+        ))
+    };
+    let mut tile_group_body = assemble(&tile_payloads)?;
+
+    // r431 — replay the committed trees under `emit_params` (plus the
+    // optional §5.11.57 `write_lr` interleave) across the tile plan:
+    // per tile a fresh §8.2 writer, fresh §8.3.1 frame-start CDFs and
+    // fresh §5.11.2 LR-reference state, on a fresh frame-scope syntax
+    // driver re-scoped tile by tile. The replay emits the identical
+    // symbols the search committed (only header-armed literals — CDEF
+    // strength ids, LR coefficients — move the coder), so the elected
+    // arms below compare EXACT realized bytes. Returns the per-tile
+    // payloads, the `context_update_tile_id` §8.4 donation, and the
+    // accumulated driver.
+    let disable_cdf_update = fh.disable_cdf_update;
+    type EmitOut = (Vec<Vec<u8>>, TileCdfContext, PartitionSyntaxWriter);
+    let emit_tiles = |trees: &[crate::encoder::partition_tree::SyntaxNode],
+                      emit_params: &SyntaxFrameParams,
+                      lr_plan: Option<&crate::encoder::lr_elect::LrPlan>|
+     -> Result<EmitOut, Error> {
+        let mut re_state = PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
+        let mut donated: Option<TileCdfContext> = None;
+        let mut tree_idx = 0usize;
+        for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+            if !re_state.begin_tile(*geo) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let mut re_writer = SymbolWriter::new(disable_cdf_update);
+            let mut re_cdfs = TileCdfContext::new_from_defaults();
+            re_cdfs.init_coeff_cdfs(base_q_idx);
+            let mut lr_write_state = crate::encoder::loop_restoration_write::LrWriteState::new();
+            for &(sb_r, sb_c) in origins {
+                re_state.arm_read_deltas();
+                if let Some(plan) = lr_plan {
+                    crate::encoder::loop_restoration_write::write_lr(
+                        &mut re_writer,
+                        &mut re_cdfs,
+                        &mut lr_write_state,
+                        sb_r,
+                        sb_c,
+                        BLOCK_64X64,
+                        &plan.write_params,
+                        &plan.units,
+                    )?;
+                }
+                write_partition_tree_syntax(
+                    &mut re_writer,
+                    &mut re_cdfs,
+                    &mut re_state,
+                    &trees[tree_idx],
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    emit_params,
+                )?;
+                tree_idx += 1;
+            }
+            payloads.push(re_writer.finish());
+            if tile_idx as u32 == ctx_update_id {
+                donated = Some(re_cdfs);
+            }
+        }
+        Ok((
+            payloads,
+            donated.expect("context_update_tile_id < NumTiles"),
+            re_state,
+        ))
+    };
 
     // r428/r429 — §5.9.19/§7.15 CDEF election on the KEY frame
     // (deblock levels are 0 on this header, so the reconstruction IS
@@ -652,45 +1033,22 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                 let plan = &election.best;
                 let mut cdef_params_w = params.clone();
                 cdef_params_w.cdef_bits = u32::from(plan.params.cdef_bits);
-                for (tree, &idx) in trees.iter_mut().zip(plan.unit_idx.iter()) {
-                    tree.stamp_cdef_idx(idx.max(0));
+                // r431 — `plan.unit_idx` is frame-raster per 64×64
+                // unit; the trees ride tile-scan order, so the stamp
+                // maps each tree through its superblock origin.
+                let sb_cols_frame = mi_cols.div_ceil(16);
+                for (tree, &(sb_r, sb_c)) in trees.iter_mut().zip(tree_sb.iter()) {
+                    let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
+                    tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
                 }
-                let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
-                let mut re_cdfs = TileCdfContext::new_from_defaults();
-                re_cdfs.init_coeff_cdfs(base_q_idx);
-                let mut re_state = PartitionSyntaxWriter::new(
-                    mi_rows,
-                    mi_cols,
-                    TileGeometry {
-                        mi_row_start: 0,
-                        mi_row_end: mi_rows,
-                        mi_col_start: 0,
-                        mi_col_end: mi_cols,
-                    },
-                )
-                .ok_or(Error::PartitionWalkOutOfRange)?;
-                for ((sb_r, sb_c), tree) in
-                    sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees)
-                {
-                    re_state.arm_read_deltas();
-                    write_partition_tree_syntax(
-                        &mut re_writer,
-                        &mut re_cdfs,
-                        &mut re_state,
-                        tree,
-                        sb_r,
-                        sb_c,
-                        BLOCK_64X64,
-                        &cdef_params_w,
-                    )?;
-                }
-                let re_tile = re_writer.finish();
+                let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &cdef_params_w, None)?;
+                let re_body = assemble(&re_payloads)?;
                 // Exact-bytes settlement: per-unit vs the fallback arm
                 // (frame-level when it beats unfiltered, else the
                 // unfiltered default header) on the SAME `D + λ·R`
                 // scale the leaf ladders use.
                 let unit_score = plan.d * 256
-                    + lambda * 8 * 256 * ((header_len(&plan.params) + re_tile.len()) as u64);
+                    + lambda * 8 * 256 * ((header_len(&plan.params) + re_body.len()) as u64);
                 let (fb_d, fb_hdr) = match &election.frame_level {
                     Some(p) => (p.d, header_len(&p.params)),
                     None => (
@@ -702,9 +1060,11 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                         ),
                     ),
                 };
-                let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
+                let fb_score =
+                    fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_group_body.len()) as u64);
                 if unit_score < fb_score {
-                    tile_bytes = re_tile;
+                    tile_payloads = re_payloads;
+                    tile_group_body = re_body;
                     cdfs = re_cdfs;
                     state = re_state;
                     committed_cdef_bits = u32::from(plan.params.cdef_bits);
@@ -801,45 +1161,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         {
             let mut lr_params_w = params.clone();
             lr_params_w.cdef_bits = committed_cdef_bits;
-            let mut re_writer = SymbolWriter::new(fh.disable_cdf_update);
-            let mut re_cdfs = TileCdfContext::new_from_defaults();
-            re_cdfs.init_coeff_cdfs(base_q_idx);
-            let mut re_state = PartitionSyntaxWriter::new(
-                mi_rows,
-                mi_cols,
-                TileGeometry {
-                    mi_row_start: 0,
-                    mi_row_end: mi_rows,
-                    mi_col_start: 0,
-                    mi_col_end: mi_cols,
-                },
-            )
-            .ok_or(Error::PartitionWalkOutOfRange)?;
-            let mut lr_write_state = crate::encoder::loop_restoration_write::LrWriteState::new();
-            for ((sb_r, sb_c), tree) in sb_grid_origins(mi_rows, mi_cols).into_iter().zip(&trees) {
-                re_state.arm_read_deltas();
-                crate::encoder::loop_restoration_write::write_lr(
-                    &mut re_writer,
-                    &mut re_cdfs,
-                    &mut lr_write_state,
-                    sb_r,
-                    sb_c,
-                    BLOCK_64X64,
-                    &plan.write_params,
-                    &plan.units,
-                )?;
-                write_partition_tree_syntax(
-                    &mut re_writer,
-                    &mut re_cdfs,
-                    &mut re_state,
-                    tree,
-                    sb_r,
-                    sb_c,
-                    BLOCK_64X64,
-                    &lr_params_w,
-                )?;
-            }
-            let re_tile = re_writer.finish();
+            let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &lr_params_w, Some(&plan))?;
+            let re_body = assemble(&re_payloads)?;
             let lambda = lambda_for(&recon.qp);
             let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
                 let mut fh_c = fh.clone();
@@ -855,11 +1178,12 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
                     .expect("lossy KEY header carries lr_params"),
             );
             let on_score = plan.d * 256
-                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_tile.len()) as u64);
+                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
             let off_score =
-                plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64);
+                plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_group_body.len()) as u64);
             if on_score < off_score {
-                tile_bytes = re_tile;
+                tile_payloads = re_payloads;
+                tile_group_body = re_body;
                 cdfs = re_cdfs;
                 state = re_state;
                 let applied_d = crate::encoder::lr_elect::apply_lr_plan(
@@ -891,18 +1215,14 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         }
     }
 
-    // §5.11.1 tile-group body (single tile).
-    let tile_group = TileGroupObu {
-        num_tiles: 1,
-        tile_cols_log2: 0,
-        tile_rows_log2: 0,
-        tile_size_bytes: 1,
-        tg_start: 0,
-        tg_end: 0,
-        start_and_end_present: false,
-        tiles: vec![TilePayload::new(tile_bytes)],
-    };
-    let tile_group_body = write_tile_group_obu(&tile_group)?;
+    // §5.11.1 tile-group body — already assembled from the winning
+    // per-tile payloads (`tile_group_body`); stamp the REALIZED
+    // §6.8.14 `TileSizeBytes` into the header descriptor so the coded
+    // `tile_size_bytes_minus_1` matches the assembly (the header BIT
+    // LENGTH is invariant — the field is a fixed `f(2)` — so the
+    // election prices above stay exact).
+    ti.tile_size_bytes = min_tile_size_bytes(&tile_payloads) as u8;
+    fh.tile_info = Some(ti.clone());
 
     // §5.10 `frame_obu()`: `frame_header_obu()` + `byte_alignment()`
     // (zero pad — NOT §5.3.4 trailing_bits; OBU_FRAME is one of the
@@ -940,8 +1260,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
     }
 
     // r423 — §7.20 slot payload for the KEY frame's `allFrames`
-    // refresh: `save_cdfs` takes the tile's adapted frame-end CDFs
-    // (single tile ⇒ `context_update_tile_id = 0` donated them;
+    // refresh: `save_cdfs` takes tile `context_update_tile_id`'s
+    // adapted frame-end CDFs (r431: tile 0 on every layout;
     // `disable_frame_end_update_cdf = 0` on this header), and
     // `SavedSegmentIds` is the walker mirror's fully-stamped grid
     // (all-zero — §5.11.8 disabled-branch stamps).
@@ -965,6 +1285,29 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         },
         carry,
     ))
+}
+
+/// r431 — the minimal §6.8.14 `TileSizeBytes` (1..=4) that fits every
+/// non-last tile's `tile_size_minus_1` (§5.11.1: the last tile of the
+/// group carries no size field). `1` for a single-tile frame (the
+/// field is then never coded — §5.9.15 skips the trailing pair when
+/// both log2 counts are 0).
+pub(crate) fn min_tile_size_bytes(payloads: &[Vec<u8>]) -> u32 {
+    let mut need = 1u32;
+    if let Some((_, non_last)) = payloads.split_last() {
+        for p in non_last {
+            debug_assert!(!p.is_empty(), "§5.11.1: non-last tile cannot be empty");
+            let v = (p.len().max(1) - 1) as u64;
+            let bytes = match v {
+                0..=0xFF => 1,
+                0x100..=0xFFFF => 2,
+                0x1_0000..=0xFF_FFFF => 3,
+                _ => 4,
+            };
+            need = need.max(bytes);
+        }
+    }
+    need
 }
 
 // ---------------------------------------------------------------------
@@ -991,6 +1334,17 @@ pub(crate) struct BlockDecodedMirror {
     sub_y: u8,
     /// §5.5.2 `NumPlanes` (1 or 3).
     num_planes: u8,
+    /// r431 — the §5.11.2 tile scope the walk currently runs under
+    /// (`MiRowStart` / `MiRowEnd` / `MiColStart` / `MiColEnd`). The
+    /// §5.11.3 clear derives `sbWidth4` / `sbHeight4` from the tile's
+    /// END coordinates, and the §7.11.2 `haveAbove` / `haveLeft`
+    /// availability collapses to "TU origin strictly below/right of
+    /// the tile origin" (see [`build_tu_neighbours`]). Defaults to a
+    /// whole-frame sentinel (`start = 0`, `end = u32::MAX` — the ends
+    /// are clamped against the frame extents at use sites), so every
+    /// single-tile driver is unchanged; multi-tile drivers re-scope
+    /// via [`Self::set_tile`] at each tile entry.
+    tile: TileGeometry,
 }
 
 impl BlockDecodedMirror {
@@ -1000,7 +1354,30 @@ impl BlockDecodedMirror {
             sub_x,
             sub_y,
             num_planes,
+            tile: TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: u32::MAX,
+                mi_col_start: 0,
+                mi_col_end: u32::MAX,
+            },
         }
+    }
+
+    /// r431 — re-scope the mirror to `tile` (see [`Self::tile`]).
+    pub(crate) fn set_tile(&mut self, tile: TileGeometry) {
+        self.tile = tile;
+    }
+
+    /// r431 — the current tile's origin in `plane`'s own sample space
+    /// (`(x0, y0)` = the §5.11.51 `MiColStart` / `MiRowStart` scaled
+    /// by `MI_SIZE` and the plane's subsampling) — the
+    /// [`build_tu_neighbours`] `tile_x0` / `tile_y0` inputs.
+    pub(crate) fn tile_origin_px(&self, plane: usize) -> (usize, usize) {
+        let (sx, sy) = self.plane_sub(plane);
+        (
+            ((self.tile.mi_col_start as usize) * 4) >> sx,
+            ((self.tile.mi_row_start as usize) * 4) >> sy,
+        )
     }
 
     /// Per-plane §6.4.2 `(subX, subY)` (`(0, 0)` for luma, the
@@ -1031,16 +1408,21 @@ impl BlockDecodedMirror {
         Some(plane * BD_STRIDE * BD_STRIDE + yi * BD_STRIDE + xi)
     }
 
-    /// §5.11.3 `clear_block_decoded_flags( r, c, sbSize4 = 16 )` for a
-    /// single-tile frame (`MiRowEnd = MiRows`, `MiColEnd = MiCols`) at
-    /// this mirror's subsampling / plane count.
+    /// §5.11.3 `clear_block_decoded_flags( r, c, sbSize4 = 16 )` at
+    /// this mirror's subsampling / plane count. The §5.11.3
+    /// `sbWidth4` / `sbHeight4` derivations read the TILE's `MiRowEnd`
+    /// / `MiColEnd` — the [`Self::tile`] scope clamped to the frame
+    /// extents (`mi_rows` / `mi_cols`), which collapses to the frame
+    /// edge for the single-tile drivers (the pre-r431 behaviour).
     pub(crate) fn clear_for_sb(&mut self, sb_r: u32, sb_c: u32, mi_rows: u32, mi_cols: u32) {
         const SB_SIZE4: i32 = 16;
+        let mi_row_end = self.tile.mi_row_end.min(mi_rows);
+        let mi_col_end = self.tile.mi_col_end.min(mi_cols);
         for plane in 0..usize::from(self.num_planes) {
             let (sx, sy) = self.plane_sub(plane);
             let (sub_x, sub_y) = (sx as i32, sy as i32);
-            let sb_width4 = (mi_cols as i32 - sb_c as i32) >> sub_x;
-            let sb_height4 = (mi_rows as i32 - sb_r as i32) >> sub_y;
+            let sb_width4 = (mi_col_end as i32 - sb_c as i32) >> sub_x;
+            let sb_height4 = (mi_row_end as i32 - sb_r as i32) >> sub_y;
             let y_max = SB_SIZE4 >> sub_y;
             let x_max = SB_SIZE4 >> sub_x;
             for y in -1..=y_max {
@@ -1201,10 +1583,14 @@ impl ReconState {
 /// — the encoder twin of the decode walker's `AboveRow[]` / `LeftCol[]`
 /// build (head-extended representation: spec index `k` at offset
 /// `k + 2`, the `-1` corner at offset 1). `have_above` / `have_left`
-/// are the §5.11.35 `(AvailU || y > 0)` / `(AvailL || x > 0)` values,
-/// which for a single-tile whole-frame walk collapse to `start_y > 0`
-/// / `start_x > 0`. r427: the no-neighbour fills are the §7.11.2.2
-/// depth-scaled `(1 << (BitDepth - 1)) ± 1` constants.
+/// are the §5.11.35 `(AvailU || y > 0)` / `(AvailL || x > 0)` values.
+/// `AvailU` / `AvailL` are TILE-scoped (§5.11.51 `is_inside`), so the
+/// pair collapses to "TU origin strictly below / right of the tile
+/// origin **in this plane's sample space**" — `tile_x0` / `tile_y0`
+/// carry that plane-scaled tile origin (both `0` for a single-tile
+/// whole-frame walk, reproducing the pre-r431 `start_y > 0` /
+/// `start_x > 0` forms). r427: the no-neighbour fills are the
+/// §7.11.2.2 depth-scaled `(1 << (BitDepth - 1)) ± 1` constants.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn build_tu_neighbours(
     plane_buf: &[u16],
@@ -1212,14 +1598,16 @@ pub(crate) fn build_tu_neighbours(
     ph: usize,
     start_x: usize,
     start_y: usize,
+    tile_x0: usize,
+    tile_y0: usize,
     w: usize,
     h: usize,
     have_above_right: bool,
     have_below_left: bool,
     bit_depth: u8,
 ) -> (Vec<u16>, Vec<u16>, bool, bool) {
-    let have_above = start_y > 0;
-    let have_left = start_x > 0;
+    let have_above = start_y > tile_y0;
+    let have_left = start_x > tile_x0;
     let max_x = pw - 1;
     let max_y = ph - 1;
     let read = |yy: usize, xx: usize| -> u16 { plane_buf[yy.min(max_y) * pw + xx.min(max_x)] };
@@ -1390,12 +1778,15 @@ fn predict_tu(
 ) -> Vec<u16> {
     let (buf, pw, ph) = recon.plane(plane);
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, plane, start_x, start_y, w, h);
+    let (tile_x0, tile_y0) = recon.bd.tile_origin_px(plane);
     let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
         buf,
         pw,
         ph,
         start_x,
         start_y,
+        tile_x0,
+        tile_y0,
         w,
         h,
         avail_ar,
@@ -1808,12 +2199,15 @@ fn pick_y_mode(
     // decoder and carry no distortion).
     let (aw, ah) = (bw.min(recon.width - col0), bh.min(recon.height - row0));
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, 0, col0, row0, bw, bh);
+    let (tile_x0, tile_y0) = recon.bd.tile_origin_px(0);
     let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
         &recon.y,
         recon.width,
         recon.height,
         col0,
         row0,
+        tile_x0,
+        tile_y0,
         bw,
         bh,
         avail_ar,
@@ -1900,12 +2294,15 @@ fn pick_uv_mode(
 ) -> (u8, i8, Option<(i8, i8)>) {
     let pw = recon.chroma_w;
     let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cbw, cbh);
+    let (ctile_x0, ctile_y0) = recon.bd.tile_origin_px(1);
     let (above_u, left_u, ha_u, hl_u) = build_tu_neighbours(
         &recon.u,
         recon.chroma_w,
         recon.chroma_h,
         ccol0,
         crow0,
+        ctile_x0,
+        ctile_y0,
         cbw,
         cbh,
         ar_u,
@@ -1919,6 +2316,8 @@ fn pick_uv_mode(
         recon.chroma_h,
         ccol0,
         crow0,
+        ctile_x0,
+        ctile_y0,
         cbw,
         cbh,
         ar_v,

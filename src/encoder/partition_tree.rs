@@ -1305,6 +1305,30 @@ impl PartitionSyntaxWriter {
         self.write_deltas_pending
     }
 
+    /// r431 — write-side twin of the decode walker's
+    /// [`PartitionWalker::begin_tile`]: re-scope the driver to the
+    /// next tile's geometry while the frame-scope grids (`MiSizes[]`,
+    /// `SegmentIds[]`, palette colours, `Cdef_Idx[]`, …) keep
+    /// accumulating across tiles, exactly as §5.11.2 `decode_tile()`
+    /// does on the decode side (`clear_above_context()`, per-tile
+    /// `AvailU` / `AvailL`, loop-restoration reference resets, delta
+    /// lifecycle re-arm). Returns `false` on a zero / inverted /
+    /// oversize geometry (the same guards as [`Self::new`]) without
+    /// touching the driver.
+    pub fn begin_tile(&mut self, geometry: TileGeometry) -> bool {
+        if geometry.mi_row_end > self.mi_rows
+            || geometry.mi_col_end > self.mi_cols
+            || geometry.mi_row_start >= geometry.mi_row_end
+            || geometry.mi_col_start >= geometry.mi_col_end
+        {
+            return false;
+        }
+        self.geometry = geometry;
+        self.mirror.begin_tile(geometry);
+        self.write_deltas_pending = true;
+        true
+    }
+
     /// §5.11.2 `ReadDeltas = delta_q_present` — re-arm the write-side
     /// delta lifecycle at a superblock entry (the §5.11.7 line-11
     /// clear happens inside [`write_block_syntax`] after the first

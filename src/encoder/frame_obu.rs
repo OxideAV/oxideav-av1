@@ -1037,7 +1037,7 @@ fn encode_allow_intrabc(bw: &mut BitWriter, allow_scc: bool, fs: &FrameSize, all
 // §5.9.15 tile_info
 // ---------------------------------------------------------------------
 
-fn encode_tile_info(bw: &mut BitWriter, ti: &TileInfo) {
+pub(crate) fn encode_tile_info(bw: &mut BitWriter, ti: &TileInfo) {
     // The §5.9.15 lead-in derivations re-compute mi_cols / mi_rows from
     // the tile starts; sb_shift is recovered from the row-start spacing.
     // We re-derive everything here so the writer mirrors the parser

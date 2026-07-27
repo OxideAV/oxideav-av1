@@ -307,6 +307,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
             cdef_units: true,
             lr: true,
             freeze_cdfs: false,
+            tiles: (0, 0),
         };
         let (mut obu, recon, saved, carry, _aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;

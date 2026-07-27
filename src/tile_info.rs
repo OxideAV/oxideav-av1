@@ -113,6 +113,117 @@ impl TileInfo {
     pub fn is_single_tile(&self) -> bool {
         self.tile_cols == 1 && self.tile_rows == 1
     }
+
+    /// r431 — encoder-side §5.9.15 **uniform-spacing** layout builder:
+    /// the exact `TileInfo` the parser's uniform path derives for the
+    /// requested `(TileColsLog2, TileRowsLog2)` pair on a `mi_cols ×
+    /// mi_rows` frame. The write side
+    /// (`crate::encoder::frame_obu::encode_tile_info`) re-derives the
+    /// increment-bit walk from these fields, so `parse(encode(ti)) ==
+    /// ti` holds by construction.
+    ///
+    /// Returns `None` when the requested pair falls outside the
+    /// §5.9.15 legal window:
+    ///
+    ///   * `tile_cols_log2` outside
+    ///     `[minLog2TileCols, maxLog2TileCols]`, or
+    ///   * `tile_rows_log2` outside
+    ///     `[max(minLog2Tiles - tile_cols_log2, 0), maxLog2TileRows]`
+    ///
+    /// (the uniform path can only *reach* log2 values inside those
+    /// windows — the increment bits saturate at the bounds).
+    ///
+    /// `tile_size_bytes` is seeded to `4` (§6.8.14 upper bound);
+    /// multi-tile assemblers shrink it to the realized minimum once
+    /// the per-tile payload sizes are known (the header's
+    /// `tile_size_bytes_minus_1` is a fixed-width `f(2)`, so the
+    /// header LENGTH is independent of the final value).
+    /// `context_update_tile_id` is seeded to `0`.
+    #[must_use]
+    pub fn uniform_layout(
+        mi_cols: u32,
+        mi_rows: u32,
+        use_128x128_superblock: bool,
+        tile_cols_log2: u32,
+        tile_rows_log2: u32,
+    ) -> Option<TileInfo> {
+        if mi_cols == 0 || mi_rows == 0 {
+            return None;
+        }
+        // §5.9.15 lead-in derivations (identical to `read_tile_info`).
+        let (sb_cols, sb_rows, sb_shift) = if use_128x128_superblock {
+            ((mi_cols + 31) >> 5, (mi_rows + 31) >> 5, 5u32)
+        } else {
+            ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4, 4u32)
+        };
+        let sb_size = sb_shift + 2;
+        let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
+        let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
+        let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
+        let max_log2_tile_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+        let max_log2_tile_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
+        let min_log2_tiles = min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
+
+        if tile_cols_log2 < min_log2_tile_cols || tile_cols_log2 > max_log2_tile_cols {
+            return None;
+        }
+        let min_log2_tile_rows = min_log2_tiles.saturating_sub(tile_cols_log2);
+        if tile_rows_log2 < min_log2_tile_rows || tile_rows_log2 > max_log2_tile_rows {
+            return None;
+        }
+
+        // §5.9.15 uniform column walk.
+        let tile_width_sb = (sb_cols + (1u32 << tile_cols_log2) - 1) >> tile_cols_log2;
+        let mut mi_col_starts: Vec<u32> = Vec::new();
+        let mut start_sb: u32 = 0;
+        while start_sb < sb_cols {
+            mi_col_starts.push(start_sb << sb_shift);
+            start_sb += tile_width_sb;
+        }
+        let tile_cols = mi_col_starts.len() as u32;
+        mi_col_starts.push(mi_cols);
+
+        // §5.9.15 uniform row walk.
+        let tile_height_sb = (sb_rows + (1u32 << tile_rows_log2) - 1) >> tile_rows_log2;
+        let mut mi_row_starts: Vec<u32> = Vec::new();
+        let mut start_sb: u32 = 0;
+        while start_sb < sb_rows {
+            mi_row_starts.push(start_sb << sb_shift);
+            start_sb += tile_height_sb;
+        }
+        let tile_rows = mi_row_starts.len() as u32;
+        mi_row_starts.push(mi_rows);
+
+        Some(TileInfo {
+            uniform_tile_spacing_flag: true,
+            tile_cols,
+            tile_rows,
+            tile_cols_log2,
+            tile_rows_log2,
+            context_update_tile_id: 0,
+            tile_size_bytes: 4,
+            mi_col_starts,
+            mi_row_starts,
+        })
+    }
+
+    /// The §5.11.51 [`crate::cdf::TileGeometry`] of tile number
+    /// `tile_num` (row-major: `tile_row * TileCols + tile_col`), or
+    /// `None` when out of range.
+    #[must_use]
+    pub fn tile_geometry(&self, tile_num: u32) -> Option<crate::cdf::TileGeometry> {
+        if tile_num >= self.tile_cols * self.tile_rows {
+            return None;
+        }
+        let tile_row = (tile_num / self.tile_cols) as usize;
+        let tile_col = (tile_num % self.tile_cols) as usize;
+        Some(crate::cdf::TileGeometry {
+            mi_row_start: *self.mi_row_starts.get(tile_row)?,
+            mi_row_end: *self.mi_row_starts.get(tile_row + 1)?,
+            mi_col_start: *self.mi_col_starts.get(tile_col)?,
+            mi_col_end: *self.mi_col_starts.get(tile_col + 1)?,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -552,6 +663,67 @@ mod tests {
         assert_eq!(ti.context_update_tile_id, 2);
         assert_eq!(ti.tile_size_bytes, 1);
         assert_eq!(bits, 7);
+    }
+
+    /// r431 — [`TileInfo::uniform_layout`] must agree with the parser
+    /// on every legal `(cols_log2, rows_log2)` pair of a 256×128 frame
+    /// (`MiCols = 64`, `MiRows = 32`, 64-pel superblocks ⇒ `sbCols =
+    /// 4`, `sbRows = 2`): the builder's realized layout equals what
+    /// `parse_tile_info` derives from the matching increment bits.
+    #[test]
+    fn uniform_layout_matches_parser_on_256x128() {
+        // sbCols = 4 ⇒ maxLog2TileCols = 2; sbRows = 2 ⇒ maxLog2TileRows = 1.
+        // minLog2TileCols = tile_log2(64, 4) = 0; minLog2Tiles = 0.
+        for cols_log2 in 0..=2u32 {
+            for rows_log2 in 0..=1u32 {
+                let ti = TileInfo::uniform_layout(64, 32, false, cols_log2, rows_log2)
+                    .expect("legal pair");
+                assert!(ti.uniform_tile_spacing_flag);
+                assert_eq!(ti.tile_cols_log2, cols_log2);
+                assert_eq!(ti.tile_rows_log2, rows_log2);
+                assert_eq!(ti.tile_cols, 1 << cols_log2.min(2));
+                assert_eq!(ti.tile_rows, 1 << rows_log2.min(1));
+                // Sentinels close the start lists.
+                assert_eq!(*ti.mi_col_starts.last().unwrap(), 64);
+                assert_eq!(*ti.mi_row_starts.last().unwrap(), 32);
+                // Tile geometries tile the mi grid exactly.
+                let mut covered = vec![false; 64 * 32];
+                for t in 0..ti.tile_cols * ti.tile_rows {
+                    let g = ti.tile_geometry(t).expect("in range");
+                    for r in g.mi_row_start..g.mi_row_end {
+                        for c in g.mi_col_start..g.mi_col_end {
+                            let cell = &mut covered[(r * 64 + c) as usize];
+                            assert!(!*cell, "tile {t} overlaps at ({r},{c})");
+                            *cell = true;
+                        }
+                    }
+                }
+                assert!(covered.iter().all(|&b| b), "tiles must cover the frame");
+            }
+        }
+        // Out-of-window pairs are rejected.
+        assert!(TileInfo::uniform_layout(64, 32, false, 3, 0).is_none());
+        assert!(TileInfo::uniform_layout(64, 32, false, 0, 2).is_none());
+    }
+
+    /// r431 — builder × parser lockstep: encode the builder's layout
+    /// through the §5.9.15 writer and re-parse it; every field the
+    /// parser derives must equal the builder's (the `tile_size_bytes`
+    /// seed is normalised to the coded value first).
+    #[test]
+    fn uniform_layout_round_trips_through_the_writer() {
+        use crate::encoder::bitwriter::BitWriter;
+        for (mi_cols, mi_rows, cl2, rl2) in
+            [(64u32, 32u32, 1u32, 1u32), (64, 32, 2, 0), (32, 32, 1, 1)]
+        {
+            let ti = TileInfo::uniform_layout(mi_cols, mi_rows, false, cl2, rl2).expect("legal");
+            let mut bw = BitWriter::new();
+            crate::encoder::frame_obu::encode_tile_info(&mut bw, &ti);
+            bw.byte_align();
+            let bytes = bw.finish();
+            let (parsed, _) = parse_tile_info(&bytes, mi_cols, mi_rows, false).expect("parses");
+            assert_eq!(parsed, ti, "layout ({mi_cols}x{mi_rows}, {cl2},{rl2})");
+        }
     }
 
     #[test]

@@ -19,13 +19,16 @@
 //! `read_ref_frames` conformance requirement (`RefFrame[0] ==
 //! LAST_FRAME`, `RefFrame[1] == NONE`; intra leaves stay legal).
 //!
-//! One tile per frame in this arm: a §7.3-conformant tile is exactly
-//! one superblock high with a width that is a whole multiple of the
-//! superblock size, so a `W × 64` camera frame (64-pel superblocks,
-//! `W <= 4096`) IS its own single tile — the §5.12 tile list then
-//! assembles outputs from MANY camera frames / anchors. The
-//! multi-tile-per-frame write arm (tile_cols > 1 on the encoder
-//! side) is not built yet — see the crate README's frontier notes.
+//! Tile shape: a §7.3-conformant tile is exactly one superblock high
+//! with a width that is a whole multiple of the superblock size, so
+//! a `W × 64` camera frame (64-pel superblocks, `W <= 4096`) is one
+//! tile ROW — a single tile by default, or `1 << tile_cols_log2`
+//! §5.9.15 uniform tile columns via
+//! [`encode_camera_frame_yuv420_tiles`] (r431), each column its own
+//! §5.12.2 `coded_tile_data` run a tile-list entry can reference
+//! independently through `anchor_tile_col`. The §5.12 tile list then
+//! assembles outputs across MANY camera frames / anchors AND across
+//! the columns within each frame.
 //!
 //! Spec provenance: `docs/video/av1/av1-spec.txt` §5.9.2, §5.12,
 //! §6.11, §7.3 (incl. the §7.3.1 constraint list + §7.3.2 decode
@@ -57,9 +60,15 @@ pub struct CameraFrameEncode {
     /// (§5.3.4 trailer included) — the middle OBU of a §7.3 input
     /// stream.
     pub frame_header_payload: Vec<u8>,
-    /// The frame's single tile's coded bytes — a §5.12.2
-    /// `coded_tile_data` run.
+    /// The frame's FIRST tile's coded bytes — a §5.12.2
+    /// `coded_tile_data` run (kept for the r430 single-tile shape;
+    /// equals `coded_tiles[0]`).
     pub coded_tile_data: Vec<u8>,
+    /// r431 — every tile's coded bytes in tile-scan order (one
+    /// §5.12.2 `coded_tile_data` run per tile; a §5.12 tile-list
+    /// entry at `anchor_tile_col = k` consumes `coded_tiles[k]` —
+    /// camera frames are one tile row high per §7.3.1).
+    pub coded_tiles: Vec<Vec<u8>>,
     /// Encoder reconstruction (what the §7.3.2 camera-tile decode
     /// reproduces byte-for-byte; this arm is 8-bit).
     pub recon: GopFrameRecon,
@@ -110,6 +119,25 @@ pub fn encode_camera_frame_yuv420(
     anchor: &Yuv420Frame,
     base_q_idx: u8,
 ) -> Result<CameraFrameEncode, Error> {
+    encode_camera_frame_yuv420_tiles(input, anchor, base_q_idx, 0)
+}
+
+/// r431 — [`encode_camera_frame_yuv420`] with §5.9.15 tile COLUMNS:
+/// `tile_cols_log2 > 0` splits the `W × 64` camera frame into
+/// multiple one-superblock-high tiles (each a whole multiple of 64
+/// wide — every tile satisfies the §7.3.1 camera-tile constraints),
+/// surfacing one §5.12.2 `coded_tile_data` run per tile on
+/// [`CameraFrameEncode::coded_tiles`]. A §5.12 tile list can then
+/// reference DIFFERENT tiles of the SAME camera frame
+/// (`anchor_tile_col` selects the column), which is what makes
+/// multi-tile camera frames richer large-scale-tile material than
+/// the r430 one-frame-one-tile shape.
+pub fn encode_camera_frame_yuv420_tiles(
+    input: &Yuv420Frame,
+    anchor: &Yuv420Frame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+) -> Result<CameraFrameEncode, Error> {
     if input.width != anchor.width
         || input.height != anchor.height
         || input.height != 64
@@ -156,6 +184,7 @@ pub fn encode_camera_frame_yuv420(
         cdef_units: false,
         lr: false,
         freeze_cdfs: true,
+        tiles: (tile_cols_log2, 0),
     };
     let (obu, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
         &wide,
@@ -183,16 +212,15 @@ pub fn encode_camera_frame_yuv420(
     let parsed = parse_tile_group_obu_body(
         &obu.body[tg_offset..],
         ti.tile_cols * ti.tile_rows,
-        0,
-        0,
+        ti.tile_cols_log2,
+        ti.tile_rows_log2,
         u32::from(ti.tile_size_bytes),
     )?;
-    let coded_tile_data = parsed
-        .tiles
+    let coded_tiles: Vec<Vec<u8>> = parsed.tiles.into_iter().map(|t| t.bytes).collect();
+    let coded_tile_data = coded_tiles
         .first()
         .ok_or(Error::PartitionWalkOutOfRange)?
-        .bytes
-        .to_vec();
+        .clone();
     let frame_header_payload = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok(CameraFrameEncode {
@@ -200,6 +228,7 @@ pub fn encode_camera_frame_yuv420(
         fh,
         frame_header_payload,
         coded_tile_data,
+        coded_tiles,
         recon: GopFrameRecon {
             y: narrow(recon.y),
             u: narrow(recon.u),

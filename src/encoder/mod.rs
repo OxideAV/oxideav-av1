@@ -317,7 +317,8 @@ pub use block_mode_info::{
 // [`crate::tile_list`]).
 #[doc(hidden)]
 pub use camera_frame::{
-    build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420, CameraFrameEncode,
+    build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420, encode_camera_frame_yuv420_tiles,
+    CameraFrameEncode,
 };
 #[doc(hidden)]
 pub use coefficients::{
@@ -379,6 +380,10 @@ pub use key_frame::{encode_key_frame_yuv, encode_key_frame_yuv_with_q, EncodedKe
 pub use key_frame::{
     encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
 };
+// r431 — §5.9.15 multi-tile write arm (uniform tile layouts,
+// explicitly configured; `(0, 0)` reproduces the single-tile stream
+// byte for byte).
+pub use key_frame::{encode_key_frame_yuv420_with_q_tiles, encode_key_frame_yuv_with_q_tiles};
 #[doc(hidden)]
 pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
 #[doc(hidden)]
