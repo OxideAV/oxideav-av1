@@ -1,0 +1,10 @@
+# Deep spec-driver decode/encode recursion overflows the default
+# spawned-thread stack in debug `cargo test` builds on the
+# smaller-default-stack runners (Windows especially). The r431 KEY
+# delta-q dispatcher (§5.9.17) tipped
+# `encoder::key_frame::tests::r418_search_selects_intrabc_on_tiled_content`
+# over `STATUS_STACK_OVERFLOW` on the windows-debug leg while
+# ubuntu/macos passed. Reserve 16 MiB for libtest's per-test threads —
+# virtual-address-space only, no runtime cost, output-invariant.
+[env]
+RUST_MIN_STACK = "16777216"
