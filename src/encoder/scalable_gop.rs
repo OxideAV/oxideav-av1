@@ -351,6 +351,336 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
     })
 }
 
+// ---------------------------------------------------------------------
+// r431 — SPATIAL scalability: independently-coded spatial layers.
+// ---------------------------------------------------------------------
+
+/// r431 — an encoded spatially scalable stream (see
+/// [`encode_spatial_layered_gop_yuv_with_q`]).
+#[derive(Debug, Clone)]
+pub struct SpatialLayeredGopYuv {
+    /// Complete IVF v0 file (one record per §7.5 temporal unit).
+    pub ivf_bytes: Vec<u8>,
+    /// The bare §7.5 temporal units, one per time instant — each
+    /// carries every spatial layer's frame OBU in increasing
+    /// `spatial_id` order (unit 0 also carries the shared sequence
+    /// header).
+    pub temporal_units: Vec<Vec<u8>>,
+    /// The shared sequence header (top-layer dimension budget +
+    /// the §6.7.5 spatial operating-point list).
+    pub seq: crate::sequence_header::SequenceHeader,
+    /// `layer_recons[ s ][ i ]` — layer `s`'s reconstruction of time
+    /// instant `i`, at that layer's own dimensions.
+    pub layer_recons: Vec<Vec<GopFrameReconYuv>>,
+    /// Per-layer `(width, height)`.
+    pub layer_dims: Vec<(u32, u32)>,
+}
+
+/// 8-bit 4:2:0 sibling of [`SpatialLayeredGopYuv`].
+#[derive(Debug, Clone)]
+pub struct SpatialLayeredGop {
+    pub ivf_bytes: Vec<u8>,
+    pub temporal_units: Vec<Vec<u8>>,
+    pub seq: crate::sequence_header::SequenceHeader,
+    /// `layer_recons[ s ][ i ]`, 8-bit planes.
+    pub layer_recons: Vec<Vec<crate::encoder::inter_frame::GopFrameRecon>>,
+    pub layer_dims: Vec<(u32, u32)>,
+}
+
+/// The §6.7.5 operating-point list for `s_count` INDEPENDENTLY CODED
+/// spatial layers (one temporal layer): entry `k` selects spatial
+/// layers `0..=s_count-1-k` — nested prefixes, so every §6.7.5
+/// sub-bitstream still begins with the base layer's KEY frame (an
+/// operating point excluding layer 0 would start on an
+/// `INTRA_ONLY` frame, which cannot begin a coded video sequence).
+fn spatial_operating_points_for(base: OperatingPoint, s_count: u8) -> Vec<OperatingPoint> {
+    (0..s_count)
+        .map(|k| OperatingPoint {
+            operating_point_idc: (((1u16 << (s_count - k)) - 1) << 8) | 1,
+            ..base
+        })
+        .collect()
+}
+
+/// Encode `layers.len()` INDEPENDENTLY CODED spatial layers (2..=4;
+/// `layers[ s ][ i ]` is layer `s`'s frame at time instant `i`, all
+/// layers the same length, the LAST layer the largest — its
+/// dimensions size the shared sequence header) into one §6.7.5
+/// spatially scalable stream:
+///
+///   * ONE sequence header (top-layer dimension budget); smaller
+///     layers code §5.9.5 `frame_size_override_flag = 1` explicit
+///     dimensions (inter frames ride the §5.9.7 no-found-ref arm).
+///   * §5.3.3 extension headers on every frame OBU (`temporal_id =
+///     0`, `spatial_id = s`); each §7.5 temporal unit carries every
+///     layer's frame for that instant in increasing `spatial_id`
+///     order, one shown frame per layer (the §7.5 layered-stream
+///     rules hold by construction).
+///   * Layer 0 opens with the ONLY KEY frame (its `allFrames`
+///     refresh seeds every §7.20 slot); each enhancement layer opens
+///     with a §5.9.2 `INTRA_ONLY` frame refreshing ONLY its own two
+///     slots (`0b11 << 2s`) — sibling layers' reference state
+///     survives. Inter frames predict LAST-only inside their own
+///     layer's slot pair (`2s` / `2s + 1` rotation) with the
+///     §8.3.1 primary-reference CDF chain riding the same pair, so
+///     layers stay fully independent: dropping any spatial-layer
+///     SUFFIX (the §6.7.5 nested operating points) leaves every
+///     surviving frame bit-identical.
+///
+/// Decoding at operating point `k`
+/// ([`crate::decode_av1_at_operating_point`]) yields the shown
+/// frames of layers `0..=layers.len()-1-k`, interleaved in decode
+/// order within each temporal unit, each byte-identical to
+/// `layer_recons[ s ][ i ]`.
+///
+/// ## Errors
+///
+/// [`Error::PartitionWalkOutOfRange`] on: layer count outside 2..=4,
+/// unequal layer lengths / empty layers / over-`GOP_MAX_FRAMES`,
+/// mixed bit depths or chroma formats across layers, a layer
+/// exceeding the top layer's dimensions, or any per-frame encoder
+/// reject.
+pub fn encode_spatial_layered_gop_yuv_with_q(
+    layers: &[Vec<YuvFrame>],
+    base_q_idx: u8,
+) -> Result<SpatialLayeredGopYuv, Error> {
+    let s_count = layers.len();
+    if !(2..=4).contains(&s_count) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let n = layers[0].len();
+    if n == 0 || n > crate::encoder::inter_frame::GOP_MAX_FRAMES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let (bit_depth, format) = (layers[0][0].bit_depth, layers[0][0].format);
+    for layer in layers {
+        if layer.len() != n {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let (w, h) = (layer[0].width, layer[0].height);
+        for f in layer {
+            if f.width != w || f.height != h || f.bit_depth != bit_depth || f.format != format {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            f.validate()?;
+        }
+    }
+    let (top_w, top_h) = (layers[s_count - 1][0].width, layers[s_count - 1][0].height);
+    if layers
+        .iter()
+        .any(|l| l[0].width > top_w || l[0].height > top_h)
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // ---- The shared sequence header. ----
+    let mut seq =
+        crate::encoder::yuv_frame::build_intra_only_seq_yuv(top_w, top_h, bit_depth, format)?;
+    // The same tool gates the per-frame drivers assume (see the KEY
+    // driver's internal builder).
+    seq.enable_filter_intra = true;
+    seq.operating_points = spatial_operating_points_for(seq.operating_points[0], s_count as u8);
+    seq.operating_points_cnt_minus_1 = (s_count - 1) as u8;
+    let seq_payload = write_sequence_header_obu(&seq);
+
+    // ---- Session state: §7.20 slots partitioned two per layer. ----
+    let mut layer_recons: Vec<Vec<GopFrameReconYuv>> = vec![Vec::with_capacity(n); s_count];
+    let mut mf_store: Vec<SavedMotionField> = Vec::new();
+    let mut carry_store: Vec<Option<Rc<RefSlotCarry>>> = vec![None; 8];
+    let mut slot_hints = [0u32; 8];
+    let mut temporal_units: Vec<Vec<u8>> = Vec::with_capacity(n);
+
+    // ---- Time instant 0: the layer-0 KEY + enhancement INTRA_ONLYs. ----
+    let mut tu0: Vec<u8> = Vec::new();
+    write_obu_with_size(
+        &mut tu0,
+        &crate::encoder::obu::ObuHeader::new(ObuType::TemporalDelimiter),
+        &[],
+    );
+    write_obu_with_size(
+        &mut tu0,
+        &crate::encoder::obu::ObuHeader::new(ObuType::SequenceHeader),
+        &seq_payload,
+    );
+    for (s, layer) in layers.iter().enumerate() {
+        let extras = crate::encoder::key_frame::KeyExtras {
+            tiles: (0, 0),
+            seq_override: Some(&seq),
+            // Layer 0: a true KEY (refreshes ALL slots — §5.9.2
+            // derives allFrames); enhancement layers: INTRA_ONLY
+            // refreshing only their own pair.
+            intra_only_refresh: (s > 0).then_some(0b11u8 << (2 * s)),
+        };
+        let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
+            &layer[0],
+            base_q_idx,
+            RateModel::Twin,
+            &[],
+            None,
+            true,
+            true,
+            true,
+            &extras,
+        )?;
+        let fs = k.fh.frame_size.as_ref().expect("intra driver sizes");
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let carry = Rc::new(carry);
+        if s == 0 {
+            // §7.20 allFrames refresh: every slot takes the layer-0
+            // payload (the enhancement intras then overwrite theirs).
+            mf_store = (0..8)
+                .map(|_| SavedMotionField::intra(mi_rows, mi_cols))
+                .collect();
+            for c in carry_store.iter_mut() {
+                *c = Some(carry.clone());
+            }
+            slot_hints = [0; 8];
+        } else {
+            for b in 0..2usize {
+                mf_store[2 * s + b] = SavedMotionField::intra(mi_rows, mi_cols);
+                carry_store[2 * s + b] = Some(carry.clone());
+                slot_hints[2 * s + b] = 0;
+            }
+        }
+        // Extract the frame OBU from the driver's own temporal unit
+        // and re-wrap it with the §5.3.3 extension header.
+        let mut frame_body: Option<Vec<u8>> = None;
+        for desc in ObuIter::new(&k.temporal_unit_bytes) {
+            let desc = desc.expect("own temporal unit walks");
+            if desc.obu_type == ObuType::Frame {
+                frame_body = Some(desc.payload.to_vec());
+            }
+        }
+        let frame_body = frame_body.ok_or(Error::PartitionWalkOutOfRange)?;
+        let header = crate::encoder::obu::ObuHeader::new(ObuType::Frame)
+            .with_extension(ObuExtensionHeader::new(0, s as u8));
+        write_obu_with_size(&mut tu0, &header, &frame_body);
+        layer_recons[s].push(GopFrameReconYuv {
+            y: k.recon_y,
+            u: k.recon_u,
+            v: k.recon_v,
+        });
+    }
+    temporal_units.push(tu0);
+
+    // ---- Time instants 1..n: per-layer LAST-only inter frames. ----
+    for i in 1..n {
+        let mut tu: Vec<u8> = Vec::new();
+        write_obu_with_size(
+            &mut tu,
+            &crate::encoder::obu::ObuHeader::new(ObuType::TemporalDelimiter),
+            &[],
+        );
+        for (s, layer) in layers.iter().enumerate() {
+            // Own-layer slot rotation: frame i-1 sits in slot
+            // `2s + ((i-1) & 1)`; this frame refreshes the other one.
+            let last_slot = 2 * s + ((i - 1) & 1);
+            let refresh_slot = 2 * s + (i & 1);
+            let prev = layer_recons[s].last().expect("instant i-1 encoded").clone();
+            let last_carry = carry_store[last_slot]
+                .clone()
+                .expect("layer slots seeded at instant 0");
+            let mf: [SavedMotionField; 8] = core::array::from_fn(|k| mf_store[k].clone());
+            let cfg = InterFrameConfig {
+                order_hint: i as u32,
+                show_frame: true,
+                refresh_frame_flags: 1u8 << refresh_slot,
+                ref_frame_idx: [last_slot as u8; 7],
+                slot_hints,
+                single_refs: vec![1],
+                compound_pairs: Vec::new(),
+                refs: vec![&prev],
+                slot_to_plane: [0usize; 8],
+                primary_ref_frame: 0,
+                primary_carry: Some(&last_carry),
+                allow_temporal_seg: false,
+                alt_primaries: vec![(PRIMARY_REF_NONE, None)],
+                exact_mask: None,
+                auto_lossless: false,
+                seg_extras: None,
+                high_precision_mv: true,
+                delta_q: true,
+                cdef: true,
+                cdef_units: true,
+                lr: true,
+                freeze_cdfs: false,
+                tiles: (0, 0),
+            };
+            let (mut obu, recon, saved, carry, _aux) = encode_inter_frame_generic(
+                &layer[i],
+                &seq,
+                base_q_idx,
+                &cfg,
+                &[],
+                &mf,
+                RateModel::Twin,
+            )?;
+            obu.header.extension = Some(ObuExtensionHeader::new(0, s as u8));
+            write_obu_with_size(&mut tu, &obu.header, &obu.body);
+            layer_recons[s].push(recon);
+            mf_store[refresh_slot] = saved;
+            carry_store[refresh_slot] = Some(Rc::new(carry));
+            slot_hints[refresh_slot] = i as u32;
+        }
+        temporal_units.push(tu);
+    }
+
+    // ---- IVF wrap (top-layer dimensions). ----
+    let mut ivf_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut ivf_bytes);
+        let mut iw = IvfWriter::new(cursor, FOURCC_AV01, top_w as u16, top_h as u16, 25, 1)
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        for (idx, tu) in temporal_units.iter().enumerate() {
+            iw.write_frame(tu, idx as u64)
+                .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        }
+        iw.patch_frame_count()
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+    }
+
+    Ok(SpatialLayeredGopYuv {
+        ivf_bytes,
+        temporal_units,
+        seq,
+        layer_recons,
+        layer_dims: layers.iter().map(|l| (l[0].width, l[0].height)).collect(),
+    })
+}
+
+/// 8-bit 4:2:0 entry point of
+/// [`encode_spatial_layered_gop_yuv_with_q`].
+pub fn encode_spatial_layered_gop_yuv420_with_q(
+    layers: &[Vec<Yuv420Frame>],
+    base_q_idx: u8,
+) -> Result<SpatialLayeredGop, Error> {
+    let wide: Vec<Vec<YuvFrame>> = layers
+        .iter()
+        .map(|l| l.iter().map(YuvFrame::from_yuv420_8bit).collect())
+        .collect();
+    let s = encode_spatial_layered_gop_yuv_with_q(&wide, base_q_idx)?;
+    let narrow = |p: &[u16]| p.iter().map(|&v| v as u8).collect::<Vec<u8>>();
+    Ok(SpatialLayeredGop {
+        ivf_bytes: s.ivf_bytes,
+        temporal_units: s.temporal_units,
+        seq: s.seq,
+        layer_recons: s
+            .layer_recons
+            .iter()
+            .map(|lr| {
+                lr.iter()
+                    .map(|r| crate::encoder::inter_frame::GopFrameRecon {
+                        y: narrow(&r.y),
+                        u: narrow(&r.u),
+                        v: narrow(&r.v),
+                    })
+                    .collect()
+            })
+            .collect(),
+        layer_dims: s.layer_dims,
+    })
+}
+
 /// 8-bit 4:2:0 entry point of
 /// [`encode_temporal_layered_gop_yuv_with_q`].
 pub fn encode_temporal_layered_gop_yuv420_with_q(

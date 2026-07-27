@@ -436,6 +436,12 @@ pub use scalable_gop::{
     encode_temporal_layered_gop_yuv420_with_q, encode_temporal_layered_gop_yuv_with_q,
     temporal_layer_of, TemporalLayeredGop, TemporalLayeredGopYuv,
 };
+// r431 — spatially scalable arm: independently-coded spatial layers,
+// spatial_id extension headers, nested §6.7.5 operating points.
+pub use scalable_gop::{
+    encode_spatial_layered_gop_yuv420_with_q, encode_spatial_layered_gop_yuv_with_q,
+    SpatialLayeredGop, SpatialLayeredGopYuv,
+};
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 #[doc(hidden)]
