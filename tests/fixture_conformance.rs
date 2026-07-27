@@ -10111,3 +10111,46 @@ fn self_encoded_spatial_layers_stream_decodes_byte_exact_at_both_operating_point
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r431: the first self-encoded KEY frame with §5.9.17 per-superblock
+// delta-q — delta_q_present = 1, live §5.11.13 CurrentQIndex deltas
+// (128x128 q140, mixed flat/texture content; the delta arm elected by
+// the masking-weighted exact-realized-bytes objective).
+// ---------------------------------------------------------------------
+
+const SELF_KEY_128X128_Q140_DELTA_Q_IVF: &str = concat!(
+    "444b4946000020004156303180008000190000000100000001000000000000008e0200000000",
+    "00000000000012000a0a0000000337ffe5dfcc0232fd041600246038000304fc08d7da754531",
+    "70863978c23e112c2810ab29e994e7062844e13467d9403fc442f2e690678311f69d14dbabca",
+    "5a772e6976c71d33ee82ac6f6d63df174ea55a833abe61497ac4d7e659588e6f8b23819cc2d7",
+    "503388d7bb0e6faf5397f60e076faf72c387bf7726e79e15fd59bbc561ad3867742e749d26f4",
+    "b78c9497d91d6ca50394aa81a28eee40baa52e6c826f4d3cbf07c78b6f85c7accf78c0405c12",
+    "20b347373c4b2ffe57d7fc26775d5b7673e03010c4800fcf85e79d85a399b33755e30cbfb79d",
+    "5fe503282328d14253481cdda0e37e91854e7b459962fa1412c19cfbe7641e10573b43c05831",
+    "a3c1e5bd5af41ea55da4ecc896c2b6acb7811f3d5112d7f6e410a9fd70a9b7328e486dea1602",
+    "0511874a986f46286b505241631250290df17db3390f7a21a1cf9eea4cc51447f5a1a0af26a6",
+    "7a8fb845f402565d071f61ed03db8f35319d33cc235785cdc7d1b99bd9e9109c50e3d8a3bac6",
+    "e41813f39773e3237e22946226fb94a66122c88c964c8f74f724933935e5677fea747adc4851",
+    "d2a2e3e415bef6fa890370367a2451a22778171b38c1876b57e434a4024b33eaa39a871299dc",
+    "b57e8cb7ed7d0dcf75c75644a92e18c685ed02a7970899bf236cf525679aa249304783250304",
+    "d7bb90a18d55a98da0af736f936b3b12e4a4786f2902c9085f177da98c1806821d7e6900f0af",
+    "74089b194cd992d770a3ef96e2880434370b0b25d06da0eb7509db81482e2a31b7793731a5bf",
+    "f304c4d35d62a9141b92c4c28ff072fd80a1d8d689b53fd8e081a4c40aaf05e684593e96a905",
+    "9d745c114937dadf266e7796a8134c6215ed11a7109bc2a0ad895a421a074a3245721c82dc3a",
+    "8428f8f9f503e0eb1c31a0efdc40",
+);
+
+/// r431: KEY frame with §5.9.17 per-superblock delta-q — the digest
+/// is the byte-identical output of THREE independent black-box
+/// reference decoders; notes under
+/// `docs/video/av1/fixtures/self-key-128x128-q140-delta-q/`.
+#[test]
+fn self_encoded_key_delta_q_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-key-128x128-q140-delta-q",
+        SELF_KEY_128X128_Q140_DELTA_Q_IVF,
+        "fe79a05485e2cd0d00ee3086c4bb2c14a1e55232f03064da56059986ad5ced88",
+        1,
+    );
+}

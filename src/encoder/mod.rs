@@ -384,6 +384,9 @@ pub use key_frame::{
 // explicitly configured; `(0, 0)` reproduces the single-tile stream
 // byte for byte).
 pub use key_frame::{encode_key_frame_yuv420_with_q_tiles, encode_key_frame_yuv_with_q_tiles};
+// r431 — KEY-frame §5.9.17 delta-q A/B hook (hidden).
+#[doc(hidden)]
+pub use key_frame::encode_key_frame_yuv420_with_q_dq;
 #[doc(hidden)]
 pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
 #[doc(hidden)]

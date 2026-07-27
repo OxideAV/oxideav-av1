@@ -510,6 +510,10 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
             // derives allFrames); enhancement layers: INTRA_ONLY
             // refreshing only their own pair.
             intra_only_refresh: (s > 0).then_some(0b11u8 << (2 * s)),
+            // r431 — the same §5.9.17 delta-q election as every
+            // default intra entry.
+            delta_q: true,
+            delta_plan: None,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],

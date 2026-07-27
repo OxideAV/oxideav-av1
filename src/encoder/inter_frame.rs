@@ -326,7 +326,7 @@ const SEARCH_RANGE: i32 = 16;
 /// frames: reduced units scale by `1 << 3 = 8` quantiser-index steps,
 /// keeping the per-superblock §5.11.13 symbols in the cheap
 /// `|reduced| <= 2` literal range while covering a ±16 index swing.
-const DELTA_Q_RES: u8 = 3;
+pub(crate) const DELTA_Q_RES: u8 = 3;
 
 /// r428 — the §5.9.17 complexity probe: map per-superblock source
 /// luma activity (variance over the superblock's samples) to reduced
@@ -339,7 +339,7 @@ const DELTA_Q_RES: u8 = 3;
 /// the delta arm would only add wire cost). Encoder heuristic, free
 /// choice: the plan is simply what the frame-level exact election
 /// scores against the single-quantiser arm.
-fn delta_q_plan_units(input: &YuvFrame, mi_rows: u32, mi_cols: u32) -> Option<Vec<i32>> {
+pub(crate) fn delta_q_plan_units(input: &YuvFrame, mi_rows: u32, mi_cols: u32) -> Option<Vec<i32>> {
     let w = input.width as usize;
     let h = input.height as usize;
     let sbs = sb_grid_origins(mi_rows, mi_cols);
@@ -958,6 +958,9 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         tuning.lr && alt_q.is_empty(),
         // r431 — the GOP-wide §5.9.15 tile layout.
         tuning.tiles,
+        // r431 — the KEY frame rides the same §5.9.17 delta-q switch
+        // as the P-frames.
+        tuning.delta_q,
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];

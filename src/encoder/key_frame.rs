@@ -304,6 +304,43 @@ pub fn encode_key_frame_yuv(input: &YuvFrame) -> Result<EncodedKeyFrameYuv, Erro
     encode_key_frame_yuv_with_q(input, 0)
 }
 
+/// r431 — [`encode_key_frame_yuv420_with_q`] with the §5.9.17
+/// KEY-frame delta-q ELECTION switch exposed (hidden), so the A/B
+/// harness can measure the elected arm against the single-quantiser
+/// baseline on identical input. `delta_q = true` is what every
+/// production entry point runs; `false` forces the single-quantiser
+/// shape unconditionally.
+#[doc(hidden)]
+pub fn encode_key_frame_yuv420_with_q_dq(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    delta_q: bool,
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let (k, _) = encode_key_frame_yuv_seg_carry_tiles(
+        &wide,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        (0, 0),
+        delta_q,
+    )?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
 /// r427 — encode one KEY frame at any conformant (bit depth, chroma
 /// format) pairing into a spec-conformant IVF stream: 8 / 10 / 12-bit
 /// samples in 4:2:0, 4:2:2, 4:4:4 or monochrome layout, with the
@@ -372,6 +409,7 @@ pub fn encode_key_frame_yuv_with_q_tiles(
         true,
         true,
         (tile_cols_log2, tile_rows_log2),
+        true,
     )
     .map(|(k, _)| k)
 }
@@ -427,6 +465,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         cdef_units,
         lr,
         (0, 0),
+        true,
     )
 }
 
@@ -465,6 +504,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     cdef_units: bool,
     lr: bool,
     tiles: (u32, u32),
+    delta_q: bool,
 ) -> Result<
     (
         EncodedKeyFrameYuv,
@@ -483,6 +523,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
         lr,
         &KeyExtras {
             tiles,
+            delta_q,
             ..KeyExtras::default()
         },
     )
@@ -511,6 +552,18 @@ pub(crate) struct KeyExtras<'a> {
     /// here). `error_resilient_mode` drops to 0 on this arm (the
     /// §5.9.2 ref_order_hint block stays silent).
     pub intra_only_refresh: Option<u8>,
+    /// r431 — §5.9.17 per-superblock delta-q ELECTION switch (the KEY
+    /// twin of the inter driver's r428 arm): when the complexity
+    /// probe finds real activity spread on an unsegmented lossy
+    /// frame, a second full search runs under the per-superblock
+    /// `CurrentQIndex` plan and the frame-level election keeps
+    /// whichever arm scores better under the masking-weighted
+    /// `Dw + λ·R` objective over exact realized bytes.
+    pub delta_q: bool,
+    /// The armed §5.11.13 plan (per-superblock units in FRAME-raster
+    /// order) — set internally by the election's second arm; callers
+    /// leave it `None`.
+    pub delta_plan: Option<&'a [i32]>,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -518,6 +571,110 @@ pub(crate) struct KeyExtras<'a> {
 /// [`KeyExtras::intra_only_refresh`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_key_frame_yuv_full(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+    cdef: bool,
+    cdef_units: bool,
+    lr: bool,
+    extras: &KeyExtras<'_>,
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
+    input.validate()?;
+    // r431 — §5.9.17 per-superblock delta-q ELECTION (the KEY twin of
+    // the inter driver's r428 arm): both arms are complete frame
+    // encodes (their trees decode to different reconstructions), so
+    // the election runs the frame-level adaptive-quantisation
+    // objective `Dw·256 + λ·R_bits256` over exact realized frame
+    // bytes, with each superblock's squared error weighted by
+    // `2^(-2·units)` from the SAME probe plan on both arms (masking:
+    // banding shows first where nothing hides it).
+    //
+    // This dispatcher stays THIN on purpose: it runs the two
+    // `encode_key_frame_yuv_core` arms at its OWN (shallow) stack
+    // depth rather than nesting one core call inside another's huge
+    // frame (a 2 MiB test-thread stack overflows otherwise).
+    if extras.delta_q
+        && extras.delta_plan.is_none()
+        && base_q_idx > 0
+        && alt_q.is_empty()
+        && exact_mask.is_none()
+        && model == RateModel::Twin
+    {
+        let (mi_rows_probe, mi_cols_probe) = (input.height / 4, input.width / 4);
+        if let Some(plan) =
+            crate::encoder::inter_frame::delta_q_plan_units(input, mi_rows_probe, mi_cols_probe)
+        {
+            let base_extras = KeyExtras {
+                tiles: extras.tiles,
+                seq_override: extras.seq_override,
+                intra_only_refresh: extras.intra_only_refresh,
+                delta_q: false,
+                delta_plan: None,
+            };
+            let armed_extras = KeyExtras {
+                delta_plan: Some(&plan),
+                ..base_extras
+            };
+            let base = encode_key_frame_yuv_core(
+                input,
+                base_q_idx,
+                model,
+                alt_q,
+                exact_mask,
+                cdef,
+                cdef_units,
+                lr,
+                &base_extras,
+            )?;
+            let armed = encode_key_frame_yuv_core(
+                input,
+                base_q_idx,
+                model,
+                alt_q,
+                exact_mask,
+                cdef,
+                cdef_units,
+                lr,
+                &armed_extras,
+            )?;
+            let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
+            let score = |k: &(
+                EncodedKeyFrameYuv,
+                crate::encoder::inter_frame::RefSlotCarry,
+            )|
+             -> u64 {
+                score256(
+                    key_weighted_sse(input, &k.0.recon_y, &k.0.recon_u, &k.0.recon_v, &plan),
+                    lambda,
+                    (k.0.temporal_unit_bytes.len() as u64) * 8 * 256,
+                )
+            };
+            return Ok(if score(&armed) < score(&base) {
+                armed
+            } else {
+                base
+            });
+        }
+    }
+    encode_key_frame_yuv_core(
+        input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
+    )
+}
+
+/// r431 — the general-format intra-frame CORE (no delta-q election;
+/// the [`encode_key_frame_yuv_full`] dispatcher runs that above). One
+/// complete encode under the resolved [`KeyExtras`] (including an
+/// already-armed [`KeyExtras::delta_plan`]).
+#[allow(clippy::too_many_arguments)]
+fn encode_key_frame_yuv_core(
     input: &YuvFrame,
     base_q_idx: u8,
     model: RateModel,
@@ -681,6 +838,25 @@ pub(crate) fn encode_key_frame_yuv_full(
         }
         fh.segmentation_params = Some(crate::encoder::inter_frame::segmentation_params_for(alt_q));
     }
+    // r431 — the armed §5.9.17 delta-q arm (see [`KeyExtras::delta_plan`]):
+    // per-superblock `CurrentQIndex` walk, §5.11.13 deltas on the wire.
+    let delta_plan = extras.delta_plan;
+    if let Some(plan) = delta_plan {
+        if base_q_idx == 0
+            || !alt_q.is_empty()
+            || exact_mask.is_some()
+            || model != RateModel::Twin
+            || plan.len() != sb_grid_origins(mi_rows, mi_cols).len()
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        qp.delta_q_present = true;
+        qp.current_q_index = base_q_idx;
+        fh.delta_q_params = Some(crate::uncompressed_header_tail::DeltaQParams {
+            delta_q_present: true,
+            delta_q_res: crate::encoder::inter_frame::DELTA_Q_RES,
+        });
+    }
     // r426 — the mask requires a lossless segment; resolve it once.
     let seg_ll = crate::encoder::inter_frame::seg_lossless_array(base_q_idx, alt_q);
     let ll_seg = (0..alt_q.len())
@@ -712,9 +888,13 @@ pub(crate) fn encode_key_frame_yuv_full(
         enable_cdef: seq.enable_cdef,
         allow_intrabc: fh.allow_intrabc,
         cdef_bits: 0,
-        read_deltas: false,
+        read_deltas: delta_plan.is_some(),
         use_128x128_superblock: seq.use_128x128_superblock,
-        delta_q_res: 0,
+        delta_q_res: if delta_plan.is_some() {
+            crate::encoder::inter_frame::DELTA_Q_RES
+        } else {
+            0
+        },
         delta_lf_present: false,
         delta_lf_multi: false,
         mono_chrome: mono,
@@ -824,8 +1004,32 @@ pub(crate) fn encode_key_frame_yuv_full(
         let mut writer = SymbolWriter::new(fh.disable_cdf_update);
         let mut tile_cdfs = TileCdfContext::new_from_defaults();
         tile_cdfs.init_coeff_cdfs(base_q_idx);
+        // §5.11.1 per-tile prologue: `CurrentQIndex = base_q_idx` at
+        // every tile entry.
+        recon.qp.current_q_index = base_q_idx;
+        let sb_cols_frame = mi_cols.div_ceil(16);
         for &(sb_r, sb_c) in origins {
             recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            // r431 — §5.11.13 `CurrentQIndex` walk (the KEY twin of
+            // the inter r428 arm): apply the plan step BEFORE the
+            // superblock's search so every trial quantises (and the
+            // twin prices the first block's delta symbol) at the
+            // target index. The plan is FRAME-raster indexed and
+            // ABSOLUTE (offset from `base_q_idx`); the §5.11.13
+            // symbol codes the RELATIVE step from the running index,
+            // computed so the §7.12.2 `Clip3( 1, 255, _ )` never
+            // truncates.
+            let prev_q = recon.qp.current_q_index;
+            let dq_units = if let Some(p) = delta_plan {
+                let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
+                let step = 1i32 << params.delta_q_res;
+                let want = (i32::from(base_q_idx) + p[k] * step).clamp(1, 255);
+                let units = (want - i32::from(prev_q)) / step;
+                recon.qp.current_q_index = (i32::from(prev_q) + units * step) as u8;
+                units
+            } else {
+                0
+            };
             // r421 — arm the §5.11.2 delta lifecycle on the live state
             // AND the rate twin's fork, so both enter the superblock
             // identically.
@@ -846,6 +1050,7 @@ pub(crate) fn encode_key_frame_yuv_full(
                 &params,
                 model,
                 seg_demand.as_ref(),
+                dq_units,
             )?;
             write_partition_tree_syntax(
                 &mut writer,
@@ -865,6 +1070,17 @@ pub(crate) fn encode_key_frame_yuv_full(
                 twin.matches(&tile_cdfs, &writer),
                 "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
             );
+            // r431 — realized `CurrentQIndex`: a full-superblock skip
+            // leaf takes the §5.11.13 short-circuit arm (no delta on
+            // the wire), so the decoder's running index never moves —
+            // mirror that for the next superblock's step.
+            if delta_plan.is_some() {
+                if let SyntaxNode::Leaf(b) = &tree {
+                    if b.skip == 1 {
+                        recon.qp.current_q_index = prev_q;
+                    }
+                }
+            }
             trees.push(tree);
             tree_sb.push((sb_r, sb_c));
         }
@@ -1285,6 +1501,62 @@ pub(crate) fn encode_key_frame_yuv_full(
         },
         carry,
     ))
+}
+
+/// r431 — the KEY twin of the inter driver's masking-weighted
+/// distortion: per superblock (frame raster), the luma+chroma SSE
+/// against the source weighted by `2^(-2·units)` from the delta-q
+/// probe plan — a flat superblock's error counts up (banding shows
+/// first where nothing masks it), a textured one's counts down.
+pub(crate) fn key_weighted_sse(
+    input: &YuvFrame,
+    ry: &[u16],
+    ru: &[u16],
+    rv: &[u16],
+    plan: &[i32],
+) -> u64 {
+    let w = input.width as usize;
+    let h = input.height as usize;
+    let (ssx, ssy) = input.format.subsampling();
+    let cw = input.chroma_width() as usize;
+    let ch = input.chroma_height() as usize;
+    let num_planes = input.format.num_planes();
+    let (mi_rows, mi_cols) = (input.height / 4, input.width / 4);
+    let mut d = 0u64;
+    for (sb_index, &(sb_r, sb_c)) in sb_grid_origins(mi_rows, mi_cols).iter().enumerate() {
+        let units = plan[sb_index];
+        let y0 = (sb_r as usize) * 4;
+        let x0 = (sb_c as usize) * 4;
+        let y1 = (y0 + 64).min(h);
+        let x1 = (x0 + 64).min(w);
+        let mut sse = 0u64;
+        for r in y0..y1 {
+            for c in x0..x1 {
+                let diff = i64::from(ry[r * w + c]) - i64::from(input.y[r * w + c]);
+                sse += (diff * diff) as u64;
+            }
+        }
+        if num_planes > 1 {
+            let (cy0, cx0) = (y0 >> ssy, x0 >> ssx);
+            let (cy1, cx1) = (
+                (y1 + usize::from(ssy)) >> ssy,
+                (x1 + usize::from(ssx)) >> ssx,
+            );
+            for r in cy0..cy1.min(ch) {
+                for c in cx0..cx1.min(cw) {
+                    let du = i64::from(ru[r * cw + c]) - i64::from(input.u[r * cw + c]);
+                    let dv = i64::from(rv[r * cw + c]) - i64::from(input.v[r * cw + c]);
+                    sse += (du * du + dv * dv) as u64;
+                }
+            }
+        }
+        d += if units >= 0 {
+            sse >> (2 * units)
+        } else {
+            sse << (-2 * units)
+        };
+    }
+    d
 }
 
 /// r431 — the minimal §6.8.14 `TileSizeBytes` (1..=4) that fits every
@@ -4305,6 +4577,7 @@ pub(crate) struct KeySegDemand<'a> {
 /// driver's `recon.qp` / `recon.lossless` swapped to the qindex-0
 /// configuration for the call), everything else keeps the segment-0
 /// frame-quantiser shape.
+#[allow(clippy::too_many_arguments)]
 fn encode_key_leaf(
     r: u32,
     c: u32,
@@ -4313,6 +4586,7 @@ fn encode_key_leaf(
     recon: &mut ReconState,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
     seg: Option<&KeySegDemand<'_>>,
+    dq_units: i32,
 ) -> Result<SyntaxBlock, Error> {
     let demanded = seg.is_some_and(|d| {
         let bh4 = crate::cdf::NUM_4X4_BLOCKS_HIGH[b_size] as u32;
@@ -4321,18 +4595,34 @@ fn encode_key_leaf(
         let c1 = (c + bw4).min(recon.mi_cols);
         (r..r1).any(|rr| (c..c1).any(|cc| d.mask[(rr * recon.mi_cols + cc) as usize]))
     });
-    if !demanded {
-        return encode_leaf_sq(r, c, b_size, input, recon, pricing);
+    let mut out = if !demanded {
+        encode_leaf_sq(r, c, b_size, input, recon, pricing)?
+    } else {
+        let ll_seg = seg.expect("demanded implies seg").ll_seg;
+        let saved_qp = recon.qp;
+        let saved_lossless = recon.lossless;
+        recon.qp = QuantizerParams::neutral(0, recon.bit_depth);
+        recon.lossless = true;
+        let o = encode_leaf_sq_seg(r, c, b_size, input, recon, pricing, Some(ll_seg));
+        recon.qp = saved_qp;
+        recon.lossless = saved_lossless;
+        o?
+    };
+    // r431 — the KEY twin of the inter driver's `stamp_delta_q`: the
+    // §5.11.2 lifecycle codes the §5.11.13 delta only on the FIRST
+    // coded block of the superblock (the twin's pending bit is
+    // authoritative — build-time state == write-time state), and a
+    // full-superblock skip leaf takes the §5.11.13 short-circuit arm
+    // (zero bits; the writer validates the field is 0 there).
+    if dq_units != 0 {
+        let pending = pricing.is_some_and(|(twin, _)| twin.deltas_pending());
+        out.reduced_delta_q_index = if pending && !(b_size == BLOCK_64X64 && out.skip == 1) {
+            dq_units
+        } else {
+            0
+        };
     }
-    let ll_seg = seg.expect("demanded implies seg").ll_seg;
-    let saved_qp = recon.qp;
-    let saved_lossless = recon.lossless;
-    recon.qp = QuantizerParams::neutral(0, recon.bit_depth);
-    recon.lossless = true;
-    let out = encode_leaf_sq_seg(r, c, b_size, input, recon, pricing, Some(ll_seg));
-    recon.qp = saved_qp;
-    recon.lossless = saved_lossless;
-    out
+    Ok(out)
 }
 
 /// Recursive §5.11.4 rate-distortion partition search. At every
@@ -4366,6 +4656,7 @@ fn build_search_tree(
     params: &SyntaxFrameParams,
     model: RateModel,
     seg: Option<&KeySegDemand<'_>>,
+    dq_units: i32,
 ) -> Result<(SyntaxNode, u64), Error> {
     if r >= recon.mi_rows || c >= recon.mi_cols {
         // §5.11.4 line 1 — never inspected by the writer (and never
@@ -4374,7 +4665,7 @@ fn build_search_tree(
     }
     if b_size == BLOCK_4X4 {
         let pricing = (model == RateModel::Twin).then_some((&*twin, params));
-        let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg)?;
+        let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg, dq_units)?;
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let cost = twin.commit_subtree(&node, r, c, b_size, params)?;
         return Ok((node, cost));
@@ -4418,7 +4709,7 @@ fn build_search_tree(
                 let mut twin_s = twin.clone();
                 let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
                 let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
-                let blk = encode_key_leaf(r, c, psub, input, recon, pricing_s, seg)?;
+                let blk = encode_key_leaf(r, c, psub, input, recon, pricing_s, seg, dq_units)?;
                 let h_rate = 4 + leaf_rate(&blk);
                 cost_s += twin_s.commit_block(&blk, r, c, psub, params)?;
                 let d = region_distortion_wh(recon, input, r, c, n4 as usize, n4 as usize);
@@ -4448,7 +4739,18 @@ fn build_search_tree(
         // SPLIT arm (forced on the corner case; elected otherwise).
         let mut twin_b = twin.clone();
         let mut cost = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-        let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model, seg)?;
+        let (nw, c0) = build_search_tree(
+            r,
+            c,
+            sub,
+            input,
+            recon,
+            &mut twin_b,
+            params,
+            model,
+            seg,
+            dq_units,
+        )?;
         let (ne, c1) = build_search_tree(
             r,
             c + half,
@@ -4459,6 +4761,7 @@ fn build_search_tree(
             params,
             model,
             seg,
+            dq_units,
         )?;
         let (sw, c2) = build_search_tree(
             r + half,
@@ -4470,6 +4773,7 @@ fn build_search_tree(
             params,
             model,
             seg,
+            dq_units,
         )?;
         let (se, c3) = build_search_tree(
             r + half,
@@ -4481,6 +4785,7 @@ fn build_search_tree(
             params,
             model,
             seg,
+            dq_units,
         )?;
         cost += c0 + c1 + c2 + c3;
         let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
@@ -4508,7 +4813,7 @@ fn build_search_tree(
     // Candidate A: one PARTITION_NONE leaf (partition symbol + block
     // syntax committed to a twin fork).
     let pricing = (model == RateModel::Twin).then_some((&*twin, params));
-    let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg)?;
+    let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg, dq_units)?;
     let node_a = SyntaxNode::Leaf(Box::new(leaf));
     let d_a = region_distortion(recon, input, r, c, n4 as usize);
     let mut twin_a = twin.clone();
@@ -4563,7 +4868,7 @@ fn build_search_tree(
             let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(2);
             for &(rr, cc) in &cells {
                 let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
-                let blk = encode_key_leaf(rr, cc, psub, input, recon, pricing_s, seg)?;
+                let blk = encode_key_leaf(rr, cc, psub, input, recon, pricing_s, seg, dq_units)?;
                 h_rate += leaf_rate(&blk);
                 cost_s += twin_s.commit_block(&blk, rr, cc, psub, params)?;
                 blocks.push(blk);
@@ -4602,7 +4907,18 @@ fn build_search_tree(
     // actually be written under (SPLIT arm + earlier siblings).
     let mut twin_b = twin.clone();
     let mut cost_b = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-    let (nw, c0) = build_search_tree(r, c, sub, input, recon, &mut twin_b, params, model, seg)?;
+    let (nw, c0) = build_search_tree(
+        r,
+        c,
+        sub,
+        input,
+        recon,
+        &mut twin_b,
+        params,
+        model,
+        seg,
+        dq_units,
+    )?;
     let (ne, c1) = build_search_tree(
         r,
         c + half,
@@ -4613,6 +4929,7 @@ fn build_search_tree(
         params,
         model,
         seg,
+        dq_units,
     )?;
     let (sw, c2) = build_search_tree(
         r + half,
@@ -4624,6 +4941,7 @@ fn build_search_tree(
         params,
         model,
         seg,
+        dq_units,
     )?;
     let (se, c3) = build_search_tree(
         r + half,
@@ -4635,6 +4953,7 @@ fn build_search_tree(
         params,
         model,
         seg,
+        dq_units,
     )?;
     cost_b += c0 + c1 + c2 + c3;
     let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
@@ -4825,6 +5144,7 @@ mod tests {
                 &params,
                 RateModel::Twin,
                 None,
+                0,
             )
             .unwrap();
             total_cost256 += cost;
@@ -4938,6 +5258,7 @@ mod tests {
                 &params,
                 RateModel::Twin,
                 None,
+                0,
             )
             .unwrap();
             let (mut pal, mut other) = (0u32, 0u32);
@@ -5053,6 +5374,7 @@ mod tests {
             &params,
             RateModel::Twin,
             None,
+            0,
         )
         .unwrap();
         let (mut pal_uv, mut other_uv) = (0u32, 0u32);
@@ -5164,6 +5486,7 @@ mod tests {
                     &params,
                     RateModel::Twin,
                     None,
+                    0,
                 )
                 .unwrap();
                 count_palette_leaves_by(&tree, &mut ibc, &mut other, |b| b.intrabc_mv.is_some());
@@ -5324,6 +5647,7 @@ mod tests {
                     &params,
                     RateModel::Twin,
                     None,
+                    0,
                 )
                 .unwrap();
                 collect_dvs(&tree, &mut committed);
@@ -5411,6 +5735,7 @@ mod tests {
                 &params,
                 RateModel::Twin,
                 None,
+                0,
             )
             .unwrap();
             // The winning shape must be a rect node carrying a
@@ -5508,6 +5833,7 @@ mod tests {
                     &params,
                     RateModel::Twin,
                     None,
+                    0,
                 )
                 .unwrap();
                 if sb_r == 16 {
@@ -5610,6 +5936,7 @@ mod tests {
                 &params,
                 RateModel::Twin,
                 None,
+                0,
             )
             .expect("search");
             crate::encoder::partition_tree::write_partition_tree_syntax(
@@ -5961,6 +6288,7 @@ mod tests {
                 &params,
                 RateModel::Twin,
                 None,
+                0,
             )
             .unwrap();
             if sb_r == 32 {
@@ -6112,6 +6440,7 @@ mod tests {
             &params,
             RateModel::Twin,
             None,
+            0,
         )
         .unwrap();
         let (mut pal, mut other) = (0u32, 0u32);
