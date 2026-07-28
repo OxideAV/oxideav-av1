@@ -41,7 +41,7 @@ use crate::cdf::{
     QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
 };
 use crate::encoder::ivf::IvfReader;
-use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
+use crate::encoder::tile_group_obu::{parse_tile_group_obu_body, TilePayload};
 use crate::film_grain::film_grain_synthesis;
 use crate::frame_header::{
     parse_frame_header_with_refs, FrameHeader, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE,
@@ -227,14 +227,83 @@ pub fn decode_frame_spec(
     Ok(decode_frame_spec_full(seq, fh, tile_group_body, None)?.frame)
 }
 
+/// Parse one §5.11.1 tile-group OBU body against the frame's
+/// [`TileInfo`] — the shared derivation (`NumTiles`, `tileBits`,
+/// `TileSizeBytes`) both the whole-frame path and the r433
+/// multi-tile-group accumulation ride.
+fn parse_tile_group_body_with_ti(
+    ti: &crate::tile_info::TileInfo,
+    body: &[u8],
+) -> Result<crate::encoder::tile_group_obu::ParsedTileGroup, Error> {
+    let ceil_log2 = |v: u32| -> u32 {
+        if v <= 1 {
+            0
+        } else {
+            32 - (v - 1).leading_zeros()
+        }
+    };
+    if ti.mi_col_starts.len() != (ti.tile_cols as usize) + 1
+        || ti.mi_row_starts.len() != (ti.tile_rows as usize) + 1
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    parse_tile_group_obu_body(
+        body,
+        ti.tile_cols * ti.tile_rows,
+        ceil_log2(ti.tile_cols),
+        ceil_log2(ti.tile_rows),
+        u32::from(ti.tile_size_bytes),
+    )
+}
+
+/// Parse a tile-group body that must carry the WHOLE frame — the
+/// §5.10 `frame_obu` shape (§6.10.1 requires
+/// `tile_start_and_end_present_flag == 0` there, which forces
+/// `tg_start = 0` / `tg_end = NumTiles - 1`) and the historical
+/// single-tile-group packing the standalone entries accept.
+fn parse_whole_frame_tile_group(
+    ti: &crate::tile_info::TileInfo,
+    body: &[u8],
+    require_flag_zero: bool,
+) -> Result<Vec<TilePayload>, Error> {
+    let parsed = parse_tile_group_body_with_ti(ti, body)?;
+    let num_tiles = ti.tile_cols * ti.tile_rows;
+    if parsed.tg_start != 0 || parsed.tg_end + 1 != num_tiles {
+        return Err(Error::TileGroupInvalid);
+    }
+    if require_flag_zero && parsed.tile_start_and_end_present_flag {
+        return Err(Error::TileGroupInvalid);
+    }
+    Ok(parsed.tiles)
+}
+
 /// [`decode_frame_spec`] with the cross-frame reference state — the
-/// full §5.11 + §7.4 decode for one KEY / INTRA_ONLY / INTER frame,
-/// returning both the output frame and the §7.20 reference-update
-/// payload.
+/// full §5.11 + §7.4 decode for one KEY / INTRA_ONLY / INTER frame
+/// whose tile-group body carries every tile, returning both the
+/// output frame and the §7.20 reference-update payload.
 fn decode_frame_spec_full(
     seq: &SequenceHeader,
     fh: &FrameHeader,
     tile_group_body: &[u8],
+    refs: Option<&SpecRefState>,
+) -> Result<DecodedFrameInternal, Error> {
+    let ti = fh
+        .tile_info
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let tiles = parse_whole_frame_tile_group(ti, tile_group_body, false)?;
+    decode_frame_spec_tiles(seq, fh, &tiles, refs)
+}
+
+/// The frame decode proper, over already-parsed per-tile §8.2
+/// payloads — `tiles` must hold exactly `NumTiles` entries in tile
+/// raster order (§5.11.1 `TileNum` order; the r433 multi-tile-group
+/// accumulation concatenates conformant `tg_start..=tg_end` slices to
+/// get here).
+fn decode_frame_spec_tiles(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    tiles: &[TilePayload],
     refs: Option<&SpecRefState>,
 ) -> Result<DecodedFrameInternal, Error> {
     if fh.show_existing_frame {
@@ -389,29 +458,16 @@ fn decode_frame_spec_full(
         enable_intra_edge_filter: seq.enable_intra_edge_filter,
     };
 
-    // §5.11.1 tile-group body → per-tile byte ranges.
+    // Per-tile §8.2 byte ranges — the caller parsed the §5.11.1
+    // grouping; this driver requires the full frame's tiles.
     let num_tiles = ti.tile_cols * ti.tile_rows;
-    let ceil_log2 = |v: u32| -> u32 {
-        if v <= 1 {
-            0
-        } else {
-            32 - (v - 1).leading_zeros()
-        }
-    };
     if ti.mi_col_starts.len() != (ti.tile_cols as usize) + 1
         || ti.mi_row_starts.len() != (ti.tile_rows as usize) + 1
     {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    let parsed = parse_tile_group_obu_body(
-        tile_group_body,
-        num_tiles,
-        ceil_log2(ti.tile_cols),
-        ceil_log2(ti.tile_rows),
-        u32::from(ti.tile_size_bytes),
-    )?;
-    if parsed.tiles.len() != num_tiles as usize {
-        return Err(Error::PartitionWalkOutOfRange);
+    if tiles.len() != num_tiles as usize {
+        return Err(Error::TileGroupInvalid);
     }
 
     let mi_rows = fs.mi_rows;
@@ -697,7 +753,7 @@ fn decode_frame_spec_full(
     // frame-end state (unless `disable_frame_end_update_cdf`, which
     // keeps the frame-start state).
     let mut end_cdfs: Option<Box<TileCdfContext>> = None;
-    for (tile_num, tile) in parsed.tiles.iter().enumerate() {
+    for (tile_num, tile) in tiles.iter().enumerate() {
         let tile_row = (tile_num as u32) / ti.tile_cols;
         let tile_col = (tile_num as u32) % ti.tile_cols;
         walker.begin_tile(TileGeometry {
@@ -1539,7 +1595,26 @@ fn decode_temporal_unit_spec(
     chosen_op: u8,
     op_idc: &mut u16,
 ) -> Result<(), Error> {
-    let mut pending_fh: Option<FrameHeader> = None;
+    // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
+    // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
+    // NumTiles - 1` (which per §5.11.1 resets `SeenFrameHeader = 0`).
+    // r433 — a frame's tiles may arrive across SEVERAL tile-group
+    // OBUs; §6.10.1 requires each group's `tg_start` to equal the
+    // running `TileNum`, so the accumulator tracks the next expected
+    // index and concatenation reconstructs tile raster order.
+    struct PendingFrame {
+        fh: FrameHeader,
+        /// The original `OBU_FRAME_HEADER` payload bytes — the §6.8.1
+        /// `frame_header_copy` rule says every
+        /// `OBU_REDUNDANT_FRAME_HEADER` for this frame must carry
+        /// identical contents.
+        fh_payload: Vec<u8>,
+        /// Accumulated §8.2 per-tile payloads, tile raster order.
+        tiles: Vec<TilePayload>,
+        /// §6.10.1: the `TileNum` the next tile group must start at.
+        next_tg_start: u32,
+    }
+    let mut pending: Option<PendingFrame> = None;
     for desc in ObuIter::new(payload) {
         let desc = desc?;
         // §5.3.1 `drop_obu()`: with a non-zero OperatingPointIdc,
@@ -1589,6 +1664,15 @@ fn decode_temporal_unit_spec(
                 *seq = Some(sh);
             }
             ObuType::FrameHeader => {
+                // §6.8.1: `OBU_FRAME_HEADER` requires `SeenFrameHeader
+                // == 0` — a header arriving after this frame's tile
+                // groups started must use the REDUNDANT type. (A
+                // pending header with NO tiles yet is tolerated as a
+                // replacement, preserving the historical driver's
+                // acceptance.)
+                if pending.as_ref().is_some_and(|p| !p.tiles.is_empty()) {
+                    return Err(Error::TileGroupInvalid);
+                }
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 if fh.show_existing_frame {
@@ -1640,24 +1724,64 @@ fn decode_temporal_unit_spec(
                             }
                         }
                     }
-                    pending_fh = None;
+                    pending = None;
                 } else {
-                    pending_fh = Some(fh);
+                    pending = Some(PendingFrame {
+                        fh,
+                        fh_payload: desc.payload.to_vec(),
+                        tiles: Vec::new(),
+                        next_tg_start: 0,
+                    });
+                }
+            }
+            ObuType::RedundantFrameHeader => {
+                // §5.9.1 `frame_header_copy()`: only legal while
+                // `SeenFrameHeader == 1` (§6.8.1), and the copy must
+                // carry contents identical to the original
+                // `OBU_FRAME_HEADER`. Nothing re-parses — the byte
+                // comparison IS the identity check.
+                let p = pending.as_ref().ok_or(Error::TileGroupInvalid)?;
+                if desc.payload != &p.fh_payload[..] {
+                    return Err(Error::TileGroupInvalid);
                 }
             }
             ObuType::TileGroup => {
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                let fh = pending_fh.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                let decoded = decode_frame_spec_full(s, fh, desc.payload, Some(refs))?;
-                reference_frame_update(refs, fh, &decoded)?;
-                if fh.show_frame {
-                    out.push(decoded.frame);
+                let p = pending.as_mut().ok_or(Error::TileGroupInvalid)?;
+                let ti =
+                    p.fh.tile_info
+                        .as_ref()
+                        .ok_or(Error::PartitionWalkOutOfRange)?;
+                let num_tiles = ti.tile_cols * ti.tile_rows;
+                let parsed = parse_tile_group_body_with_ti(ti, desc.payload)?;
+                // §6.10.1: `tg_start` equals the running `TileNum`.
+                if parsed.tg_start != p.next_tg_start {
+                    return Err(Error::TileGroupInvalid);
+                }
+                p.next_tg_start = parsed.tg_end + 1;
+                p.tiles.extend(parsed.tiles);
+                // §5.11.1: the frame decodes (frame_end_update_cdf +
+                // decode_frame_wrapup, SeenFrameHeader = 0) only once
+                // `tg_end == NumTiles - 1`.
+                if parsed.tg_end + 1 == num_tiles {
+                    let pf = pending.take().expect("pending frame checked above");
+                    let decoded = decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs))?;
+                    reference_frame_update(refs, &pf.fh, &decoded)?;
+                    if pf.fh.show_frame {
+                        out.push(decoded.frame);
+                    }
                 }
             }
             ObuType::Frame => {
                 // §5.10 frame_obu: frame_header_obu() + byte_alignment()
                 // + tile_group_obu(). The tile group starts at the next
-                // byte boundary after the frame header.
+                // byte boundary after the frame header, and §6.10.1
+                // requires `tile_start_and_end_present_flag == 0` — the
+                // embedded group always covers the whole frame.
+                if pending.as_ref().is_some_and(|p| !p.tiles.is_empty()) {
+                    return Err(Error::TileGroupInvalid);
+                }
+                pending = None;
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 let tg_offset = fh.bits_consumed.div_ceil(8);
@@ -1665,7 +1789,12 @@ fn decode_temporal_unit_spec(
                     return Err(Error::UnexpectedEnd);
                 }
                 let tg_body = &desc.payload[tg_offset..];
-                let decoded = decode_frame_spec_full(s, &fh, tg_body, Some(refs))?;
+                let ti = fh
+                    .tile_info
+                    .as_ref()
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
+                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs))?;
                 reference_frame_update(refs, &fh, &decoded)?;
                 if fh.show_frame {
                     out.push(decoded.frame);
@@ -1673,6 +1802,12 @@ fn decode_temporal_unit_spec(
             }
             _ => return Err(Error::PartitionWalkOutOfRange),
         }
+    }
+    // §7.5 / §6.10.1: a coded frame's tile groups all live inside its
+    // temporal unit — the last group (`tg_end == NumTiles - 1`) must
+    // have arrived before the unit ends.
+    if pending.as_ref().is_some_and(|p| !p.tiles.is_empty()) {
+        return Err(Error::TileGroupInvalid);
     }
     Ok(())
 }

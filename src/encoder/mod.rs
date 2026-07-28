@@ -363,6 +363,10 @@ pub use inter_frame::{
     encode_gop_yuv420_with_q_seg_extras_tuned, encode_gop_yuv420_with_q_seg_lossless_tuned,
     encode_gop_yuv420_with_q_seg_tuned, GopTuning, SegExtras, TunedGop,
 };
+pub use inter_frame::{
+    encode_gop_yuv420_with_q_tile_layout, encode_gop_yuv_seg_extras_tuned_layout,
+    encode_gop_yuv_with_q_tile_layout,
+};
 #[doc(hidden)]
 pub use inter_frame::{encode_gop_yuv_seg_extras_tuned, TunedGopYuv};
 #[doc(hidden)]
@@ -383,6 +387,12 @@ pub use key_frame::{
 // r431 — §5.9.15 multi-tile write arm (uniform tile layouts,
 // explicitly configured; `(0, 0)` reproduces the single-tile stream
 // byte for byte).
+pub use key_frame::{
+    encode_key_frame_yuv420_with_q_tile_groups, encode_key_frame_yuv_with_q_tile_groups,
+};
+pub use key_frame::{
+    encode_key_frame_yuv420_with_q_tile_layout, encode_key_frame_yuv_with_q_tile_layout,
+};
 pub use key_frame::{encode_key_frame_yuv420_with_q_tiles, encode_key_frame_yuv_with_q_tiles};
 // r431 — KEY-frame §5.9.17 delta-q A/B hook (hidden).
 #[doc(hidden)]

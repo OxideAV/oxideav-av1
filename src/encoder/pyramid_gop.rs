@@ -566,9 +566,11 @@ impl PyramidSession {
                         lr: self.tuning.lr,
                         freeze_cdfs: false,
                         tiles: (0, 0),
+                        tile_groups: 1,
+                        explicit_tiles: None,
                     };
                     let q = self.role_q(&role);
-                    let (obu, rc, saved, carry, aux) = encode_inter_frame_generic(
+                    let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
                         &frames[role.display],
                         &self.seq,
                         q,
@@ -579,7 +581,7 @@ impl PyramidSession {
                     )?;
                     self.primary_elections
                         .push((role.display as u32, aux.primary_ref));
-                    pending.push(obu);
+                    pending.extend(obus);
                     if role.show {
                         self.temporal_units
                             .push(build_temporal_unit(None, &pending));

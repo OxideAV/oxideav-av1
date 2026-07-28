@@ -2442,6 +2442,21 @@ pub enum Error {
     /// that needs a reference's saved CDF state is undecodable from
     /// these inputs.
     TileListInvalid,
+    /// r433 — a frame's tile-group OBU sequence violates the §5.11.1
+    /// / §6.8.1 / §6.10.1 conformance rules: a tile group arriving
+    /// with no §5.9.1 frame header pending (`SeenFrameHeader == 0`),
+    /// a `tg_start` that does not equal the running `TileNum` (tile
+    /// groups must cover the frame's tiles contiguously, in order), a
+    /// frame whose tile groups do not complete inside its §7.5
+    /// temporal unit, an `OBU_FRAME_HEADER` arriving mid-frame
+    /// (`SeenFrameHeader == 1` — later copies must use
+    /// `OBU_REDUNDANT_FRAME_HEADER`), an
+    /// `OBU_REDUNDANT_FRAME_HEADER` whose §6.8.1 `frame_header_copy`
+    /// bytes differ from the original (or with no frame in
+    /// progress), or an `OBU_FRAME` whose embedded tile group does
+    /// not cover the whole frame with
+    /// `tile_start_and_end_present_flag == 0` (§6.10.1).
+    TileGroupInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -2600,6 +2615,10 @@ impl core::fmt::Display for Error {
             Self::TileListInvalid => write!(
                 f,
                 "oxideav-av1: tile-list OBU / large-scale-tile inputs violate the §5.12/§6.11/§7.3 conformance envelope"
+            ),
+            Self::TileGroupInvalid => write!(
+                f,
+                "oxideav-av1: tile-group OBU sequence violates the §5.11.1/§6.8.1/§6.10.1 conformance rules (ordering, coverage, or frame-header copy discipline)"
             ),
         }
     }

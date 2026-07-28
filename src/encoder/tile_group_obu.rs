@@ -261,6 +261,66 @@ pub fn write_tile_group_obu(obu: &TileGroupObu) -> Result<Vec<u8>, Error> {
     TileGroupObuWriter.write(obu)
 }
 
+/// r433 — re-frame an assembled whole-frame §5.11.1 tile-group body
+/// as `groups` separate tile-group OBU BODIES, splitting the frame's
+/// tiles contiguously and as evenly as possible (the first
+/// `NumTiles % groups` groups take one extra tile). Each returned
+/// body codes `tile_start_and_end_present_flag = 1` with its
+/// `tg_start` / `tg_end` slice — §6.10.1's running-`TileNum`
+/// discipline holds by construction — except the degenerate
+/// `groups <= 1` (or single-tile) case, which returns the §6.10.1
+/// whole-frame shape (`flag = 0`) unchanged.
+///
+/// The entropy payloads are NOT re-coded: the body is parsed back
+/// into its per-tile §8.2 partitions and re-wrapped, so the split
+/// stream's tile bytes are identical to the single-group stream's.
+/// `tile_size_bytes` is the frame header's coded §6.8.14
+/// `TileSizeBytes` — every group's non-last size fields ride it.
+pub(crate) fn split_whole_frame_body(
+    body: &[u8],
+    num_tiles: u32,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    tile_size_bytes: u32,
+    groups: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let groups = groups.clamp(1, num_tiles);
+    if groups <= 1 || num_tiles <= 1 {
+        return Ok(vec![body.to_vec()]);
+    }
+    let parsed = parse_tile_group_obu_body(
+        body,
+        num_tiles,
+        tile_cols_log2,
+        tile_rows_log2,
+        tile_size_bytes,
+    )?;
+    debug_assert_eq!(parsed.tg_start, 0, "whole-frame body expected");
+    debug_assert_eq!(parsed.tg_end + 1, num_tiles, "whole-frame body expected");
+    let base = num_tiles / groups;
+    let rem = num_tiles % groups;
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(groups as usize);
+    let mut start = 0u32;
+    for g in 0..groups {
+        let count = base + u32::from(g < rem);
+        let end = start + count - 1;
+        let obu = TileGroupObu {
+            num_tiles,
+            tile_cols_log2,
+            tile_rows_log2,
+            tile_size_bytes,
+            tg_start: start,
+            tg_end: end,
+            start_and_end_present: true,
+            tiles: parsed.tiles[start as usize..=end as usize].to_vec(),
+        };
+        out.push(write_tile_group_obu(&obu)?);
+        start = end + 1;
+    }
+    debug_assert_eq!(start, num_tiles);
+    Ok(out)
+}
+
 /// Parser counterpart for round-trip tests: walks a §5.11.1
 /// `tile_group_obu` body and surfaces the same fields the writer
 /// emitted. Lives next to the writer because no production caller

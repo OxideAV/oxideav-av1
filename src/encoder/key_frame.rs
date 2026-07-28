@@ -327,6 +327,8 @@ pub fn encode_key_frame_yuv420_with_q_dq(
         true,
         true,
         (0, 0),
+        1,
+        None,
         delta_q,
     )?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
@@ -409,6 +411,8 @@ pub fn encode_key_frame_yuv_with_q_tiles(
         true,
         true,
         (tile_cols_log2, tile_rows_log2),
+        1,
+        None,
         true,
     )
     .map(|(k, _)| k)
@@ -423,6 +427,137 @@ pub fn encode_key_frame_yuv420_with_q_tiles(
 ) -> Result<EncodedKeyFrame, Error> {
     let wide = YuvFrame::from_yuv420_8bit(input);
     let k = encode_key_frame_yuv_with_q_tiles(&wide, base_q_idx, tile_cols_log2, tile_rows_log2)?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
+/// r433 — [`encode_key_frame_yuv_with_q_tiles`] with §5.11.1
+/// multi-tile-group PACKAGING: the frame's tiles are split across
+/// `tile_groups` separate `OBU_TILE_GROUP` OBUs (contiguous
+/// `tg_start ..= tg_end` slices with `tile_start_and_end_present_flag
+/// = 1`, per §6.10.1 as even as possible), emitted after a standalone
+/// `OBU_FRAME_HEADER` instead of the §5.10 `OBU_FRAME` packing.
+///
+/// The per-tile §8.2 entropy payloads are BYTE-IDENTICAL to the
+/// single-group stream's — only the §5.2 OBU framing changes — so the
+/// decoded pixels match the `_tiles` entry exactly. `tile_groups <= 1`
+/// reproduces the `_tiles` stream byte for byte; values above the
+/// realized tile count clamp to one group per tile.
+///
+/// ## Errors
+///
+/// * Every [`encode_key_frame_yuv_with_q_tiles`] reject —
+///   [`Error::PartitionWalkOutOfRange`].
+pub fn encode_key_frame_yuv_with_q_tile_groups(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    tile_groups: u32,
+) -> Result<EncodedKeyFrameYuv, Error> {
+    encode_key_frame_yuv_full(
+        input,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        &KeyExtras {
+            tiles: (tile_cols_log2, tile_rows_log2),
+            tile_groups,
+            delta_q: true,
+            ..KeyExtras::default()
+        },
+    )
+    .map(|(k, _)| k)
+}
+
+/// 8-bit 4:2:0 sibling of [`encode_key_frame_yuv_with_q_tile_groups`].
+pub fn encode_key_frame_yuv420_with_q_tile_groups(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    tile_groups: u32,
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let k = encode_key_frame_yuv_with_q_tile_groups(
+        &wide,
+        base_q_idx,
+        tile_cols_log2,
+        tile_rows_log2,
+        tile_groups,
+    )?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
+/// r433 — [`encode_key_frame_yuv_with_q`] with an explicitly
+/// configured §5.9.15 **NON-UNIFORM** tile layout
+/// (`uniform_tile_spacing_flag = 0`): `widths_sb` / `heights_sb` give
+/// each tile column's width and each tile row's height in SUPERBLOCK
+/// units (64-pel superblocks on every conformance-grade stream), coded
+/// through the `width_in_sbs_minus_1` / `height_in_sbs_minus_1`
+/// `ns()` walks. The widths must sum to the frame's superblock
+/// columns (heights to its rows) and respect the §5.9.15 bounds —
+/// see [`crate::tile_info::TileInfo::explicit_layout`].
+///
+/// ## Errors
+///
+/// * The layout is outside the §5.9.15 legal window, plus every
+///   [`encode_key_frame_yuv_with_q`] reject —
+///   [`Error::PartitionWalkOutOfRange`].
+pub fn encode_key_frame_yuv_with_q_tile_layout(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    widths_sb: &[u32],
+    heights_sb: &[u32],
+) -> Result<EncodedKeyFrameYuv, Error> {
+    encode_key_frame_yuv_full(
+        input,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        &KeyExtras {
+            explicit_tiles: Some((widths_sb, heights_sb)),
+            delta_q: true,
+            ..KeyExtras::default()
+        },
+    )
+    .map(|(k, _)| k)
+}
+
+/// 8-bit 4:2:0 sibling of [`encode_key_frame_yuv_with_q_tile_layout`].
+pub fn encode_key_frame_yuv420_with_q_tile_layout(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    widths_sb: &[u32],
+    heights_sb: &[u32],
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let k = encode_key_frame_yuv_with_q_tile_layout(&wide, base_q_idx, widths_sb, heights_sb)?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok(EncodedKeyFrame {
         ivf_bytes: k.ivf_bytes,
@@ -465,6 +600,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         cdef_units,
         lr,
         (0, 0),
+        1,
+        None,
         true,
     )
 }
@@ -504,6 +641,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     cdef_units: bool,
     lr: bool,
     tiles: (u32, u32),
+    tile_groups: u32,
+    explicit_tiles: Option<(&[u32], &[u32])>,
     delta_q: bool,
 ) -> Result<
     (
@@ -523,6 +662,8 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
         lr,
         &KeyExtras {
             tiles,
+            tile_groups,
+            explicit_tiles,
             delta_q,
             ..KeyExtras::default()
         },
@@ -536,6 +677,24 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
 pub(crate) struct KeyExtras<'a> {
     /// §5.9.15 uniform tile layout `(TileColsLog2, TileRowsLog2)`.
     pub tiles: (u32, u32),
+    /// r433 — §5.11.1 tile-group packaging: split the frame's tiles
+    /// across this many `OBU_TILE_GROUP` OBUs (contiguous, as even as
+    /// possible, each coding `tile_start_and_end_present_flag = 1`
+    /// with its `tg_start` / `tg_end` slice), emitted after a
+    /// standalone `OBU_FRAME_HEADER` instead of the §5.10 `OBU_FRAME`
+    /// packing. `0` / `1` keep the historical single-`OBU_FRAME`
+    /// shape; values above the realized tile count clamp to it. The
+    /// per-tile entropy payloads are byte-identical either way — only
+    /// the §5.2 OBU framing changes.
+    pub tile_groups: u32,
+    /// r433 — §5.9.15 NON-UNIFORM (explicit) tile layout: per-column
+    /// widths and per-row heights in superblock units
+    /// (`uniform_tile_spacing_flag = 0` on the wire, coded through
+    /// the `width_in_sbs_minus_1` / `height_in_sbs_minus_1` `ns()`
+    /// walks). Overrides [`KeyExtras::tiles`] when `Some`; the
+    /// layout must satisfy the §5.9.15 legal window (see
+    /// [`crate::tile_info::TileInfo::explicit_layout`]).
+    pub explicit_tiles: Option<(&'a [u32], &'a [u32])>,
     /// Code the frame under THIS sequence header instead of building
     /// one from the input dimensions (the §6.7.5 layered-stream shape
     /// — one sequence header spans every spatial layer, so smaller
@@ -614,6 +773,8 @@ pub(crate) fn encode_key_frame_yuv_full(
         {
             let base_extras = KeyExtras {
                 tiles: extras.tiles,
+                tile_groups: extras.tile_groups,
+                explicit_tiles: extras.explicit_tiles,
                 seq_override: extras.seq_override,
                 intra_only_refresh: extras.intra_only_refresh,
                 delta_q: false,
@@ -791,13 +952,23 @@ fn encode_key_frame_yuv_core(
             .ok_or(Error::PartitionWalkOutOfRange)?;
         (fs.mi_rows, fs.mi_cols)
     };
-    let mut ti = crate::tile_info::TileInfo::uniform_layout(
-        fs_mi_cols,
-        fs_mi_rows,
-        seq.use_128x128_superblock,
-        tiles.0,
-        tiles.1,
-    )
+    let mut ti = match extras.explicit_tiles {
+        // r433 — §5.9.15 non-uniform (explicit) layout.
+        Some((widths_sb, heights_sb)) => crate::tile_info::TileInfo::explicit_layout(
+            fs_mi_cols,
+            fs_mi_rows,
+            seq.use_128x128_superblock,
+            widths_sb,
+            heights_sb,
+        ),
+        None => crate::tile_info::TileInfo::uniform_layout(
+            fs_mi_cols,
+            fs_mi_rows,
+            seq.use_128x128_superblock,
+            tiles.0,
+            tiles.1,
+        ),
+    }
     .ok_or(Error::PartitionWalkOutOfRange)?;
     let multi_tile = !ti.is_single_tile();
     fh.tile_info = Some(ti.clone());
@@ -1440,21 +1611,47 @@ fn encode_key_frame_yuv_core(
     ti.tile_size_bytes = min_tile_size_bytes(&tile_payloads) as u8;
     fh.tile_info = Some(ti.clone());
 
-    // §5.10 `frame_obu()`: `frame_header_obu()` + `byte_alignment()`
-    // (zero pad — NOT §5.3.4 trailing_bits; OBU_FRAME is one of the
-    // §5.3.1 trailer-exempt types) + `tile_group_obu()`.
-    let frame_body = {
-        let mut bw = crate::encoder::bitwriter::BitWriter::new();
-        encode_uncompressed_header(&mut bw, &fh, &seq);
-        bw.byte_align();
-        let mut body = bw.finish();
-        body.extend_from_slice(&tile_group_body);
-        body
-    };
-    // §7.5 temporal unit: TD + SH + OBU_FRAME.
+    // §7.5 temporal unit. r433 — two packagings of the SAME header
+    // bits and tile payloads:
+    //
+    //   * `tile_groups <= 1` (or a single tile): the §5.10
+    //     `OBU_FRAME` — `frame_header_obu()` + `byte_alignment()`
+    //     (zero pad — NOT §5.3.4 trailing_bits; OBU_FRAME is one of
+    //     the §5.3.1 trailer-exempt types) + `tile_group_obu()`.
+    //   * `tile_groups > 1`: a standalone `OBU_FRAME_HEADER` (§5.3.4
+    //     trailing_bits) followed by that many `OBU_TILE_GROUP` OBUs,
+    //     the whole-frame body re-framed into contiguous
+    //     `tg_start ..= tg_end` slices (§6.10.1).
     let sh_body = write_sequence_header_obu(&seq);
-    let temporal_unit_bytes =
-        build_temporal_unit(Some(&sh_body), &[ObuFrame::new(ObuType::Frame, frame_body)]);
+    let effective_groups = extras.tile_groups.clamp(1, num_tiles);
+    let temporal_unit_bytes = if effective_groups > 1 {
+        let fh_payload = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
+        let tg_bodies = crate::encoder::tile_group_obu::split_whole_frame_body(
+            &tile_group_body,
+            num_tiles,
+            ti.tile_cols_log2,
+            ti.tile_rows_log2,
+            u32::from(ti.tile_size_bytes),
+            effective_groups,
+        )?;
+        let mut obus = vec![ObuFrame::new(ObuType::FrameHeader, fh_payload)];
+        obus.extend(
+            tg_bodies
+                .into_iter()
+                .map(|b| ObuFrame::new(ObuType::TileGroup, b)),
+        );
+        build_temporal_unit(Some(&sh_body), &obus)
+    } else {
+        let frame_body = {
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            encode_uncompressed_header(&mut bw, &fh, &seq);
+            bw.byte_align();
+            let mut body = bw.finish();
+            body.extend_from_slice(&tile_group_body);
+            body
+        };
+        build_temporal_unit(Some(&sh_body), &[ObuFrame::new(ObuType::Frame, frame_body)])
+    };
 
     // IVF v0 wrap.
     let mut ivf_bytes: Vec<u8> = Vec::new();

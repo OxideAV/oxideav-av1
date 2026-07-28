@@ -308,12 +308,16 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
             lr: true,
             freeze_cdfs: false,
             tiles: (0, 0),
+            tile_groups: 1,
+            explicit_tiles: None,
         };
-        let (mut obu, recon, saved, carry, _aux) =
+        let (mut obus, recon, saved, carry, _aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
-        // §5.3.3 / §7.5: the frame OBU carries its layer id.
-        obu.header.extension = Some(ObuExtensionHeader::new(tid, 0));
-        temporal_units.push(build_temporal_unit(None, &[obu]));
+        // §5.3.3 / §7.5: every OBU of the frame carries its layer id.
+        for obu in &mut obus {
+            obu.header.extension = Some(ObuExtensionHeader::new(tid, 0));
+        }
+        temporal_units.push(build_temporal_unit(None, &obus));
         temporal_ids.push(tid);
         recons.push(recon);
         // §7.20 reference frame update under the slot policy.
@@ -505,6 +509,8 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
     for (s, layer) in layers.iter().enumerate() {
         let extras = crate::encoder::key_frame::KeyExtras {
             tiles: (0, 0),
+            tile_groups: 1,
+            explicit_tiles: None,
             seq_override: Some(&seq),
             // Layer 0: a true KEY (refreshes ALL slots — §5.9.2
             // derives allFrames); enhancement layers: INTRA_ONLY
@@ -609,8 +615,10 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
                 lr: true,
                 freeze_cdfs: false,
                 tiles: (0, 0),
+                tile_groups: 1,
+                explicit_tiles: None,
             };
-            let (mut obu, recon, saved, carry, _aux) = encode_inter_frame_generic(
+            let (obus, recon, saved, carry, _aux) = encode_inter_frame_generic(
                 &layer[i],
                 &seq,
                 base_q_idx,
@@ -619,8 +627,10 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
                 &mf,
                 RateModel::Twin,
             )?;
-            obu.header.extension = Some(ObuExtensionHeader::new(0, s as u8));
-            write_obu_with_size(&mut tu, &obu.header, &obu.body);
+            for mut obu in obus {
+                obu.header.extension = Some(ObuExtensionHeader::new(0, s as u8));
+                write_obu_with_size(&mut tu, &obu.header, &obu.body);
+            }
             layer_recons[s].push(recon);
             mf_store[refresh_slot] = saved;
             carry_store[refresh_slot] = Some(Rc::new(carry));

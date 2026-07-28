@@ -185,8 +185,13 @@ pub fn encode_camera_frame_yuv420_tiles(
         lr: false,
         freeze_cdfs: true,
         tiles: (tile_cols_log2, 0),
+        // §7.3 camera frames stay on the single-`OBU_FRAME` packing
+        // (the §5.12 tile-list assembly consumes the raw
+        // coded_tile_data, not the OBU framing).
+        tile_groups: 1,
+        explicit_tiles: None,
     };
-    let (obu, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
+    let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
         &wide,
         &seq,
         base_q_idx,
@@ -195,6 +200,11 @@ pub fn encode_camera_frame_yuv420_tiles(
         &mf_store,
         RateModel::Twin,
     )?;
+    debug_assert_eq!(obus.len(), 1, "tile_groups = 1 packs one OBU_FRAME");
+    let obu = obus
+        .into_iter()
+        .next()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
 
     // Split the §5.10 OBU_FRAME body back into (frame header, tile
     // bytes): the header ends at the §5.10 byte_alignment(), the tile

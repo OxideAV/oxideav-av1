@@ -651,6 +651,15 @@ pub struct GopTuning {
     /// `(0, 0)` is the single-tile pre-r431 shape (bit-identical).
     /// Must sit inside the §5.9.15 legal window for the frame size.
     pub tiles: (u32, u32),
+    /// r433 — §5.11.1 tile-group packaging on EVERY frame of the GOP:
+    /// split each frame's tiles across this many `OBU_TILE_GROUP`
+    /// OBUs (standalone `OBU_FRAME_HEADER` + contiguous
+    /// `tg_start ..= tg_end` slices, `tile_start_and_end_present_flag
+    /// = 1`) instead of the single §5.10 `OBU_FRAME`. `0` / `1` keep
+    /// the historical one-OBU shape (bit-identical); clamps to each
+    /// frame's realized tile count. Entropy payloads are
+    /// byte-identical either way — only the OBU framing changes.
+    pub tile_groups: u32,
 }
 
 impl Default for GopTuning {
@@ -666,6 +675,7 @@ impl Default for GopTuning {
             cdef_units: true,
             lr: true,
             tiles: (0, 0),
+            tile_groups: 1,
         }
     }
 }
@@ -874,8 +884,49 @@ pub fn encode_gop_yuv_with_q(frames: &[YuvFrame], base_q_idx: u8) -> Result<Enco
     .map(|t| t.gop)
 }
 
+/// r433 — KEY + P GOP with an explicitly configured §5.9.15
+/// **NON-UNIFORM** tile layout on every frame
+/// (`uniform_tile_spacing_flag = 0`): `widths_sb` / `heights_sb` in
+/// superblock units per [`crate::tile_info::TileInfo::explicit_layout`].
+///
+/// ## Errors
+///
+/// * The layout is outside the §5.9.15 legal window, plus every
+///   [`encode_gop_yuv_with_q`] reject —
+///   [`Error::PartitionWalkOutOfRange`].
+pub fn encode_gop_yuv_with_q_tile_layout(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    widths_sb: &[u32],
+    heights_sb: &[u32],
+) -> Result<EncodedGopYuv, Error> {
+    encode_gop_yuv_seg_extras_tuned_layout(
+        frames,
+        base_q_idx,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning::default(),
+        Some((widths_sb, heights_sb)),
+    )
+    .map(|t| t.gop)
+}
+
+/// 8-bit 4:2:0 sibling of [`encode_gop_yuv_with_q_tile_layout`].
+pub fn encode_gop_yuv420_with_q_tile_layout(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    widths_sb: &[u32],
+    heights_sb: &[u32],
+) -> Result<EncodedGop, Error> {
+    let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
+    encode_gop_yuv_with_q_tile_layout(&wide, base_q_idx, widths_sb, heights_sb).map(narrow_gop_8bit)
+}
+
 /// r427 — the general-format GOP core: every entry point above
-/// funnels here.
+/// funnels here (through the r433 `_layout` sibling below, which
+/// additionally threads a §5.9.15 non-uniform tile layout).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gop_yuv_seg_extras_tuned(
@@ -886,6 +937,34 @@ pub fn encode_gop_yuv_seg_extras_tuned(
     auto_detect: bool,
     extras: Option<&SegExtras>,
     tuning: GopTuning,
+) -> Result<TunedGopYuv, Error> {
+    encode_gop_yuv_seg_extras_tuned_layout(
+        frames,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        extras,
+        tuning,
+        None,
+    )
+}
+
+/// r433 — [`encode_gop_yuv_seg_extras_tuned`] with an optional
+/// §5.9.15 NON-UNIFORM tile layout (`(widths_sb, heights_sb)` in
+/// superblock units, `uniform_tile_spacing_flag = 0` on every frame's
+/// wire) overriding [`GopTuning::tiles`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gop_yuv_seg_extras_tuned_layout(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+    extras: Option<&SegExtras>,
+    tuning: GopTuning,
+    explicit_tiles: Option<(&[u32], &[u32])>,
 ) -> Result<TunedGopYuv, Error> {
     if let Some(x) = extras {
         let ll = seg_lossless_array(base_q_idx, alt_q);
@@ -956,8 +1035,12 @@ pub fn encode_gop_yuv_seg_extras_tuned(
         tuning.cdef_units,
         // r429 scope: LR mirrors the CDEF segmented-GOP gate.
         tuning.lr && alt_q.is_empty(),
-        // r431 — the GOP-wide §5.9.15 tile layout.
+        // r431 — the GOP-wide §5.9.15 tile layout (r433: the explicit
+        // non-uniform override rides beside it).
         tuning.tiles,
+        // r433 — the GOP-wide §5.11.1 tile-group packaging.
+        tuning.tile_groups,
+        explicit_tiles,
         // r431 — the KEY frame rides the same §5.9.17 delta-q switch
         // as the P-frames.
         tuning.delta_q,
@@ -1039,6 +1122,8 @@ pub fn encode_gop_yuv_seg_extras_tuned(
             tuning.cdef_units,
             tuning.lr,
             tuning.tiles,
+            tuning.tile_groups,
+            explicit_tiles,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1244,6 +1329,20 @@ pub(crate) struct InterFrameConfig<'a> {
     /// legal window for the frame size (see
     /// [`crate::tile_info::TileInfo::uniform_layout`]).
     pub tiles: (u32, u32),
+    /// r433 — §5.11.1 tile-group packaging: split the frame's tiles
+    /// across this many `OBU_TILE_GROUP` OBUs (standalone
+    /// `OBU_FRAME_HEADER` + contiguous `tg_start ..= tg_end` slices)
+    /// instead of the single §5.10 `OBU_FRAME`. `0` / `1` keep the
+    /// historical one-OBU shape; clamps to the realized tile count.
+    /// The per-tile entropy payloads are byte-identical either way.
+    pub tile_groups: u32,
+    /// r433 — §5.9.15 NON-UNIFORM (explicit) tile layout: per-column
+    /// widths and per-row heights in superblock units
+    /// (`uniform_tile_spacing_flag = 0`). Overrides
+    /// [`InterFrameConfig::tiles`] when `Some`; must satisfy the
+    /// §5.9.15 legal window (see
+    /// [`crate::tile_info::TileInfo::explicit_layout`]).
+    pub explicit_tiles: Option<(&'a [u32], &'a [u32])>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1538,6 +1637,8 @@ fn p_frame_config_primary<'a>(
         lr: true,
         freeze_cdfs: false,
         tiles: (0, 0),
+        tile_groups: 1,
+        explicit_tiles: None,
     }
 }
 
@@ -1588,6 +1689,8 @@ fn encode_p_frame_yuv(
     cdef_units: bool,
     lr: bool,
     tiles: (u32, u32),
+    tile_groups: u32,
+    explicit_tiles: Option<(&[u32], &[u32])>,
 ) -> Result<
     (
         Vec<u8>,
@@ -1609,7 +1712,9 @@ fn encode_p_frame_yuv(
     cfg.cdef_units = cdef_units;
     cfg.lr = lr;
     cfg.tiles = tiles;
-    let (obu, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
+    cfg.tile_groups = tile_groups;
+    cfg.explicit_tiles = explicit_tiles;
+    let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
         base_q_idx,
@@ -1619,11 +1724,12 @@ fn encode_p_frame_yuv(
         model,
         global_motion,
     )?;
-    // §7.5 temporal unit: TD + OBU_FRAME (the SH rode the KEY frame's
-    // unit; §7.5 requires it once per coded video sequence). Every
-    // P-frame is shown, so the one-OBU unit satisfies the "exactly
-    // one shown frame per temporal unit" bitstream conformance rule.
-    Ok((build_temporal_unit(None, &[obu]), recon, saved, carry, aux))
+    // §7.5 temporal unit: TD + the frame's OBUs (one `OBU_FRAME`, or
+    // r433's `OBU_FRAME_HEADER` + tile groups; the SH rode the KEY
+    // frame's unit — §7.5 requires it once per coded video sequence).
+    // Every P-frame is shown, so the unit satisfies the "exactly one
+    // shown frame per temporal unit" bitstream conformance rule.
+    Ok((build_temporal_unit(None, &obus), recon, saved, carry, aux))
 }
 
 /// r415 — the shared INTER frame encoder every pyramid role (P / ALT /
@@ -1647,7 +1753,7 @@ pub(crate) fn encode_inter_frame_generic(
     model: RateModel,
 ) -> Result<
     (
-        ObuFrame,
+        Vec<ObuFrame>,
         GopFrameReconYuv,
         SavedMotionField,
         RefSlotCarry,
@@ -1673,7 +1779,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     global_motion: bool,
 ) -> Result<
     (
-        ObuFrame,
+        Vec<ObuFrame>,
         GopFrameReconYuv,
         SavedMotionField,
         RefSlotCarry,
@@ -1721,13 +1827,23 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // config asked for columns/rows). The whole driver — search arms,
     // every post-tile replay election, the §5.11.1 assembly — walks
     // the same tile plan.
-    let mut ti = crate::tile_info::TileInfo::uniform_layout(
-        mi_cols,
-        mi_rows,
-        seq.use_128x128_superblock,
-        cfg.tiles.0,
-        cfg.tiles.1,
-    )
+    let mut ti = match cfg.explicit_tiles {
+        // r433 — §5.9.15 non-uniform (explicit) layout.
+        Some((widths_sb, heights_sb)) => crate::tile_info::TileInfo::explicit_layout(
+            mi_cols,
+            mi_rows,
+            seq.use_128x128_superblock,
+            widths_sb,
+            heights_sb,
+        ),
+        None => crate::tile_info::TileInfo::uniform_layout(
+            mi_cols,
+            mi_rows,
+            seq.use_128x128_superblock,
+            cfg.tiles.0,
+            cfg.tiles.1,
+        ),
+    }
     .ok_or(Error::PartitionWalkOutOfRange)?;
     fh.tile_info = Some(ti.clone());
     let num_tiles = ti.tile_cols * ti.tile_rows;
@@ -3006,24 +3122,57 @@ pub(crate) fn encode_inter_frame_generic_gm(
     fh.tile_info = Some(ti.clone());
     let tile_group_body = tile_bytes;
 
-    // §5.10 `frame_obu()`: header + `byte_alignment()` + tile group.
-    // r423: with a primary reference the §5.9.24 subexp recentering
-    // codes against the carried `SavedGmParams` (§7.21
-    // `load_previous()`), not the setup_past_independence defaults.
-    let frame_body = {
-        let mut bw = crate::encoder::bitwriter::BitWriter::new();
+    // Frame packaging. r423: with a primary reference the §5.9.24
+    // subexp recentering codes against the carried `SavedGmParams`
+    // (§7.21 `load_previous()`), not the setup_past_independence
+    // defaults. r433 — two packagings of the SAME header bits + tile
+    // payloads: the §5.10 `OBU_FRAME` (header + `byte_alignment()` +
+    // tile group), or — when `cfg.tile_groups > 1` — a standalone
+    // `OBU_FRAME_HEADER` (§5.3.4 trailing_bits) followed by that many
+    // `OBU_TILE_GROUP` OBUs re-framing the whole-frame body into
+    // contiguous `tg_start ..= tg_end` slices (§6.10.1).
+    let write_fh_bits = |bw: &mut crate::encoder::bitwriter::BitWriter| {
         crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
-            &mut bw,
+            bw,
             &fh,
             seq,
             prev_gm_for_header.as_ref(),
         );
-        bw.byte_align();
-        let mut body = bw.finish();
-        body.extend_from_slice(&tile_group_body);
-        body
     };
-    let frame_obu = ObuFrame::new(ObuType::Frame, frame_body);
+    let effective_groups = cfg.tile_groups.clamp(1, num_tiles);
+    let frame_obus: Vec<ObuFrame> = if effective_groups > 1 {
+        let fh_payload = {
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            write_fh_bits(&mut bw);
+            bw.trailing_bits_to_alignment();
+            bw.finish()
+        };
+        let tg_bodies = crate::encoder::tile_group_obu::split_whole_frame_body(
+            &tile_group_body,
+            num_tiles,
+            ti.tile_cols_log2,
+            ti.tile_rows_log2,
+            u32::from(ti.tile_size_bytes),
+            effective_groups,
+        )?;
+        let mut obus = vec![ObuFrame::new(ObuType::FrameHeader, fh_payload)];
+        obus.extend(
+            tg_bodies
+                .into_iter()
+                .map(|b| ObuFrame::new(ObuType::TileGroup, b)),
+        );
+        obus
+    } else {
+        let frame_body = {
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            write_fh_bits(&mut bw);
+            bw.byte_align();
+            let mut body = bw.finish();
+            body.extend_from_slice(&tile_group_body);
+            body
+        };
+        vec![ObuFrame::new(ObuType::Frame, frame_body)]
+    };
 
     // r413 — §7.19 motion field motion vector storage: filter the
     // committed Mvs[] / RefFrames[] mirror grids down to the §7.20
@@ -3092,7 +3241,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     };
 
     Ok((
-        frame_obu,
+        frame_obus,
         GopFrameReconYuv {
             y: recon.y,
             u: recon.u,
@@ -8398,6 +8547,8 @@ mod tests {
             true,
             true,
             (0, 0),
+            1,
+            None,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);

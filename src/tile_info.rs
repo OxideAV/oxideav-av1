@@ -207,6 +207,118 @@ impl TileInfo {
         })
     }
 
+    /// r433 — encoder-side §5.9.15 **non-uniform** (explicit) layout
+    /// builder: the exact `TileInfo` the parser's
+    /// `uniform_tile_spacing_flag = 0` path derives for the requested
+    /// per-column widths / per-row heights (in superblock units). The
+    /// write side (`crate::encoder::frame_obu::encode_tile_info`)
+    /// re-derives the `width_in_sbs_minus_1` / `height_in_sbs_minus_1`
+    /// `ns()` walk from the start arrays, so `parse(encode(ti)) == ti`
+    /// holds by construction.
+    ///
+    /// Returns `None` when the layout falls outside the §5.9.15 legal
+    /// window:
+    ///
+    ///   * `widths_sb` does not sum to the frame's superblock columns
+    ///     (or `heights_sb` to its rows), an entry is zero, or a
+    ///     count exceeds `MAX_TILE_COLS` / `MAX_TILE_ROWS`;
+    ///   * a width exceeds `maxTileWidthSb`, or a height exceeds the
+    ///     §5.9.15 `maxTileHeightSb = max( maxTileAreaSb /
+    ///     widestTileSb, 1 )` bound (derived from the widest coded
+    ///     column exactly as the parser derives it).
+    ///
+    /// `tile_size_bytes` / `context_update_tile_id` seed like
+    /// [`TileInfo::uniform_layout`].
+    #[must_use]
+    pub fn explicit_layout(
+        mi_cols: u32,
+        mi_rows: u32,
+        use_128x128_superblock: bool,
+        widths_sb: &[u32],
+        heights_sb: &[u32],
+    ) -> Option<TileInfo> {
+        if mi_cols == 0 || mi_rows == 0 || widths_sb.is_empty() || heights_sb.is_empty() {
+            return None;
+        }
+        // §5.9.15 lead-in derivations (identical to `read_tile_info`).
+        let (sb_cols, sb_rows, sb_shift) = if use_128x128_superblock {
+            ((mi_cols + 31) >> 5, (mi_rows + 31) >> 5, 5u32)
+        } else {
+            ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4, 4u32)
+        };
+        let sb_size = sb_shift + 2;
+        let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
+        let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
+        let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
+        let min_log2_tiles = min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
+
+        if widths_sb.len() as u32 > MAX_TILE_COLS || heights_sb.len() as u32 > MAX_TILE_ROWS {
+            return None;
+        }
+
+        // §5.9.15 non-uniform column walk: each width must be codable
+        // as `ns( min( sbCols - startSb, maxTileWidthSb ) )`.
+        let mut mi_col_starts: Vec<u32> = Vec::with_capacity(widths_sb.len() + 1);
+        let mut widest_tile_sb: u32 = 0;
+        let mut start_sb: u32 = 0;
+        for &w in widths_sb {
+            if start_sb >= sb_cols {
+                return None;
+            }
+            let max_width = (sb_cols - start_sb).min(max_tile_width_sb);
+            if w == 0 || w > max_width {
+                return None;
+            }
+            mi_col_starts.push(start_sb << sb_shift);
+            widest_tile_sb = widest_tile_sb.max(w);
+            start_sb += w;
+        }
+        if start_sb != sb_cols {
+            return None;
+        }
+        mi_col_starts.push(mi_cols);
+        let tile_cols = widths_sb.len() as u32;
+
+        // §5.9.15 non-uniform row walk under the recomputed
+        // `maxTileAreaSb` and the widest-column height bound.
+        let max_tile_area_sb_local = if min_log2_tiles > 0 {
+            (sb_rows * sb_cols) >> (min_log2_tiles + 1)
+        } else {
+            sb_rows * sb_cols
+        };
+        let max_tile_height_sb = (max_tile_area_sb_local / widest_tile_sb).max(1);
+        let mut mi_row_starts: Vec<u32> = Vec::with_capacity(heights_sb.len() + 1);
+        let mut start_sb: u32 = 0;
+        for &h in heights_sb {
+            if start_sb >= sb_rows {
+                return None;
+            }
+            let max_height = (sb_rows - start_sb).min(max_tile_height_sb);
+            if h == 0 || h > max_height {
+                return None;
+            }
+            mi_row_starts.push(start_sb << sb_shift);
+            start_sb += h;
+        }
+        if start_sb != sb_rows {
+            return None;
+        }
+        mi_row_starts.push(mi_rows);
+        let tile_rows = heights_sb.len() as u32;
+
+        Some(TileInfo {
+            uniform_tile_spacing_flag: false,
+            tile_cols,
+            tile_rows,
+            tile_cols_log2: tile_log2(1, tile_cols),
+            tile_rows_log2: tile_log2(1, tile_rows),
+            context_update_tile_id: 0,
+            tile_size_bytes: 4,
+            mi_col_starts,
+            mi_row_starts,
+        })
+    }
+
     /// The §5.11.51 [`crate::cdf::TileGeometry`] of tile number
     /// `tile_num` (row-major: `tile_row * TileCols + tile_col`), or
     /// `None` when out of range.
