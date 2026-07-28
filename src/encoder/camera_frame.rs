@@ -290,7 +290,17 @@ mod tests {
     fn camera_geometry_envelope_is_enforced() {
         let f = Yuv420Frame::filled(64, 64, 100);
         let tall = Yuv420Frame::filled(64, 128, 100);
+        // Mismatched input/anchor geometry rejects.
         assert!(encode_camera_frame_yuv420(&f, &tall, 60).is_err());
-        assert!(encode_camera_frame_yuv420(&tall, &tall, 60).is_err());
+        // r433 — a taller frame (height a multiple of 64) is LEGAL:
+        // it codes one §7.3.1-conformant one-superblock-high tile row
+        // per superblock row.
+        let e = encode_camera_frame_yuv420(&tall, &tall, 60).expect("two-row camera frame");
+        assert_eq!(e.coded_tiles.len(), 2, "one tile per superblock row");
+        // Non-multiple-of-64 heights (and widths) still reject.
+        let odd_h = Yuv420Frame::filled(64, 96, 100);
+        assert!(encode_camera_frame_yuv420(&odd_h, &odd_h, 60).is_err());
+        let odd_w = Yuv420Frame::filled(96, 64, 100);
+        assert!(encode_camera_frame_yuv420(&odd_w, &odd_w, 60).is_err());
     }
 }
