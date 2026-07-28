@@ -962,8 +962,13 @@ masking-weighted (variance-normalising) joint objective. Measured
 reported honestly; the uniform-spread control stays bit-identical.
 Pinned: `self-gop-128x128-q100-deltaq` — the corpus's first
 `delta_q_present = 1` stream, byte-identical through three
-independent black-box reference decoders (corpus 107). KEY-frame
-delta-q and the segmentation × delta-q pairing stay open.
+independent black-box reference decoders (corpus 107). r431 lands
+the KEY-frame twin: the shared complexity probe plans per-superblock
+`CurrentQIndex` units on unsegmented lossy KEY frames, a second full
+search encodes under the plan, and the masking-weighted
+exact-realized-bytes election keeps the better arm (corpus 115,
+`self-key-128x128-q140-delta-q`). The segmentation × delta-q pairing
+stays open.
 
 ### Frame-level CDEF election (r428)
 
@@ -982,8 +987,15 @@ Measured (`tests/cdef_ab.rs`): **+0.28 dB at −1.2% bytes** on
 ringing-prone edges (96×80 q140). Pinned:
 `self-gop-96x80-q140-cdef` — the corpus's first self-encoded stream
 with non-zero §5.9.19 strengths, byte-identical through three
-independent black-box reference decoders (corpus 108). Per-64×64
-`cdef_bits > 0` election and the segmentation pairing stay open.
+independent black-box reference decoders (corpus 108). r429 deepens
+both in-loop filters to UNIT granularity: per-64×64 `cdef_bits > 0`
+election (multi-set §5.9.19 headers, §5.11.56 per-unit strength-id
+literals via tile re-emission; corpus 110) and the §5.9.20/§5.11.57/
+§7.17 loop-restoration election — per-unit Wiener (alternating-LS
+fit) + self-guided (projection fit over all 16 Sgr sets) mirrored on
+the encoder recon path with exact-realized-bytes settlement (+0.32 dB
+at ~2 B/frame on detail content; corpus 111). The CDEF segmentation
+pairing stays open.
 
 ### Mirror-path retirement (r428)
 
@@ -1065,19 +1077,93 @@ byte-identical to the per-frame encoder reconstructions, and the
 lossless arm reproduces the source exactly
 (`tests/large_scale_tile.rs`).
 
+### Multi-tile encoding: the §5.9.15 write arm (r431)
+
+The encoder codes real tile grids. Every conformance-grade encode
+path takes a uniform `(TileColsLog2, TileRowsLog2)` layout
+(`encode_key_frame_yuv{,420}_with_q_tiles`, `GopTuning::tiles`; r433
+extends this to the B-pyramid / adaptive driver via
+`PyramidTuning::tiles` and the temporal ladder via
+`encode_temporal_layered_gop_yuv{,420}_with_q_tiles`): per-tile §8.2
+symbol partitions from the §8.3.1 frame-start CDF state, §5.11.2
+`begin_tile` re-scoping (clear_above, tile-scoped availability,
+LR-reference resets) on the write driver AND the search context,
+§5.11.1 `tile_size_minus_1` fields at the minimal realized §6.8.14
+`TileSizeBytes`, tile-0 §8.4 CDF donation, and every post-tile
+exact-bytes election (hp / temporal-seg / primary-ref / CDEF / LR)
+re-emitting ALL tiles. `(0, 0)` reproduces the single-tile streams
+byte for byte. §7.3 camera frames split into tile COLUMNS
+(`encode_camera_frame_yuv420_tiles` — one §5.12.2 `coded_tile_data`
+run per column for `anchor_tile_col`-addressed tile-list entries).
+Corpus stream 113 (`self-gop-192x128-q72-tiles-2x2`) pins the first
+multi-tile stream, byte-identical across three independent black-box
+reference decoders.
+
+r433 adds the §5.9.15 **non-uniform** arm
+(`uniform_tile_spacing_flag = 0`): `TileInfo::explicit_layout` (the
+parser-twin derivation under the `maxTileWidthSb` /
+recomputed-`maxTileAreaSb` / widest-column `maxTileHeightSb` bounds)
+drives `encode_key_frame_yuv{,420}_with_q_tile_layout` and
+`encode_gop_yuv{,420}_with_q_tile_layout` — uneven splits no uniform
+layout can express (1+2 / 2+1 / 1+3+1 columns, 1+2 rows) round-trip
+pixel-exact and decode byte-identical in three independent reference
+decoders.
+
+### Multi-tile-group frames (r433)
+
+Both arms of the §5.11.1 tile-group SPLIT wire shape. Decode: the
+OBU walk accumulates a frame's tiles across several
+`OBU_TILE_GROUP` OBUs under the §5.9.1 `SeenFrameHeader` discipline
+— §6.10.1 running-`TileNum` ordering enforced, decode fires only at
+`tg_end == NumTiles - 1`, `OBU_REDUNDANT_FRAME_HEADER` accepted
+mid-frame iff its §6.8.1 `frame_header_copy` bytes match the
+original, mid-frame `OBU_FRAME_HEADER` / flagged `OBU_FRAME` groups /
+temporal units ending mid-frame all reject with the typed
+`Error::TileGroupInvalid`. Encode:
+`encode_key_frame_yuv{,420}_with_q_tile_groups`,
+`GopTuning::tile_groups` and `PyramidTuning::tile_groups` emit a
+standalone `OBU_FRAME_HEADER` (§5.3.4 trailing bits) plus N
+tile-group OBUs with contiguous `tg_start ..= tg_end` slices — the
+per-tile entropy payloads are byte-identical to the single-group
+stream (framing-only change), and `tile_groups <= 1` reproduces the
+§5.10 `OBU_FRAME` packing bit for bit. Every repacked grouping,
+native split KEY / GOP / pyramid / layered-ladder stream decodes
+byte-identical through three independent black-box reference
+decoders.
+
+### Spatial scalability: the SVC write arm (r431)
+
+`encode_spatial_layered_gop_yuv{,420}_with_q` codes 2..=4
+INDEPENDENTLY CODED spatial layers under ONE sequence header
+(top-layer dimension budget; smaller layers ride §5.9.5
+`frame_size_override_flag = 1`, inter frames the §5.9.7 no-found-ref
+arm), §5.3.3 `spatial_id` extension headers on every frame OBU, one
+shown frame per layer per §7.5 temporal unit, and nested §6.7.5
+operating points (every sub-bitstream opens on the layer-0 KEY).
+Layer 0 opens with the stream's only KEY frame; each enhancement
+layer opens with a §5.9.2 `INTRA_ONLY` frame refreshing only its own
+§7.20 slot pair, then predicts LAST-only inside its own rotation
+with the §8.3.1 primary-reference CDF chain riding the same pair.
+Corpus stream 114 (`self-svc-64-128-q72-spatial-layers`) pins the
+first `spatial_id > 0` stream at BOTH operating points against
+independent reference decoders' operating-point output.
+
 ### Not yet supported
 
-- Large-scale-tile WRITE side is single-tile-per-frame (`W×64`
-  camera frames — already §7.3-conformant tiles); a multi-tile
-  encoder arm (`tile_cols > 1`) is the open frontier. The DECODE
-  side handles any §7.3-conformant tile grid. No black-box
-  cross-check exists for assembled tile-list output (external
-  decoders cannot take an external anchor array); the coded tiles
-  themselves ride the corpus-validated §5.11 walk.
-- Spatial-layer (multi-`spatial_id`) streams ride the same §5.3.1
-  drop rule, but no spatial-SVC encoder arm or inter-layer
-  dependency validation exists; temporal scalability is the
-  validated axis.
+- No black-box cross-check exists for assembled §5.12 tile-list
+  output (external decoders cannot take an external anchor array);
+  the coded camera tiles themselves ride the corpus-validated §5.11
+  walk. (r433: the camera WRITE arm codes full 2-D grids — heights
+  in multiples of 64 force one §7.3.1-conformant tile row per
+  superblock row, addressed via `anchor_tile_row` /
+  `anchor_tile_col`.)
+- The spatial-SVC driver codes each layer single-tile (per-layer
+  tile layouts would need per-layer legality windows); temporal
+  ladders, GOPs, pyramids and KEY frames take full tile layouts.
+- `context_update_tile_id` is fixed at tile 0 (an exact-bytes
+  election over the NEXT frame's realized rate is a possible future
+  arm); `tile_start_and_end_present_flag = 1` single-group frames
+  are read but never emitted.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /
