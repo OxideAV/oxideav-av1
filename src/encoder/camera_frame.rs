@@ -64,10 +64,12 @@ pub struct CameraFrameEncode {
     /// `coded_tile_data` run (kept for the r430 single-tile shape;
     /// equals `coded_tiles[0]`).
     pub coded_tile_data: Vec<u8>,
-    /// r431 — every tile's coded bytes in tile-scan order (one
-    /// §5.12.2 `coded_tile_data` run per tile; a §5.12 tile-list
-    /// entry at `anchor_tile_col = k` consumes `coded_tiles[k]` —
-    /// camera frames are one tile row high per §7.3.1).
+    /// r431/r433 — every tile's coded bytes in tile-scan (row-major)
+    /// order: one §5.12.2 `coded_tile_data` run per tile of the
+    /// camera frame's grid. A §5.12 tile-list entry at
+    /// `(anchor_tile_row, anchor_tile_col) = (r, k)` consumes
+    /// `coded_tiles[r * TileCols + k]` (every §7.3.1 camera tile is
+    /// one superblock high, so `TileRows = height / 64`).
     pub coded_tiles: Vec<Vec<u8>>,
     /// Encoder reconstruction (what the §7.3.2 camera-tile decode
     /// reproduces byte-for-byte; this arm is 8-bit).
@@ -105,9 +107,11 @@ pub fn build_camera_seq_yuv420_8bit(max_width: u32, max_height: u32) -> Sequence
 /// means", so the prediction source IS the externally agreed anchor
 /// plane set, not a decoded stream).
 ///
-/// `input` and `anchor` share one geometry: width a multiple of 64
-/// up to 4096, height exactly 64 (one 64-pel superblock — the frame
-/// is its own §7.3-conformant tile).
+/// `input` and `anchor` share one geometry: width AND height
+/// multiples of 64 up to 4096. r433 — a taller frame codes one
+/// §7.3-conformant tile ROW per 64-pel superblock row (§7.3.1
+/// requires camera tiles exactly one superblock high); the r430
+/// `W×64` shape is the single-row special case.
 ///
 /// ## Errors
 ///
@@ -122,16 +126,16 @@ pub fn encode_camera_frame_yuv420(
     encode_camera_frame_yuv420_tiles(input, anchor, base_q_idx, 0)
 }
 
-/// r431 — [`encode_camera_frame_yuv420`] with §5.9.15 tile COLUMNS:
-/// `tile_cols_log2 > 0` splits the `W × 64` camera frame into
+/// r431/r433 — [`encode_camera_frame_yuv420`] with a §5.9.15 tile
+/// GRID: `tile_cols_log2 > 0` splits each superblock row into
 /// multiple one-superblock-high tiles (each a whole multiple of 64
-/// wide — every tile satisfies the §7.3.1 camera-tile constraints),
-/// surfacing one §5.12.2 `coded_tile_data` run per tile on
-/// [`CameraFrameEncode::coded_tiles`]. A §5.12 tile list can then
-/// reference DIFFERENT tiles of the SAME camera frame
-/// (`anchor_tile_col` selects the column), which is what makes
-/// multi-tile camera frames richer large-scale-tile material than
-/// the r430 one-frame-one-tile shape.
+/// wide), and a height above 64 adds one §7.3.1-conformant tile ROW
+/// per 64-pel superblock row — every tile satisfies the §7.3.1
+/// camera-tile constraints. One §5.12.2 `coded_tile_data` run per
+/// grid tile lands on [`CameraFrameEncode::coded_tiles`] in
+/// tile-scan order, so a §5.12 tile list can reference DIFFERENT
+/// tiles of the SAME camera frame through
+/// (`anchor_tile_row`, `anchor_tile_col`).
 pub fn encode_camera_frame_yuv420_tiles(
     input: &Yuv420Frame,
     anchor: &Yuv420Frame,
@@ -140,7 +144,9 @@ pub fn encode_camera_frame_yuv420_tiles(
 ) -> Result<CameraFrameEncode, Error> {
     if input.width != anchor.width
         || input.height != anchor.height
-        || input.height != 64
+        || input.height == 0
+        || input.height % 64 != 0
+        || input.height > 4096
         || input.width == 0
         || input.width % 64 != 0
         || input.width > 4096
@@ -184,7 +190,19 @@ pub fn encode_camera_frame_yuv420_tiles(
         cdef_units: false,
         lr: false,
         freeze_cdfs: true,
-        tiles: (tile_cols_log2, 0),
+        // r433 — every §7.3.1 camera tile is exactly ONE superblock
+        // high, so a taller frame forces one tile row per superblock
+        // row: `TileRowsLog2 = ceil_log2( sbRows )` realizes 1-SB-high
+        // uniform rows (a 64-high frame keeps the r430/r431 single-row
+        // shape bit for bit).
+        tiles: (tile_cols_log2, {
+            let sb_rows = input.height / 64;
+            if sb_rows <= 1 {
+                0
+            } else {
+                32 - (sb_rows - 1).leading_zeros()
+            }
+        }),
         // §7.3 camera frames stay on the single-`OBU_FRAME` packing
         // (the §5.12 tile-list assembly consumes the raw
         // coded_tile_data, not the OBU framing).

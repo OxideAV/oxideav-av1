@@ -157,6 +157,16 @@ pub struct PyramidTuning {
     /// tuning's field of the same name). `false` keeps the
     /// all-RESTORE_NONE shape on every frame (the A/B baseline).
     pub lr: bool,
+    /// r433 — the §5.9.15 uniform tile layout `(TileColsLog2,
+    /// TileRowsLog2)` coded on EVERY frame of the pyramid (KEY, ALT,
+    /// MID, B). `(0, 0)` is the single-tile shape (bit-identical to
+    /// the pre-r433 streams); must sit inside the §5.9.15 legal
+    /// window for the frame size.
+    pub tiles: (u32, u32),
+    /// r433 — §5.11.1 tile-group packaging on every coded frame (see
+    /// [`super::inter_frame::GopTuning::tile_groups`]). `0` / `1`
+    /// keep the single-`OBU_FRAME` shape.
+    pub tile_groups: u32,
 }
 
 impl Default for PyramidTuning {
@@ -171,6 +181,8 @@ impl Default for PyramidTuning {
             cdef: true,
             cdef_units: true,
             lr: true,
+            tiles: (0, 0),
+            tile_groups: 1,
         }
     }
 }
@@ -432,7 +444,7 @@ impl PyramidSession {
     fn new(frames: &[YuvFrame], base_q: u8, tuning: PyramidTuning) -> Result<Self, Error> {
         let n = frames.len();
         let (width, height) = (frames[0].width, frames[0].height);
-        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry(
+        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles(
             &frames[0],
             base_q,
             tuning.model,
@@ -441,6 +453,13 @@ impl PyramidSession {
             tuning.cdef,
             tuning.cdef_units,
             tuning.lr,
+            // r433 — the pyramid-wide §5.9.15 tile layout + §5.11.1
+            // tile-group packaging (KEY delta-q stays default-on, as
+            // the pre-r433 `encode_key_frame_yuv_seg_carry` shape).
+            tuning.tiles,
+            tuning.tile_groups,
+            None,
+            true,
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -565,8 +584,8 @@ impl PyramidSession {
                         cdef_units: self.tuning.cdef_units,
                         lr: self.tuning.lr,
                         freeze_cdfs: false,
-                        tiles: (0, 0),
-                        tile_groups: 1,
+                        tiles: self.tuning.tiles,
+                        tile_groups: self.tuning.tile_groups,
                         explicit_tiles: None,
                     };
                     let q = self.role_q(&role);

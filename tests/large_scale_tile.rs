@@ -341,3 +341,73 @@ fn conformance_gate_rejects_out_of_envelope_inputs() {
         Err(Error::TileListInvalid)
     );
 }
+
+// ---------------------------------------------------------------------
+// r433 — 2-D camera grids: tile ROWS via taller camera frames.
+// ---------------------------------------------------------------------
+
+/// A 128×128 camera frame at `tile_cols_log2 = 1` codes a 2×2 grid
+/// of 64×64 §7.3.1-conformant tiles (each one superblock high — the
+/// r433 write arm forces one tile row per superblock row). A §5.12
+/// tile list addressing all four grid tiles through
+/// `(anchor_tile_row, anchor_tile_col)` reassembles the full frame
+/// byte-exact to the camera reconstruction.
+#[test]
+fn camera_grid_2x2_reassembles_through_anchor_tile_rows() {
+    use oxideav_av1::encoder::encode_camera_frame_yuv420_tiles;
+    let anchor = textured(11, 128, 128);
+    let cam = camera_view(&anchor);
+    let e = encode_camera_frame_yuv420_tiles(&cam, &anchor, 60, 1).expect("camera grid encodes");
+    assert_eq!(e.coded_tiles.len(), 4, "2x2 grid");
+    let fh_ti = e.fh.tile_info.as_ref().expect("camera header tile info");
+    assert_eq!((fh_ti.tile_cols, fh_ti.tile_rows), (2, 2));
+    let anchor_frames = vec![anchor_spec_frame(&anchor)];
+    // One entry per grid tile at its own output position (tile-scan
+    // order: row-major).
+    let tl = TileListObu {
+        output_frame_width_in_tiles_minus_1: 1,
+        output_frame_height_in_tiles_minus_1: 1,
+        entries: (0..4)
+            .map(|i| TileListEntry {
+                anchor_frame_idx: 0,
+                anchor_tile_row: (i / 2) as u8,
+                anchor_tile_col: (i % 2) as u8,
+                coded_tile_data: e.coded_tiles[i].clone(),
+            })
+            .collect(),
+    };
+    let out = decode_tile_list(&e.seq, &e.fh, &anchor_frames, &tl).expect("grid decodes");
+    assert_eq!((out.width, out.height), (128, 128));
+    assert_eq!(out.planes[0], e.recon.y, "grid luma");
+    assert_eq!(out.planes[1], e.recon.u, "grid U");
+    assert_eq!(out.planes[2], e.recon.v, "grid V");
+}
+
+/// The lossless 2-row arm: a 64×128 camera frame (single column, two
+/// tile rows) at `q = 0` reproduces the source exactly through the
+/// per-row tile-list assembly.
+#[test]
+fn lossless_camera_tile_rows_reproduce_the_source() {
+    use oxideav_av1::encoder::encode_camera_frame_yuv420_tiles;
+    let anchor = textured(13, 64, 128);
+    let cam = camera_view(&anchor);
+    let e = encode_camera_frame_yuv420_tiles(&cam, &anchor, 0, 0).expect("camera rows encode");
+    assert_eq!(e.coded_tiles.len(), 2, "two tile rows");
+    let tl = TileListObu {
+        output_frame_width_in_tiles_minus_1: 0,
+        output_frame_height_in_tiles_minus_1: 1,
+        entries: (0..2)
+            .map(|r| TileListEntry {
+                anchor_frame_idx: 0,
+                anchor_tile_row: r as u8,
+                anchor_tile_col: 0,
+                coded_tile_data: e.coded_tiles[r].clone(),
+            })
+            .collect(),
+    };
+    let out = decode_tile_list(&e.seq, &e.fh, &[anchor_spec_frame(&anchor)], &tl).expect("decodes");
+    assert_eq!((out.width, out.height), (64, 128));
+    assert_eq!(out.planes[0], cam.y, "lossless rows: luma");
+    assert_eq!(out.planes[1], cam.u, "lossless rows: U");
+    assert_eq!(out.planes[2], cam.v, "lossless rows: V");
+}

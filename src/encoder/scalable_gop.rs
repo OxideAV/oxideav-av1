@@ -62,7 +62,7 @@ use crate::encoder::inter_frame::{
     InterFrameConfig, RefSlotCarry, SavedMotionField,
 };
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
-use crate::encoder::key_frame::encode_key_frame_yuv_seg_carry;
+use crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles;
 use crate::encoder::obu::{
     build_temporal_unit, write_obu_with_size, ObuExtensionHeader, ObuHeader,
 };
@@ -189,6 +189,24 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
     base_q_idx: u8,
     temporal_layers: u8,
 ) -> Result<TemporalLayeredGopYuv, Error> {
+    encode_temporal_layered_gop_yuv_with_q_tiles(frames, base_q_idx, temporal_layers, (0, 0), 1)
+}
+
+/// r433 — [`encode_temporal_layered_gop_yuv_with_q`] with a §5.9.15
+/// uniform tile layout (`(TileColsLog2, TileRowsLog2)`, coded on
+/// every frame of the ladder) and §5.11.1 tile-group packaging
+/// (`tile_groups > 1` splits each frame's tiles across that many
+/// `OBU_TILE_GROUP` OBUs behind a standalone `OBU_FRAME_HEADER`; the
+/// §5.3.3 extension header rides EVERY frame OBU either way, per
+/// §7.5). `(0, 0)` / `1` reproduce the unlayered-tile stream bit for
+/// bit.
+pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    temporal_layers: u8,
+    tiles: (u32, u32),
+    tile_groups: u32,
+) -> Result<TemporalLayeredGopYuv, Error> {
     if !(2..=4).contains(&temporal_layers) {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -196,7 +214,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
     let n = frames.len();
 
     // ---- KEY frame + the multi-OP sequence header. ----
-    let (key, key_carry) = encode_key_frame_yuv_seg_carry(
+    let (key, key_carry) = encode_key_frame_yuv_seg_carry_tiles(
         &frames[0],
         base_q_idx,
         RateModel::Twin,
@@ -205,6 +223,11 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
         /* cdef = */ true,
         /* cdef_units = */ true,
         /* lr = */ true,
+        // r433 — the ladder-wide tile layout + tile-group packaging.
+        tiles,
+        tile_groups,
+        None,
+        /* delta_q = */ true,
     )?;
     let mut seq = key.seq.clone();
     seq.operating_points = operating_points_for(seq.operating_points[0], temporal_layers);
@@ -307,8 +330,8 @@ pub fn encode_temporal_layered_gop_yuv_with_q(
             cdef_units: true,
             lr: true,
             freeze_cdfs: false,
-            tiles: (0, 0),
-            tile_groups: 1,
+            tiles,
+            tile_groups,
             explicit_tiles: None,
         };
         let (mut obus, recon, saved, carry, _aux) =
@@ -704,6 +727,29 @@ pub fn encode_temporal_layered_gop_yuv420_with_q(
 ) -> Result<TemporalLayeredGop, Error> {
     let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
     let t = encode_temporal_layered_gop_yuv_with_q(&wide, base_q_idx, temporal_layers)?;
+    Ok(TemporalLayeredGop {
+        gop: narrow_gop_8bit(t.gop),
+        temporal_ids: t.temporal_ids,
+    })
+}
+
+/// 8-bit 4:2:0 sibling of
+/// [`encode_temporal_layered_gop_yuv_with_q_tiles`].
+pub fn encode_temporal_layered_gop_yuv420_with_q_tiles(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    temporal_layers: u8,
+    tiles: (u32, u32),
+    tile_groups: u32,
+) -> Result<TemporalLayeredGop, Error> {
+    let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
+    let t = encode_temporal_layered_gop_yuv_with_q_tiles(
+        &wide,
+        base_q_idx,
+        temporal_layers,
+        tiles,
+        tile_groups,
+    )?;
     Ok(TemporalLayeredGop {
         gop: narrow_gop_8bit(t.gop),
         temporal_ids: t.temporal_ids,

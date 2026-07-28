@@ -170,6 +170,8 @@ fn baseline_tuning() -> PyramidTuning {
         cdef: true,
         cdef_units: true,
         lr: true,
+        tiles: (0, 0),
+        tile_groups: 1,
     }
 }
 
