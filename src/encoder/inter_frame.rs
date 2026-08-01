@@ -1088,11 +1088,12 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         model,
         if key_mask.is_some() { alt_q } else { &[] },
         key_mask.as_deref(),
-        // r428 scope: CDEF stays off SEGMENTED GOPs entirely (the
-        // filtered-reference perturbation destabilises the r423
-        // temporal segment-map election chain) — the pairing is left
-        // open.
-        tuning.cdef && alt_q.is_empty(),
+        // r436 — CDEF is armed on segmented GOPs too (the r428
+        // scope gate is lifted; the KEY of a plain segmented GOP is
+        // itself unsegmented — it takes the table only under
+        // exactness-demand masks, where the encoder-side
+        // `exact_mask` gate closes CDEF anyway).
+        tuning.cdef,
         tuning.cdef_units,
         // r429 scope: LR mirrors the CDEF segmented-GOP gate.
         tuning.lr && alt_q.is_empty(),
@@ -2333,7 +2334,23 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // source-luma activity to reduced §5.11.13 delta units (`None`
     // when the spread is flat — the single-quantiser arm is then the
     // only arm searched).
-    let delta_plan: Option<Vec<i32>> = if cfg.delta_q && alt_q.is_empty() && !lossless {
+    // r436 — §5.9.17 × §5.9.14: the delta-q arm runs on SEGMENTED
+    // frames too. §7.12.2 `get_qindex` composes the segment's
+    // SEG_LVL_ALT_Q data on top of the running §5.11.13
+    // `CurrentQIndex` (both the search twin and the decoder ride the
+    // same shared derivation), so the plan and the segment map are
+    // orthogonal on the wire. Conservative guard per the §7.12.2
+    // note: tables carrying a LOSSLESS segment stay on the
+    // single-quantiser arm — a `CurrentQIndex` swing must never lift
+    // a lossless segment off qindex 0 (`CodedLossless` frames are
+    // excluded by `!lossless` and the §5.9.17 `base_q_idx > 0` read
+    // gate; the exactness-demand/auto-lossless paths carry such a
+    // segment by construction and stay off with it).
+    let seg_lossless_free = alt_q.is_empty()
+        || !seg_lossless_array(base_q_idx, alt_q)[..alt_q.len()]
+            .iter()
+            .any(|&l| l);
+    let delta_plan: Option<Vec<i32>> = if cfg.delta_q && !lossless && seg_lossless_free {
         delta_q_plan_units(input, mi_rows, mi_cols)
     } else {
         None
@@ -3038,9 +3055,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // filters every non-skip 8×8 block regardless of its segment, so
     // an elected strength would break the demanded regions'
     // pixel-exactness contract even when the frame-total SSD improves.
-    // Segmented frames also stay off this arm (r428 scope): the CDEF
-    // reference perturbation destabilises the r423 temporal
-    // segment-map election chain — the pairing is left open.
+    // r436 — SEGMENTED frames join the arm (the r428 scope gate is
+    // lifted): §7.15 is segment-agnostic apart from the Skips grid,
+    // the r423 temporal segment-map election replays the committed
+    // trees (segment ids are carried state, not pixels — a filtered
+    // reference cannot desync it), and the whole pairing is pinned
+    // bit-exact against independent decoders.
     // r429 — the elected frame-start CDF state, rebuilt on demand for
     // the CDEF / LR tile re-emissions: the primary-ref election may
     // have swapped the ordinal — reproduce its §8.3.1 start state
@@ -3089,13 +3109,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     let mut committed_cdef_bits: u32 = 0;
     let mut cdef_elected = false;
-    if cfg.cdef
-        && !lossless
-        && seq.enable_cdef
-        && cfg.exact_mask.is_none()
-        && !cfg.auto_lossless
-        && alt_q.is_empty()
-    {
+    if cfg.cdef && !lossless && seq.enable_cdef && cfg.exact_mask.is_none() && !cfg.auto_lossless {
         if let Some(election) =
             crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
                 mirror: state.mirror(),
@@ -3975,12 +3989,25 @@ impl PSearchCtx {
     /// segment of a 10/12-bit GOP (encoder recon diverged from the
     /// decoder's §7.12.3 dequantisation of the very coefficients it
     /// wrote).
+    /// r436 — §5.9.17 pairing: on a delta-q-armed frame the §7.12.2
+    /// step-3 branch composes the segment's data on top of the
+    /// RUNNING `CurrentQIndex` (the §5.11.13 walk), not `base_q_idx`
+    /// — the caller's `frame_qp` carries the superblock's live index,
+    /// and the decoder's `get_qindex( 0, segment_id )` will resolve
+    /// to exactly this value (baking `base_q_idx + data` here
+    /// mis-quantised every non-zero segment of a delta-stepped
+    /// superblock: encoder recon diverged from the §7.12.3
+    /// dequantisation of the very coefficients it wrote).
     fn seg_qp(&self, frame_qp: &QuantizerParams, segment_id: u8) -> QuantizerParams {
         if self.seg_alt_q.is_empty() || segment_id == 0 {
             return *frame_qp;
         }
-        let q = (i32::from(self.base_q_idx) + i32::from(self.seg_alt_q[segment_id as usize]))
-            .clamp(0, 255) as u8;
+        let base = if frame_qp.delta_q_present {
+            i32::from(frame_qp.current_q_index)
+        } else {
+            i32::from(self.base_q_idx)
+        };
+        let q = (base + i32::from(self.seg_alt_q[segment_id as usize])).clamp(0, 255) as u8;
         QuantizerParams::neutral(q, frame_qp.bit_depth)
     }
 
