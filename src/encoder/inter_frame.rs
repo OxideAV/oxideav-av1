@@ -1095,8 +1095,10 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // `exact_mask` gate closes CDEF anyway).
         tuning.cdef,
         tuning.cdef_units,
-        // r429 scope: LR mirrors the CDEF segmented-GOP gate.
-        tuning.lr && alt_q.is_empty(),
+        // r436 — LR joins CDEF on segmented GOPs (the KEY of a
+        // plain segmented GOP is itself unsegmented; under
+        // exactness-demand masks the encoder-side gate closes LR).
+        tuning.lr,
         // r431 — the GOP-wide §5.9.15 tile layout (r433: the explicit
         // non-uniform override rides beside it).
         tuning.tiles,
@@ -3099,12 +3101,17 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // r429 — loop restoration needs the PRE-CDEF reconstruction
     // (§7.17 reads `CurrFrame` at stripe boundaries): snapshot before
     // the CDEF election below overwrites it.
+    // r436 — SEGMENTED frames join this arm too (the last in-loop
+    // pairing): §7.17 is segment-agnostic, the unit fits run on the
+    // committed reconstruction, and the tile re-emission replays the
+    // committed trees (segment ids included) with the §5.11.57
+    // interleave — the pairing is pinned bit-exact against
+    // independent decoders alongside the CDEF one.
     let lr_armed = cfg.lr
         && !lossless
         && seq.enable_restoration
         && cfg.exact_mask.is_none()
-        && !cfg.auto_lossless
-        && alt_q.is_empty();
+        && !cfg.auto_lossless;
     let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     let mut committed_cdef_bits: u32 = 0;

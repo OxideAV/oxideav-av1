@@ -996,9 +996,8 @@ literals via tile re-emission; corpus 110) and the §5.9.20/§5.11.57/
 fit) + self-guided (projection fit over all 16 Sgr sets) mirrored on
 the encoder recon path with exact-realized-bytes settlement (+0.32 dB
 at ~2 B/frame on detail content; corpus 111). r436 lifts the
-segmented-frame gate on both the CDEF and the delta-q elections (see
-the segmentation-pairings section; loop restoration keeps its
-segmented gate).
+segmented-frame gates on the CDEF, delta-q AND loop-restoration
+elections (see the segmentation-pairings section).
 
 ### Mirror-path retirement (r428)
 
@@ -1134,19 +1133,21 @@ native split KEY / GOP / pyramid / layered-ladder stream decodes
 byte-identical through three independent black-box reference
 decoders.
 
-### Segmentation pairings: delta-q and CDEF (r436)
+### Segmentation pairings: delta-q, CDEF and LR (r436)
 
-The r428 scope gates are lifted: §5.9.17 per-superblock delta-q and
-§5.9.19/§7.15 CDEF (frame-level + per-unit ids) both run on ACTIVELY
-segmented frames. A non-zero-segment block of a delta-stepped
+The r428/r429 scope gates are lifted: §5.9.17 per-superblock
+delta-q, §5.9.19/§7.15 CDEF (frame-level + per-unit ids) AND
+§5.9.20/§7.17 loop restoration all run on ACTIVELY segmented
+frames. A non-zero-segment block of a delta-stepped
 superblock quantises at the §7.12.2 step-3 composition
 `Clip3(0, 255, CurrentQIndex + FeatureData)` (an encoder-side
 per-segment bundle previously baked `base_q_idx + data` — fixed);
 tables carrying a lossless segment conservatively stay on the
-single-quantiser arm per the §7.12.2 note. Corpus streams 120 + 121
+single-quantiser arm per the §7.12.2 note. Corpus streams 120–122
 (`self-gop-128x128-q120-seg-delta-q`,
-`self-gop-128x96-q140-seg-cdef`) pin both pairings byte-identical
-through three independent black-box reference decoders.
+`self-gop-128x96-q140-seg-cdef`, `self-gop-128x96-q140-seg-lr`) pin
+all three pairings byte-identical through three independent
+black-box reference decoders.
 
 ### `context_update_tile_id` election (r436)
 
@@ -1210,10 +1211,8 @@ decoders at both operating points.
   `anchor_tile_col`.)
 - `tile_start_and_end_present_flag = 1` single-group frames are
   read but never emitted.
-- Loop restoration keeps its segmented-frame gate (the CDEF and
-  delta-q pairings opened in r436; the LR × segmentation pairing is
-  the remaining in-loop one), and delta-q stays off tables carrying
-  a lossless segment (conservative §7.12.2-note guard).
+- Delta-q stays off tables carrying a lossless segment
+  (conservative §7.12.2-note guard).
 - The §6.8.14 donor election runs on the plain GOP and
   temporal-ladder drivers (the ladder under the freeze-at-first-
   consumption discipline); the pyramid and SVC drivers still emit

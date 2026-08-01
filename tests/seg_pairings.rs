@@ -319,4 +319,61 @@ fn seg_pairings_fixture_staging() {
     .expect("segmented cdef encode");
     assert!(cd.cdef_elections.iter().any(|&e| e));
     dump("gop-128x96-q140-seg-cdef", &cd);
+    let lr = encode_gop_yuv420_with_q_seg_tuned(
+        &frames,
+        140,
+        &SEG_TABLE,
+        GopTuning {
+            delta_q: false,
+            cdef: false,
+            cdef_units: false,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented lr encode");
+    assert!(lr.lr_elections.iter().any(|&e| e));
+    dump("gop-128x96-q140-seg-lr", &lr);
+}
+
+/// §5.9.20/§7.17 loop restoration on an actively segmented GOP (the
+/// last in-loop pairing): per-unit Wiener/self-guided plans elected
+/// beside a live segment map, the §5.11.57 interleave re-emitted
+/// around the committed segment-carrying trees — and the restored
+/// reference chain decodes bit-exact.
+#[test]
+fn segmented_lr_pairs_and_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..5).map(|t| mixed_frame(128, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_tuned(
+        &frames,
+        140,
+        &SEG_TABLE,
+        GopTuning {
+            // Isolate the LR axis.
+            delta_q: false,
+            cdef: false,
+            cdef_units: false,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented lr encode");
+    assert!(
+        enc.lr_elections.iter().any(|&e| e),
+        "designed detail content must elect LR on a segmented P-frame: {:?}",
+        enc.lr_elections
+    );
+    assert!(
+        enc.p_segment_maps.iter().any(|m| m.iter().any(|&s| s != 0)),
+        "the segment map must actually commit non-zero segments"
+    );
+    assert_decodes_to_recons("seg-lr", &enc);
+
+    let headers = wire_headers(&enc, 128, 96);
+    assert!(
+        headers.iter().any(|fh| {
+            let seg_on = fh.segmentation_params.as_ref().is_some_and(|sp| sp.enabled);
+            let lr_on = fh.lr_params.as_ref().is_some_and(|lp| lp.uses_lr);
+            seg_on && lr_on
+        }),
+        "no wire header pairs segmentation_enabled with UsesLr"
+    );
 }
