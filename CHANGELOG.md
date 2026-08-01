@@ -4,6 +4,38 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/OxideAV/oxideav-av1/compare/v0.1.16...v0.1.17) - 2026-08-01
+
+### Other
+
+- r436 segmented loop restoration — the last in-loop pairing, corpus pin 122
+- r436 §6.8.14 donor election on the temporal ladder — freeze-at-first-consumption discipline
+- r436 segmentation pairings — delta-q + CDEF on segmented frames, §7.12.2 seg-bundle fix, corpus pins 120+121
+- r436 §6.8.14 context_update_tile_id election — exact-bytes donor replay, wire patch-back, corpus pin 119
+- r436 per-layer tile layouts + tile-group packaging on the spatial-SVC driver, corpus pin 118
+- *(camera_frame)* the geometry-envelope unit test tracks the r433 2-D grid envelope
+- r429-r433 status — multi-tile write arm, tile-group split framing, non-uniform layouts, spatial SVC, per-unit CDEF/LR, KEY delta-q
+- tile layouts through the pyramid/adaptive + temporal-ladder drivers, §7.3 camera tile GRIDS, corpus pins 116 + 117
+- §5.11.1 multi-tile-group frames (both arms) + §5.9.15 non-uniform tile layouts (write arm)
+- RUST_MIN_STACK=16MiB via .cargo/config [env] — fix windows-debug test stack overflow
+- *(cdef_unit_ab)* isolate the CDEF axis from the §5.9.17 delta-q confound
+- KEY-frame §5.9.17 per-superblock delta-q election + corpus pin 115
+- pin the first multi-tile and first spatially scalable streams (corpus 113 + 114)
+- spatial-scalability write arm — independent spatial layers, spatial_id extension headers, nested §6.7.5 operating points
+- §5.9.15 multi-tile WRITE arm — KEY + generic inter drivers, camera-frame tile columns
+- pin the first temporally scalable stream (corpus 112) — digested at every operating point
+- §7.3 camera-frame write arm — LST material end to end
+- tile list: §5.12 OBU parse/write + the §7.3 large-scale-tile decoding process
+- temporally scalable GOP arm — §6.7.5 operating points + §5.3.3 extension headers on the wire
+- operating-point selection (§5.5.1/§6.7.5) + the §5.3.1 drop_obu rule
+- tier the test matrix — full suite on ubuntu/macos, lib-tests smoke on windows
+- 10-bit depth-axis tripwire — election + byte-exact round trip at BitDepth 10
+- pin the first loop-restoration stream (corpus 111)
+- loop-restoration election — §5.9.20/§5.11.57/§7.17 per-unit Wiener + self-guided with exact-bytes settlement
+- pin the first per-unit CDEF stream (corpus 110)
+- per-64x64 CDEF strengths — cdef_bits > 0 election with exact-bytes settlement
+- seg_qp derives the frame's real bit depth — segmented >8-bit GOPs fix + corpus-109 pin
+
 - SEGMENTED LOOP RESTORATION (r436): the r429 segmented-frame gate on the §5.9.20/§7.17 election is lifted too — per-unit Wiener/self-guided plans now fit and elect on ACTIVELY segmented frames (the §5.11.57 `read_lr` interleave re-emitted around the committed segment-carrying trees, restored frames feeding the §7.20 reference chain), completing the in-loop pairing set. Corpus pin 122 (`self-gop-128x96-q140-seg-lr`): the first stream pairing `segmentation_enabled = 1` with `UsesLr = 1` — digest byte-identical across THREE independent black-box reference decoders
 - §6.8.14 donor election on the TEMPORAL LADDER (r436): `encode_temporal_layered_gop_yuv{,420}_with_q_tiles` now elects `context_update_tile_id` on multi-tile ladders under the MULTI-CONSUMER discipline — several frames may chain their §8.3.1 primary reference off the same §7.20 slot (the KEY's `allFrames` refresh seeds all eight), so a slot's donor set FREEZES at its FIRST consumption whether or not the election won (a later consumer re-electing would silently re-start the first consumer's already-committed CDF chain); on a win the primary frame's already-emitted field is patched in place and every slot holding that carry is swept by pointer identity. Top-layer (non-reference) frames skip donor collection — their donation is never consumed. Every §6.7.5 operating point decodes the patched stream bit-exact (layer drops leave each surviving frame's donation intact)
 - SEGMENTATION PAIRINGS (r436): the r428 scope gates are lifted — §5.9.17 per-superblock delta-q AND §5.9.19/§7.15 CDEF (frame-level + per-unit `cdef_bits > 0` ids) now run on ACTIVELY segmented frames. BUG FIX en route: the encoder's per-segment quantiser bundle baked `base_q_idx + FeatureData` unconditionally — under an armed delta-q frame the §7.12.2 step-3 composition is `Clip3(0, 255, CurrentQIndex + FeatureData)` (the RUNNING §5.11.13 index), so every non-zero segment of a delta-stepped superblock mis-quantised and the encoder recon diverged from the decoder's §7.12.3 dequantisation; the bundle now keys off `delta_q_present`/`current_q_index`. Conservative guard per the §7.12.2 note: tables carrying a LOSSLESS segment stay on the single-quantiser arm. New `seg_pairings` suite (probe→election→wire-audit→bit-exact decode on both pairings + the lossless-table guard); corpus pins 120 + 121 (`self-gop-128x128-q120-seg-delta-q`, `self-gop-128x96-q140-seg-cdef`) — both digests byte-identical across THREE independent black-box reference decoders, first streams pairing `segmentation_enabled = 1` with `delta_q_present = 1` / live CDEF params
