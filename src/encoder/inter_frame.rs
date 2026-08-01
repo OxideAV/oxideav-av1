@@ -164,6 +164,12 @@ pub struct TunedGopYuv {
     /// r429 — each P-frame's §5.9.20 loop-restoration election
     /// (index 0 is the first P-frame).
     pub lr_elections: Vec<bool>,
+    /// r436 — each P-frame's §6.8.14 donor election: `Some(t)` when
+    /// the frame elected tile `t != 0` of its PRIMARY frame as the
+    /// CDF donor (the primary frame's `context_update_tile_id` was
+    /// patched to `t` on the wire); `None` when the tile-0 donation
+    /// stood (index 0 is the first P-frame).
+    pub ctx_donor_elections: Vec<Option<u32>>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -210,6 +216,12 @@ pub struct TunedGop {
     /// r429 — each P-frame's §5.9.20 loop-restoration election
     /// (index 0 is the first P-frame).
     pub lr_elections: Vec<bool>,
+    /// r436 — each P-frame's §6.8.14 donor election: `Some(t)` when
+    /// the frame elected tile `t != 0` of its PRIMARY frame as the
+    /// CDF donor (the primary frame's `context_update_tile_id` was
+    /// patched to `t` on the wire); `None` when the tile-0 donation
+    /// stood (index 0 is the first P-frame).
+    pub ctx_donor_elections: Vec<Option<u32>>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -289,6 +301,27 @@ pub(crate) struct RefSlotCarry {
     pub(crate) mi_rows: u32,
     pub(crate) mi_cols: u32,
     pub(crate) gm_params: [[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME],
+    /// r436 — §6.8.14 DONOR CANDIDATES: every tile's frame-end
+    /// adapted CDF state, in tile order (`donor_cdfs[ t ]` = tile
+    /// `t`'s state; `donor_cdfs[ 0 ] == cdfs` — the header was
+    /// emitted with `context_update_tile_id = 0`). Populated only
+    /// when the frame was encoded with
+    /// [`InterFrameConfig::collect_donor_cdfs`] on a multi-tile
+    /// layout; EMPTY otherwise, and cleared by the driver once a
+    /// consumer frame's election commits the donor (later consumers
+    /// of the same slot must load the COMMITTED donation, not
+    /// re-elect).
+    pub(crate) donor_cdfs: Vec<Box<TileCdfContext>>,
+    /// r436 — the position of this frame's §5.9.15
+    /// `context_update_tile_id` field on the wire: `(bit offset from
+    /// the start of the frame-header payload, field width in bits)`.
+    /// `Some` exactly when the layout codes the field
+    /// (`TileColsLog2 + TileRowsLog2 > 0`); the driver patches the already-emitted
+    /// frame in place when a later consumer's election lands (the
+    /// field is fixed-width `f(n)` and nothing after it depends on
+    /// its value, so the patch is length- and meaning-preserving for
+    /// every other syntax element).
+    pub(crate) ctx_update_span: Option<(u32, u32)>,
 }
 
 /// r424 — one INTER frame's auxiliary election outcomes, returned by
@@ -317,6 +350,15 @@ pub(crate) struct InterFrameAux {
     /// a per-unit Wiener/self-guided plan won the exact-bytes
     /// settlement and landed in the header + reconstruction).
     pub(crate) lr: bool,
+    /// r436 — the §6.8.14 donor election outcome: `Some(t)` when the
+    /// exact-bytes replay election found that starting THIS frame's
+    /// §8.3.1 CDF chain from the PRIMARY frame's tile-`t` frame-end
+    /// state (`t != 0`) realizes a smaller frame than the committed
+    /// tile-0 donation. The caller must then patch the primary
+    /// frame's already-emitted `context_update_tile_id` field to `t`
+    /// (via its carry's [`RefSlotCarry::ctx_update_span`]) and fix
+    /// the stored carry so `cdfs` is the elected tile's state.
+    pub(crate) donor_elected: Option<u32>,
 }
 
 /// Integer-pel motion-search radius (luma samples per axis).
@@ -660,6 +702,16 @@ pub struct GopTuning {
     /// frame's realized tile count. Entropy payloads are
     /// byte-identical either way — only the OBU framing changes.
     pub tile_groups: u32,
+    /// r436 — §6.8.14 `context_update_tile_id` election on
+    /// multi-tile GOPs: each P-frame replays its committed trees
+    /// from every tile-donor CDF state of its PRIMARY frame and
+    /// keeps the smallest realized body; a win patches the primary
+    /// frame's already-emitted (fixed-width) field in place — no
+    /// other bit of the stream moves. `false` keeps the tile-0
+    /// donation on every frame (the A/B baseline; bit-identical to
+    /// the pre-r436 streams). Inert on single-tile layouts or with
+    /// [`Self::primary_ref`] off.
+    pub ctx_update_elect: bool,
 }
 
 impl Default for GopTuning {
@@ -676,6 +728,7 @@ impl Default for GopTuning {
             lr: true,
             tiles: (0, 0),
             tile_groups: 1,
+            ctx_update_elect: true,
         }
     }
 }
@@ -851,6 +904,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         delta_q_elections: t.delta_q_elections,
         cdef_elections: t.cdef_elections,
         lr_elections: t.lr_elections,
+        ctx_donor_elections: t.ctx_donor_elections,
     })
 }
 
@@ -1021,6 +1075,13 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // same grid the fh builder below derives).
         build_exact_mask(regions, width, height, height / 4, width / 4)
     });
+    // r436 — arm the §6.8.14 donor election: multi-tile layouts
+    // with a primary-reference chain (single-tile frames have no
+    // `context_update_tile_id` field; without a primary chain
+    // nobody consumes the donation).
+    let donor_armed = tuning.ctx_update_elect
+        && tuning.primary_ref
+        && (tuning.tiles != (0, 0) || explicit_tiles.is_some());
     let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles(
         &frames[0],
         base_q_idx,
@@ -1044,6 +1105,8 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // r431 — the KEY frame rides the same §5.9.17 delta-q switch
         // as the P-frames.
         tuning.delta_q,
+        // r436 — the KEY donates too: collect its per-tile end CDFs.
+        donor_armed,
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
@@ -1082,12 +1145,16 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     let key_carry = std::rc::Rc::new(key_carry);
     let mut carry_store: [std::rc::Rc<RefSlotCarry>; 8] =
         core::array::from_fn(|_| key_carry.clone());
+    // r436 — which temporal unit each slot's carried frame lives in
+    // (the donor patch rewrites that unit's header field in place).
+    let mut carry_tu: [usize; 8] = [0; 8];
     let mut seg_temporal_updates: Vec<bool> = Vec::new();
     let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
     let mut hp_mv_elections: Vec<bool> = Vec::new();
     let mut delta_q_elections: Vec<bool> = Vec::new();
     let mut cdef_elections: Vec<bool> = Vec::new();
     let mut lr_elections: Vec<bool> = Vec::new();
+    let mut ctx_donor_elections: Vec<Option<u32>> = Vec::new();
 
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
@@ -1124,20 +1191,51 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
             tuning.tiles,
             tuning.tile_groups,
             explicit_tiles,
+            donor_armed,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
+        // r436 — a §6.8.14 donor win: patch the PRIMARY frame's
+        // already-emitted `context_update_tile_id` to the elected
+        // tile and fix every slot holding that frame's carry so its
+        // `cdfs` is the elected donation (the donor set is cleared —
+        // the election is committed once; §7.20 slots sharing the
+        // same frame all point at the same fixed carry).
+        if let Some(t) = aux.donor_elected {
+            let src_slot = (p_index & 1) as usize;
+            let elected_from = carry_store[src_slot].clone();
+            let span = elected_from
+                .ctx_update_span
+                .expect("donor election only fires on multi-tile primaries");
+            patch_ctx_update_in_tu(&mut temporal_units[carry_tu[src_slot]], span, t);
+            let fixed = std::rc::Rc::new(RefSlotCarry {
+                cdfs: elected_from.donor_cdfs[t as usize].clone(),
+                segment_ids: elected_from.segment_ids.clone(),
+                mi_rows: elected_from.mi_rows,
+                mi_cols: elected_from.mi_cols,
+                gm_params: elected_from.gm_params,
+                donor_cdfs: Vec::new(),
+                ctx_update_span: None,
+            });
+            for slot in carry_store.iter_mut() {
+                if std::rc::Rc::ptr_eq(slot, &elected_from) {
+                    *slot = fixed.clone();
+                }
+            }
+        }
         seg_temporal_updates.push(aux.seg_temporal);
         hp_mv_elections.push(aux.hp_mv);
         delta_q_elections.push(aux.delta_q);
         cdef_elections.push(aux.cdef);
         lr_elections.push(aux.lr);
+        ctx_donor_elections.push(aux.donor_elected);
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
         // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
         mf_store[((p_index - 1) & 1) as usize] = saved_mf;
         carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
+        carry_tu[((p_index - 1) & 1) as usize] = p_index as usize;
     }
 
     // IVF v0 wrap.
@@ -1167,6 +1265,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         delta_q_elections,
         cdef_elections,
         lr_elections,
+        ctx_donor_elections,
     })
 }
 
@@ -1336,6 +1435,24 @@ pub(crate) struct InterFrameConfig<'a> {
     /// historical one-OBU shape; clamps to the realized tile count.
     /// The per-tile entropy payloads are byte-identical either way.
     pub tile_groups: u32,
+    /// r436 — collect every tile's frame-end adapted CDF state into
+    /// the returned carry ([`RefSlotCarry::donor_cdfs`]) so a LATER
+    /// frame chaining its §8.3.1 primary reference off this frame's
+    /// slot can run the §6.8.14 donor election. Inert on single-tile
+    /// layouts.
+    pub collect_donor_cdfs: bool,
+    /// r436 — §6.8.14 `context_update_tile_id` ELECTION: when the
+    /// primary carry offers donor candidates
+    /// ([`RefSlotCarry::donor_cdfs`]) and the main primary reference
+    /// survives the r424 ordinal election, replay the committed trees
+    /// from EACH candidate tile's frame-end CDF state and keep the
+    /// start state realizing the smallest assembled tile body (the
+    /// header is donor-invariant — the election is exact realized
+    /// bytes, and every candidate decodes to the identical
+    /// reconstruction). A win is reported via
+    /// [`InterFrameAux::donor_elected`]; the caller patches the
+    /// primary frame's `context_update_tile_id` on the wire.
+    pub elect_donor: bool,
     /// r433 — §5.9.15 NON-UNIFORM (explicit) tile layout: per-column
     /// widths and per-row heights in superblock units
     /// (`uniform_tile_spacing_flag = 0`). Overrides
@@ -1638,6 +1755,8 @@ fn p_frame_config_primary<'a>(
         freeze_cdfs: false,
         tiles: (0, 0),
         tile_groups: 1,
+        collect_donor_cdfs: false,
+        elect_donor: false,
         explicit_tiles: None,
     }
 }
@@ -1666,6 +1785,44 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
 /// GOLDEN_FRAME — the KEY recon again for the first two P-frames).
 /// Returns the §7.5 temporal unit (TD + `OBU_FRAME`) and this frame's
 /// reconstruction.
+/// r436 — patch an already-emitted §7.5 temporal unit's frame-header
+/// `context_update_tile_id` field in place: locate the unit's first
+/// frame-carrying OBU (`OBU_FRAME`, or the standalone
+/// `OBU_FRAME_HEADER` on the split packaging — the header bits start
+/// at payload offset 0 in both), then overwrite the fixed-width
+/// `f(n)` field at `span = (bit offset, n)` with `id`. Nothing else
+/// moves: the field is fixed-width and no later syntax element
+/// depends on its value (§5.9.15), so tile payloads, OBU sizes and
+/// every other header bit are untouched.
+pub(crate) fn patch_ctx_update_in_tu(tu: &mut [u8], span: (u32, u32), id: u32) {
+    let payload_off = {
+        let base = tu.as_ptr() as usize;
+        let mut found: Option<usize> = None;
+        for desc in crate::obu::ObuIter::new(tu) {
+            let desc = desc.expect("own temporal unit walks");
+            if matches!(
+                desc.obu_type,
+                crate::obu::ObuType::Frame | crate::obu::ObuType::FrameHeader
+            ) {
+                found = Some(desc.payload.as_ptr() as usize - base);
+                break;
+            }
+        }
+        found.expect("temporal unit carries a frame OBU")
+    };
+    let (start, n) = span;
+    for i in 0..n {
+        let bitpos = payload_off * 8 + (start + i) as usize;
+        let byte = bitpos / 8;
+        let mask = 1u8 << (7 - (bitpos % 8));
+        if (id >> (n - 1 - i)) & 1 == 1 {
+            tu[byte] |= mask;
+        } else {
+            tu[byte] &= !mask;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_p_frame_yuv(
     input: &YuvFrame,
@@ -1691,6 +1848,7 @@ fn encode_p_frame_yuv(
     tiles: (u32, u32),
     tile_groups: u32,
     explicit_tiles: Option<(&[u32], &[u32])>,
+    donor_armed: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -1714,6 +1872,11 @@ fn encode_p_frame_yuv(
     cfg.tiles = tiles;
     cfg.tile_groups = tile_groups;
     cfg.explicit_tiles = explicit_tiles;
+    // r436 — the §6.8.14 donor election arms both directions: this
+    // frame ELECTS over its primary's donor set, and COLLECTS its
+    // own per-tile end CDFs for the next frame's election.
+    cfg.collect_donor_cdfs = donor_armed;
+    cfg.elect_donor = donor_armed;
     let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2188,7 +2351,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
         // Boxed: `TileCdfContext` (and the search context) are far
         // too large for by-value moves through closure returns on a
         // 2 MiB test-thread stack (debug builds memcpy every move).
-        cdfs: Box<TileCdfContext>,
+        // r436 — EVERY tile's frame-end adapted state, in tile order
+        // (`all_cdfs[ context_update_tile_id ]` is the §8.4
+        // donation; the donor election needs the full set).
+        all_cdfs: Vec<Box<TileCdfContext>>,
         state: PartitionSyntaxWriter,
         trees: Vec<SyntaxNode>,
         recon: Box<ReconState>,
@@ -2292,9 +2458,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
             // frame raster on the single-tile layout).
             let mut trees: Vec<SyntaxNode> = Vec::new();
             let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
-            let mut donated: Option<Box<TileCdfContext>> = None;
+            let mut all_cdfs: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
             let sb_cols_frame = mi_cols.div_ceil(16);
-            for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+            for (geo, origins) in tile_plan.iter() {
                 // §5.11.2 per-tile re-scope on BOTH mirrors (the write
                 // driver and the search context — §7.10.2 walker plus its
                 // precomputed availability grids), plus the pixel path's
@@ -2381,15 +2547,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     trees.push(tree);
                 }
                 payloads.push(writer.finish());
-                if tile_idx as u32 == ctx_update_id {
-                    donated = Some(cdfs);
-                }
+                all_cdfs.push(cdfs);
             }
             let body = assemble(&payloads)?;
             Ok(FrameArm {
                 payloads,
                 tile: body,
-                cdfs: donated.expect("context_update_tile_id < NumTiles"),
+                all_cdfs,
                 state,
                 trees,
                 recon,
@@ -2527,7 +2691,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let FrameArm {
         payloads: mut tile_payloads,
         tile: mut tile_bytes,
-        mut cdfs,
+        mut all_cdfs,
         mut state,
         mut trees,
         mut recon,
@@ -2544,7 +2708,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // rejects. Every post-tile election below re-emits ALL tiles and
     // prices the ASSEMBLED §5.11.1 body.
     let disable_cdf_update = fh.disable_cdf_update;
-    type EmitOut = (Vec<Vec<u8>>, Box<TileCdfContext>, PartitionSyntaxWriter);
+    type EmitOut = (
+        Vec<Vec<u8>>,
+        Vec<Box<TileCdfContext>>,
+        PartitionSyntaxWriter,
+    );
     let emit_tiles = |trees: &[SyntaxNode],
                       emit_params: &SyntaxFrameParams,
                       start_cdfs: &dyn Fn() -> Box<TileCdfContext>,
@@ -2562,9 +2730,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
         )
         .ok_or(Error::PartitionWalkOutOfRange)?;
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
-        let mut donated: Option<Box<TileCdfContext>> = None;
+        let mut all: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
         let mut tree_idx = 0usize;
-        for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+        for (geo, origins) in tile_plan.iter() {
             if !re_state.begin_tile(*geo) {
                 return Err(Error::PartitionWalkOutOfRange);
             }
@@ -2598,15 +2766,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 tree_idx += 1;
             }
             payloads.push(re_writer.finish());
-            if tile_idx as u32 == ctx_update_id {
-                donated = Some(re_cdfs);
-            }
+            all.push(re_cdfs);
         }
-        Ok((
-            payloads,
-            donated.expect("context_update_tile_id < NumTiles"),
-            re_state,
-        ))
+        Ok((payloads, all, re_state))
     };
 
     // r428 — §5.9.2 `allow_high_precision_mv` election by EXACT
@@ -2652,7 +2814,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 hp_elected = false;
                 tile_payloads = alt_payloads;
                 tile_bytes = alt_body;
-                cdfs = alt_cdfs;
+                all_cdfs = alt_cdfs;
                 state = alt_state;
                 // The later elections (temporal segment arm, primary
                 // reference) replay under the ELECTED precision arm,
@@ -2695,7 +2857,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             seg_temporal_elected = true;
             tile_payloads = alt_payloads;
             tile_bytes = alt_body;
-            cdfs = alt_cdfs;
+            all_cdfs = alt_cdfs;
             state = alt_state;
         }
     }
@@ -2748,7 +2910,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             u8,
             Vec<Vec<u8>>,
             Vec<u8>,
-            Box<TileCdfContext>,
+            Vec<Box<TileCdfContext>>,
             PartitionSyntaxWriter,
             Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]>,
         )> = None;
@@ -2797,9 +2959,62 @@ pub(crate) fn encode_inter_frame_generic_gm(
             fh.primary_ref_frame = ord;
             tile_payloads = e_payloads;
             tile_bytes = e_body;
-            cdfs = e_cdfs;
+            all_cdfs = e_cdfs;
             state = e_state;
             prev_gm_for_header = e_prev;
+        }
+    }
+
+    // r436 — §6.8.14 `context_update_tile_id` DONOR election by
+    // EXACT realized bytes: the PRIMARY frame's header names which of
+    // its tiles donates the §8.4 frame-end CDF state this frame's
+    // §8.3.1 chain loads (§6.8.21 `load_cdfs`). The main pass
+    // searched and wrote under the committed tile-0 donation
+    // (`primary_carry.cdfs`); when the carry offers the full donor
+    // set and the main primary reference survived the r424 ordinal
+    // election, replay the identical committed trees from EACH other
+    // tile's frame-end state and keep the start state realizing the
+    // smallest assembled §5.11.1 body. THIS frame's header is
+    // donor-invariant (the field lives in the PRIMARY frame's
+    // header, fixed-width `f(n)` — even its byte length cannot
+    // move), and every candidate decodes to the identical
+    // reconstruction, so the election is purely rate; the caller
+    // patches the primary frame's already-emitted field to the
+    // elected id and fixes the stored carry.
+    let mut donor_elected: Option<u32> = None;
+    if cfg.elect_donor
+        && cfg.primary_ref_frame != PRIMARY_REF_NONE
+        && fh.primary_ref_frame == cfg.primary_ref_frame
+    {
+        if let Some(pc) = cfg.primary_carry {
+            if pc.donor_cdfs.len() > 1 {
+                // Replay under the ELECTED params (hp updated
+                // `params.inter` in place; the temporal-seg arm
+                // swapped the tile without touching `params`, so
+                // mirror its flag here — same doctrine as the CDEF
+                // re-emission below).
+                let mut d_params = params.clone();
+                if let Some(ip) = d_params.inter.as_mut() {
+                    ip.segmentation_temporal_update = seg_temporal_elected;
+                }
+                for (tid, cand) in pc.donor_cdfs.iter().enumerate().skip(1) {
+                    let cand_start = || -> Box<TileCdfContext> {
+                        let mut loaded = cand.clone();
+                        loaded.zero_counts();
+                        loaded
+                    };
+                    let (cand_payloads, cand_all, cand_state) =
+                        emit_tiles(&trees, &d_params, &cand_start, None)?;
+                    let cand_body = assemble(&cand_payloads)?;
+                    if cand_body.len() < tile_bytes.len() {
+                        donor_elected = Some(tid as u32);
+                        tile_payloads = cand_payloads;
+                        tile_bytes = cand_body;
+                        all_cdfs = cand_all;
+                        state = cand_state;
+                    }
+                }
+            }
         }
     }
 
@@ -2832,6 +3047,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // exactly as the candidate loop did (§6.8.21 `load_cdfs` of the
     // carried slot, or the per-frame defaults).
     let start_cdfs_for = |ord: u8| -> Box<TileCdfContext> {
+        // r436 — a donor election supersedes the main start state
+        // (it only fires when `ord == cfg.primary_ref_frame`).
+        if let (Some(t), Some(pc)) = (donor_elected, cfg.primary_carry) {
+            let mut loaded = pc.donor_cdfs[t as usize].clone();
+            loaded.zero_counts();
+            return loaded;
+        }
         if ord == cfg.primary_ref_frame {
             frame_start_cdfs.clone()
         } else {
@@ -2951,7 +3173,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 if unit_score < fb_score {
                     tile_payloads = re_payloads;
                     tile_bytes = re_body;
-                    cdfs = re_cdfs;
+                    all_cdfs = re_cdfs;
                     state = re_state;
                     committed_cdef_bits = u32::from(plan.params.cdef_bits);
                     debug_assert!(
@@ -3080,7 +3302,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 if on_score < off_score {
                     tile_payloads = re_payloads;
                     tile_bytes = re_body;
-                    cdfs = re_cdfs;
+                    all_cdfs = re_cdfs;
                     state = re_state;
                     let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                         &plan,
@@ -3121,6 +3343,50 @@ pub(crate) fn encode_inter_frame_generic_gm(
     ti.tile_size_bytes = crate::encoder::key_frame::min_tile_size_bytes(&tile_payloads) as u8;
     fh.tile_info = Some(ti.clone());
     let tile_group_body = tile_bytes;
+
+    // r436 — locate the §5.9.15 `context_update_tile_id` field on
+    // the wire for the caller's deferred donor patch: write the
+    // header twice (field = 0 vs 1 — legal on every multi-tile
+    // layout) and the single differing bit is the field's LSB (the
+    // field is fixed-width `f(n)` and no later syntax element
+    // depends on its value, so the two writes differ in exactly
+    // that bit).
+    let ctx_update_span: Option<(u32, u32)> = if ti.tile_cols_log2 + ti.tile_rows_log2 > 0 {
+        let write_with = |ctx: u32| -> Vec<u8> {
+            let mut fh_c = fh.clone();
+            if let Some(t) = fh_c.tile_info.as_mut() {
+                t.context_update_tile_id = ctx;
+            }
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                &fh_c,
+                seq,
+                prev_gm_for_header.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish()
+        };
+        let a = write_with(0);
+        let b = write_with(1);
+        debug_assert_eq!(a.len(), b.len(), "f(n) field cannot move the header length");
+        let n = ti.tile_cols_log2 + ti.tile_rows_log2;
+        let mut lsb: Option<u32> = None;
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            let d = x ^ y;
+            if d != 0 {
+                debug_assert!(
+                    d.count_ones() == 1 && lsb.is_none(),
+                    "exactly one bit distinguishes ctx ids 0 and 1"
+                );
+                lsb = Some((i as u32) * 8 + (7 - d.trailing_zeros()));
+            }
+        }
+        let lsb = lsb.ok_or(Error::PartitionWalkOutOfRange)?;
+        Some((lsb + 1 - n, n))
+    } else {
+        None
+    };
 
     // Frame packaging. r423: with a primary reference the §5.9.24
     // subexp recentering codes against the carried `SavedGmParams`
@@ -3228,6 +3494,15 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // to the decode walker's by the lockstep argument), and
     // `SavedGmParams` (this frame's decoded GmParams table; identity
     // rows where no model was coded).
+    // r436 — the donation is `all_cdfs[ context_update_tile_id ]`
+    // (id 0 as emitted; a LATER consumer's donor election may patch
+    // the field, in which case the caller swaps `cdfs` for the
+    // elected entry of `donor_cdfs`).
+    let (cdfs, donor_cdfs) = if cfg.collect_donor_cdfs && all_cdfs.len() > 1 {
+        (all_cdfs[ctx_update_id as usize].clone(), all_cdfs)
+    } else {
+        (all_cdfs.swap_remove(ctx_update_id as usize), Vec::new())
+    };
     let carry = RefSlotCarry {
         cdfs,
         segment_ids: state.mirror().segment_ids().to_vec(),
@@ -3238,6 +3513,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
             .as_ref()
             .map(|g| g.gm_params)
             .unwrap_or_else(crate::uncompressed_header_tail::prev_gm_params_default),
+        donor_cdfs,
+        ctx_update_span,
     };
 
     Ok((
@@ -3256,6 +3533,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             delta_q: delta_q_elected,
             cdef: cdef_elected,
             lr: lr_elected,
+            donor_elected,
         },
     ))
 }
@@ -8549,6 +8827,7 @@ mod tests {
             (0, 0),
             1,
             None,
+            false,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);

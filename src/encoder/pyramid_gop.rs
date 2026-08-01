@@ -460,6 +460,7 @@ impl PyramidSession {
             tuning.tile_groups,
             None,
             true,
+            false,
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -586,6 +587,8 @@ impl PyramidSession {
                         freeze_cdfs: false,
                         tiles: self.tuning.tiles,
                         tile_groups: self.tuning.tile_groups,
+                        collect_donor_cdfs: false,
+                        elect_donor: false,
                         explicit_tiles: None,
                     };
                     let q = self.role_q(&role);

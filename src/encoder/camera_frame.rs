@@ -207,6 +207,8 @@ pub fn encode_camera_frame_yuv420_tiles(
         // (the §5.12 tile-list assembly consumes the raw
         // coded_tile_data, not the OBU framing).
         tile_groups: 1,
+        collect_donor_cdfs: false,
+        elect_donor: false,
         explicit_tiles: None,
     };
     let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(

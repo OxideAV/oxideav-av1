@@ -330,6 +330,7 @@ pub fn encode_key_frame_yuv420_with_q_dq(
         1,
         None,
         delta_q,
+        false,
     )?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok(EncodedKeyFrame {
@@ -414,6 +415,7 @@ pub fn encode_key_frame_yuv_with_q_tiles(
         1,
         None,
         true,
+        false,
     )
     .map(|(k, _)| k)
 }
@@ -603,6 +605,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         1,
         None,
         true,
+        false,
     )
 }
 
@@ -644,6 +647,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     tile_groups: u32,
     explicit_tiles: Option<(&[u32], &[u32])>,
     delta_q: bool,
+    collect_donor_cdfs: bool,
 ) -> Result<
     (
         EncodedKeyFrameYuv,
@@ -665,6 +669,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
             tile_groups,
             explicit_tiles,
             delta_q,
+            collect_donor_cdfs,
             ..KeyExtras::default()
         },
     )
@@ -723,6 +728,11 @@ pub(crate) struct KeyExtras<'a> {
     /// order) — set internally by the election's second arm; callers
     /// leave it `None`.
     pub delta_plan: Option<&'a [i32]>,
+    /// r436 — collect every tile's frame-end adapted CDF state into
+    /// the returned carry so a consumer frame chaining its §8.3.1
+    /// primary reference off this KEY's slot can run the §6.8.14
+    /// donor election. Inert on single-tile layouts.
+    pub collect_donor_cdfs: bool,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -779,6 +789,7 @@ pub(crate) fn encode_key_frame_yuv_full(
                 intra_only_refresh: extras.intra_only_refresh,
                 delta_q: false,
                 delta_plan: None,
+                collect_donor_cdfs: extras.collect_donor_cdfs,
             };
             let armed_extras = KeyExtras {
                 delta_plan: Some(&plan),
@@ -1165,9 +1176,11 @@ fn encode_key_frame_yuv_core(
     let mut tree_sb: Vec<(u32, u32)> = Vec::new();
     let mut tile_payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
     // The §8.4 frame-end donation: tile `context_update_tile_id`'s
-    // adapted CDFs (`save_cdfs`).
-    let mut cdfs = TileCdfContext::new_from_defaults();
-    for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+    // adapted CDFs (`save_cdfs`). r436: EVERY tile's end state is
+    // kept (boxed — far too large for by-value moves) so the carry
+    // can offer the §6.8.14 donor-candidate set.
+    let mut all_cdfs: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
+    for (geo, origins) in tile_plan.iter() {
         if !state.begin_tile(*geo) {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -1256,9 +1269,7 @@ fn encode_key_frame_yuv_core(
             tree_sb.push((sb_r, sb_c));
         }
         tile_payloads.push(writer.finish());
-        if tile_idx as u32 == ti.context_update_tile_id {
-            cdfs = tile_cdfs;
-        }
+        all_cdfs.push(Box::new(tile_cdfs));
     }
 
     // §5.11.1 assembled tile-group body length — what the exact-bytes
@@ -1293,7 +1304,11 @@ fn encode_key_frame_yuv_core(
     // payloads, the `context_update_tile_id` §8.4 donation, and the
     // accumulated driver.
     let disable_cdf_update = fh.disable_cdf_update;
-    type EmitOut = (Vec<Vec<u8>>, TileCdfContext, PartitionSyntaxWriter);
+    type EmitOut = (
+        Vec<Vec<u8>>,
+        Vec<Box<TileCdfContext>>,
+        PartitionSyntaxWriter,
+    );
     let emit_tiles = |trees: &[crate::encoder::partition_tree::SyntaxNode],
                       emit_params: &SyntaxFrameParams,
                       lr_plan: Option<&crate::encoder::lr_elect::LrPlan>|
@@ -1310,9 +1325,9 @@ fn encode_key_frame_yuv_core(
         )
         .ok_or(Error::PartitionWalkOutOfRange)?;
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
-        let mut donated: Option<TileCdfContext> = None;
+        let mut all: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
         let mut tree_idx = 0usize;
-        for (tile_idx, (geo, origins)) in tile_plan.iter().enumerate() {
+        for (geo, origins) in tile_plan.iter() {
             if !re_state.begin_tile(*geo) {
                 return Err(Error::PartitionWalkOutOfRange);
             }
@@ -1347,15 +1362,9 @@ fn encode_key_frame_yuv_core(
                 tree_idx += 1;
             }
             payloads.push(re_writer.finish());
-            if tile_idx as u32 == ctx_update_id {
-                donated = Some(re_cdfs);
-            }
+            all.push(Box::new(re_cdfs));
         }
-        Ok((
-            payloads,
-            donated.expect("context_update_tile_id < NumTiles"),
-            re_state,
-        ))
+        Ok((payloads, all, re_state))
     };
 
     // r428/r429 — §5.9.19/§7.15 CDEF election on the KEY frame
@@ -1452,7 +1461,7 @@ fn encode_key_frame_yuv_core(
                 if unit_score < fb_score {
                     tile_payloads = re_payloads;
                     tile_group_body = re_body;
-                    cdfs = re_cdfs;
+                    all_cdfs = re_cdfs;
                     state = re_state;
                     committed_cdef_bits = u32::from(plan.params.cdef_bits);
                     // The re-emitted mirror's §5.11.56 grid must equal
@@ -1571,7 +1580,7 @@ fn encode_key_frame_yuv_core(
             if on_score < off_score {
                 tile_payloads = re_payloads;
                 tile_group_body = re_body;
-                cdfs = re_cdfs;
+                all_cdfs = re_cdfs;
                 state = re_state;
                 let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                     &plan,
@@ -1610,6 +1619,41 @@ fn encode_key_frame_yuv_core(
     // election prices above stay exact).
     ti.tile_size_bytes = min_tile_size_bytes(&tile_payloads) as u8;
     fh.tile_info = Some(ti.clone());
+
+    // r436 — locate the §5.9.15 `context_update_tile_id` field on
+    // the wire (see the inter driver's twin): two header writes with
+    // field values 0 and 1 differ in exactly the field's LSB.
+    let ctx_update_span: Option<(u32, u32)> = if ti.tile_cols_log2 + ti.tile_rows_log2 > 0 {
+        let write_with = |ctx: u32| -> Vec<u8> {
+            let mut fh_c = fh.clone();
+            if let Some(t) = fh_c.tile_info.as_mut() {
+                t.context_update_tile_id = ctx;
+            }
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            encode_uncompressed_header(&mut bw, &fh_c, &seq);
+            bw.byte_align();
+            bw.finish()
+        };
+        let a = write_with(0);
+        let b = write_with(1);
+        debug_assert_eq!(a.len(), b.len(), "f(n) field cannot move the header length");
+        let n = ti.tile_cols_log2 + ti.tile_rows_log2;
+        let mut lsb: Option<u32> = None;
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            let d = x ^ y;
+            if d != 0 {
+                debug_assert!(
+                    d.count_ones() == 1 && lsb.is_none(),
+                    "exactly one bit distinguishes ctx ids 0 and 1"
+                );
+                lsb = Some((i as u32) * 8 + (7 - d.trailing_zeros()));
+            }
+        }
+        let lsb = lsb.ok_or(Error::PartitionWalkOutOfRange)?;
+        Some((lsb + 1 - n, n))
+    } else {
+        None
+    };
 
     // §7.5 temporal unit. r433 — two packagings of the SAME header
     // bits and tile payloads:
@@ -1678,12 +1722,22 @@ fn encode_key_frame_yuv_core(
     // `disable_frame_end_update_cdf = 0` on this header), and
     // `SavedSegmentIds` is the walker mirror's fully-stamped grid
     // (all-zero — §5.11.8 disabled-branch stamps).
+    // r436 — the donation is `all_cdfs[ context_update_tile_id ]`
+    // (id 0 as emitted); the full donor set rides along when the
+    // caller armed the §6.8.14 election.
+    let (cdfs, donor_cdfs) = if extras.collect_donor_cdfs && all_cdfs.len() > 1 {
+        (all_cdfs[ctx_update_id as usize].clone(), all_cdfs)
+    } else {
+        (all_cdfs.swap_remove(ctx_update_id as usize), Vec::new())
+    };
     let carry = crate::encoder::inter_frame::RefSlotCarry {
-        cdfs: Box::new(cdfs),
+        cdfs,
         segment_ids: state.mirror().segment_ids().to_vec(),
         mi_rows,
         mi_cols,
         gm_params: crate::uncompressed_header_tail::prev_gm_params_default(),
+        donor_cdfs,
+        ctx_update_span,
     };
 
     Ok((

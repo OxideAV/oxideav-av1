@@ -1131,6 +1131,22 @@ native split KEY / GOP / pyramid / layered-ladder stream decodes
 byte-identical through three independent black-box reference
 decoders.
 
+### `context_update_tile_id` election (r436)
+
+On multi-tile GOPs the §6.8.14 field is ELECTED, not fixed: each
+P-frame replays its committed trees from EVERY tile of its primary
+frame's frame-end CDF states (§6.8.21 `load_cdfs`) and keeps the
+start state realizing the smallest assembled §5.11.1 body — then
+the primary frame's already-emitted fixed-width field is patched in
+place (nothing else on the wire moves). `GopTuning::ctx_update_elect
+= false` keeps the tile-0 donation bit for bit. On a designed
+flat-tile/textured-tile GOP, 4 of 5 P-frames elect tile 1 and every
+elected frame is strictly smaller (3298 → 3258 total bytes). Corpus
+stream 119 (`self-gop-128x64-q80-ctx-update-elect`) pins the first
+non-zero `context_update_tile_id` fields — three independent
+black-box reference decoders ride the patched donations
+byte-identically.
+
 ### Spatial scalability: the SVC write arm (r431)
 
 `encode_spatial_layered_gop_yuv{,420}_with_q` codes 2..=4
@@ -1170,10 +1186,13 @@ decoders at both operating points.
   in multiples of 64 force one §7.3.1-conformant tile row per
   superblock row, addressed via `anchor_tile_row` /
   `anchor_tile_col`.)
-- `context_update_tile_id` is fixed at tile 0 (an exact-bytes
-  election over the NEXT frame's realized rate is a possible future
-  arm); `tile_start_and_end_present_flag = 1` single-group frames
-  are read but never emitted.
+- `tile_start_and_end_present_flag = 1` single-group frames are
+  read but never emitted.
+- The §6.8.14 donor election runs on the plain GOP driver; the
+  temporal-ladder / pyramid / SVC drivers still emit
+  `context_update_tile_id = 0` (their multi-consumer §7.20 slot
+  sharing needs the first-consumer-elects discipline wired
+  per driver).
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /

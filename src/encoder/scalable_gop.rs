@@ -228,6 +228,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
         tile_groups,
         None,
         /* delta_q = */ true,
+        false,
     )?;
     let mut seq = key.seq.clone();
     seq.operating_points = operating_points_for(seq.operating_points[0], temporal_layers);
@@ -332,6 +333,8 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             freeze_cdfs: false,
             tiles,
             tile_groups,
+            collect_donor_cdfs: false,
+            elect_donor: false,
             explicit_tiles: None,
         };
         let (mut obus, recon, saved, carry, _aux) =
@@ -587,6 +590,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // default intra entry.
             delta_q: true,
             delta_plan: None,
+            collect_donor_cdfs: false,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],
@@ -693,6 +697,8 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 // r436 — the layer's own layout on every inter frame.
                 tiles: tiles_of(s),
                 tile_groups,
+                collect_donor_cdfs: false,
+                elect_donor: false,
                 explicit_tiles: None,
             };
             let (obus, recon, saved, carry, _aux) = encode_inter_frame_generic(
