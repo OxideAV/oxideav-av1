@@ -459,6 +459,11 @@ pub use scalable_gop::{
     encode_spatial_layered_gop_yuv420_with_q, encode_spatial_layered_gop_yuv_with_q,
     SpatialLayeredGop, SpatialLayeredGopYuv,
 };
+// r436 — per-layer tile layouts + tile-group packaging on the
+// spatial-SVC driver.
+pub use scalable_gop::{
+    encode_spatial_layered_gop_yuv420_with_q_tiles, encode_spatial_layered_gop_yuv_with_q_tiles,
+};
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 #[doc(hidden)]

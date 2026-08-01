@@ -1148,6 +1148,19 @@ Corpus stream 114 (`self-svc-64-128-q72-spatial-layers`) pins the
 first `spatial_id > 0` stream at BOTH operating points against
 independent reference decoders' operating-point output.
 
+r436 adds PER-LAYER tile layouts:
+`encode_spatial_layered_gop_yuv{,420}_with_q_tiles` codes each
+spatial layer under its own §5.9.15 uniform layout (validated
+against that layer's legality window) on every frame of the layer,
+plus §5.11.1 tile-group packaging clamped per frame to the layer's
+realized tile count — split frames ride `OBU_FRAME_HEADER` +
+`OBU_TILE_GROUP` OBUs with the §5.3.3 extension header on every
+frame-carrying OBU per §7.5. Corpus stream 118
+(`self-svc-tiles-128-256-q84`) pins a 2×1-tiled base under a
+4×2-tiled enhancement, both split across two tile groups,
+byte-identical through three independent black-box reference
+decoders at both operating points.
+
 ### Not yet supported
 
 - No black-box cross-check exists for assembled §5.12 tile-list
@@ -1157,9 +1170,6 @@ independent reference decoders' operating-point output.
   in multiples of 64 force one §7.3.1-conformant tile row per
   superblock row, addressed via `anchor_tile_row` /
   `anchor_tile_col`.)
-- The spatial-SVC driver codes each layer single-tile (per-layer
-  tile layouts would need per-layer legality windows); temporal
-  ladders, GOPs, pyramids and KEY frames take full tile layouts.
 - `context_update_tile_id` is fixed at tile 0 (an exact-bytes
   election over the NEXT frame's realized rate is a possible future
   arm); `tile_start_and_end_present_flag = 1` single-group frames

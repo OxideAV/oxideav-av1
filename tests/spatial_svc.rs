@@ -253,3 +253,218 @@ fn spatial_fixture_staging() {
     }
     std::fs::write(root.join(format!("{name}.full.yuv")), &full).expect("write yuv");
 }
+
+// ---------------------------------------------------------------------
+// r436 — PER-LAYER tile layouts + tile-group packaging.
+// ---------------------------------------------------------------------
+
+use oxideav_av1::encoder::encode_spatial_layered_gop_yuv420_with_q_tiles;
+
+/// Per-spatial-layer §5.9.15 uniform layouts: a `(1, 0)` two-column
+/// base layer at 128×64 under a `(2, 1)` eight-tile enhancement
+/// layer at 256×128 — every frame of each layer codes its OWN
+/// layout, and both operating points still decode bit-exactly.
+#[test]
+fn spatial_per_layer_tiles_decode_bit_exact() {
+    let layers = vec![
+        (0..3).map(|t| moving(128, 64, t, 11)).collect::<Vec<_>>(),
+        (0..3).map(|t| moving(256, 128, t, 12)).collect::<Vec<_>>(),
+    ];
+    let enc =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 84, Some(&[(1, 0), (2, 1)]), 1)
+            .expect("per-layer tiled spatial encode");
+    assert_eq!(enc.layer_dims, vec![(128, 64), (256, 128)]);
+
+    // Wire audit on unit 0: the KEY (layer 0) codes 2×1 tiles, the
+    // INTRA_ONLY (layer 1) 4×2 — each layer its own layout.
+    let seq = {
+        let mut found = None;
+        for desc in ObuIter::new(&enc.temporal_units[0]) {
+            let desc = desc.expect("TU walks");
+            if desc.obu_type == ObuType::SequenceHeader {
+                found = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+            }
+        }
+        found.expect("unit 0 carries the SH")
+    };
+    let mut expect = [(2u32, 1u32), (4, 2)].iter();
+    for desc in ObuIter::new(&enc.temporal_units[0]) {
+        let desc = desc.expect("TU walks");
+        if desc.obu_type != ObuType::Frame {
+            continue;
+        }
+        let fh = parse_frame_header_with_refs(desc.payload, &seq, &RefInfo::default())
+            .expect("frame header parses");
+        let ti = fh.tile_info.expect("tile info coded");
+        let &(ec, er) = expect.next().expect("two frames in unit 0");
+        assert_eq!(
+            (ti.tile_cols, ti.tile_rows),
+            (ec, er),
+            "layer {} layout",
+            desc.spatial_id
+        );
+    }
+    assert!(expect.next().is_none(), "both unit-0 frames audited");
+
+    // Operating point 0 — both layers, bit-exact interleave.
+    let full =
+        oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 0).expect("full-stream decode");
+    assert_eq!(full.len(), 6);
+    for i in 0..3 {
+        for s in 0..2 {
+            let (planes, w, h) = spec_planes(&full[i * 2 + s]);
+            assert_eq!((w, h), enc.layer_dims[s], "instant {i} layer {s} dims");
+            let rc = &enc.layer_recons[s][i];
+            assert_eq!(planes[0], rc.y, "instant {i} layer {s} luma");
+            assert_eq!(planes[1], rc.u, "instant {i} layer {s} U");
+            assert_eq!(planes[2], rc.v, "instant {i} layer {s} V");
+        }
+    }
+    // Operating point 1 — the tiled base layer alone.
+    let base =
+        oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 1).expect("base-layer decode");
+    assert_eq!(base.len(), 3);
+    for (i, f) in base.iter().enumerate() {
+        let (planes, ..) = spec_planes(f);
+        let rc = &enc.layer_recons[0][i];
+        assert_eq!(planes[0], rc.y, "base instant {i} luma");
+        assert_eq!(planes[1], rc.u, "base instant {i} U");
+        assert_eq!(planes[2], rc.v, "base instant {i} V");
+    }
+}
+
+/// The §5.9.15 legality window is PER LAYER: a layout the small base
+/// layer cannot express rejects even though the enhancement layer
+/// could code it — and the same layout on the enhancement layer
+/// alone is accepted.
+#[test]
+fn spatial_per_layer_tile_legality_windows() {
+    let layers = vec![
+        (0..2).map(|t| moving(64, 64, t, 13)).collect::<Vec<_>>(),
+        (0..2).map(|t| moving(128, 128, t, 14)).collect::<Vec<_>>(),
+    ];
+    // (1, 0) needs two superblock columns — the 64×64 base has one.
+    assert!(
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 72, Some(&[(1, 0), (0, 0)]), 1)
+            .is_err(),
+        "base-layer window must reject (1, 0) at 64×64"
+    );
+    // The same layout is legal at the 128×128 enhancement layer.
+    let enc =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 72, Some(&[(0, 0), (1, 0)]), 1)
+            .expect("enhancement-layer (1, 0) encodes");
+    let full = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 0).expect("decode");
+    assert_eq!(full.len(), 4);
+    // Mismatched per-layer list length rejects.
+    assert!(
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 72, Some(&[(0, 0)]), 1).is_err()
+    );
+}
+
+/// `layer_tiles = None` / all-`(0, 0)` + `tile_groups <= 1`
+/// reproduce the r431 untiled spatial stream BIT FOR BIT.
+#[test]
+fn spatial_tiles_default_reproduces_untiled_stream() {
+    let layers = two_layers(2, false);
+    let plain = encode_spatial_layered_gop_yuv420_with_q(&layers, 72).expect("plain encode");
+    let zeroed =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 72, Some(&[(0, 0), (0, 0)]), 1)
+            .expect("zero-layout encode");
+    assert_eq!(plain.ivf_bytes, zeroed.ivf_bytes, "all-(0,0) layouts");
+    let grouped = encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 72, None, 0)
+        .expect("groups=0 encode");
+    assert_eq!(plain.ivf_bytes, grouped.ivf_bytes, "tile_groups clamp");
+}
+
+/// §5.11.1 tile-group packaging under §5.3.3 extension headers: the
+/// four-tile enhancement layer splits into `OBU_FRAME_HEADER` + two
+/// `OBU_TILE_GROUP` OBUs (every one carrying `spatial_id = 1`), the
+/// single-tile base layer keeps its `OBU_FRAME` — and the stream
+/// still decodes bit-exactly at both operating points.
+#[test]
+fn spatial_tile_groups_split_framing() {
+    let layers = vec![
+        (0..2).map(|t| moving(64, 64, t, 15)).collect::<Vec<_>>(),
+        (0..2).map(|t| moving(128, 128, t, 16)).collect::<Vec<_>>(),
+    ];
+    let enc =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 76, Some(&[(0, 0), (1, 1)]), 2)
+            .expect("grouped spatial encode");
+    for (u, tu) in enc.temporal_units.iter().enumerate() {
+        let mut shapes: Vec<(ObuType, u8)> = Vec::new();
+        for desc in ObuIter::new(tu) {
+            let desc = desc.expect("TU walks");
+            match desc.obu_type {
+                ObuType::TemporalDelimiter | ObuType::SequenceHeader => {}
+                t => {
+                    assert!(desc.extension_flag, "unit {u}: frame OBUs carry extensions");
+                    shapes.push((t, desc.spatial_id));
+                }
+            }
+        }
+        assert_eq!(
+            shapes,
+            vec![
+                (ObuType::Frame, 0),
+                (ObuType::FrameHeader, 1),
+                (ObuType::TileGroup, 1),
+                (ObuType::TileGroup, 1),
+            ],
+            "unit {u} OBU shapes"
+        );
+    }
+    let full = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 0).expect("decode");
+    assert_eq!(full.len(), 4);
+    for i in 0..2 {
+        for s in 0..2 {
+            let (planes, ..) = spec_planes(&full[i * 2 + s]);
+            let rc = &enc.layer_recons[s][i];
+            assert_eq!(planes[0], rc.y, "instant {i} layer {s} luma");
+            assert_eq!(planes[1], rc.u, "instant {i} layer {s} U");
+            assert_eq!(planes[2], rc.v, "instant {i} layer {s} V");
+        }
+    }
+    let base = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 1).expect("base decode");
+    assert_eq!(base.len(), 2);
+}
+
+/// Env-gated staging dump (`OXIDEAV_AV1_SVC_TILES_DIR`): the
+/// per-layer-tiled + tile-group-split spatial stream for black-box
+/// reference-decoder validation and corpus pinning.
+#[test]
+fn spatial_per_layer_tiles_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_SVC_TILES_DIR") else {
+        eprintln!("OXIDEAV_AV1_SVC_TILES_DIR unset — skipping the tiled spatial staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let layers = vec![
+        (0..4).map(|t| moving(128, 64, t, 11)).collect::<Vec<_>>(),
+        (0..4).map(|t| moving(256, 128, t, 12)).collect::<Vec<_>>(),
+    ];
+    let enc =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 84, Some(&[(1, 0), (2, 1)]), 2)
+            .expect("per-layer tiled spatial encode");
+    let name = "svc-s2-tiles-128-256-q84";
+    std::fs::write(root.join(format!("{name}.ivf")), &enc.ivf_bytes).expect("write ivf");
+    for (s, lr) in enc.layer_recons.iter().enumerate() {
+        let mut yuv: Vec<u8> = Vec::new();
+        for rc in lr {
+            yuv.extend_from_slice(&rc.y);
+            yuv.extend_from_slice(&rc.u);
+            yuv.extend_from_slice(&rc.v);
+        }
+        std::fs::write(root.join(format!("{name}.layer{s}.yuv")), &yuv).expect("write yuv");
+    }
+    let mut full: Vec<u8> = Vec::new();
+    for i in 0..4 {
+        for s in 0..2 {
+            let rc = &enc.layer_recons[s][i];
+            full.extend_from_slice(&rc.y);
+            full.extend_from_slice(&rc.u);
+            full.extend_from_slice(&rc.v);
+        }
+    }
+    std::fs::write(root.join(format!("{name}.full.yuv")), &full).expect("write yuv");
+}

@@ -471,10 +471,52 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
     layers: &[Vec<YuvFrame>],
     base_q_idx: u8,
 ) -> Result<SpatialLayeredGopYuv, Error> {
+    encode_spatial_layered_gop_yuv_with_q_tiles(layers, base_q_idx, None, 1)
+}
+
+/// r436 — [`encode_spatial_layered_gop_yuv_with_q`] with PER-LAYER
+/// §5.9.15 uniform tile layouts and §5.11.1 tile-group packaging.
+///
+/// `layer_tiles[ s ] = (TileColsLog2, TileRowsLog2)` is layer `s`'s
+/// OWN tile layout, coded on every frame of that layer (the KEY /
+/// `INTRA_ONLY` opener and every inter frame). Each layout must sit
+/// inside the §5.9.15 legal window FOR THAT LAYER'S dimensions (the
+/// per-layer legality windows: a 64×64 base layer admits only
+/// `(0, 0)` while a 256×256 enhancement layer admits up to
+/// `(2, 2)` — the layouts are validated independently per layer,
+/// exactly like the single-layer drivers validate theirs).
+/// `None` (or all-`(0, 0)`) reproduces the untiled spatial stream
+/// bit for bit.
+///
+/// `tile_groups > 1` splits EVERY frame whose realized tile count
+/// allows it across that many `OBU_TILE_GROUP` OBUs behind a
+/// standalone `OBU_FRAME_HEADER` (clamping per frame to its layer's
+/// tile count, so a single-tile base layer keeps the §5.10
+/// `OBU_FRAME` packing while a tiled enhancement layer splits). The
+/// §5.3.3 extension header rides EVERY frame-carrying OBU of a
+/// layer's frame — `OBU_FRAME`, `OBU_FRAME_HEADER` and
+/// `OBU_TILE_GROUP` alike — per the §7.5 layered-stream rule.
+///
+/// ## Errors
+///
+/// [`Error::PartitionWalkOutOfRange`] on every
+/// [`encode_spatial_layered_gop_yuv_with_q`] reject, on
+/// `layer_tiles` whose length differs from `layers.len()`, or on a
+/// layout outside its own layer's §5.9.15 legal window.
+pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
+    layers: &[Vec<YuvFrame>],
+    base_q_idx: u8,
+    layer_tiles: Option<&[(u32, u32)]>,
+    tile_groups: u32,
+) -> Result<SpatialLayeredGopYuv, Error> {
     let s_count = layers.len();
     if !(2..=4).contains(&s_count) {
         return Err(Error::PartitionWalkOutOfRange);
     }
+    if layer_tiles.is_some_and(|t| t.len() != s_count) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let tiles_of = |s: usize| layer_tiles.map_or((0, 0), |t| t[s]);
     let n = layers[0].len();
     if n == 0 || n > crate::encoder::inter_frame::GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
@@ -531,8 +573,10 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
     );
     for (s, layer) in layers.iter().enumerate() {
         let extras = crate::encoder::key_frame::KeyExtras {
-            tiles: (0, 0),
-            tile_groups: 1,
+            // r436 — the layer's OWN §5.9.15 layout + §5.11.1
+            // packaging (validated against ITS dimensions).
+            tiles: tiles_of(s),
+            tile_groups,
             explicit_tiles: None,
             seq_override: Some(&seq),
             // Layer 0: a true KEY (refreshes ALL slots — §5.9.2
@@ -575,19 +619,28 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
                 slot_hints[2 * s + b] = 0;
             }
         }
-        // Extract the frame OBU from the driver's own temporal unit
-        // and re-wrap it with the §5.3.3 extension header.
-        let mut frame_body: Option<Vec<u8>> = None;
+        // Extract the frame-carrying OBUs from the driver's own
+        // temporal unit and re-wrap each with the §5.3.3 extension
+        // header (r436: with `tile_groups > 1` the intra driver
+        // emits `OBU_FRAME_HEADER` + N `OBU_TILE_GROUP` OBUs instead
+        // of one `OBU_FRAME` — §7.5 requires the extension header on
+        // ALL of them).
+        let mut wrote_frame = false;
         for desc in ObuIter::new(&k.temporal_unit_bytes) {
             let desc = desc.expect("own temporal unit walks");
-            if desc.obu_type == ObuType::Frame {
-                frame_body = Some(desc.payload.to_vec());
+            match desc.obu_type {
+                ObuType::TemporalDelimiter | ObuType::SequenceHeader => {}
+                other => {
+                    let header = crate::encoder::obu::ObuHeader::new(other)
+                        .with_extension(ObuExtensionHeader::new(0, s as u8));
+                    write_obu_with_size(&mut tu0, &header, desc.payload);
+                    wrote_frame = true;
+                }
             }
         }
-        let frame_body = frame_body.ok_or(Error::PartitionWalkOutOfRange)?;
-        let header = crate::encoder::obu::ObuHeader::new(ObuType::Frame)
-            .with_extension(ObuExtensionHeader::new(0, s as u8));
-        write_obu_with_size(&mut tu0, &header, &frame_body);
+        if !wrote_frame {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
         layer_recons[s].push(GopFrameReconYuv {
             y: k.recon_y,
             u: k.recon_u,
@@ -637,8 +690,9 @@ pub fn encode_spatial_layered_gop_yuv_with_q(
                 cdef_units: true,
                 lr: true,
                 freeze_cdfs: false,
-                tiles: (0, 0),
-                tile_groups: 1,
+                // r436 — the layer's own layout on every inter frame.
+                tiles: tiles_of(s),
+                tile_groups,
                 explicit_tiles: None,
             };
             let (obus, recon, saved, carry, _aux) = encode_inter_frame_generic(
@@ -691,11 +745,23 @@ pub fn encode_spatial_layered_gop_yuv420_with_q(
     layers: &[Vec<Yuv420Frame>],
     base_q_idx: u8,
 ) -> Result<SpatialLayeredGop, Error> {
+    encode_spatial_layered_gop_yuv420_with_q_tiles(layers, base_q_idx, None, 1)
+}
+
+/// 8-bit 4:2:0 entry point of
+/// [`encode_spatial_layered_gop_yuv_with_q_tiles`].
+pub fn encode_spatial_layered_gop_yuv420_with_q_tiles(
+    layers: &[Vec<Yuv420Frame>],
+    base_q_idx: u8,
+    layer_tiles: Option<&[(u32, u32)]>,
+    tile_groups: u32,
+) -> Result<SpatialLayeredGop, Error> {
     let wide: Vec<Vec<YuvFrame>> = layers
         .iter()
         .map(|l| l.iter().map(YuvFrame::from_yuv420_8bit).collect())
         .collect();
-    let s = encode_spatial_layered_gop_yuv_with_q(&wide, base_q_idx)?;
+    let s =
+        encode_spatial_layered_gop_yuv_with_q_tiles(&wide, base_q_idx, layer_tiles, tile_groups)?;
     let narrow = |p: &[u16]| p.iter().map(|&v| v as u8).collect::<Vec<u8>>();
     Ok(SpatialLayeredGop {
         ivf_bytes: s.ivf_bytes,
