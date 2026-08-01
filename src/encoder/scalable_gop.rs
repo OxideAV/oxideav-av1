@@ -212,6 +212,9 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
     }
     let (width, height) = validate_gop_input(frames)?;
     let n = frames.len();
+    // r436 — the §6.8.14 donor election arms on multi-tile ladders
+    // (single-tile frames carry no `context_update_tile_id` field).
+    let donor_armed = tiles != (0, 0);
 
     // ---- KEY frame + the multi-OP sequence header. ----
     let (key, key_carry) = encode_key_frame_yuv_seg_carry_tiles(
@@ -228,7 +231,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
         tile_groups,
         None,
         /* delta_q = */ true,
-        false,
+        donor_armed,
     )?;
     let mut seq = key.seq.clone();
     seq.operating_points = operating_points_for(seq.operating_points[0], temporal_layers);
@@ -249,6 +252,9 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
     let mut mf_store: [SavedMotionField; 8] =
         core::array::from_fn(|_| SavedMotionField::intra(key_mi.0, key_mi.1));
     let mut carry_store: [Rc<RefSlotCarry>; 8] = core::array::from_fn(|_| key_carry.clone());
+    // r436 — which temporal unit each slot's carried frame lives in
+    // (the donor patch rewrites that unit's header field in place).
+    let mut carry_tu: [usize; 8] = [0; 8];
     let mut slot_hints = [0u32; 8];
     let mut slot_display = [0usize; 8];
     let mut recons: Vec<GopFrameReconYuv> = Vec::with_capacity(n);
@@ -333,12 +339,57 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             freeze_cdfs: false,
             tiles,
             tile_groups,
-            collect_donor_cdfs: false,
-            elect_donor: false,
+            // r436 — collect only on REFERENCE frames (a top-layer
+            // frame's donation is never consumed); elect whenever the
+            // primary carry offers candidates.
+            collect_donor_cdfs: donor_armed && tid + 1 < temporal_layers,
+            elect_donor: donor_armed,
             explicit_tiles: None,
         };
-        let (mut obus, recon, saved, carry, _aux) =
+        let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
+        // r436 — §6.8.14 donor settlement. THE MULTI-CONSUMER RULE:
+        // a slot's donor set is frozen at its FIRST consumption —
+        // whether or not the election won — because this frame's
+        // bytes were committed under the donation as it stood; a
+        // LATER consumer re-electing would silently re-start THIS
+        // frame's already-emitted CDF chain. On a win the primary
+        // frame's already-emitted `context_update_tile_id` is
+        // patched in place and its stored carry takes the elected
+        // tile's state; either way the donor set clears, and every
+        // §7.20 slot holding the same frame's carry (the KEY seeds
+        // all eight) is swept by pointer identity.
+        if carry_store[last_slot].donor_cdfs.len() > 1 {
+            let consumed = carry_store[last_slot].clone();
+            let fixed_cdfs = match aux.donor_elected {
+                Some(t) => {
+                    let span = consumed
+                        .ctx_update_span
+                        .expect("donor election only fires on multi-tile primaries");
+                    crate::encoder::inter_frame::patch_ctx_update_in_tu(
+                        &mut temporal_units[carry_tu[last_slot]],
+                        span,
+                        t,
+                    );
+                    consumed.donor_cdfs[t as usize].clone()
+                }
+                None => consumed.cdfs.clone(),
+            };
+            let fixed = Rc::new(RefSlotCarry {
+                cdfs: fixed_cdfs,
+                segment_ids: consumed.segment_ids.clone(),
+                mi_rows: consumed.mi_rows,
+                mi_cols: consumed.mi_cols,
+                gm_params: consumed.gm_params,
+                donor_cdfs: Vec::new(),
+                ctx_update_span: None,
+            });
+            for slot in carry_store.iter_mut() {
+                if Rc::ptr_eq(slot, &consumed) {
+                    *slot = fixed.clone();
+                }
+            }
+        }
         // §5.3.3 / §7.5: every OBU of the frame carries its layer id.
         for obu in &mut obus {
             obu.header.extension = Some(ObuExtensionHeader::new(tid, 0));
@@ -351,6 +402,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             let s = usize::from(tid);
             mf_store[s] = saved;
             carry_store[s] = Rc::new(carry);
+            carry_tu[s] = i;
             slot_hints[s] = i as u32;
             slot_display[s] = i;
         }

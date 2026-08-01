@@ -1162,7 +1162,12 @@ elected frame is strictly smaller (3298 → 3258 total bytes). Corpus
 stream 119 (`self-gop-128x64-q80-ctx-update-elect`) pins the first
 non-zero `context_update_tile_id` fields — three independent
 black-box reference decoders ride the patched donations
-byte-identically.
+byte-identically. The §6.7.5 temporal-ladder driver elects too,
+under the multi-consumer discipline: a slot's donor set FREEZES at
+its first consumption (several frames may chain off the same slot —
+the KEY seeds all eight), so every later consumer replays the
+committed donation, and every operating point decodes the patched
+stream bit-exact.
 
 ### Spatial scalability: the SVC write arm (r431)
 
@@ -1209,11 +1214,10 @@ decoders at both operating points.
   delta-q pairings opened in r436; the LR × segmentation pairing is
   the remaining in-loop one), and delta-q stays off tables carrying
   a lossless segment (conservative §7.12.2-note guard).
-- The §6.8.14 donor election runs on the plain GOP driver; the
-  temporal-ladder / pyramid / SVC drivers still emit
-  `context_update_tile_id = 0` (their multi-consumer §7.20 slot
-  sharing needs the first-consumer-elects discipline wired
-  per driver).
+- The §6.8.14 donor election runs on the plain GOP and
+  temporal-ladder drivers (the ladder under the freeze-at-first-
+  consumption discipline); the pyramid and SVC drivers still emit
+  `context_update_tile_id = 0`.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /

@@ -275,3 +275,84 @@ fn ctx_update_fixture_staging() {
     )
     .expect("write elections");
 }
+
+// ---------------------------------------------------------------------
+// r436 — the §6.8.14 election on the TEMPORAL LADDER driver.
+// ---------------------------------------------------------------------
+
+use oxideav_av1::encoder::encode_temporal_layered_gop_yuv420_with_q_tiles;
+
+/// The multi-consumer discipline on the §6.7.5 ladder: a slot's
+/// donor set freezes at its FIRST consumption (several frames may
+/// chain their §8.3.1 primary off the same slot — the KEY seeds all
+/// eight), the patched fields land on the wire, and EVERY operating
+/// point still decodes bit-exact — dropping any layer suffix leaves
+/// each surviving frame's patched donation intact.
+#[test]
+fn ladder_ctx_update_election_survives_every_operating_point() {
+    let frames: Vec<Yuv420Frame> = (0..8).map(|t| hetero_frame(128, 64, t)).collect();
+    let enc = encode_temporal_layered_gop_yuv420_with_q_tiles(&frames, 80, 3, (1, 0), 1)
+        .expect("tiled layered encode");
+
+    // Wire audit: at least one frame's coded id was patched off 0.
+    let mut seq = None;
+    let mut refinfo = RefInfo::default();
+    for i in 0..8 {
+        refinfo.valid[i] = true;
+        refinfo.upscaled_width[i] = 128;
+        refinfo.frame_height[i] = 64;
+        refinfo.render_width[i] = 128;
+        refinfo.render_height[i] = 64;
+    }
+    let mut ids = Vec::new();
+    for tu in &enc.gop.temporal_units {
+        for desc in ObuIter::new(tu) {
+            let desc = desc.expect("TU walks");
+            match desc.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+                }
+                ObuType::Frame | ObuType::FrameHeader => {
+                    let fh = parse_frame_header_with_refs(
+                        desc.payload,
+                        seq.as_ref().expect("SH precedes frames"),
+                        &refinfo,
+                    )
+                    .expect("frame header parses");
+                    ids.push(fh.tile_info.expect("tiled stream").context_update_tile_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(ids.len(), frames.len());
+    assert!(
+        ids.iter().any(|&id| id != 0),
+        "designed content must patch at least one ladder donation: {ids:?}"
+    );
+
+    // Every §6.7.5 operating point decodes its layer subset
+    // bit-exact (op k keeps temporal ids <= 2 - k).
+    for k in 0..3u8 {
+        let out = oxideav_av1::decode_av1_at_operating_point(&enc.gop.ivf_bytes, k)
+            .unwrap_or_else(|e| panic!("op {k} decode: {e:?}"));
+        let keep: Vec<usize> = enc
+            .temporal_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, &tid)| tid <= 2 - k)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(out.len(), keep.len(), "op {k} shown frames");
+        for (f, &i) in out.iter().zip(keep.iter()) {
+            match f {
+                Frame::Spec(s) => {
+                    assert_eq!(s.planes[0], enc.gop.recon[i].y, "op {k} frame {i} luma");
+                    assert_eq!(s.planes[1], enc.gop.recon[i].u, "op {k} frame {i} U");
+                    assert_eq!(s.planes[2], enc.gop.recon[i].v, "op {k} frame {i} V");
+                }
+                other => panic!("op {k}: non-Spec frame {other:?}"),
+            }
+        }
+    }
+}
