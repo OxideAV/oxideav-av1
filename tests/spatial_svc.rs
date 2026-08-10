@@ -468,3 +468,105 @@ fn spatial_per_layer_tiles_fixture_staging() {
     }
     std::fs::write(root.join(format!("{name}.full.yuv")), &full).expect("write yuv");
 }
+
+// ---------------------------------------------------------------------
+// r439 — the §6.8.14 `context_update_tile_id` election on the SVC
+// driver.
+// ---------------------------------------------------------------------
+
+/// Left half flat, right half textured + moving (the tile-1 CDF
+/// donation prices consumers smaller under a `(1, 0)` layout).
+fn hetero(w: u32, h: u32, t: usize) -> Yuv420Frame {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut f = Yuv420Frame::filled(w, h, 128);
+    for r in 0..hu {
+        for c in 0..wu {
+            let v = if c < wu / 2 {
+                96 + ((r / 16) % 2) * 4
+            } else {
+                (r * 7 + (c + 5 * t) * 13 + (r % 5) * (c % 7) * 3) % 256
+            };
+            f.y[r * wu + c] = v as u8;
+        }
+    }
+    f
+}
+
+/// Per-layer donor elections on a two-layer tiled SVC stream: at
+/// least one frame's `context_update_tile_id` is patched off 0 on
+/// the wire, and BOTH §6.7.5 operating points decode bit-exact —
+/// dropping the enhancement layer leaves every base-layer frame's
+/// patched donation intact (per-layer §7.20 slot pairs, per-layer
+/// freeze-at-first-consumption).
+#[test]
+fn svc_ctx_update_election_fires_and_operating_points_decode_bit_exact() {
+    let layers = vec![
+        (0..5).map(|t| hetero(128, 64, t)).collect::<Vec<_>>(),
+        (0..5).map(|t| hetero(256, 128, t)).collect::<Vec<_>>(),
+    ];
+    let enc =
+        encode_spatial_layered_gop_yuv420_with_q_tiles(&layers, 80, Some(&[(1, 0), (1, 0)]), 1)
+            .expect("tiled spatial encode");
+
+    // Wire audit: walk every coded frame header of every unit.
+    let mut seq = None;
+    let mut refinfo = RefInfo::default();
+    for i in 0..8 {
+        refinfo.valid[i] = true;
+        refinfo.upscaled_width[i] = 256;
+        refinfo.frame_height[i] = 128;
+        refinfo.render_width[i] = 256;
+        refinfo.render_height[i] = 128;
+    }
+    let mut ids = Vec::new();
+    for tu in &enc.temporal_units {
+        for desc in ObuIter::new(tu) {
+            let desc = desc.expect("TU walks");
+            match desc.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+                }
+                ObuType::Frame | ObuType::FrameHeader => {
+                    let fh = parse_frame_header_with_refs(
+                        desc.payload,
+                        seq.as_ref().expect("SH precedes frames"),
+                        &refinfo,
+                    )
+                    .expect("frame header parses");
+                    if fh.show_existing_frame {
+                        continue;
+                    }
+                    ids.push(fh.tile_info.expect("tiled stream").context_update_tile_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(ids.len(), 10, "one coded frame per layer per instant");
+    assert!(
+        ids.iter().any(|&id| id != 0),
+        "designed content must patch at least one SVC donation: {ids:?}"
+    );
+
+    // Both operating points decode their layer subsets bit-exact.
+    let full = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 0).expect("full decode");
+    assert_eq!(full.len(), 10);
+    for i in 0..5 {
+        for s in 0..2 {
+            let (planes, _, _) = spec_planes(&full[i * 2 + s]);
+            let rc = &enc.layer_recons[s][i];
+            assert_eq!(planes[0], rc.y, "instant {i} layer {s} luma");
+            assert_eq!(planes[1], rc.u, "instant {i} layer {s} U");
+            assert_eq!(planes[2], rc.v, "instant {i} layer {s} V");
+        }
+    }
+    let base = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 1).expect("base decode");
+    assert_eq!(base.len(), 5);
+    for (i, f) in base.iter().enumerate() {
+        let (planes, _, _) = spec_planes(f);
+        let rc = &enc.layer_recons[0][i];
+        assert_eq!(planes[0], rc.y, "base instant {i} luma");
+        assert_eq!(planes[1], rc.u, "base instant {i} U");
+        assert_eq!(planes[2], rc.v, "base instant {i} V");
+    }
+}

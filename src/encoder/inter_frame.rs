@@ -158,6 +158,9 @@ pub struct TunedGopYuv {
     /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
     /// flag (index 0 is the first P-frame).
     pub delta_q_elections: Vec<bool>,
+    /// r439 — each P-frame's elected §5.9.12 `using_qmatrix` header
+    /// flag (index 0 is the first P-frame).
+    pub qm_elections: Vec<bool>,
     /// r428 — each P-frame's frame-level §5.9.19 CDEF election
     /// (index 0 is the first P-frame).
     pub cdef_elections: Vec<bool>,
@@ -210,6 +213,9 @@ pub struct TunedGop {
     /// r428 — each P-frame's elected §5.9.17 `delta_q_present` header
     /// flag (index 0 is the first P-frame).
     pub delta_q_elections: Vec<bool>,
+    /// r439 — each P-frame's elected §5.9.12 `using_qmatrix` header
+    /// flag (index 0 is the first P-frame).
+    pub qm_elections: Vec<bool>,
     /// r428 — each P-frame's frame-level §5.9.19 CDEF election
     /// (index 0 is the first P-frame).
     pub cdef_elections: Vec<bool>,
@@ -342,6 +348,10 @@ pub(crate) struct InterFrameAux {
     /// per-superblock delta-q arm won the frame-level joint-objective
     /// election over the single-quantiser arm).
     pub(crate) delta_q: bool,
+    /// r439 — the elected §5.9.12 `using_qmatrix` header flag (the
+    /// quantizer-matrix arm won the frame-level joint-objective
+    /// election over the flat-quantiser arm).
+    pub(crate) qm: bool,
     /// r428 — the elected frame-level §5.9.19 CDEF strengths (`true`
     /// when a non-zero strength set beat the unfiltered frame and
     /// landed in the header + reconstruction).
@@ -369,6 +379,59 @@ const SEARCH_RANGE: i32 = 16;
 /// keeping the per-superblock §5.11.13 symbols in the cheap
 /// `|reduced| <= 2` literal range while covering a ±16 index swing.
 pub(crate) const DELTA_Q_RES: u8 = 3;
+
+/// r439 — the §5.9.12 quantizer-matrix level candidate for a frame
+/// quantiser. §9.5.3 levels run 0..=14 (0 = steepest deviation from
+/// the flat quantiser, 14 nearly flat; 15 is the §7.12.3 no-QM
+/// short-circuit). Coarser base quantisers take steeper matrices —
+/// at low q the flat quantiser is already near the joint optimum and
+/// only a gentle reshape can win; at high q the high-frequency
+/// coefficients' rate dominates and a steeper reshape pays. The map
+/// was settled by measurement on the `qm_ab` harness; the per-frame
+/// election only KEEPS the arm where it wins, so the map needs to be
+/// good, not perfect.
+pub(crate) fn qm_level_for_q(base_q_idx: u8) -> u8 {
+    match base_q_idx {
+        0..=80 => 10,
+        81..=160 => 8,
+        _ => 6,
+    }
+}
+
+/// r439 — the QM arm's content gate: mean absolute horizontal +
+/// vertical luma second difference, in 1/16ths of an 8-bit-normalized
+/// sample step. Smooth content (flat fills, gradients) has
+/// essentially no high-frequency energy for a §9.5.3 matrix to
+/// reshape — the arm cannot win there, and skipping the second full
+/// search keeps smooth-content streams bit-identical to the
+/// baseline.
+pub(crate) fn qm_probe(input: &YuvFrame) -> bool {
+    let (w, h) = (input.width as usize, input.height as usize);
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for r in 0..h {
+        for c in 1..w.saturating_sub(1) {
+            let m = i64::from(input.y[r * w + c]);
+            sum += (2 * m - i64::from(input.y[r * w + c - 1]) - i64::from(input.y[r * w + c + 1]))
+                .unsigned_abs();
+            count += 1;
+        }
+    }
+    for r in 1..h.saturating_sub(1) {
+        for c in 0..w {
+            let m = i64::from(input.y[r * w + c]);
+            sum +=
+                (2 * m - i64::from(input.y[(r - 1) * w + c]) - i64::from(input.y[(r + 1) * w + c]))
+                    .unsigned_abs();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return false;
+    }
+    let mean16 = (sum * 16) / count / (1u64 << (input.bit_depth - 8));
+    mean16 >= 8
+}
 
 /// r428 — the §5.9.17 complexity probe: map per-superblock source
 /// luma activity (variance over the superblock's samples) to reduced
@@ -669,6 +732,15 @@ pub struct GopTuning {
     /// arm election). `false` keeps the single-quantiser shape on
     /// every frame (the A/B baseline).
     pub delta_q: bool,
+    /// r439 — §5.9.12 quantizer-matrix election on unsegmented lossy
+    /// frames (KEY + inter): a second full search under
+    /// `using_qmatrix = 1` at the [`qm_level_for_q`] §9.5.3 level,
+    /// elected per frame by the joint objective over exact realized
+    /// bytes; the [`qm_probe`] high-frequency gate skips the arm on
+    /// smooth content (bit-identical to the baseline there). `false`
+    /// keeps the flat-quantiser shape on every frame (the A/B
+    /// baseline).
+    pub qm: bool,
     /// r428 — frame-level §5.9.19/§7.15 CDEF election on lossy
     /// frames (KEY + inter): decoder-mirror filtering on the recon
     /// path, source-scored strength search, zero tile bits. `false`
@@ -723,6 +795,7 @@ impl Default for GopTuning {
             temporal_seg: true,
             high_precision_mv: true,
             delta_q: true,
+            qm: true,
             cdef: true,
             cdef_units: true,
             lr: true,
@@ -902,6 +975,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         p_segment_maps: t.p_segment_maps,
         hp_mv_elections: t.hp_mv_elections,
         delta_q_elections: t.delta_q_elections,
+        qm_elections: t.qm_elections,
         cdef_elections: t.cdef_elections,
         lr_elections: t.lr_elections,
         ctx_donor_elections: t.ctx_donor_elections,
@@ -1108,6 +1182,8 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // r431 — the KEY frame rides the same §5.9.17 delta-q switch
         // as the P-frames.
         tuning.delta_q,
+        // r439 — and the same §5.9.12 quantizer-matrix switch.
+        tuning.qm,
         // r436 — the KEY donates too: collect its per-tile end CDFs.
         donor_armed,
     )?;
@@ -1155,6 +1231,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     let mut p_segment_maps: Vec<Vec<i32>> = Vec::new();
     let mut hp_mv_elections: Vec<bool> = Vec::new();
     let mut delta_q_elections: Vec<bool> = Vec::new();
+    let mut qm_elections: Vec<bool> = Vec::new();
     let mut cdef_elections: Vec<bool> = Vec::new();
     let mut lr_elections: Vec<bool> = Vec::new();
     let mut ctx_donor_elections: Vec<Option<u32>> = Vec::new();
@@ -1188,6 +1265,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
             extras,
             tuning.high_precision_mv,
             tuning.delta_q,
+            tuning.qm,
             tuning.cdef,
             tuning.cdef_units,
             tuning.lr,
@@ -1229,6 +1307,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         seg_temporal_updates.push(aux.seg_temporal);
         hp_mv_elections.push(aux.hp_mv);
         delta_q_elections.push(aux.delta_q);
+        qm_elections.push(aux.qm);
         cdef_elections.push(aux.cdef);
         lr_elections.push(aux.lr);
         ctx_donor_elections.push(aux.donor_elected);
@@ -1266,6 +1345,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         p_segment_maps,
         hp_mv_elections,
         delta_q_elections,
+        qm_elections,
         cdef_elections,
         lr_elections,
         ctx_donor_elections,
@@ -1397,6 +1477,16 @@ pub(crate) struct InterFrameConfig<'a> {
     /// scores better under `D + λ·R`. `false` keeps the pre-r428
     /// single-quantiser shape unconditionally (the A/B baseline).
     pub delta_q: bool,
+    /// r439 — §5.9.12 quantizer-matrix arm: on an UNSEGMENTED lossy
+    /// frame whose luma carries real high-frequency energy (the
+    /// [`qm_probe`] gate), a second full search runs under
+    /// `using_qmatrix = 1` with the §9.5.3 level from
+    /// [`qm_level_for_q`] on all three planes (the §7.12.3 QM-scaled
+    /// `q2` on every quantise/dequantise step), and a frame-level
+    /// joint-objective election over exact realized (header + tile)
+    /// bytes keeps the better arm. `false` keeps the flat-quantiser
+    /// shape unconditionally (the A/B baseline).
+    pub qm: bool,
     /// r428 — frame-level §5.9.19/§7.15 CDEF arm: after the tile is
     /// committed the reconstruction is filtered through the decoder's
     /// own §7.15 driver over the write mirror's grids, a bounded
@@ -1752,6 +1842,7 @@ fn p_frame_config_primary<'a>(
         seg_extras: None,
         high_precision_mv: true,
         delta_q: true,
+        qm: true,
         cdef: true,
         cdef_units: true,
         lr: true,
@@ -1798,30 +1889,62 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
 /// depends on its value (§5.9.15), so tile payloads, OBU sizes and
 /// every other header bit are untouched.
 pub(crate) fn patch_ctx_update_in_tu(tu: &mut [u8], span: (u32, u32), id: u32) {
+    patch_ctx_update_in_tu_frame(tu, 0, span, id);
+}
+
+/// r439 — multi-frame-unit sibling of [`patch_ctx_update_in_tu`]:
+/// the out-of-order (pyramid) and layered (SVC) drivers pack SEVERAL
+/// frames into one §7.5 temporal unit, so the patch target is the
+/// `frame_ord`-th frame-carrying OBU (`OBU_FRAME` /
+/// `OBU_FRAME_HEADER`) of the unit, counting in emission order
+/// (`show_existing_frame` short headers ride `OBU_FRAME_HEADER` too
+/// but always FOLLOW the coded frames of their unit, so coded-frame
+/// ordinals are stable). Extension-carrying OBU headers (§5.3.3) walk
+/// through the ordinary `ObuIter`, so layered units patch the same
+/// way.
+pub(crate) fn patch_ctx_update_in_tu_frame(
+    tu: &mut [u8],
+    frame_ord: usize,
+    span: (u32, u32),
+    id: u32,
+) {
     let payload_off = {
         let base = tu.as_ptr() as usize;
         let mut found: Option<usize> = None;
+        let mut seen = 0usize;
         for desc in crate::obu::ObuIter::new(tu) {
             let desc = desc.expect("own temporal unit walks");
             if matches!(
                 desc.obu_type,
                 crate::obu::ObuType::Frame | crate::obu::ObuType::FrameHeader
             ) {
-                found = Some(desc.payload.as_ptr() as usize - base);
-                break;
+                if seen == frame_ord {
+                    found = Some(desc.payload.as_ptr() as usize - base);
+                    break;
+                }
+                seen += 1;
             }
         }
-        found.expect("temporal unit carries a frame OBU")
+        found.expect("temporal unit carries the addressed frame OBU")
     };
+    patch_bits_at(tu, payload_off, span, id);
+}
+
+/// r439 — overwrite the fixed-width `f(n)` field at `span = (bit
+/// offset from `payload_off * 8`, n)` with `id`. Shared by the
+/// temporal-unit patchers above and the pyramid driver's
+/// pending-OBU patch (where the frame-header payload IS the buffer,
+/// `payload_off = 0`).
+pub(crate) fn patch_bits_at(buf: &mut [u8], payload_off: usize, span: (u32, u32), id: u32) {
     let (start, n) = span;
     for i in 0..n {
         let bitpos = payload_off * 8 + (start + i) as usize;
         let byte = bitpos / 8;
         let mask = 1u8 << (7 - (bitpos % 8));
         if (id >> (n - 1 - i)) & 1 == 1 {
-            tu[byte] |= mask;
+            buf[byte] |= mask;
         } else {
-            tu[byte] &= !mask;
+            buf[byte] &= !mask;
         }
     }
 }
@@ -1845,6 +1968,7 @@ fn encode_p_frame_yuv(
     seg_extras: Option<&SegExtras>,
     high_precision_mv: bool,
     delta_q: bool,
+    qm: bool,
     cdef: bool,
     cdef_units: bool,
     lr: bool,
@@ -1869,6 +1993,7 @@ fn encode_p_frame_yuv(
     cfg.seg_extras = seg_extras;
     cfg.high_precision_mv = high_precision_mv;
     cfg.delta_q = delta_q;
+    cfg.qm = qm;
     cfg.cdef = cdef;
     cfg.cdef_units = cdef_units;
     cfg.lr = lr;
@@ -2386,6 +2511,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // / writer state from the shared frame-start snapshot, so arms
     // are exactly comparable and the winner's artifacts flow into the
     // unchanged post-tile pipeline.
+    // r439 — the two header fields the arm runner reads, captured by
+    // VALUE so the closure does not borrow `fh` (the QM election
+    // assigns `fh` between two `run_arm` calls; both fields are
+    // arm-invariant).
+    let fh_sct = fh.allow_screen_content_tools;
+    let fh_disable_cdf_update = fh.disable_cdf_update;
     let run_arm =
         |arm_params: &SyntaxFrameParams, plan: Option<&[i32]>| -> Result<FrameArm, Error> {
             let mut recon = Box::new(ReconState {
@@ -2403,7 +2534,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 mi_rows,
                 mi_cols,
                 lossless,
-                allow_screen_content_tools: fh.allow_screen_content_tools,
+                allow_screen_content_tools: fh_sct,
                 // §5.9.20: intra-block-copy is intra-frame-only.
                 allow_intrabc: false,
                 qp: arm_params.quant,
@@ -2489,7 +2620,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 }
                 ictx.begin_tile(*geo);
                 recon.bd.set_tile(*geo);
-                let mut writer = SymbolWriter::new(fh.disable_cdf_update);
+                let mut writer = SymbolWriter::new(fh_disable_cdf_update);
                 // §8.3.1: every tile starts from the frame-start CDF
                 // state (§6.8.21 `load_cdfs` under a primary reference,
                 // the q-selected defaults otherwise).
@@ -2596,6 +2727,119 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // weighted objective is what makes delta-q a real tool; the A/B
     // harness reports the resulting plain-PSNR/bytes trade honestly.
     let mut arm = run_arm(&params, None)?;
+
+    // r439 — §5.9.12 quantizer-matrix election by EXACT realized
+    // bytes + distortion: on an unsegmented lossy frame with real
+    // high-frequency luma energy (the `qm_probe` gate — the arm
+    // cannot win on smooth content, and skipping it keeps those
+    // streams bit-identical), a second full search runs under
+    // `using_qmatrix = 1` at the `qm_level_for_q` §9.5.3 level on
+    // all three planes: every quantise/dequantise step rides the
+    // §7.12.3 `q2 = Round2( q * Quantizer_Matrix[ .. ], 5 )` scaling
+    // through the SAME `SegQMLevel[ plane ][ 0 ]` row the decoder
+    // derives per §5.9.2 (segment 0 is the only coded segment). Both
+    // arms are complete frame encodes with different
+    // reconstructions, so the election runs the plain joint
+    // objective `D·256 + λ·R_bits256` over realized (header + tile)
+    // bytes — the QM arm typically trades a small SSE increase in
+    // the high frequencies for an outsized rate saving on textured
+    // content; the winner's params flow into the delta-q election
+    // below (the arms compose — a delta-q plan quantises at the
+    // running index with the SAME QM scaling on both sides).
+    let qm_arm_level: Option<u8> = if cfg.qm
+        && !lossless
+        && alt_q.is_empty()
+        && cfg.exact_mask.is_none()
+        && !cfg.auto_lossless
+        && qm_probe(input)
+    {
+        Some(qm_level_for_q(base_q_idx))
+    } else {
+        None
+    };
+    let mut qm_elected = false;
+    if let Some(lvl) = qm_arm_level {
+        let mut qp_m = qp;
+        qp_m.using_qmatrix = true;
+        for plane in 0..3 {
+            for seg in 0..crate::uncompressed_header_tail::MAX_SEGMENTS {
+                qp_m.seg_qm_level[plane][seg] = lvl;
+            }
+        }
+        let mut params_m = params.clone();
+        params_m.quant = qp_m;
+        let cand = run_arm(&params_m, None)?;
+        let mut fh_m = fh.clone();
+        if let Some(q) = fh_m.quantization_params.as_mut() {
+            q.using_qmatrix = true;
+            q.qm_y = lvl;
+            q.qm_u = lvl;
+            q.qm_v = lvl;
+        }
+        let lambda = lambda_for(&qp);
+        let prev_gm_score: Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]> =
+            if fh.primary_ref_frame != PRIMARY_REF_NONE {
+                cfg.primary_carry.map(|c| c.gm_params)
+            } else {
+                None
+            };
+        let header_len = |fh_arm: &FrameHeader| -> usize {
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                fh_arm,
+                seq,
+                prev_gm_score.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let plain_sse = |rc: &ReconState| -> u64 {
+            let mut d = 0u64;
+            for (a, b) in rc.y.iter().zip(&input.y) {
+                let diff = i64::from(*a) - i64::from(*b);
+                d += (diff * diff) as u64;
+            }
+            if num_planes > 1 {
+                for (a, b) in rc.u.iter().zip(&input.u).chain(rc.v.iter().zip(&input.v)) {
+                    let diff = i64::from(*a) - i64::from(*b);
+                    d += (diff * diff) as u64;
+                }
+            }
+            d
+        };
+        let score_base = score256(
+            plain_sse(&arm.recon),
+            lambda,
+            ((header_len(&fh) + arm.tile.len()) as u64) * 8 * 256,
+        );
+        let score_qm = score256(
+            plain_sse(&cand.recon),
+            lambda,
+            ((header_len(&fh_m) + cand.tile.len()) as u64) * 8 * 256,
+        );
+        if std::env::var_os("OXIDEAV_AV1_QM_DEBUG").is_some() {
+            eprintln!(
+                "qm-frame oh={} lvl={} base: tile {} B sse {} score {} | qm: tile {} B sse {} score {}",
+                cfg.order_hint,
+                lvl,
+                arm.tile.len(),
+                plain_sse(&arm.recon),
+                score_base,
+                cand.tile.len(),
+                plain_sse(&cand.recon),
+                score_qm,
+            );
+        }
+        if score_qm < score_base {
+            qm_elected = true;
+            arm = cand;
+            fh = fh_m;
+            params = params_m;
+            qp = qp_m;
+        }
+    }
+
     let mut delta_q_elected = false;
     if let Some(plan) = &delta_plan {
         let mut qp_d = qp;
@@ -3000,12 +3244,26 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // reconstruction, so the election is purely rate; the caller
     // patches the primary frame's already-emitted field to the
     // elected id and fixes the stored carry.
+    // r439 — the donor election follows the ELECTED primary: when the
+    // r424 ordinal election committed an ALT candidate (the pyramid's
+    // nearest-backward anchor), that carry's donor set is the one
+    // this frame's §8.3.1 chain loads from, so the replay candidates
+    // come from IT (the caller patches THAT frame's field). The
+    // GOP / ladder / SVC drivers only ever offer `PRIMARY_REF_NONE`
+    // as the alternative, so their arm is unchanged.
+    let donor_src: Option<&RefSlotCarry> = if fh.primary_ref_frame == PRIMARY_REF_NONE {
+        None
+    } else if fh.primary_ref_frame == cfg.primary_ref_frame {
+        cfg.primary_carry
+    } else {
+        cfg.alt_primaries
+            .iter()
+            .find(|(o, _)| *o == fh.primary_ref_frame)
+            .and_then(|(_, c)| *c)
+    };
     let mut donor_elected: Option<u32> = None;
-    if cfg.elect_donor
-        && cfg.primary_ref_frame != PRIMARY_REF_NONE
-        && fh.primary_ref_frame == cfg.primary_ref_frame
-    {
-        if let Some(pc) = cfg.primary_carry {
+    if cfg.elect_donor {
+        if let Some(pc) = donor_src {
             if pc.donor_cdfs.len() > 1 {
                 // Replay under the ELECTED params (hp updated
                 // `params.inter` in place; the temporal-seg arm
@@ -3070,8 +3328,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // carried slot, or the per-frame defaults).
     let start_cdfs_for = |ord: u8| -> Box<TileCdfContext> {
         // r436 — a donor election supersedes the main start state
-        // (it only fires when `ord == cfg.primary_ref_frame`).
-        if let (Some(t), Some(pc)) = (donor_elected, cfg.primary_carry) {
+        // (r439: it fires on the ELECTED primary's carry — main or
+        // alt — so the donation is read from `donor_src`).
+        if let (Some(t), Some(pc)) = (donor_elected, donor_src) {
             let mut loaded = pc.donor_cdfs[t as usize].clone();
             loaded.zero_counts();
             return loaded;
@@ -3552,6 +3811,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             primary_ref: fh.primary_ref_frame,
             hp_mv: hp_elected,
             delta_q: delta_q_elected,
+            qm: qm_elected,
             cdef: cdef_elected,
             lr: lr_elected,
             donor_elected,
@@ -6592,9 +6852,13 @@ pub(crate) fn residual_tx_search_luma_inter(
             continue;
         }
         let coeffs = forward_transform_2d(&residual, tx_sz, t, false);
-        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
+        // r439 — luma §5.9.12 QM row (15 = the no-QM §7.12.3
+        // short-circuit; the QM election arms it on unsegmented lossy
+        // frames — the bundle's segment-0 row is the coded one).
+        let qm = qp.seg_qm_level[0][0];
+        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, qm, qp), w, h);
         let all_zero = quant.iter().all(|&q| q == 0);
-        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
+        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, qm, qp);
         let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
         // §7.12.3 step-3 destination remap (FLIPADST family).
         let (flip_ud, flip_lr) = crate::encoder::key_frame::step3_flips(t);
@@ -8853,6 +9117,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             true,
             true,

@@ -330,6 +330,9 @@ pub fn encode_key_frame_yuv420_with_q_dq(
         1,
         None,
         delta_q,
+        // r439 — the delta-q A/B entry holds the §5.9.12 QM election
+        // OFF so the delta-q axis stays the only variable.
+        false,
         false,
     )?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
@@ -415,6 +418,7 @@ pub fn encode_key_frame_yuv_with_q_tiles(
         1,
         None,
         true,
+        true,
         false,
     )
     .map(|(k, _)| k)
@@ -478,6 +482,7 @@ pub fn encode_key_frame_yuv_with_q_tile_groups(
             tiles: (tile_cols_log2, tile_rows_log2),
             tile_groups,
             delta_q: true,
+            qm: true,
             ..KeyExtras::default()
         },
     )
@@ -545,6 +550,7 @@ pub fn encode_key_frame_yuv_with_q_tile_layout(
         &KeyExtras {
             explicit_tiles: Some((widths_sb, heights_sb)),
             delta_q: true,
+            qm: true,
             ..KeyExtras::default()
         },
     )
@@ -605,6 +611,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         1,
         None,
         true,
+        true,
         false,
     )
 }
@@ -647,6 +654,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     tile_groups: u32,
     explicit_tiles: Option<(&[u32], &[u32])>,
     delta_q: bool,
+    qm: bool,
     collect_donor_cdfs: bool,
 ) -> Result<
     (
@@ -669,6 +677,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
             tile_groups,
             explicit_tiles,
             delta_q,
+            qm,
             collect_donor_cdfs,
             ..KeyExtras::default()
         },
@@ -678,7 +687,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
 /// r431 — the spatial-scalability shape knobs on the intra driver
 /// (see [`encode_key_frame_yuv_full`]). Every field's default keeps
 /// the pre-r431 KEY shape bit-for-bit.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub(crate) struct KeyExtras<'a> {
     /// §5.9.15 uniform tile layout `(TileColsLog2, TileRowsLog2)`.
     pub tiles: (u32, u32),
@@ -728,6 +737,19 @@ pub(crate) struct KeyExtras<'a> {
     /// order) — set internally by the election's second arm; callers
     /// leave it `None`.
     pub delta_plan: Option<&'a [i32]>,
+    /// r439 — §5.9.12 quantizer-matrix ELECTION switch (the KEY twin
+    /// of the inter driver's arm): on an unsegmented lossy frame
+    /// whose luma carries real high-frequency energy (the
+    /// [`crate::encoder::inter_frame::qm_probe`] gate), a second full
+    /// search runs under `using_qmatrix = 1` at the
+    /// [`crate::encoder::inter_frame::qm_level_for_q`] §9.5.3 level
+    /// and the frame-level joint-objective election keeps the better
+    /// arm; the winner then feeds the delta-q election (the arms
+    /// compose).
+    pub qm: bool,
+    /// The armed §9.5.3 level — set internally by the election's
+    /// second arm; callers leave it `None`.
+    pub qm_level: Option<u8>,
     /// r436 — collect every tile's frame-end adapted CDF state into
     /// the returned carry so a consumer frame chaining its §8.3.1
     /// primary reference off this KEY's slot can run the §6.8.14
@@ -766,79 +788,132 @@ pub(crate) fn encode_key_frame_yuv_full(
     // `2^(-2·units)` from the SAME probe plan on both arms (masking:
     // banding shows first where nothing hides it).
     //
-    // This dispatcher stays THIN on purpose: it runs the two
+    // r439 — the §5.9.12 quantizer-matrix ELECTION runs FIRST (the
+    // KEY twin of the inter driver's arm, plain joint objective over
+    // full-frame SSE + exact realized bytes), and the winner feeds
+    // the delta-q election — the arms compose: a delta-q plan
+    // quantises at the running index with the SAME §7.12.3 QM
+    // scaling on both sides.
+    //
+    // This dispatcher stays THIN on purpose: it runs the
     // `encode_key_frame_yuv_core` arms at its OWN (shallow) stack
     // depth rather than nesting one core call inside another's huge
     // frame (a 2 MiB test-thread stack overflows otherwise).
-    if extras.delta_q
-        && extras.delta_plan.is_none()
-        && base_q_idx > 0
+    let elections_ok = base_q_idx > 0
         && alt_q.is_empty()
         && exact_mask.is_none()
         && model == RateModel::Twin
-    {
+        && extras.delta_plan.is_none()
+        && extras.qm_level.is_none();
+    let qm_candidate: Option<u8> =
+        if elections_ok && extras.qm && crate::encoder::inter_frame::qm_probe(input) {
+            Some(crate::encoder::inter_frame::qm_level_for_q(base_q_idx))
+        } else {
+            None
+        };
+    let delta_plan_opt: Option<Vec<i32>> = if elections_ok && extras.delta_q {
         let (mi_rows_probe, mi_cols_probe) = (input.height / 4, input.width / 4);
-        if let Some(plan) =
-            crate::encoder::inter_frame::delta_q_plan_units(input, mi_rows_probe, mi_cols_probe)
-        {
-            let base_extras = KeyExtras {
-                tiles: extras.tiles,
-                tile_groups: extras.tile_groups,
-                explicit_tiles: extras.explicit_tiles,
-                seq_override: extras.seq_override,
-                intra_only_refresh: extras.intra_only_refresh,
-                delta_q: false,
-                delta_plan: None,
-                collect_donor_cdfs: extras.collect_donor_cdfs,
-            };
-            let armed_extras = KeyExtras {
-                delta_plan: Some(&plan),
-                ..base_extras
-            };
-            let base = encode_key_frame_yuv_core(
-                input,
-                base_q_idx,
-                model,
-                alt_q,
-                exact_mask,
-                cdef,
-                cdef_units,
-                lr,
-                &base_extras,
-            )?;
-            let armed = encode_key_frame_yuv_core(
-                input,
-                base_q_idx,
-                model,
-                alt_q,
-                exact_mask,
-                cdef,
-                cdef_units,
-                lr,
-                &armed_extras,
-            )?;
-            let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
-            let score = |k: &(
-                EncodedKeyFrameYuv,
-                crate::encoder::inter_frame::RefSlotCarry,
-            )|
-             -> u64 {
-                score256(
-                    key_weighted_sse(input, &k.0.recon_y, &k.0.recon_u, &k.0.recon_v, &plan),
-                    lambda,
-                    (k.0.temporal_unit_bytes.len() as u64) * 8 * 256,
-                )
-            };
-            return Ok(if score(&armed) < score(&base) {
-                armed
-            } else {
-                base
-            });
-        }
+        crate::encoder::inter_frame::delta_q_plan_units(input, mi_rows_probe, mi_cols_probe)
+    } else {
+        None
+    };
+    if qm_candidate.is_none() && delta_plan_opt.is_none() {
+        return encode_key_frame_yuv_core(
+            input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
+        );
     }
-    encode_key_frame_yuv_core(
-        input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
-    )
+    let flat_extras = KeyExtras {
+        tiles: extras.tiles,
+        tile_groups: extras.tile_groups,
+        explicit_tiles: extras.explicit_tiles,
+        seq_override: extras.seq_override,
+        intra_only_refresh: extras.intra_only_refresh,
+        delta_q: false,
+        delta_plan: None,
+        qm: false,
+        qm_level: None,
+        collect_donor_cdfs: extras.collect_donor_cdfs,
+    };
+    let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
+    type KeyOut = (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    );
+    // Stage 1 — §5.9.12 QM election under the plain joint objective.
+    let plain_score = |k: &KeyOut| -> u64 {
+        let mut d = 0u64;
+        for (a, b) in
+            k.0.recon_y
+                .iter()
+                .zip(&input.y)
+                .chain(k.0.recon_u.iter().zip(&input.u))
+                .chain(k.0.recon_v.iter().zip(&input.v))
+        {
+            let diff = i64::from(*a) - i64::from(*b);
+            d += (diff * diff) as u64;
+        }
+        score256(d, lambda, (k.0.temporal_unit_bytes.len() as u64) * 8 * 256)
+    };
+    let base = encode_key_frame_yuv_core(
+        input,
+        base_q_idx,
+        model,
+        alt_q,
+        exact_mask,
+        cdef,
+        cdef_units,
+        lr,
+        &flat_extras,
+    )?;
+    let (stage1_extras, stage1) = match qm_candidate {
+        Some(lvl) => {
+            let qm_extras = KeyExtras {
+                qm_level: Some(lvl),
+                ..flat_extras
+            };
+            let armed = encode_key_frame_yuv_core(
+                input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &qm_extras,
+            )?;
+            if plain_score(&armed) < plain_score(&base) {
+                (qm_extras, armed)
+            } else {
+                (flat_extras, base)
+            }
+        }
+        None => (flat_extras, base),
+    };
+    // Stage 2 — §5.9.17 delta-q election on the stage-1 winner (the
+    // masking-weighted objective, exactly the r431 arm).
+    if let Some(plan) = &delta_plan_opt {
+        let armed_extras = KeyExtras {
+            delta_plan: Some(plan),
+            ..stage1_extras
+        };
+        let armed = encode_key_frame_yuv_core(
+            input,
+            base_q_idx,
+            model,
+            alt_q,
+            exact_mask,
+            cdef,
+            cdef_units,
+            lr,
+            &armed_extras,
+        )?;
+        let score = |k: &KeyOut| -> u64 {
+            score256(
+                key_weighted_sse(input, &k.0.recon_y, &k.0.recon_u, &k.0.recon_v, plan),
+                lambda,
+                (k.0.temporal_unit_bytes.len() as u64) * 8 * 256,
+            )
+        };
+        return Ok(if score(&armed) < score(&stage1) {
+            armed
+        } else {
+            stage1
+        });
+    }
+    Ok(stage1)
 }
 
 /// r431 — the general-format intra-frame CORE (no delta-q election;
@@ -1019,6 +1094,35 @@ fn encode_key_frame_yuv_core(
             qp.seg_alt_q_data[seg] = d;
         }
         fh.segmentation_params = Some(crate::encoder::inter_frame::segmentation_params_for(alt_q));
+    }
+    // r439 — the armed §5.9.12 quantizer-matrix arm (see
+    // [`KeyExtras::qm_level`]): `using_qmatrix = 1` + the level on
+    // all three planes in the header, and the `SegQMLevel[ plane ][
+    // 0 ]` rows on the quantiser bundle — every §7.12.3
+    // quantise/dequantise step in the search and the residual chain
+    // rides the QM-scaled `q2`, matching the decoder's §5.9.2
+    // derivation (segment 0 is the only coded segment).
+    if let Some(lvl) = extras.qm_level {
+        if base_q_idx == 0
+            || !alt_q.is_empty()
+            || exact_mask.is_some()
+            || model != RateModel::Twin
+            || lvl >= 15
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        qp.using_qmatrix = true;
+        for plane in 0..3 {
+            for seg in 0..crate::uncompressed_header_tail::MAX_SEGMENTS {
+                qp.seg_qm_level[plane][seg] = lvl;
+            }
+        }
+        if let Some(q) = fh.quantization_params.as_mut() {
+            q.using_qmatrix = true;
+            q.qm_y = lvl;
+            q.qm_u = lvl;
+            q.qm_v = lvl;
+        }
     }
     // r431 — the armed §5.9.17 delta-q arm (see [`KeyExtras::delta_plan`]):
     // per-superblock `CurrentQIndex` walk, §5.11.13 deltas on the wire.
@@ -2538,9 +2642,14 @@ pub(crate) fn residual_tx_avail(
     } else {
         forward_transform_2d(&residual, tx_sz, tx_type, false)
     };
-    let dense = forward_quantize(&coeffs, tx_sz, plane, 0, tx_type, 15, qp);
+    // r439 — the §5.9.12 `SegQMLevel[ plane ][ 0 ]` row rides the
+    // quantiser bundle (15 = the no-QM §7.12.3 short-circuit; the
+    // QM election sets it on unsegmented lossy frames, so segment 0
+    // is the only coded segment whenever it is < 15).
+    let qm = qp.seg_qm_level[plane as usize][0];
+    let dense = forward_quantize(&coeffs, tx_sz, plane, 0, tx_type, qm, qp);
     let quant = repack_compact(dense, w, h);
-    let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, 15, qp);
+    let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, qm, qp);
     let res_back =
         inverse_transform_2d(&dequant, tx_sz, tx_type, u32::from(qp.bit_depth), lossless);
     let (flip_ud, flip_lr) = step3_flips(tx_type);
@@ -2624,9 +2733,11 @@ fn residual_tx_search_luma_avail(
             continue;
         }
         let coeffs = forward_transform_2d(&residual, tx_sz, t, false);
-        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
+        // r439 — luma §5.9.12 QM row (15 = no-QM; see `residual_tx_avail`).
+        let qm = qp.seg_qm_level[0][0];
+        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, qm, qp), w, h);
         let all_zero = quant.iter().all(|&q| q == 0);
-        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
+        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, qm, qp);
         let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
         let mut d = 0u64;
         for i in 0..ah {

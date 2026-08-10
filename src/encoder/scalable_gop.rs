@@ -231,6 +231,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
         tile_groups,
         None,
         /* delta_q = */ true,
+        /* qm = */ true,
         donor_armed,
     )?;
     let mut seq = key.seq.clone();
@@ -345,6 +346,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             collect_donor_cdfs: donor_armed && tid + 1 < temporal_layers,
             elect_donor: donor_armed,
             explicit_tiles: None,
+            qm: true,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -613,6 +615,17 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
     let mut carry_store: Vec<Option<Rc<RefSlotCarry>>> = vec![None; 8];
     let mut slot_hints = [0u32; 8];
     let mut temporal_units: Vec<Vec<u8>> = Vec::with_capacity(n);
+    // r439 — the §6.8.14 donor election arms PER LAYER on multi-tile
+    // layouts (a single-tile layer's frames carry no
+    // `context_update_tile_id` field). `carry_wire[ slot ]` locates
+    // each slot's carried frame on the wire — `(temporal-unit index,
+    // frame ordinal within the unit)`; every §7.5 unit carries one
+    // frame per layer in increasing `spatial_id` order, so layer
+    // `s`'s frame is ordinal `s` (the ordinal counts `OBU_FRAME` /
+    // `OBU_FRAME_HEADER` OBUs — tile groups and the sequence header
+    // don't shift it).
+    let donor_armed_layer = |s: usize| tiles_of(s) != (0, 0);
+    let mut carry_wire: [Option<(usize, usize)>; 8] = [None; 8];
 
     // ---- Time instant 0: the layer-0 KEY + enhancement INTRA_ONLYs. ----
     let mut tu0: Vec<u8> = Vec::new();
@@ -642,7 +655,13 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // default intra entry.
             delta_q: true,
             delta_plan: None,
-            collect_donor_cdfs: false,
+            // r439 — and the §5.9.12 QM election.
+            qm: true,
+            qm_level: None,
+            // r439 — the opener donates too: collect its per-tile end
+            // CDFs so the layer's first inter frame can run the
+            // §6.8.14 election.
+            collect_donor_cdfs: donor_armed_layer(s),
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],
@@ -668,11 +687,13 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 *c = Some(carry.clone());
             }
             slot_hints = [0; 8];
+            carry_wire = [Some((0, 0)); 8];
         } else {
             for b in 0..2usize {
                 mf_store[2 * s + b] = SavedMotionField::intra(mi_rows, mi_cols);
                 carry_store[2 * s + b] = Some(carry.clone());
                 slot_hints[2 * s + b] = 0;
+                carry_wire[2 * s + b] = Some((0, s));
             }
         }
         // Extract the frame-carrying OBUs from the driver's own
@@ -749,11 +770,16 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 // r436 — the layer's own layout on every inter frame.
                 tiles: tiles_of(s),
                 tile_groups,
-                collect_donor_cdfs: false,
-                elect_donor: false,
+                // r439 — the §6.8.14 donor election per layer chain:
+                // collect this frame's per-tile end CDFs for the
+                // layer's NEXT frame, elect over the previous frame's
+                // donor set.
+                collect_donor_cdfs: donor_armed_layer(s),
+                elect_donor: donor_armed_layer(s),
                 explicit_tiles: None,
+                qm: true,
             };
-            let (obus, recon, saved, carry, _aux) = encode_inter_frame_generic(
+            let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
                 &layer[i],
                 &seq,
                 base_q_idx,
@@ -762,6 +788,49 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 &mf,
                 RateModel::Twin,
             )?;
+            // r439 — §6.8.14 donor settlement (same multi-consumer
+            // discipline as the temporal ladder: the consumed slot's
+            // donor set freezes at first consumption whether or not
+            // the election won; every slot holding the same frame's
+            // carry — the layer-0 KEY seeds all eight — is swept by
+            // pointer identity). The consumed frame's unit flushed at
+            // a previous time instant, so the patch always rewrites
+            // an already-emitted unit at the layer's frame ordinal.
+            if last_carry.donor_cdfs.len() > 1 {
+                let fixed_cdfs = match aux.donor_elected {
+                    Some(t) => {
+                        let span = last_carry
+                            .ctx_update_span
+                            .expect("donor election only fires on multi-tile frames");
+                        let (tu_idx, ord) =
+                            carry_wire[last_slot].expect("consumed frame located on the wire");
+                        crate::encoder::inter_frame::patch_ctx_update_in_tu_frame(
+                            &mut temporal_units[tu_idx],
+                            ord,
+                            span,
+                            t,
+                        );
+                        last_carry.donor_cdfs[t as usize].clone()
+                    }
+                    None => last_carry.cdfs.clone(),
+                };
+                let fixed = Rc::new(RefSlotCarry {
+                    cdfs: fixed_cdfs,
+                    segment_ids: last_carry.segment_ids.clone(),
+                    mi_rows: last_carry.mi_rows,
+                    mi_cols: last_carry.mi_cols,
+                    gm_params: last_carry.gm_params,
+                    donor_cdfs: Vec::new(),
+                    ctx_update_span: None,
+                });
+                for slot in carry_store.iter_mut() {
+                    if let Some(c) = slot {
+                        if Rc::ptr_eq(c, &last_carry) {
+                            *slot = Some(fixed.clone());
+                        }
+                    }
+                }
+            }
             for mut obu in obus {
                 obu.header.extension = Some(ObuExtensionHeader::new(0, s as u8));
                 write_obu_with_size(&mut tu, &obu.header, &obu.body);
@@ -770,6 +839,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             mf_store[refresh_slot] = saved;
             carry_store[refresh_slot] = Some(Rc::new(carry));
             slot_hints[refresh_slot] = i as u32;
+            carry_wire[refresh_slot] = Some((i, s));
         }
         temporal_units.push(tu);
     }

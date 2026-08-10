@@ -144,6 +144,10 @@ pub struct PyramidTuning {
     /// arm election). `false` keeps the single-quantiser shape on
     /// every frame (the A/B baseline).
     pub delta_q: bool,
+    /// r439 — §5.9.12 quantizer-matrix election (see
+    /// [`super::inter_frame::GopTuning::qm`]). `false` keeps the
+    /// flat-quantiser shape on every frame (the A/B baseline).
+    pub qm: bool,
     /// r428 — frame-level §5.9.19/§7.15 CDEF election on lossy
     /// frames (KEY + every pyramid role). `false` keeps the
     /// all-zero-strength shape on every frame (the A/B baseline).
@@ -167,6 +171,23 @@ pub struct PyramidTuning {
     /// [`super::inter_frame::GopTuning::tile_groups`]). `0` / `1`
     /// keep the single-`OBU_FRAME` shape.
     pub tile_groups: u32,
+    /// r439 — §6.8.14 `context_update_tile_id` election through the
+    /// pyramid's refresh graph (the out-of-order sibling of
+    /// [`super::inter_frame::GopTuning::ctx_update_elect`]): a coded
+    /// frame whose elected §5.9.2 primary reference offers the full
+    /// donor set replays its committed trees from EACH tile's
+    /// frame-end CDF state and keeps the start state realizing the
+    /// smallest assembled §5.11.1 body; a win patches the donor
+    /// frame's already-emitted fixed-width field in place — inside a
+    /// still-pending multi-frame temporal unit or an already-flushed
+    /// one. A slot's donor set FREEZES at its first consumption
+    /// (whether or not the election won — the consumer's bytes chain
+    /// off the donation as it stood), swept by pointer identity
+    /// across every §7.20 slot holding the same frame's carry.
+    /// `false` keeps the tile-0 donation on every frame (the A/B
+    /// baseline; bit-identical to the pre-r439 streams). Inert on
+    /// single-tile layouts or with [`Self::primary_ref`] off.
+    pub ctx_update_elect: bool,
 }
 
 impl Default for PyramidTuning {
@@ -178,11 +199,13 @@ impl Default for PyramidTuning {
             primary_ref: true,
             high_precision_mv: true,
             delta_q: true,
+            qm: true,
             cdef: true,
             cdef_units: true,
             lr: true,
             tiles: (0, 0),
             tile_groups: 1,
+            ctx_update_elect: true,
         }
     }
 }
@@ -198,6 +221,12 @@ pub struct TunedPyramidGop {
     pub gop: EncodedGop,
     pub chunk_lengths: Vec<usize>,
     pub primary_elections: Vec<(u32, u8)>,
+    /// r439 — per coded inter frame in CODING order: `(order_hint,
+    /// Some(t))` when the frame elected tile `t != 0` of its primary
+    /// frame as the §6.8.14 CDF donor (the donor frame's
+    /// `context_update_tile_id` was patched to `t` on the wire);
+    /// `None` when the tile-0 donation stood.
+    pub ctx_donor_elections: Vec<(u32, Option<u32>)>,
 }
 
 /// r427 (hidden) — general-format sibling of [`TunedPyramidGop`].
@@ -207,6 +236,8 @@ pub struct TunedPyramidGopYuv {
     pub gop: EncodedGopYuv,
     pub chunk_lengths: Vec<usize>,
     pub primary_elections: Vec<(u32, u8)>,
+    /// r439 — see [`TunedPyramidGop::ctx_donor_elections`].
+    pub ctx_donor_elections: Vec<(u32, Option<u32>)>,
 }
 
 /// One coded (non-KEY) pyramid frame's role.
@@ -437,9 +468,28 @@ struct PyramidSession {
     temporal_units: Vec<Vec<u8>>,
     chunk_lengths: Vec<usize>,
     primary_elections: Vec<(u32, u8)>,
+    /// r439 — where each §7.20 slot's carried frame sits on the wire:
+    /// `(temporal-unit index, frame ordinal within the unit)` — the
+    /// §6.8.14 donor patch target once the unit has FLUSHED. `None`
+    /// while the frame is still pending inside the current chunk's
+    /// open unit (the patch then rewrites the pending OBU body
+    /// directly). Every mini-GOP plan ends flushed, so `None` never
+    /// crosses a chunk boundary.
+    slot_wire: [Option<(usize, usize)>; 8],
+    /// r439 — donor-election trace (see
+    /// [`TunedPyramidGop::ctx_donor_elections`]).
+    ctx_donor_elections: Vec<(u32, Option<u32>)>,
 }
 
 impl PyramidSession {
+    /// r439 — the §6.8.14 donor election arms on multi-tile pyramids
+    /// with the primary-reference carry live (single-tile frames
+    /// carry no `context_update_tile_id` field; without a primary
+    /// chain nobody consumes the donation).
+    fn donor_armed(tuning: &PyramidTuning) -> bool {
+        tuning.ctx_update_elect && tuning.primary_ref && tuning.tiles != (0, 0)
+    }
+
     /// Encode the KEY frame and seed every §7.20 slot with its state.
     fn new(frames: &[YuvFrame], base_q: u8, tuning: PyramidTuning) -> Result<Self, Error> {
         let n = frames.len();
@@ -460,7 +510,12 @@ impl PyramidSession {
             tuning.tile_groups,
             None,
             true,
-            false,
+            // r439 — the KEY rides the pyramid's §5.9.12 QM switch.
+            tuning.qm,
+            // r439 — the KEY donates too: collect its per-tile end
+            // CDFs so the first consumer can run the §6.8.14
+            // election.
+            Self::donor_armed(&tuning),
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -488,6 +543,10 @@ impl PyramidSession {
             temporal_units: vec![key.temporal_unit_bytes],
             chunk_lengths: Vec::new(),
             primary_elections: Vec::new(),
+            // r439 — the KEY frame is temporal unit 0, frame ordinal
+            // 0; its `allFrames` refresh seeds every slot.
+            slot_wire: [Some((0, 0)); 8],
+            ctx_donor_elections: Vec::new(),
         })
     }
 
@@ -503,11 +562,17 @@ impl PyramidSession {
     /// Encode one mini-GOP of `l` frames starting at display `pos`
     /// (anchor at `pos - 1`).
     fn encode_chunk(&mut self, frames: &[YuvFrame], pos: usize, l: usize) -> Result<(), Error> {
+        let donor_armed = Self::donor_armed(&self.tuning);
         let (steps, alt_slot) = plan_mini_gop(pos, l, self.anchor_slot);
         // §7.5 bitstream conformance: each temporal unit must carry
         // EXACTLY ONE shown frame — decoded-not-shown pyramid frames
         // accumulate here and ride the next shown frame's unit.
         let mut pending: Vec<ObuFrame> = Vec::new();
+        // r439 — per slot, the index into `pending` of the refreshed
+        // frame's header-carrying OBU while its temporal unit is
+        // still open (the donor patch then rewrites the pending body
+        // directly; a flush resolves the slot to `slot_wire`).
+        let mut pending_slot_idx: [Option<usize>; 8] = [None; 8];
         for step in steps {
             match step {
                 Step::Code(role) => {
@@ -587,9 +652,14 @@ impl PyramidSession {
                         freeze_cdfs: false,
                         tiles: self.tuning.tiles,
                         tile_groups: self.tuning.tile_groups,
-                        collect_donor_cdfs: false,
-                        elect_donor: false,
+                        // r439 — collect only on REFERENCE frames (a
+                        // non-reference B leaf's donation is never
+                        // consumed); elect whenever the primary carry
+                        // offers candidates.
+                        collect_donor_cdfs: donor_armed && role.refresh.is_some(),
+                        elect_donor: donor_armed,
                         explicit_tiles: None,
+                        qm: self.tuning.qm,
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
@@ -603,26 +673,115 @@ impl PyramidSession {
                     )?;
                     self.primary_elections
                         .push((role.display as u32, aux.primary_ref));
-                    pending.extend(obus);
-                    if role.show {
-                        self.temporal_units
-                            .push(build_temporal_unit(None, &pending));
-                        pending.clear();
+                    // r439 — §6.8.14 donor settlement. The slot whose
+                    // carry this frame's committed bytes chain off is
+                    // the ELECTED primary's (§5.9.2 ordinal 0 = the
+                    // LAST slot, 4 = the BWDREF slot; PRIMARY_REF_NONE
+                    // consumes nothing). THE MULTI-CONSUMER RULE: that
+                    // slot's donor set freezes at this first
+                    // consumption whether or not the election won — a
+                    // later consumer re-electing would silently
+                    // re-start this frame's already-committed §8.3.1
+                    // chain. On a win (only possible when the MAIN
+                    // primary survived) the donor frame's
+                    // already-emitted `context_update_tile_id` is
+                    // patched in place — inside the current chunk's
+                    // still-open temporal unit or an already-flushed
+                    // one — and every §7.20 slot holding the same
+                    // frame's carry is swept by pointer identity.
+                    let consumed_slot: Option<usize> = if self.tuning.primary_ref {
+                        match aux.primary_ref {
+                            0 => Some(role.last_slot),
+                            4 => role.bwd_slot,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = consumed_slot {
+                        if self.carry_store[slot].donor_cdfs.len() > 1 {
+                            let consumed = self.carry_store[slot].clone();
+                            let fixed_cdfs = match aux.donor_elected {
+                                Some(t) => {
+                                    let span = consumed
+                                        .ctx_update_span
+                                        .expect("donor election only fires on multi-tile frames");
+                                    match pending_slot_idx[slot] {
+                                        Some(idx) => {
+                                            // Pending `OBU_FRAME` /
+                                            // `OBU_FRAME_HEADER` bodies
+                                            // start with the header bits.
+                                            crate::encoder::inter_frame::patch_bits_at(
+                                                &mut pending[idx].body,
+                                                0,
+                                                span,
+                                                t,
+                                            );
+                                        }
+                                        None => {
+                                            let (tu, ord) = self.slot_wire[slot]
+                                                .expect("flushed frame located on the wire");
+                                            crate::encoder::inter_frame::patch_ctx_update_in_tu_frame(
+                                                &mut self.temporal_units[tu],
+                                                ord,
+                                                span,
+                                                t,
+                                            );
+                                        }
+                                    }
+                                    consumed.donor_cdfs[t as usize].clone()
+                                }
+                                None => consumed.cdfs.clone(),
+                            };
+                            let fixed = Rc::new(RefSlotCarry {
+                                cdfs: fixed_cdfs,
+                                segment_ids: consumed.segment_ids.clone(),
+                                mi_rows: consumed.mi_rows,
+                                mi_cols: consumed.mi_cols,
+                                gm_params: consumed.gm_params,
+                                donor_cdfs: Vec::new(),
+                                ctx_update_span: None,
+                            });
+                            for s in self.carry_store.iter_mut() {
+                                if Rc::ptr_eq(s, &consumed) {
+                                    *s = fixed.clone();
+                                }
+                            }
+                        }
                     }
+                    if donor_armed {
+                        self.ctx_donor_elections
+                            .push((role.display as u32, aux.donor_elected));
+                    }
+                    // r439 — locate this frame's header OBU inside the
+                    // open unit before extending the pending list.
+                    let header_idx = pending.len()
+                        + obus
+                            .iter()
+                            .position(|o| {
+                                matches!(o.header.obu_type, ObuType::Frame | ObuType::FrameHeader)
+                            })
+                            .expect("coded frame carries a header OBU");
+                    pending.extend(obus);
                     self.recons[role.display] = Some(rc);
-                    // §7.20 reference frame update.
+                    // §7.20 reference frame update (the wire location
+                    // records BEFORE the flush so the flush resolves
+                    // it to `slot_wire`).
                     if let Some(s) = role.refresh {
                         self.mf_store[s] = saved;
                         self.carry_store[s] = Rc::new(carry);
                         self.slot_hints[s] = role.display as u32;
                         self.slot_display[s] = role.display;
+                        pending_slot_idx[s] = Some(header_idx);
+                        self.slot_wire[s] = None;
+                    }
+                    if role.show {
+                        self.flush_pending(&mut pending, &mut pending_slot_idx);
                     }
                 }
                 Step::Show(slot) => {
                     pending.push(show_existing_obu(&self.seq, slot as u8));
-                    self.temporal_units
-                        .push(build_temporal_unit(None, &pending));
-                    pending.clear();
+                    self.flush_pending(&mut pending, &mut pending_slot_idx);
                 }
             }
         }
@@ -630,6 +789,33 @@ impl PyramidSession {
         self.anchor_slot = alt_slot;
         self.chunk_lengths.push(l);
         Ok(())
+    }
+
+    /// r439 — close the current §7.5 temporal unit: resolve every
+    /// slot whose refreshed frame rides this unit to its final wire
+    /// location `(temporal-unit index, frame ordinal within the
+    /// unit)`, then serialize and clear the pending list. The frame
+    /// ordinal counts header-carrying OBUs (`OBU_FRAME` /
+    /// `OBU_FRAME_HEADER`) in emission order — `build_temporal_unit`
+    /// only prepends a temporal delimiter, which the patch walk
+    /// skips.
+    fn flush_pending(
+        &mut self,
+        pending: &mut Vec<ObuFrame>,
+        pending_slot_idx: &mut [Option<usize>; 8],
+    ) {
+        let tu_idx = self.temporal_units.len();
+        for (s, slot) in pending_slot_idx.iter_mut().enumerate() {
+            if let Some(idx) = slot.take() {
+                let ord = pending[..idx]
+                    .iter()
+                    .filter(|o| matches!(o.header.obu_type, ObuType::Frame | ObuType::FrameHeader))
+                    .count();
+                self.slot_wire[s] = Some((tu_idx, ord));
+            }
+        }
+        self.temporal_units.push(build_temporal_unit(None, pending));
+        pending.clear();
     }
 
     /// Sum of coded bytes across all emitted temporal units.
@@ -686,6 +872,7 @@ impl PyramidSession {
             },
             chunk_lengths: self.chunk_lengths,
             primary_elections: self.primary_elections,
+            ctx_donor_elections: self.ctx_donor_elections,
         })
     }
 }
@@ -771,6 +958,7 @@ pub fn encode_pyramid_gop_yuv420_with_q_tuned(
         gop: narrow_gop_8bit(t.gop),
         chunk_lengths: t.chunk_lengths,
         primary_elections: t.primary_elections,
+        ctx_donor_elections: t.ctx_donor_elections,
     })
 }
 
@@ -843,6 +1031,8 @@ pub struct TunedAdaptiveGopYuv {
     pub cuts: Vec<bool>,
     pub elections: Vec<(usize, usize, usize, usize)>,
     pub primary_elections: Vec<(u32, u8)>,
+    /// r439 — see [`TunedPyramidGop::ctx_donor_elections`].
+    pub ctx_donor_elections: Vec<(u32, Option<u32>)>,
 }
 
 /// r424 (hidden) — [`EncodedGop`] plus the adaptive election traces.
@@ -863,6 +1053,8 @@ pub struct TunedAdaptiveGop {
     /// §5.9.2 primary_ref_frame ordinal)` — see
     /// [`TunedPyramidGop::primary_elections`].
     pub primary_elections: Vec<(u32, u8)>,
+    /// r439 — see [`TunedPyramidGop::ctx_donor_elections`].
+    pub ctx_donor_elections: Vec<(u32, Option<u32>)>,
 }
 
 /// Half-resolution luma (2×2 box filter) for the motion probe.
@@ -965,6 +1157,7 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
         cuts: t.cuts,
         elections: t.elections,
         primary_elections: t.primary_elections,
+        ctx_donor_elections: t.ctx_donor_elections,
     })
 }
 
@@ -1069,6 +1262,7 @@ pub fn encode_adaptive_gop_yuv_with_q_tuned(
         cuts,
         elections,
         primary_elections: tuned.primary_elections,
+        ctx_donor_elections: tuned.ctx_donor_elections,
     })
 }
 

@@ -190,8 +190,12 @@ pub fn encode_inter_block_residual_4x4(
     } else {
         forward_transform_2d(&residual, TX_4X4, DCT_DCT, false)
     };
-    let quant = forward_quantize(&coeffs, TX_4X4, plane, 0, DCT_DCT, 15, qp);
-    let dequant = crate::cdf::dequantize_step1(&quant, TX_4X4, plane, 0, DCT_DCT, 15, qp);
+    // r439 — the §5.9.12 `SegQMLevel[ plane ][ 0 ]` row rides the
+    // quantiser bundle (15 = the no-QM §7.12.3 short-circuit; the
+    // conformance drivers arm it on the quantizer-matrix election).
+    let qm = qp.seg_qm_level[plane as usize][0];
+    let quant = forward_quantize(&coeffs, TX_4X4, plane, 0, DCT_DCT, qm, qp);
+    let dequant = crate::cdf::dequantize_step1(&quant, TX_4X4, plane, 0, DCT_DCT, qm, qp);
     let resid_back = crate::transform::inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
     let mut recon = [0u8; 16];
     for k in 0..16 {

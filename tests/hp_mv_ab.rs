@@ -126,6 +126,8 @@ fn encode_ab(frames: &[Yuv420Frame], q: u8) -> (TunedGop, TunedGop) {
             None,
             GopTuning {
                 high_precision_mv: hp,
+                // r439 — hold the §5.9.12 QM election off (axis isolation).
+                qm: false,
                 ..GopTuning::default()
             },
         )

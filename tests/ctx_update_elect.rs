@@ -282,6 +282,140 @@ fn ctx_update_fixture_staging() {
 
 use oxideav_av1::encoder::encode_temporal_layered_gop_yuv420_with_q_tiles;
 
+// ---------------------------------------------------------------------
+// r439 — the §6.8.14 election on the B-PYRAMID driver.
+// ---------------------------------------------------------------------
+
+use oxideav_av1::encoder::{encode_pyramid_gop_yuv420_with_q_tuned, PyramidTuning};
+
+/// Coded (non-`show_existing_frame`) frame headers' wire
+/// `context_update_tile_id`s across a stream, in decode order.
+fn wire_ctx_ids_tus(tus: &[Vec<u8>], w: u32, h: u32) -> Vec<u32> {
+    let mut seq = None;
+    let mut refinfo = RefInfo::default();
+    for i in 0..8 {
+        refinfo.valid[i] = true;
+        refinfo.upscaled_width[i] = w;
+        refinfo.frame_height[i] = h;
+        refinfo.render_width[i] = w;
+        refinfo.render_height[i] = h;
+    }
+    let mut out = Vec::new();
+    for tu in tus {
+        for desc in ObuIter::new(tu) {
+            let desc = desc.expect("TU walks");
+            match desc.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+                }
+                ObuType::Frame | ObuType::FrameHeader => {
+                    let fh = parse_frame_header_with_refs(
+                        desc.payload,
+                        seq.as_ref().expect("SH precedes frames"),
+                        &refinfo,
+                    )
+                    .expect("frame header parses");
+                    // `show_existing_frame` short headers carry no
+                    // tile info — skip them.
+                    if fh.show_existing_frame {
+                        continue;
+                    }
+                    out.push(fh.tile_info.expect("tiled stream").context_update_tile_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The pyramid drives the §6.8.14 election through its out-of-order
+/// refresh graph: the flat left tile beside the textured moving right
+/// tile makes tile-1 donations price consumers smaller, the patched
+/// fields land on the wire (inside multi-frame temporal units — ALT /
+/// MID frames ride their B leaf's unit), and the whole stream decodes
+/// display-order bit-exact through the spec driver.
+#[test]
+fn pyramid_ctx_update_election_fires_and_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..6).map(|t| hetero_frame(128, 64, t)).collect();
+    let on = encode_pyramid_gop_yuv420_with_q_tuned(
+        &frames,
+        80,
+        PyramidTuning {
+            tiles: (1, 0),
+            ..PyramidTuning::default()
+        },
+    )
+    .expect("pyramid election encode");
+    let elected: Vec<&(u32, Option<u32>)> = on
+        .ctx_donor_elections
+        .iter()
+        .filter(|(_, e)| e.is_some())
+        .collect();
+    assert!(
+        !elected.is_empty(),
+        "designed content must elect a non-zero donor at least once: {:?}",
+        on.ctx_donor_elections
+    );
+    // Wire audit: every Some(t) election patched exactly one coded
+    // frame's field to a non-zero id (a slot's donor set freezes at
+    // first consumption, so patch targets are distinct).
+    let ids = wire_ctx_ids_tus(&on.gop.temporal_units, 128, 64);
+    assert_eq!(ids.len(), frames.len(), "one coded frame per display");
+    assert_eq!(
+        ids.iter().filter(|&&id| id != 0).count(),
+        elected.len(),
+        "patched wire ids must match the election trace: ids {ids:?} trace {:?}",
+        on.ctx_donor_elections
+    );
+    // §6.8.21/§8.4 semantics survive the patches: display-order decode
+    // equals the encoder reconstructions byte for byte.
+    let decoded =
+        oxideav_av1::decoder::decode_av1_spec(&on.gop.ivf_bytes).expect("patched pyramid decodes");
+    assert_eq!(decoded.len(), frames.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], on.gop.recon[i].y, "display {i} luma");
+        assert_eq!(f.planes[1], on.gop.recon[i].u, "display {i} U");
+        assert_eq!(f.planes[2], on.gop.recon[i].v, "display {i} V");
+    }
+    // The off arm keeps every donation at tile 0 and reports no
+    // elections.
+    let off = encode_pyramid_gop_yuv420_with_q_tuned(
+        &frames,
+        80,
+        PyramidTuning {
+            tiles: (1, 0),
+            ctx_update_elect: false,
+            ..PyramidTuning::default()
+        },
+    )
+    .expect("pyramid baseline encode");
+    assert!(off.ctx_donor_elections.is_empty());
+    assert!(wire_ctx_ids_tus(&off.gop.temporal_units, 128, 64)
+        .iter()
+        .all(|&id| id == 0));
+}
+
+/// Single-tile pyramids carry no `context_update_tile_id` field — the
+/// knob is inert and the streams are bit-identical.
+#[test]
+fn pyramid_ctx_update_election_inert_on_single_tile() {
+    let frames: Vec<Yuv420Frame> = (0..5).map(|t| hetero_frame(64, 64, t)).collect();
+    let on = encode_pyramid_gop_yuv420_with_q_tuned(&frames, 80, PyramidTuning::default())
+        .expect("single-tile on");
+    let off = encode_pyramid_gop_yuv420_with_q_tuned(
+        &frames,
+        80,
+        PyramidTuning {
+            ctx_update_elect: false,
+            ..PyramidTuning::default()
+        },
+    )
+    .expect("single-tile off");
+    assert_eq!(on.gop.ivf_bytes, off.gop.ivf_bytes);
+    assert!(on.ctx_donor_elections.is_empty());
+}
+
 /// The multi-consumer discipline on the §6.7.5 ladder: a slot's
 /// donor set freezes at its FIRST consumption (several frames may
 /// chain their §8.3.1 primary off the same slot — the KEY seeds all
@@ -355,4 +489,92 @@ fn ladder_ctx_update_election_survives_every_operating_point() {
             }
         }
     }
+}
+
+/// Env-gated staging dump (`OXIDEAV_AV1_CTX_ELECT_PYR_DIR`): the
+/// elected tiled-pyramid and tiled-SVC streams + expected YUV for
+/// black-box reference-decoder validation and corpus pinning. Inert
+/// otherwise.
+#[test]
+fn pyramid_svc_ctx_update_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_CTX_ELECT_PYR_DIR") else {
+        eprintln!(
+            "OXIDEAV_AV1_CTX_ELECT_PYR_DIR unset — skipping the pyramid/SVC ctx staging dump"
+        );
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+
+    // Tiled B-pyramid with elected donors.
+    let frames: Vec<Yuv420Frame> = (0..6).map(|t| hetero_frame(128, 64, t)).collect();
+    let pyr = encode_pyramid_gop_yuv420_with_q_tuned(
+        &frames,
+        80,
+        PyramidTuning {
+            tiles: (1, 0),
+            ..PyramidTuning::default()
+        },
+    )
+    .expect("pyramid election encode");
+    assert!(
+        pyr.ctx_donor_elections.iter().any(|(_, e)| e.is_some()),
+        "staged pyramid must elect at least one donor: {:?}",
+        pyr.ctx_donor_elections
+    );
+    std::fs::write(
+        root.join("pyr-128x64-q80-tiles-ctx-elect.ivf"),
+        &pyr.gop.ivf_bytes,
+    )
+    .expect("write ivf");
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &pyr.gop.recon {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("pyr-128x64-q80-tiles-ctx-elect.yuv"), &yuv).expect("write yuv");
+    std::fs::write(
+        root.join("pyr-ctx-elections.txt"),
+        format!(
+            "elections (order_hint, donor): {:?}\n",
+            pyr.ctx_donor_elections
+        ),
+    )
+    .expect("write notes");
+
+    // Tiled two-layer SVC with per-layer elected donors.
+    let svc_layers = vec![
+        (0..5).map(|t| hetero_frame(128, 64, t)).collect::<Vec<_>>(),
+        (0..5)
+            .map(|t| hetero_frame(256, 128, t))
+            .collect::<Vec<_>>(),
+    ];
+    let svc = oxideav_av1::encoder::encode_spatial_layered_gop_yuv420_with_q_tiles(
+        &svc_layers,
+        80,
+        Some(&[(1, 0), (1, 0)]),
+        1,
+    )
+    .expect("tiled SVC encode");
+    std::fs::write(root.join("svc-128-256-q80-ctx-elect.ivf"), &svc.ivf_bytes).expect("write ivf");
+    // Full-interleave expected output (per instant: layer 0 then 1).
+    let mut yuv: Vec<u8> = Vec::new();
+    for i in 0..5 {
+        for s in 0..2 {
+            let rc = &svc.layer_recons[s][i];
+            yuv.extend_from_slice(&rc.y);
+            yuv.extend_from_slice(&rc.u);
+            yuv.extend_from_slice(&rc.v);
+        }
+    }
+    std::fs::write(root.join("svc-128-256-q80-ctx-elect.yuv"), &yuv).expect("write yuv");
+    // Base-layer (operating point 1) expected output.
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &svc.layer_recons[0] {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("svc-128-256-q80-ctx-elect-op1.yuv"), &yuv).expect("write yuv");
 }

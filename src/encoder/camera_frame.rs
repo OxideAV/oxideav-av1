@@ -209,6 +209,10 @@ pub fn encode_camera_frame_yuv420_tiles(
         tile_groups: 1,
         collect_donor_cdfs: false,
         elect_donor: false,
+        // r439 — the §7.3 camera-frame shape stays on the flat
+        // quantiser (the frozen-CDF conformance mode keeps its
+        // minimal header surface).
+        qm: false,
         explicit_tiles: None,
     };
     let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(

@@ -105,6 +105,10 @@ fn encode_ab(frames: &[Yuv420Frame], q: u8) -> (TunedGop, TunedGop) {
             None,
             GopTuning {
                 cdef,
+                // r439 — hold the §5.9.12 QM election off: the CDEF
+                // axis stays the only variable (and the committed
+                // measurement claims stay comparable).
+                qm: false,
                 ..GopTuning::default()
             },
         )

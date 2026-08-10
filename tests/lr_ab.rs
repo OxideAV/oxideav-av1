@@ -118,6 +118,8 @@ fn encode_arm(frames: &[Yuv420Frame], q: u8, lr: bool) -> EncodedGop {
         None,
         GopTuning {
             lr,
+            // r439 — hold the §5.9.12 QM election off (axis isolation).
+            qm: false,
             ..GopTuning::default()
         },
     )

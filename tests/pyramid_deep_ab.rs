@@ -167,11 +167,15 @@ fn baseline_tuning() -> PyramidTuning {
         // arms so the pyramid-depth axis stays the only variable.
         high_precision_mv: true,
         delta_q: true,
+        // r439 — both A/B arms ride the same §5.9.12 QM election so
+        // the pyramid-depth axis stays the only variable.
+        qm: true,
         cdef: true,
         cdef_units: true,
         lr: true,
         tiles: (0, 0),
         tile_groups: 1,
+        ctx_update_elect: true,
     }
 }
 

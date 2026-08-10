@@ -1170,6 +1170,50 @@ the KEY seeds all eight), so every later consumer replays the
 committed donation, and every operating point decodes the patched
 stream bit-exact.
 
+r439 closes the election on the two remaining drivers. The
+**B-pyramid / adaptive** encoder elects through its out-of-order
+refresh graph: the donor election follows the frame's ELECTED
+§5.9.2 primary (the r424 ordinal election may commit the
+nearest-backward anchor — the replay candidates then come from THAT
+carry and the patch lands in THAT frame's field), and both patch
+paths of the multi-frame temporal units are live — a donor frame
+still pending inside the current chunk's open unit is patched in
+its OBU body, a flushed one through the unit's frame-ordinal walk.
+The **spatial-SVC** driver elects per layer chain (openers included)
+at each layer's own multi-tile layout, patching at `(temporal unit,
+spatial-layer ordinal)` wire locations; every §6.7.5 operating
+point decodes the patched stream bit-exact.
+`PyramidTuning::ctx_update_elect` is the A/B switch (default on;
+inert on single-tile layouts).
+
+### Quantizer-matrix election (r439)
+
+The §5.9.12 `using_qmatrix` / `qm_y` / `qm_u` / `qm_v` write arm goes
+live with a frame-level election — the encoder side of the §9.5.3
+dequant tables the conformance corpus has exercised decode-side
+since r394. On an unsegmented lossy frame whose luma carries real
+high-frequency energy (a mean-absolute-second-difference probe —
+smooth gradients skip the arm and stay bit-identical), a second
+full search runs under `using_qmatrix = 1` at a quantiser-keyed
+§9.5.3 level on all three planes: every quantise/dequantise step of
+the residual chain rides the §7.12.3 QM-scaled
+`q2 = Round2( q * Quantizer_Matrix[..], 5 )` through the same
+`SegQMLevel[ plane ][ 0 ]` row the decoder derives per §5.9.2, and
+the per-TU rate twin prices the actual QM-quantised coefficient
+chains. The election is the plain joint objective
+`D·256 + λ·R_bits256` over exact realized bytes, per frame (KEY and
+inter alike), and the winner feeds the §5.9.17 delta-q election —
+the arms compose on the wire. Default-on for every conformance-grade
+driver except the §7.3 camera mode; `GopTuning::qm` /
+`PyramidTuning::qm` A/B switches, `tests/qm_ab.rs` harness. Measured
+on the committed natural-texture matrix: up to **−14.85% bytes at
+−0.067 dB** (96×80 q100 GOP) and −5.39% at **+0.20 dB** (128×128
+q140); gradients stay bit-identical. Pinned:
+`self-kf-128x128-q140-qm` and `self-gop-96x80-q100-qm` — the
+corpus's first self-encoded `using_qmatrix = 1` streams,
+byte-identical through three independent black-box reference
+decoders.
+
 ### Spatial scalability: the SVC write arm (r431)
 
 `encode_spatial_layered_gop_yuv{,420}_with_q` codes 2..=4
@@ -1213,10 +1257,10 @@ decoders at both operating points.
   read but never emitted.
 - Delta-q stays off tables carrying a lossless segment
   (conservative §7.12.2-note guard).
-- The §6.8.14 donor election runs on the plain GOP and
-  temporal-ladder drivers (the ladder under the freeze-at-first-
-  consumption discipline); the pyramid and SVC drivers still emit
-  `context_update_tile_id = 0`.
+- The §5.9.12 quantizer-matrix election stays off SEGMENTED frames
+  (the per-segment `SegQMLevel` bundle threading is open; the
+  decode side has handled the pairing since r394) and off the §7.3
+  camera-frame mode.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /

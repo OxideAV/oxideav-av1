@@ -162,6 +162,11 @@ fn encode_arm(frames: &[Yuv420Frame], q: u8, cdef_units: bool) -> EncodedGop {
             // axis it is named for. Delta-q's own composition is guarded
             // by `key_delta_q_ab` / the inter delta-q A/B suite.
             delta_q: false,
+            // r439 — the §5.9.12 QM election is a third post-CDEF
+            // confound on this adversarial content (same knife-edge
+            // argument as delta-q above): hold it off so the CDEF
+            // axis stays the only variable.
+            qm: false,
             ..GopTuning::default()
         },
     )
