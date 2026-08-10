@@ -1184,7 +1184,12 @@ at each layer's own multi-tile layout, patching at `(temporal unit,
 spatial-layer ordinal)` wire locations; every §6.7.5 operating
 point decodes the patched stream bit-exact.
 `PyramidTuning::ctx_update_elect` is the A/B switch (default on;
-inert on single-tile layouts).
+inert on single-tile layouts). Pinned:
+`self-pyr-128x64-q80-tiles-ctx-elect` (the first out-of-order stream
+with a patched donation) and `self-svc-128-256-q80-ctx-elect` (the
+first spatially scalable one, digested at both operating points) —
+byte-identical through three independent black-box reference
+decoders (corpus 126 with the two QM pins).
 
 ### Quantizer-matrix election (r439)
 
