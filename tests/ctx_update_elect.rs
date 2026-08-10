@@ -396,6 +396,63 @@ fn pyramid_ctx_update_election_fires_and_decodes_bit_exact() {
         .all(|&id| id == 0));
 }
 
+/// The ADAPTIVE mini-GOP driver rides the same session mechanics —
+/// its boundary election CLONES the pyramid session (temporal units,
+/// carry store, wire locations) for the deep-vs-split trial encodes
+/// and keeps one; the donor patches and freeze sweeps of a discarded
+/// trial must never leak into the committed stream. Scene-cut hetero
+/// content forces multiple chunk boundaries; the committed stream
+/// must decode display-order bit-exact.
+#[test]
+fn adaptive_ctx_update_election_survives_trial_cloning() {
+    use oxideav_av1::encoder::{encode_adaptive_gop_yuv420_with_q_tuned, AdaptiveTuning};
+    let n = 9usize;
+    let frames: Vec<Yuv420Frame> = (0..n)
+        .map(|t| {
+            if t >= n / 2 {
+                // Different texture family after the cut.
+                hetero_frame(128, 64, 40 + 3 * t)
+            } else {
+                hetero_frame(128, 64, t)
+            }
+        })
+        .collect();
+    let tuned = encode_adaptive_gop_yuv420_with_q_tuned(
+        &frames,
+        80,
+        AdaptiveTuning {
+            pyramid: PyramidTuning {
+                tiles: (1, 0),
+                ..PyramidTuning::default()
+            },
+            elect: true,
+        },
+    )
+    .expect("adaptive tiled encode");
+    // Wire/trace agreement on the COMMITTED stream (whatever the
+    // boundary elections kept).
+    let ids = wire_ctx_ids_tus(&tuned.gop.temporal_units, 128, 64);
+    assert_eq!(ids.len(), n, "one coded frame per display");
+    assert_eq!(
+        ids.iter().filter(|&&id| id != 0).count(),
+        tuned
+            .ctx_donor_elections
+            .iter()
+            .filter(|(_, e)| e.is_some())
+            .count(),
+        "patched wire ids must match the committed trace: ids {ids:?} trace {:?}",
+        tuned.ctx_donor_elections
+    );
+    let decoded = oxideav_av1::decoder::decode_av1_spec(&tuned.gop.ivf_bytes)
+        .expect("adaptive tiled stream decodes");
+    assert_eq!(decoded.len(), n);
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], tuned.gop.recon[i].y, "display {i} luma");
+        assert_eq!(f.planes[1], tuned.gop.recon[i].u, "display {i} U");
+        assert_eq!(f.planes[2], tuned.gop.recon[i].v, "display {i} V");
+    }
+}
+
 /// Single-tile pyramids carry no `context_update_tile_id` field — the
 /// knob is inert and the streams are bit-identical.
 #[test]
