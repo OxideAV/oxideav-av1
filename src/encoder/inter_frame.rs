@@ -398,6 +398,22 @@ pub(crate) fn qm_level_for_q(base_q_idx: u8) -> u8 {
     }
 }
 
+/// r439 — the QM arm's ARMING WINDOW: the measured win regime. The
+/// `qm_ab` matrix showed the joint objective electing the arm in the
+/// MID-RATE band (level-8 territory — e.g. −14.85% bytes at
+/// −0.067 dB at q100, −5.39% at +0.20 dB at q140) while at fine
+/// quantisers the election trades bytes for distortion the flat
+/// lattice already serves (q60: +4.7..+20% bytes) and at very coarse
+/// ones it essentially never fires (q180+: ≤ ±3%, mostly inert).
+/// Tiny frames' fixed header cost dominates any reshape. So the
+/// second full search is only spent where the tool measurably pays:
+/// `base_q_idx` in `88..=176` and a luma extent of at least 96×80.
+/// An encoder election-scoping choice, not a conformance constraint
+/// (the decode side handles every §5.9.12 configuration).
+pub(crate) fn qm_arm_allowed(base_q_idx: u8, width: usize, height: usize) -> bool {
+    (88..=176).contains(&base_q_idx) && width * height >= 96 * 80
+}
+
 /// r439 — the QM arm's content gate: mean absolute horizontal +
 /// vertical luma second difference, in 1/16ths of an 8-bit-normalized
 /// sample step. Smooth content (flat fills, gradients) has
@@ -2751,6 +2767,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
         && alt_q.is_empty()
         && cfg.exact_mask.is_none()
         && !cfg.auto_lossless
+        && qm_arm_allowed(base_q_idx, width, height)
         && qm_probe(input)
     {
         Some(qm_level_for_q(base_q_idx))

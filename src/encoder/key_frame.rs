@@ -805,12 +805,19 @@ pub(crate) fn encode_key_frame_yuv_full(
         && model == RateModel::Twin
         && extras.delta_plan.is_none()
         && extras.qm_level.is_none();
-    let qm_candidate: Option<u8> =
-        if elections_ok && extras.qm && crate::encoder::inter_frame::qm_probe(input) {
-            Some(crate::encoder::inter_frame::qm_level_for_q(base_q_idx))
-        } else {
-            None
-        };
+    let qm_candidate: Option<u8> = if elections_ok
+        && extras.qm
+        && crate::encoder::inter_frame::qm_arm_allowed(
+            base_q_idx,
+            input.width as usize,
+            input.height as usize,
+        )
+        && crate::encoder::inter_frame::qm_probe(input)
+    {
+        Some(crate::encoder::inter_frame::qm_level_for_q(base_q_idx))
+    } else {
+        None
+    };
     let delta_plan_opt: Option<Vec<i32>> = if elections_ok && extras.delta_q {
         let (mi_rows_probe, mi_cols_probe) = (input.height / 4, input.width / 4);
         crate::encoder::inter_frame::delta_q_plan_units(input, mi_rows_probe, mi_cols_probe)

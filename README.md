@@ -1208,7 +1208,12 @@ the per-TU rate twin prices the actual QM-quantised coefficient
 chains. The election is the plain joint objective
 `D·256 + λ·R_bits256` over exact realized bytes, per frame (KEY and
 inter alike), and the winner feeds the §5.9.17 delta-q election —
-the arms compose on the wire. Default-on for every conformance-grade
+the arms compose on the wire. The second full search is spent only
+inside the MEASURED win regime (`base_q_idx` 88..=176, luma extent
+≥ 96×80 — at fine quantisers the election trades bytes for
+distortion the flat lattice already serves, at very coarse ones it
+essentially never fires): an election-scoping choice, not a
+conformance constraint. Default-on for every conformance-grade
 driver except the §7.3 camera mode; `GopTuning::qm` /
 `PyramidTuning::qm` A/B switches, `tests/qm_ab.rs` harness. Measured
 on the committed natural-texture matrix: up to **−14.85% bytes at
