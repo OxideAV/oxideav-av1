@@ -8,3 +8,17 @@
 # virtual-address-space only, no runtime cost, output-invariant.
 [env]
 RUST_MIN_STACK = "16777216"
+
+# r439 CI-latency fix: the full conformance suite (126-pin triple-decode
+# corpus + A/B harnesses) ran 5h+ per push at the default debug
+# opt-level and brushed the 6-hour hosted-runner cap. Optimised
+# codegen for dev/test profiles cuts the encoder/decoder hot loops by
+# an order of magnitude; debug assertions remain enabled (they are
+# independent of opt-level), so the suite's assert coverage is
+# unchanged. Applies wherever cargo runs with this directory as the
+# manifest root — CI checkouts and per-crate local runs alike.
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
