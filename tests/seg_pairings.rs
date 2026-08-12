@@ -238,6 +238,84 @@ fn segmented_cdef_pairs_and_decodes_bit_exact() {
     );
 }
 
+/// r441 — §5.9.12 quantizer matrices on an actively segmented GOP:
+/// the QM election fires beside a live segment map (`using_qmatrix =
+/// 1` composing with SEG_LVL_ALT_Q on the same frame header), every
+/// non-zero segment's residual chain rides its own §5.9.2
+/// `SegQMLevel[ plane ][ segment_id ]` row through the per-segment
+/// quantiser bundle, and the stream decodes bit-exact — a bundle
+/// that dropped the QM state would desync the encoder recon from the
+/// decoder's §7.12.3 dequantisation on every non-zero-segment block.
+#[test]
+fn segmented_qm_pairs_and_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..5).map(|t| mixed_frame(128, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_tuned(
+        &frames,
+        120,
+        &SEG_TABLE,
+        GopTuning {
+            // Isolate the QM axis.
+            delta_q: false,
+            cdef: false,
+            cdef_units: false,
+            lr: false,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented qm encode");
+    assert!(
+        enc.qm_elections.iter().any(|&e| e),
+        "designed textured content must elect the QM arm on a segmented P-frame: {:?}",
+        enc.qm_elections
+    );
+    assert!(
+        enc.p_segment_maps.iter().any(|m| m.iter().any(|&s| s != 0)),
+        "the segment map must actually commit non-zero segments"
+    );
+    assert_decodes_to_recons("seg-qm", &enc);
+
+    let headers = wire_headers(&enc, 128, 96);
+    assert!(
+        headers.iter().any(|fh| {
+            let seg_on = fh.segmentation_params.as_ref().is_some_and(|sp| sp.enabled);
+            let qm_on = fh
+                .quantization_params
+                .as_ref()
+                .is_some_and(|q| q.using_qmatrix);
+            seg_on && qm_on
+        }),
+        "no wire header pairs segmentation_enabled with using_qmatrix"
+    );
+}
+
+/// r441 — the §5.9.2 lossless-segment sentinel: a segmented table
+/// whose segment reaches qindex 0 keeps `SegQMLevel = 15` for that
+/// segment (its blocks ride the flat WHT chain) while the OTHER
+/// segments still take the elected §9.5.3 level — the whole
+/// composition decodes bit-exact.
+#[test]
+fn segmented_qm_lossless_sentinel_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..3).map(|t| mixed_frame(128, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_tuned(
+        &frames,
+        120,
+        &[0, -120], // segment 1 reaches qindex 0 — lossless
+        GopTuning {
+            delta_q: false,
+            cdef: false,
+            cdef_units: false,
+            lr: false,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented qm lossless-sentinel encode");
+    // The election may or may not fire per frame — what this test
+    // pins is that WHEN the arm runs over a lossless-segment table,
+    // the sentinel derivation keeps every block's quantisation in
+    // lockstep with the decoder.
+    assert_decodes_to_recons("seg-qm-lossless-sentinel", &enc);
+}
+
 /// The lossless-segment guard: a table whose segment reaches qindex 0
 /// keeps the delta-q arm OFF (the conservative §7.12.2-note gate),
 /// and the stream still decodes bit-exact.

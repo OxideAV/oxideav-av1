@@ -2745,26 +2745,33 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let mut arm = run_arm(&params, None)?;
 
     // r439 — §5.9.12 quantizer-matrix election by EXACT realized
-    // bytes + distortion: on an unsegmented lossy frame with real
-    // high-frequency luma energy (the `qm_probe` gate — the arm
-    // cannot win on smooth content, and skipping it keeps those
-    // streams bit-identical), a second full search runs under
+    // bytes + distortion: on a lossy frame with real high-frequency
+    // luma energy (the `qm_probe` gate — the arm cannot win on
+    // smooth content, and skipping it keeps those streams
+    // bit-identical), a second full search runs under
     // `using_qmatrix = 1` at the `qm_level_for_q` §9.5.3 level on
     // all three planes: every quantise/dequantise step rides the
     // §7.12.3 `q2 = Round2( q * Quantizer_Matrix[ .. ], 5 )` scaling
-    // through the SAME `SegQMLevel[ plane ][ 0 ]` row the decoder
-    // derives per §5.9.2 (segment 0 is the only coded segment). Both
-    // arms are complete frame encodes with different
-    // reconstructions, so the election runs the plain joint
-    // objective `D·256 + λ·R_bits256` over realized (header + tile)
-    // bytes — the QM arm typically trades a small SSE increase in
-    // the high frequencies for an outsized rate saving on textured
-    // content; the winner's params flow into the delta-q election
-    // below (the arms compose — a delta-q plan quantises at the
-    // running index with the SAME QM scaling on both sides).
+    // through the SAME `SegQMLevel[ plane ][ segment_id ]` row the
+    // decoder derives per §5.9.2. Both arms are complete frame
+    // encodes with different reconstructions, so the election runs
+    // the plain joint objective `D·256 + λ·R_bits256` over realized
+    // (header + tile) bytes — the QM arm typically trades a small
+    // SSE increase in the high frequencies for an outsized rate
+    // saving on textured content; the winner's params flow into the
+    // delta-q election below (the arms compose — a delta-q plan
+    // quantises at the running index with the SAME QM scaling on
+    // both sides).
+    //
+    // r441 — the SEGMENTED-frame gate is lifted: the arm's per-
+    // segment `SegQMLevel` rows follow the §5.9.2 derivation (a
+    // lossless segment takes the no-QM sentinel 15, every other
+    // segment the coded level), the per-segment quantiser bundle
+    // (`seg_qp`) carries each block's own row through the residual
+    // chain, and the SEG_LVL feature trials price their QM-quantised
+    // chains through the same bundles.
     let qm_arm_level: Option<u8> = if cfg.qm
         && !lossless
-        && alt_q.is_empty()
         && cfg.exact_mask.is_none()
         && !cfg.auto_lossless
         && qm_arm_allowed(base_q_idx, width, height)
@@ -2776,11 +2783,15 @@ pub(crate) fn encode_inter_frame_generic_gm(
     };
     let mut qm_elected = false;
     if let Some(lvl) = qm_arm_level {
+        let seg_ll = seg_lossless_array(base_q_idx, alt_q);
         let mut qp_m = qp;
         qp_m.using_qmatrix = true;
         for plane in 0..3 {
-            for seg in 0..crate::uncompressed_header_tail::MAX_SEGMENTS {
-                qp_m.seg_qm_level[plane][seg] = lvl;
+            for (seg, &ll) in seg_ll.iter().enumerate() {
+                // §5.9.2: a lossless segment's `SegQMLevel` is the
+                // no-QM sentinel 15; every other segment carries the
+                // coded `qm_y` / `qm_u` / `qm_v`.
+                qp_m.seg_qm_level[plane][seg] = if ll { 15 } else { lvl };
             }
         }
         let mut params_m = params.clone();
@@ -4282,6 +4293,14 @@ impl PSearchCtx {
     /// mis-quantised every non-zero segment of a delta-stepped
     /// superblock: encoder recon diverged from the §7.12.3
     /// dequantisation of the very coefficients it wrote).
+    /// r441 — §5.9.12 pairing: the bundle carries the frame's
+    /// `using_qmatrix` and THIS segment's §5.9.2 `SegQMLevel[ plane ][
+    /// segment_id ]` row (the residual chain reads the bundle's slot
+    /// 0, so the segment's own triple is installed uniformly). A
+    /// neutral bundle dropped the QM state, so on a QM-elected
+    /// segmented frame every non-zero segment quantised through the
+    /// flat lattice while the decoder dequantised through the §9.5.3
+    /// matrix.
     fn seg_qp(&self, frame_qp: &QuantizerParams, segment_id: u8) -> QuantizerParams {
         if self.seg_alt_q.is_empty() || segment_id == 0 {
             return *frame_qp;
@@ -4292,7 +4311,15 @@ impl PSearchCtx {
             i32::from(self.base_q_idx)
         };
         let q = (base + i32::from(self.seg_alt_q[segment_id as usize])).clamp(0, 255) as u8;
-        QuantizerParams::neutral(q, frame_qp.bit_depth)
+        let mut qp = QuantizerParams::neutral(q, frame_qp.bit_depth);
+        if frame_qp.using_qmatrix {
+            qp.using_qmatrix = true;
+            let row = frame_qp.seg_qm_level_for(segment_id);
+            for (plane, &lvl) in row.iter().enumerate() {
+                qp.seg_qm_level[plane] = [lvl; crate::uncompressed_header_tail::MAX_SEGMENTS];
+            }
+        }
+        qp
     }
 
     /// r426 — `LosslessArray[ segment_id ]` for this GOP's frames
