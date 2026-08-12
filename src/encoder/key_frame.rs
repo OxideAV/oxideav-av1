@@ -331,9 +331,94 @@ pub fn encode_key_frame_yuv420_with_q_dq(
         None,
         delta_q,
         // r439 — the delta-q A/B entry holds the §5.9.12 QM election
-        // OFF so the delta-q axis stays the only variable.
+        // OFF so the delta-q axis stays the only variable (r441: the
+        // §5.9.8 superres election too).
         false,
         false,
+        false,
+    )?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
+/// r441 — [`encode_key_frame_yuv420_with_q`] with the §5.9.8
+/// superres ELECTION switch exposed (hidden), so the A/B harness can
+/// measure the elected arm against the flat-width baseline on
+/// identical input. `superres = true` is what every production entry
+/// point runs; `false` forces the flat-width shape unconditionally.
+#[doc(hidden)]
+pub fn encode_key_frame_yuv420_with_q_sr(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    superres: bool,
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let (k, _) = encode_key_frame_yuv_seg_carry_tiles(
+        &wide,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        (0, 0),
+        1,
+        None,
+        true,
+        true,
+        superres,
+        false,
+    )?;
+    let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
+    Ok(EncodedKeyFrame {
+        ivf_bytes: k.ivf_bytes,
+        temporal_unit_bytes: k.temporal_unit_bytes,
+        recon_y: narrow(k.recon_y),
+        recon_u: narrow(k.recon_u),
+        recon_v: narrow(k.recon_v),
+        seq: k.seq,
+        fh: k.fh,
+    })
+}
+
+/// r441 — FORCE one §5.9.8 superres candidate arm (hidden): the KEY
+/// codes at `denom`'s downscaled width regardless of the arming
+/// window, so the A/B harness can measure the arm inside AND outside
+/// the committed regime. The returned reconstruction lives at the
+/// UPSCALED extent (the decoder's own §7.16 driver), exactly what the
+/// spec decode driver outputs.
+#[doc(hidden)]
+pub fn encode_key_frame_yuv420_with_q_sr_forced(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+    denom: u32,
+) -> Result<EncodedKeyFrame, Error> {
+    let wide = YuvFrame::from_yuv420_8bit(input);
+    let extras = KeyExtras {
+        delta_q: true,
+        qm: true,
+        ..KeyExtras::default()
+    };
+    let (k, _) = encode_key_frame_superres_arm(
+        &wide,
+        base_q_idx,
+        RateModel::Twin,
+        &[],
+        None,
+        true,
+        true,
+        true,
+        &extras,
+        denom,
     )?;
     let narrow = |p: Vec<u16>| p.into_iter().map(|s| s as u8).collect::<Vec<u8>>();
     Ok(EncodedKeyFrame {
@@ -418,6 +503,9 @@ pub fn encode_key_frame_yuv_with_q_tiles(
         1,
         None,
         true,
+        true,
+        // r441 — the §5.9.8 superres election rides the default
+        // switches (it self-scopes to the single-tile shape).
         true,
         false,
     )
@@ -612,6 +700,9 @@ pub(crate) fn encode_key_frame_yuv_seg_carry(
         None,
         true,
         true,
+        // r441 — the standalone entries run the §5.9.8 superres
+        // election (regime-gated; unsegmented lossy frames only).
+        true,
         false,
     )
 }
@@ -655,6 +746,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     explicit_tiles: Option<(&[u32], &[u32])>,
     delta_q: bool,
     qm: bool,
+    superres: bool,
     collect_donor_cdfs: bool,
 ) -> Result<
     (
@@ -678,6 +770,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
             explicit_tiles,
             delta_q,
             qm,
+            superres_elect: superres,
             collect_donor_cdfs,
             ..KeyExtras::default()
         },
@@ -755,6 +848,20 @@ pub(crate) struct KeyExtras<'a> {
     /// primary reference off this KEY's slot can run the §6.8.14
     /// donor election. Inert on single-tile layouts.
     pub collect_donor_cdfs: bool,
+    /// r441 — §5.9.8 SUPERRES election switch (stage 0 of the
+    /// dispatcher): on an unsegmented lossy single-tile KEY frame
+    /// inside the measured win regime, each candidate denominator
+    /// codes the frame at the §5.9.8 downscaled width (the inner
+    /// QM / delta-q elections run at the coded extent), the
+    /// reconstruction is upscaled through the decoder's own §7.16
+    /// driver, and the plain joint objective over the ORIGINAL-extent
+    /// SSE + exact realized bytes keeps the winner.
+    pub superres_elect: bool,
+    /// The armed §5.9.8 pair `(UpscaledWidth, SuperresDenom)` — set
+    /// internally by the election's candidate arms (the CORE then
+    /// codes `input` as the downscaled frame and the header carries
+    /// the upscaled width + `coded_denom`); callers leave it `None`.
+    pub superres: Option<(u32, u32)>,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -779,6 +886,100 @@ pub(crate) fn encode_key_frame_yuv_full(
     Error,
 > {
     input.validate()?;
+    // r441 — §5.9.8 SUPERRES election (stage 0, outermost): on an
+    // unsegmented lossy single-tile KEY frame inside the measured win
+    // regime, each candidate denominator codes the frame at the
+    // §5.9.8 downscaled width — a COMPLETE dispatcher run, so the
+    // §5.9.12 / §5.9.17 elections settle at the coded extent inside
+    // each arm — the reconstruction is upscaled through the decoder's
+    // own §7.16 driver, and the plain joint objective over the
+    // ORIGINAL-extent SSE + exact realized bytes keeps the winner
+    // (the flat arm on ties: streams outside an elected win stay
+    // bit-identical to the pre-r441 baseline).
+    if extras.superres_elect && extras.superres.is_none() {
+        let sr_ok = base_q_idx > 0
+            && alt_q.is_empty()
+            && exact_mask.is_none()
+            && model == RateModel::Twin
+            && extras.seq_override.is_none()
+            && extras.intra_only_refresh.is_none()
+            && extras.tiles == (0, 0)
+            && extras.explicit_tiles.is_none()
+            && extras.tile_groups <= 1
+            && crate::encoder::superres_elect::superres_arm_allowed(
+                base_q_idx,
+                input.width as usize,
+                input.height as usize,
+            )
+            && crate::encoder::superres_elect::superres_probe(input);
+        let candidates = if sr_ok {
+            crate::encoder::superres_elect::candidate_denoms(input.width)
+        } else {
+            Vec::new()
+        };
+        let mut plain_extras = *extras;
+        plain_extras.superres_elect = false;
+        if candidates.is_empty() {
+            return encode_key_frame_yuv_full(
+                input,
+                base_q_idx,
+                model,
+                alt_q,
+                exact_mask,
+                cdef,
+                cdef_units,
+                lr,
+                &plain_extras,
+            );
+        }
+        let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
+        let score = |k: &EncodedKeyFrameYuv| -> u64 {
+            let mut d = 0u64;
+            for (a, b) in k
+                .recon_y
+                .iter()
+                .zip(&input.y)
+                .chain(k.recon_u.iter().zip(&input.u))
+                .chain(k.recon_v.iter().zip(&input.v))
+            {
+                let diff = i64::from(*a) - i64::from(*b);
+                d += (diff * diff) as u64;
+            }
+            score256(d, lambda, (k.temporal_unit_bytes.len() as u64) * 8 * 256)
+        };
+        let mut best = encode_key_frame_yuv_full(
+            input,
+            base_q_idx,
+            model,
+            alt_q,
+            exact_mask,
+            cdef,
+            cdef_units,
+            lr,
+            &plain_extras,
+        )?;
+        let mut best_score = score(&best.0);
+        for denom in candidates {
+            let cand = encode_key_frame_superres_arm(
+                input,
+                base_q_idx,
+                model,
+                alt_q,
+                exact_mask,
+                cdef,
+                cdef_units,
+                lr,
+                &plain_extras,
+                denom,
+            )?;
+            let s = score(&cand.0);
+            if s < best_score {
+                best_score = s;
+                best = cand;
+            }
+        }
+        return Ok(best);
+    }
     // r431 — §5.9.17 per-superblock delta-q ELECTION (the KEY twin of
     // the inter driver's r428 arm): both arms are complete frame
     // encodes (their trees decode to different reconstructions), so
@@ -840,6 +1041,10 @@ pub(crate) fn encode_key_frame_yuv_full(
         qm: false,
         qm_level: None,
         collect_donor_cdfs: extras.collect_donor_cdfs,
+        // r441 — an armed §5.9.8 pair rides every inner-election arm
+        // (the QM / delta-q stages of a superres candidate encode).
+        superres_elect: false,
+        superres: extras.superres,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -923,6 +1128,70 @@ pub(crate) fn encode_key_frame_yuv_full(
     Ok(stage1)
 }
 
+/// r441 — one §5.9.8 superres candidate arm: downscale the source to
+/// the denominator's §5.9.8 coded width, run the COMPLETE dispatcher
+/// on the downscaled frame with the pair armed (the inner §5.9.12 /
+/// §5.9.17 elections settle at the coded extent), then upscale the
+/// in-loop reconstruction through the decoder's own §7.16 driver —
+/// the returned `recon_*` planes live at the UPSCALED extent, exactly
+/// what the decoder outputs and stores in the §7.20 reference slots.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_key_frame_superres_arm(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+    cdef: bool,
+    cdef_units: bool,
+    lr: bool,
+    extras: &KeyExtras<'_>,
+    denom: u32,
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
+    let wd = crate::encoder::superres_elect::superres_coded_width(input.width, denom);
+    let down = crate::encoder::superres_elect::downscale_width(input, wd);
+    let mut ex = *extras;
+    ex.superres_elect = false;
+    ex.superres = Some((input.width, denom));
+    let (mut k, carry) = encode_key_frame_yuv_full(
+        &down, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &ex,
+    )?;
+    let (frame_width, frame_height, upscaled_width, mi_cols) = {
+        let fs =
+            k.fh.frame_size
+                .as_ref()
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+        (
+            fs.frame_width,
+            fs.frame_height,
+            fs.upscaled_width,
+            fs.mi_cols,
+        )
+    };
+    let (ssx, ssy) = input.format.subsampling();
+    let (uy, uu, uv) = crate::encoder::superres_elect::upscale_recon(
+        [&k.recon_y, &k.recon_u, &k.recon_v],
+        frame_width,
+        frame_height,
+        upscaled_width,
+        mi_cols,
+        input.bit_depth,
+        ssx,
+        ssy,
+        usize::from(input.format.num_planes()),
+    )?;
+    k.recon_y = uy;
+    k.recon_u = uu;
+    k.recon_v = uv;
+    Ok((k, carry))
+}
+
 /// r431 — the general-format intra-frame CORE (no delta-q election;
 /// the [`encode_key_frame_yuv_full`] dispatcher runs that above). One
 /// complete encode under the resolved [`KeyExtras`] (including an
@@ -986,6 +1255,24 @@ fn encode_key_frame_yuv_core(
     // election, not a conformance constraint.
     let sc_eligible = bit_depth == 8 && input.format == ChromaFormat::Yuv420;
 
+    // r441 — the armed §5.9.8 superres pair (see
+    // [`KeyExtras::superres`]): `input` is the DOWNSCALED frame; the
+    // sequence maximum + §5.9.6 render size carry the upscaled width,
+    // the header codes `use_superres = 1` + `coded_denom`, and the
+    // §5.9.8 derivation must land exactly on the coded width.
+    let superres: Option<(u32, u32)> = extras.superres;
+    if let Some((up_w, denom)) = superres {
+        if extras.seq_override.is_some()
+            || extras.intra_only_refresh.is_some()
+            || !(crate::frame_header::SUPERRES_DENOM_MIN..=16).contains(&denom)
+            || crate::encoder::superres_elect::superres_coded_width(up_w, denom) != input.width
+            || up_w <= input.width
+            || up_w > KEY_FRAME_MAX_DIM
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
     let seq = match extras.seq_override {
         // r431 — layered-stream shape: code under the caller's shared
         // sequence header (its dimension budget must cover this
@@ -999,18 +1286,38 @@ fn encode_key_frame_yuv_core(
             shared.clone()
         }
         None => {
-            let mut s =
-                build_intra_only_seq_yuv(input.width, input.height, bit_depth, input.format)?;
+            // r441 — under superres the sequence maximum is the
+            // UPSCALED width: §5.9.5 `frame_size_override_flag = 0`
+            // seeds `FrameWidth` from it and §5.9.8 then derives the
+            // coded width.
+            let seq_w = superres.map_or(input.width, |(up_w, _)| up_w);
+            let mut s = build_intra_only_seq_yuv(seq_w, input.height, bit_depth, input.format)?;
             // r410: open the §5.11.24 filter-intra gate — the mode
             // picker now evaluates the five §7.11.2.3 recursive modes
             // on eligible luma blocks (the historical mirror drivers
             // build their own sequence headers and stay unaffected).
             s.enable_filter_intra = true;
+            s.enable_superres = superres.is_some();
             s
         }
     };
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    // r441 — patch the §5.9.8 fields: the wire codes the UPSCALED
+    // width (via the sequence maximum) + `coded_denom`; `FrameWidth`
+    // / the mi grid stay at the coded (downscaled) extent the builder
+    // derived from `input`.
+    if let Some((up_w, denom)) = superres {
+        let fs = fh
+            .frame_size
+            .as_mut()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        fs.upscaled_width = up_w;
+        fs.render_width = up_w;
+        fs.use_superres = true;
+        fs.superres_denom = denom;
+        fs.coded_denom = (denom - crate::frame_header::SUPERRES_DENOM_MIN) as u8;
+    }
     // r431 — §5.9.5: under a shared sequence header a smaller frame
     // codes its dimensions explicitly.
     fh.frame_size_override_flag = extras.seq_override.is_some()
@@ -1069,7 +1376,13 @@ fn encode_key_frame_yuv_core(
     // content-level scan finds at least one §6.10.24-reachable exact
     // duplicate superblock — the per-leaf `use_intrabc` S() overhead
     // is only worth coding when a copy source provably exists.
-    fh.allow_intrabc = fh.allow_screen_content_tools && !multi_tile && intrabc_beneficial(input);
+    // r441 — §5.9.5 gates `allow_intrabc` on `UpscaledWidth ==
+    // FrameWidth`: a superres frame never codes the bit, so the
+    // search must not commit intra-bc leaves.
+    fh.allow_intrabc = superres.is_none()
+        && fh.allow_screen_content_tools
+        && !multi_tile
+        && intrabc_beneficial(input);
     // §5.9.19: `allow_intrabc = 1` short-circuits the cdef_params
     // block — keep the header descriptor on the parser's
     // short-circuit shape (the r428 election is gated off there too).
@@ -1499,8 +1812,16 @@ fn encode_key_frame_yuv_core(
     // r429 — loop restoration needs the PRE-CDEF reconstruction
     // (§7.17 reads `CurrFrame` at stripe boundaries): snapshot before
     // the CDEF election below overwrites it.
-    let lr_armed =
-        lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
+    // r441 — LR is scoped off the superres arm: §7.17 runs at the
+    // UPSCALED extent (§7.4 order — superres between CDEF and LR),
+    // while this election's fit/mirror operate at the coded extent.
+    // An election-scoping choice; the LR × superres pairing is open.
+    let lr_armed = lr
+        && base_q_idx > 0
+        && seq.enable_restoration
+        && !fh.allow_intrabc
+        && exact_mask.is_none()
+        && superres.is_none();
     let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     // The §5.9.19 `cdef_bits` the FINAL committed tile was emitted
@@ -1808,14 +2129,16 @@ fn encode_key_frame_yuv_core(
         build_temporal_unit(Some(&sh_body), &[ObuFrame::new(ObuType::Frame, frame_body)])
     };
 
-    // IVF v0 wrap.
+    // IVF v0 wrap. r441 — the container carries DISPLAY dimensions:
+    // the §5.9.8 upscaled width on a superres frame.
+    let ivf_w = superres.map_or(input.width, |(up_w, _)| up_w);
     let mut ivf_bytes: Vec<u8> = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut ivf_bytes);
         let mut iw = IvfWriter::new(
             cursor,
             FOURCC_AV01,
-            input.width as u16,
+            ivf_w as u16,
             input.height as u16,
             25,
             1,

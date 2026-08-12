@@ -800,6 +800,17 @@ pub struct GopTuning {
     /// the pre-r436 streams). Inert on single-tile layouts or with
     /// [`Self::primary_ref`] off.
     pub ctx_update_elect: bool,
+    /// r441 — §5.9.8 SUPERRES election on the KEY frame of an
+    /// unsegmented single-tile GOP inside the measured win regime:
+    /// each candidate denominator codes the KEY at the §5.9.8
+    /// downscaled width, the reconstruction upscales through the
+    /// decoder's own §7.16 driver (the P chain predicts from the
+    /// upscaled reference, exactly the decoder's §7.20 store), and
+    /// the joint objective over original-extent SSE + exact realized
+    /// bytes keeps the winner. `false` keeps the flat-width shape on
+    /// every frame (the A/B baseline; bit-identical outside an
+    /// elected win).
+    pub superres: bool,
 }
 
 impl Default for GopTuning {
@@ -818,6 +829,7 @@ impl Default for GopTuning {
             tiles: (0, 0),
             tile_groups: 1,
             ctx_update_elect: true,
+            superres: true,
         }
     }
 }
@@ -1200,6 +1212,10 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         tuning.delta_q,
         // r439 — and the same §5.9.12 quantizer-matrix switch.
         tuning.qm,
+        // r441 — §5.9.8 superres on the KEY (unsegmented GOPs only:
+        // a segmented P-frame's §5.11.19 temporal prediction would
+        // read the KEY's mi-grid-mismatched SavedSegmentIds).
+        tuning.superres && alt_q.is_empty(),
         // r436 — the KEY donates too: collect its per-tile end CDFs.
         donor_armed,
     )?;

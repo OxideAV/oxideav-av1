@@ -512,6 +512,11 @@ impl PyramidSession {
             true,
             // r439 — the KEY rides the pyramid's §5.9.12 QM switch.
             tuning.qm,
+            // r441 — the §5.9.8 superres election stays off the
+            // B-pyramid KEY this round (the out-of-order refresh
+            // graph's reference/motion-field bookkeeping around a
+            // downscaled KEY is unvalidated; a follow-up).
+            false,
             // r439 — the KEY donates too: collect its per-tile end
             // CDFs so the first consumer can run the §6.8.14
             // election.

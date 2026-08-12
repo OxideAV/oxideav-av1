@@ -232,6 +232,12 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
         None,
         /* delta_q = */ true,
         /* qm = */ true,
+        // r441 — the §5.9.8 superres election stays off the §6.7.5
+        // temporal ladder this round (the KEY unit is repacked under
+        // a rebuilt multi-OP sequence header; an election-scoping
+        // choice, follow-up).
+        /* superres = */
+        false,
         donor_armed,
     )?;
     let mut seq = key.seq.clone();
@@ -662,6 +668,11 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // CDFs so the layer's first inter frame can run the
             // §6.8.14 election.
             collect_donor_cdfs: donor_armed_layer(s),
+            // r441 — the §5.9.8 superres election stays off the
+            // layered shape (per-layer §5.9.5 explicit sizes; an
+            // election-scoping choice).
+            superres_elect: false,
+            superres: None,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],

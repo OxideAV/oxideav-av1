@@ -292,6 +292,8 @@ pub(crate) mod rate_twin;
 pub mod scalable_gop;
 #[doc(hidden)]
 pub mod sequence_obu;
+
+pub(crate) mod superres_elect;
 #[doc(hidden)]
 pub mod symbol_writer;
 #[doc(hidden)]
