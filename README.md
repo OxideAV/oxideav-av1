@@ -1236,7 +1236,11 @@ the same bundles, and the winner still feeds the §5.9.17 delta-q
 election (three-way composition on the wire). r441 also grows the
 arm into a **multi-level ladder**: the quantiser-keyed §9.5.3 level
 plus its lighter neighbour both run full searches, settled by the
-same exact-realized-bytes joint objective.
+same exact-realized-bytes joint objective (refinement discipline —
+the neighbour runs only when the keyed level already won). Pinned:
+`self-gop-128x96-q120-seg-qm` — the first stream pairing
+`segmentation_enabled = 1` with `using_qmatrix = 1`, byte-identical
+through three independent black-box reference decoders.
 
 ### Superres election (r441)
 
@@ -1259,6 +1263,10 @@ content the arm wins across the band — 128×96 q100 −9.3 % bytes at
 (18 → 14 dB) and stays probe-gated bit-identical.
 `GopTuning::superres` (default on, unsegmented GOPs); the pyramid /
 temporal-ladder / SVC drivers are conservatively off (follow-ups).
+Pinned: `self-gop-128x96-q180-superres` — the corpus's first
+self-encoded `use_superres = 1` stream (KEY at denominator 16, P
+frames off the upscaled reference), byte-identical through three
+independent black-box reference decoders.
 
 ### Film-grain election (r441)
 
@@ -1279,7 +1287,11 @@ Measured (`tests/film_grain_ab.rs`): −9.4 % bytes at amp-6 q60,
 −6.1 % at amp-3 q60, with the honest plain-PSNR trade reported
 (~1–2 dB vs the noisy source — definitional for synthetic grain);
 the elected KEY + P stream decodes bit-exact through the spec driver
-on every frame. `GopTuning::film_grain` (default on).
+on every frame. `GopTuning::film_grain` (default on). Pinned:
+`self-gop-128x96-q60-film-grain` — the corpus's first self-encoded
+`apply_grain = 1` stream (corpus 129 with the three r441 pins),
+byte-identical through three independent black-box reference
+decoders.
 
 ### Spatial scalability: the SVC write arm (r431)
 
