@@ -353,6 +353,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             elect_donor: donor_armed,
             explicit_tiles: None,
             qm: true,
+            film_grain: None,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -673,6 +674,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // election-scoping choice).
             superres_elect: false,
             superres: None,
+            film_grain: None,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],
@@ -789,6 +791,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 elect_donor: donor_armed_layer(s),
                 explicit_tiles: None,
                 qm: true,
+                film_grain: None,
             };
             let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
                 &layer[i],

@@ -293,6 +293,8 @@ pub mod scalable_gop;
 #[doc(hidden)]
 pub mod sequence_obu;
 
+pub(crate) mod film_grain_elect;
+
 pub(crate) mod superres_elect;
 #[doc(hidden)]
 pub mod symbol_writer;

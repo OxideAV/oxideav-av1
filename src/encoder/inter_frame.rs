@@ -99,7 +99,7 @@ use crate::inter_pred::{
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::uncompressed_header_tail::{
-    InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
+    FilmGrainParams, InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
 };
 use crate::Error;
 
@@ -173,6 +173,10 @@ pub struct TunedGopYuv {
     /// patched to `t` on the wire); `None` when the tile-0 donation
     /// stood (index 0 is the first P-frame).
     pub ctx_donor_elections: Vec<Option<u32>>,
+    /// r441 — whether the §5.9.30 film-grain arm won the GOP-level
+    /// election (the `recon` planes then carry the §7.18.3 synthesis,
+    /// exactly the decoder's output).
+    pub film_grain_elected: bool,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -228,6 +232,9 @@ pub struct TunedGop {
     /// patched to `t` on the wire); `None` when the tile-0 donation
     /// stood (index 0 is the first P-frame).
     pub ctx_donor_elections: Vec<Option<u32>>,
+    /// r441 — whether the §5.9.30 film-grain arm won (see
+    /// [`TunedGopYuv::film_grain_elected`]).
+    pub film_grain_elected: bool,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -811,6 +818,15 @@ pub struct GopTuning {
     /// every frame (the A/B baseline; bit-identical outside an
     /// elected win).
     pub superres: bool,
+    /// r441 — §5.9.30 FILM-GRAIN election on unsegmented lossy GOPs
+    /// whose content passes the noise probe (energy + spatial
+    /// whiteness + temporal decorrelation): the grain arm codes the
+    /// DENOISED frames with full §5.9.30 parameters on every header
+    /// and publishes §7.18.3-synthesized output planes, elected under
+    /// the documented perceptually-neutral-rate objective. `false`
+    /// keeps the no-grain shape on every frame (the A/B baseline;
+    /// probe-failing content is bit-identical either way).
+    pub film_grain: bool,
 }
 
 impl Default for GopTuning {
@@ -830,6 +846,7 @@ impl Default for GopTuning {
             tile_groups: 1,
             ctx_update_elect: true,
             superres: true,
+            film_grain: true,
         }
     }
 }
@@ -1007,6 +1024,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         cdef_elections: t.cdef_elections,
         lr_elections: t.lr_elections,
         ctx_donor_elections: t.ctx_donor_elections,
+        film_grain_elected: t.film_grain_elected,
     })
 }
 
@@ -1110,6 +1128,23 @@ pub fn encode_gop_yuv_seg_extras_tuned(
 /// §5.9.15 NON-UNIFORM tile layout (`(widths_sb, heights_sb)` in
 /// superblock units, `uniform_tile_spacing_flag = 0` on every frame's
 /// wire) overriding [`GopTuning::tiles`].
+///
+/// r441 — this wrapper additionally owns the §5.9.30 FILM-GRAIN
+/// election, under the documented "perceptually-neutral rate"
+/// objective (grain is OUTPUT-ONLY and its noise field is by design
+/// not sample-matched, so the grain arm's distortion is STRUCTURE
+/// fidelity — its pre-grain reconstruction against the DENOISED
+/// source — plus a per-frame noise-AMPLITUDE mismatch penalty
+/// `luma_samples · (σ_src − σ_syn)²`, while the plain arm keeps the
+/// ordinary source-matched SSE; rate is exact realized IVF bytes on
+/// both arms). The arm is spent only when the
+/// [`crate::encoder::film_grain_elect::film_grain_probe`] content
+/// gate fires (real noise energy, spatially white, temporally
+/// decorrelated); probe-failing content stays bit-identical to the
+/// baseline. On a win the published `recon` planes carry the §7.18.3
+/// synthesis (the decoder's own driver — byte-identical to its
+/// output) while the reference chain inside the encode stayed
+/// pre-grain, exactly the decoder's §7.20 store.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gop_yuv_seg_extras_tuned_layout(
@@ -1121,6 +1156,152 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     extras: Option<&SegExtras>,
     tuning: GopTuning,
     explicit_tiles: Option<(&[u32], &[u32])>,
+) -> Result<TunedGopYuv, Error> {
+    let plain = encode_gop_yuv_core_fg(
+        frames,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        extras,
+        tuning,
+        explicit_tiles,
+        None,
+    )?;
+    // r441 — §5.9.30 film-grain election gates: unsegmented lossy
+    // twin-model GOPs of at least two frames (the probe needs a
+    // temporal-decorrelation witness).
+    if !(tuning.film_grain
+        && base_q_idx > 0
+        && alt_q.is_empty()
+        && regions.is_empty()
+        && !auto_detect
+        && extras.is_none()
+        && tuning.model == RateModel::Twin
+        && frames.len() >= 2)
+    {
+        return Ok(plain);
+    }
+    use crate::encoder::film_grain_elect as fge;
+    let dn01: Vec<YuvFrame> = frames[..2].iter().map(fge::denoise_frame).collect();
+    if !fge::film_grain_probe(&frames[..2], &dn01) {
+        return Ok(plain);
+    }
+    let mut denoised = dn01;
+    denoised.extend(frames[2..].iter().map(fge::denoise_frame));
+    let est = fge::noise_estimate(&frames[0], &denoised[0]);
+    let bit_depth = frames[0].bit_depth;
+    let fg_base = fge::build_grain_params(&est, bit_depth);
+    let cand = encode_gop_yuv_core_fg(
+        &denoised,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        extras,
+        tuning,
+        explicit_tiles,
+        Some(&fg_base),
+    )?;
+    // The published output planes: the §7.18.3 synthesis through the
+    // decoder's own driver, per-frame seeds from the shared schedule.
+    let (width, height) = (frames[0].width, frames[0].height);
+    let format = frames[0].format;
+    let (ssx, ssy) = format.subsampling();
+    let num_planes = format.num_planes();
+    let mc = cand.gop.seq.color_config.matrix_coefficients;
+    let grained: Vec<GopFrameReconYuv> = cand
+        .gop
+        .recon
+        .iter()
+        .enumerate()
+        .map(|(k, rc)| {
+            let mut fg = fg_base.clone();
+            fg.grain_seed = fge::grain_seed_for(k as u32);
+            let (gy, gu, gv) = fge::apply_grain_to_recon(
+                &fg, &rc.y, &rc.u, &rc.v, width, height, bit_depth, ssx, ssy, num_planes, mc,
+            );
+            GopFrameReconYuv {
+                y: gy,
+                u: gu,
+                v: gv,
+            }
+        })
+        .collect();
+    // Perceptually-neutral-rate scoring (see the doc comment above).
+    let sse_pair = |a: &GopFrameReconYuv, f: &YuvFrame| -> u64 {
+        let mut d = 0u64;
+        for (x, y) in
+            a.y.iter()
+                .zip(&f.y)
+                .chain(a.u.iter().zip(&f.u))
+                .chain(a.v.iter().zip(&f.v))
+        {
+            let diff = i64::from(*x) - i64::from(*y);
+            d += (diff * diff) as u64;
+        }
+        d
+    };
+    let d_plain: u64 = plain
+        .gop
+        .recon
+        .iter()
+        .zip(frames)
+        .map(|(rc, f)| sse_pair(rc, f))
+        .sum();
+    let mut d_grain: u64 = cand
+        .gop
+        .recon
+        .iter()
+        .zip(&denoised)
+        .map(|(rc, f)| sse_pair(rc, f))
+        .sum();
+    let shift = u32::from(bit_depth - 8);
+    for k in 0..frames.len() {
+        let sig_src = fge::luma_sigma16(&frames[k].y, &denoised[k].y, bit_depth);
+        let sig_syn = fge::luma_sigma16(&grained[k].y, &cand.gop.recon[k].y, bit_depth);
+        let diff = sig_src.abs_diff(sig_syn);
+        // (σ16 difference)² / 256 = σ² in 8-bit sample² units; scale
+        // back to the stream's raw sample² scale.
+        d_grain += (frames[k].y.len() as u64) * diff * diff * (1u64 << (2 * shift)) / 256;
+    }
+    let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, bit_depth));
+    let score_plain = score256(
+        d_plain,
+        lambda,
+        (plain.gop.ivf_bytes.len() as u64) * 8 * 256,
+    );
+    let score_grain = score256(d_grain, lambda, (cand.gop.ivf_bytes.len() as u64) * 8 * 256);
+    // The tool's mandate is RATE at perceptually-neutral quality: a
+    // grain arm that scores better only through the structure-side
+    // distortion asymmetry but realizes MORE bytes is not a win —
+    // demand both the joint-score win AND strictly fewer bytes.
+    if score_grain < score_plain && cand.gop.ivf_bytes.len() < plain.gop.ivf_bytes.len() {
+        let mut out = cand;
+        out.gop.recon = grained;
+        out.film_grain_elected = true;
+        Ok(out)
+    } else {
+        Ok(plain)
+    }
+}
+
+/// The GOP core behind [`encode_gop_yuv_seg_extras_tuned_layout`]:
+/// one complete KEY + P encode, with an optional armed §5.9.30
+/// film-grain parameter set riding every frame header (per-frame
+/// seeds from [`crate::encoder::film_grain_elect::grain_seed_for`];
+/// reconstructions stay PRE-grain).
+#[allow(clippy::too_many_arguments)]
+fn encode_gop_yuv_core_fg(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+    extras: Option<&SegExtras>,
+    tuning: GopTuning,
+    explicit_tiles: Option<(&[u32], &[u32])>,
+    film_grain: Option<&FilmGrainParams>,
 ) -> Result<TunedGopYuv, Error> {
     if let Some(x) = extras {
         let ll = seg_lossless_array(base_q_idx, alt_q);
@@ -1184,7 +1365,14 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     let donor_armed = tuning.ctx_update_elect
         && tuning.primary_ref
         && (tuning.tiles != (0, 0) || explicit_tiles.is_some());
-    let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles(
+    // r441 — the KEY's per-frame §5.9.30 seed rides the shared
+    // schedule at display position 0.
+    let key_fg: Option<FilmGrainParams> = film_grain.map(|base| {
+        let mut f = base.clone();
+        f.grain_seed = crate::encoder::film_grain_elect::grain_seed_for(0);
+        f
+    });
+    let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
         &frames[0],
         base_q_idx,
         model,
@@ -1201,23 +1389,31 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // plain segmented GOP is itself unsegmented; under
         // exactness-demand masks the encoder-side gate closes LR).
         tuning.lr,
-        // r431 — the GOP-wide §5.9.15 tile layout (r433: the explicit
-        // non-uniform override rides beside it).
-        tuning.tiles,
-        // r433 — the GOP-wide §5.11.1 tile-group packaging.
-        tuning.tile_groups,
-        explicit_tiles,
-        // r431 — the KEY frame rides the same §5.9.17 delta-q switch
-        // as the P-frames.
-        tuning.delta_q,
-        // r439 — and the same §5.9.12 quantizer-matrix switch.
-        tuning.qm,
-        // r441 — §5.9.8 superres on the KEY (unsegmented GOPs only:
-        // a segmented P-frame's §5.11.19 temporal prediction would
-        // read the KEY's mi-grid-mismatched SavedSegmentIds).
-        tuning.superres && alt_q.is_empty(),
-        // r436 — the KEY donates too: collect its per-tile end CDFs.
-        donor_armed,
+        &crate::encoder::key_frame::KeyExtras {
+            // r431 — the GOP-wide §5.9.15 tile layout (r433: the
+            // explicit non-uniform override rides beside it), r433 —
+            // the GOP-wide §5.11.1 tile-group packaging.
+            tiles: tuning.tiles,
+            tile_groups: tuning.tile_groups,
+            explicit_tiles,
+            // r431 — the KEY frame rides the same §5.9.17 delta-q
+            // switch as the P-frames; r439 — and the §5.9.12 QM
+            // switch.
+            delta_q: tuning.delta_q,
+            qm: tuning.qm,
+            // r441 — §5.9.8 superres on the KEY (unsegmented GOPs
+            // only: a segmented P-frame's §5.11.19 temporal
+            // prediction would read the KEY's mi-grid-mismatched
+            // SavedSegmentIds).
+            superres_elect: tuning.superres && alt_q.is_empty(),
+            // r441 — the armed §5.9.30 parameter set (opens the
+            // sequence gate for the whole GOP).
+            film_grain: key_fg.as_ref(),
+            // r436 — the KEY donates too: collect its per-tile end
+            // CDFs.
+            collect_donor_cdfs: donor_armed,
+            ..crate::encoder::key_frame::KeyExtras::default()
+        },
     )?;
     let seq = key.seq.clone();
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
@@ -1279,6 +1475,13 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         } else {
             None
         };
+        // r441 — the P-frame's per-frame §5.9.30 seed rides the
+        // shared schedule at its display position.
+        let p_fg: Option<FilmGrainParams> = film_grain.map(|base| {
+            let mut f = base.clone();
+            f.grain_seed = crate::encoder::film_grain_elect::grain_seed_for(p_index);
+            f
+        });
         let (tu, rc, saved_mf, carry, aux) = encode_p_frame_yuv(
             input,
             prev,
@@ -1305,6 +1508,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
             tuning.tile_groups,
             explicit_tiles,
             donor_armed,
+            p_fg.as_ref(),
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1381,6 +1585,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         cdef_elections,
         lr_elections,
         ctx_donor_elections,
+        film_grain_elected: false,
     })
 }
 
@@ -1585,6 +1790,14 @@ pub(crate) struct InterFrameConfig<'a> {
     /// §5.9.15 legal window (see
     /// [`crate::tile_info::TileInfo::explicit_layout`]).
     pub explicit_tiles: Option<(&'a [u32], &'a [u32])>,
+    /// r441 — the armed §5.9.30 film-grain parameter set for THIS
+    /// frame (`apply_grain = 1`, full parameters, `update_grain = 1`,
+    /// per-frame `grain_seed`). OUTPUT-ONLY: the reconstruction /
+    /// §7.20 reference payload stays pre-grain; the GOP-level
+    /// election applies the §7.18.3 synthesis to the published
+    /// output planes. `None` keeps the pre-r441 header shape (the
+    /// sequence gate is closed unless the KEY armed it).
+    pub film_grain: Option<&'a FilmGrainParams>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -1639,6 +1852,12 @@ fn build_inter_frame_fh(
     // §5.9.2 ref_order_hint block is not coded, but the writer needs
     // them as session state for the §5.9.22 skipModeAllowed twin.
     fh.ref_order_hints = Some(cfg.slot_hints);
+    // r441 — the armed §5.9.30 film-grain block for this frame (see
+    // [`InterFrameConfig::film_grain`]); the sequence gate must have
+    // been opened by the KEY's arm.
+    if let Some(fg) = cfg.film_grain {
+        fh.film_grain_params = Some(fg.clone());
+    }
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
     // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
     // `tx_depth` choice and inter leaves the §5.11.17 `txfm_split`
@@ -1872,6 +2091,7 @@ fn p_frame_config_primary<'a>(
         exact_mask: None,
         auto_lossless: false,
         seg_extras: None,
+        film_grain: None,
         high_precision_mv: true,
         delta_q: true,
         qm: true,
@@ -2008,6 +2228,7 @@ fn encode_p_frame_yuv(
     tile_groups: u32,
     explicit_tiles: Option<(&[u32], &[u32])>,
     donor_armed: bool,
+    film_grain: Option<&FilmGrainParams>,
 ) -> Result<
     (
         Vec<u8>,
@@ -2019,6 +2240,8 @@ fn encode_p_frame_yuv(
     Error,
 > {
     let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry);
+    // r441 — the armed §5.9.30 film-grain block for this frame.
+    cfg.film_grain = film_grain;
     cfg.allow_temporal_seg = allow_temporal_seg;
     cfg.exact_mask = exact_mask;
     cfg.auto_lossless = auto_lossless;
@@ -9187,6 +9410,7 @@ mod tests {
             1,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);

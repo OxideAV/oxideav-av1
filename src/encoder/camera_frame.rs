@@ -214,6 +214,7 @@ pub fn encode_camera_frame_yuv420_tiles(
         // minimal header surface).
         qm: false,
         explicit_tiles: None,
+        film_grain: None,
     };
     let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
         &wide,

@@ -665,6 +665,7 @@ impl PyramidSession {
                         elect_donor: donor_armed,
                         explicit_tiles: None,
                         qm: self.tuning.qm,
+                        film_grain: None,
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(

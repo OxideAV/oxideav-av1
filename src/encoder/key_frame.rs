@@ -128,6 +128,7 @@ use crate::frame_header::FrameHeader;
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::transform::inverse_transform_2d;
+use crate::uncompressed_header_tail::FilmGrainParams;
 use crate::Error;
 
 /// Result of [`encode_key_frame_yuv`] / [`encode_key_frame_yuv_with_q`]
@@ -862,6 +863,15 @@ pub(crate) struct KeyExtras<'a> {
     /// codes `input` as the downscaled frame and the header carries
     /// the upscaled width + `coded_denom`); callers leave it `None`.
     pub superres: Option<(u32, u32)>,
+    /// r441 — the armed §5.9.30 film-grain parameter set: the
+    /// internally-built sequence header opens
+    /// `film_grain_params_present` and the frame header carries the
+    /// full §5.9.30 block (`apply_grain = 1`). OUTPUT-ONLY — the
+    /// reconstruction this core returns stays PRE-grain (the §7.20
+    /// reference payload); the GOP-level election applies the
+    /// §7.18.3 synthesis to the output planes it publishes. Callers
+    /// outside the film-grain election leave it `None`.
+    pub film_grain: Option<&'a FilmGrainParams>,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -1041,10 +1051,12 @@ pub(crate) fn encode_key_frame_yuv_full(
         qm: false,
         qm_level: None,
         collect_donor_cdfs: extras.collect_donor_cdfs,
-        // r441 — an armed §5.9.8 pair rides every inner-election arm
-        // (the QM / delta-q stages of a superres candidate encode).
+        // r441 — an armed §5.9.8 pair / §5.9.30 parameter set rides
+        // every inner-election arm (the QM / delta-q stages of a
+        // superres or film-grain candidate encode).
         superres_elect: false,
         superres: extras.superres,
+        film_grain: extras.film_grain,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -1298,6 +1310,9 @@ fn encode_key_frame_yuv_core(
             // build their own sequence headers and stay unaffected).
             s.enable_filter_intra = true;
             s.enable_superres = superres.is_some();
+            // r441 — the §5.9.30 sequence gate (see
+            // [`KeyExtras::film_grain`]).
+            s.film_grain_params_present = extras.film_grain.is_some();
             s
         }
     };
@@ -1317,6 +1332,15 @@ fn encode_key_frame_yuv_core(
         fs.use_superres = true;
         fs.superres_denom = denom;
         fs.coded_denom = (denom - crate::frame_header::SUPERRES_DENOM_MIN) as u8;
+    }
+    // r441 — the armed §5.9.30 film-grain block (see
+    // [`KeyExtras::film_grain`]): full parameters on the wire; the
+    // reconstruction below stays pre-grain.
+    if let Some(fg) = extras.film_grain {
+        if extras.seq_override.is_some() || !seq.film_grain_params_present || !fg.apply_grain {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        fh.film_grain_params = Some(fg.clone());
     }
     // r431 — §5.9.5: under a shared sequence header a smaller frame
     // codes its dimensions explicitly.
