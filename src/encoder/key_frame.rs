@@ -1016,7 +1016,10 @@ pub(crate) fn encode_key_frame_yuv_full(
         && model == RateModel::Twin
         && extras.delta_plan.is_none()
         && extras.qm_level.is_none();
-    let qm_candidate: Option<u8> = if elections_ok
+    // r441 — the multi-level QM ladder (the KEY twin of the inter
+    // driver's: the quantiser-keyed level plus its lighter §9.5.3
+    // neighbour, each settled by the same joint objective).
+    let qm_candidates: Vec<u8> = if elections_ok
         && extras.qm
         && crate::encoder::inter_frame::qm_arm_allowed(
             base_q_idx,
@@ -1025,9 +1028,9 @@ pub(crate) fn encode_key_frame_yuv_full(
         )
         && crate::encoder::inter_frame::qm_probe(input)
     {
-        Some(crate::encoder::inter_frame::qm_level_for_q(base_q_idx))
+        crate::encoder::inter_frame::qm_ladder_for_q(base_q_idx)
     } else {
-        None
+        Vec::new()
     };
     let delta_plan_opt: Option<Vec<i32>> = if elections_ok && extras.delta_q {
         let (mi_rows_probe, mi_cols_probe) = (input.height / 4, input.width / 4);
@@ -1035,7 +1038,7 @@ pub(crate) fn encode_key_frame_yuv_full(
     } else {
         None
     };
-    if qm_candidate.is_none() && delta_plan_opt.is_none() {
+    if qm_candidates.is_empty() && delta_plan_opt.is_none() {
         return encode_key_frame_yuv_core(
             input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
         );
@@ -1089,23 +1092,31 @@ pub(crate) fn encode_key_frame_yuv_full(
         lr,
         &flat_extras,
     )?;
-    let (stage1_extras, stage1) = match qm_candidate {
-        Some(lvl) => {
-            let qm_extras = KeyExtras {
-                qm_level: Some(lvl),
-                ..flat_extras
-            };
-            let armed = encode_key_frame_yuv_core(
-                input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &qm_extras,
-            )?;
-            if plain_score(&armed) < plain_score(&base) {
-                (qm_extras, armed)
-            } else {
-                (flat_extras, base)
-            }
+    let mut stage1_extras = flat_extras;
+    let mut stage1 = base;
+    let mut stage1_score = plain_score(&stage1);
+    let mut stage1_won = false;
+    for &lvl in &qm_candidates {
+        let qm_extras = KeyExtras {
+            qm_level: Some(lvl),
+            ..flat_extras
+        };
+        let armed = encode_key_frame_yuv_core(
+            input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &qm_extras,
+        )?;
+        let score = plain_score(&armed);
+        if score < stage1_score {
+            stage1_score = score;
+            stage1_extras = qm_extras;
+            stage1 = armed;
+            stage1_won = true;
         }
-        None => (flat_extras, base),
-    };
+        // Refinement discipline (see the inter driver's ladder): only
+        // a winning keyed level earns the neighbour's extra search.
+        if crate::encoder::inter_frame::QM_LADDER_REFINES_ONLY && !stage1_won {
+            break;
+        }
+    }
     // Stage 2 — §5.9.17 delta-q election on the stage-1 winner (the
     // masking-weighted objective, exactly the r431 arm).
     if let Some(plan) = &delta_plan_opt {

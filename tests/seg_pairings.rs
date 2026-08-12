@@ -396,6 +396,22 @@ fn seg_pairings_fixture_staging() {
     )
     .expect("segmented cdef encode");
     assert!(cd.cdef_elections.iter().any(|&e| e));
+    // r441 — the QM × segmentation pairing stream.
+    let qm = encode_gop_yuv420_with_q_seg_tuned(
+        &frames,
+        120,
+        &SEG_TABLE,
+        GopTuning {
+            delta_q: false,
+            cdef: false,
+            cdef_units: false,
+            lr: false,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented qm encode");
+    assert!(qm.qm_elections.iter().any(|&e| e));
+    dump("gop-128x96-q120-seg-qm", &qm);
     dump("gop-128x96-q140-seg-cdef", &cd);
     let lr = encode_gop_yuv420_with_q_seg_tuned(
         &frames,

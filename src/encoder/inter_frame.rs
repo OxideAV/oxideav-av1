@@ -405,6 +405,33 @@ pub(crate) fn qm_level_for_q(base_q_idx: u8) -> u8 {
     }
 }
 
+/// r441 — the multi-level QM LADDER: the quantiser-keyed level plus
+/// its LIGHTER §9.5.3 neighbour two steps up (levels rise toward the
+/// flat lattice at 15). The keyed banding is a coarse fit — near a
+/// band edge, or on content whose spectrum sits between the bands'
+/// design points, the neighbour reshapes better; the election settles
+/// each candidate by the same exact-realized-bytes joint objective,
+/// so the ladder can only improve the elected stream. Two candidates
+/// keep the extra full searches inside the tiered-CI budget (an
+/// election-scoping choice).
+pub(crate) fn qm_ladder_for_q(base_q_idx: u8) -> Vec<u8> {
+    let keyed = qm_level_for_q(base_q_idx);
+    let lighter = (keyed + 2).min(12);
+    if lighter == keyed {
+        vec![keyed]
+    } else {
+        vec![keyed, lighter]
+    }
+}
+
+/// r441 — the ladder's REFINEMENT discipline: candidates past the
+/// first run only when the keyed level already beat the flat arm.
+/// Measured on the committed matrix, the lighter neighbour refines
+/// wins but never overturns a loss — so the extra full search is
+/// spent only on frames already paying for the tool (the r440
+/// CI-budget lesson applied up front).
+pub(crate) const QM_LADDER_REFINES_ONLY: bool = true;
+
 /// r439 — the QM arm's ARMING WINDOW: the measured win regime. The
 /// `qm_ab` matrix showed the joint objective electing the arm in the
 /// MID-RATE band (level-8 territory — e.g. −14.85% bytes at
@@ -3009,40 +3036,21 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // (`seg_qp`) carries each block's own row through the residual
     // chain, and the SEG_LVL feature trials price their QM-quantised
     // chains through the same bundles.
-    let qm_arm_level: Option<u8> = if cfg.qm
+    let qm_arm_levels: Vec<u8> = if cfg.qm
         && !lossless
         && cfg.exact_mask.is_none()
         && !cfg.auto_lossless
         && qm_arm_allowed(base_q_idx, width, height)
         && qm_probe(input)
     {
-        Some(qm_level_for_q(base_q_idx))
+        // r441 — the multi-level ladder (see [`qm_ladder_for_q`]).
+        qm_ladder_for_q(base_q_idx)
     } else {
-        None
+        Vec::new()
     };
     let mut qm_elected = false;
-    if let Some(lvl) = qm_arm_level {
+    if !qm_arm_levels.is_empty() {
         let seg_ll = seg_lossless_array(base_q_idx, alt_q);
-        let mut qp_m = qp;
-        qp_m.using_qmatrix = true;
-        for plane in 0..3 {
-            for (seg, &ll) in seg_ll.iter().enumerate() {
-                // §5.9.2: a lossless segment's `SegQMLevel` is the
-                // no-QM sentinel 15; every other segment carries the
-                // coded `qm_y` / `qm_u` / `qm_v`.
-                qp_m.seg_qm_level[plane][seg] = if ll { 15 } else { lvl };
-            }
-        }
-        let mut params_m = params.clone();
-        params_m.quant = qp_m;
-        let cand = run_arm(&params_m, None)?;
-        let mut fh_m = fh.clone();
-        if let Some(q) = fh_m.quantization_params.as_mut() {
-            q.using_qmatrix = true;
-            q.qm_y = lvl;
-            q.qm_u = lvl;
-            q.qm_v = lvl;
-        }
         let lambda = lambda_for(&qp);
         let prev_gm_score: Option<[[i32; 6]; TOTAL_REFS_PER_FRAME]> =
             if fh.primary_ref_frame != PRIMARY_REF_NONE {
@@ -3075,35 +3083,61 @@ pub(crate) fn encode_inter_frame_generic_gm(
             }
             d
         };
-        let score_base = score256(
+        let mut best_score = score256(
             plain_sse(&arm.recon),
             lambda,
             ((header_len(&fh) + arm.tile.len()) as u64) * 8 * 256,
         );
-        let score_qm = score256(
-            plain_sse(&cand.recon),
-            lambda,
-            ((header_len(&fh_m) + cand.tile.len()) as u64) * 8 * 256,
-        );
-        if std::env::var_os("OXIDEAV_AV1_QM_DEBUG").is_some() {
-            eprintln!(
-                "qm-frame oh={} lvl={} base: tile {} B sse {} score {} | qm: tile {} B sse {} score {}",
-                cfg.order_hint,
-                lvl,
-                arm.tile.len(),
-                plain_sse(&arm.recon),
-                score_base,
-                cand.tile.len(),
+        for &lvl in &qm_arm_levels {
+            let mut qp_m = qp;
+            qp_m.using_qmatrix = true;
+            for plane in 0..3 {
+                for (seg, &ll) in seg_ll.iter().enumerate() {
+                    // §5.9.2: a lossless segment's `SegQMLevel` is the
+                    // no-QM sentinel 15; every other segment carries
+                    // the coded `qm_y` / `qm_u` / `qm_v`.
+                    qp_m.seg_qm_level[plane][seg] = if ll { 15 } else { lvl };
+                }
+            }
+            let mut params_m = params.clone();
+            params_m.quant = qp_m;
+            let cand = run_arm(&params_m, None)?;
+            let mut fh_m = fh.clone();
+            if let Some(q) = fh_m.quantization_params.as_mut() {
+                q.using_qmatrix = true;
+                q.qm_y = lvl;
+                q.qm_u = lvl;
+                q.qm_v = lvl;
+            }
+            let score_qm = score256(
                 plain_sse(&cand.recon),
-                score_qm,
+                lambda,
+                ((header_len(&fh_m) + cand.tile.len()) as u64) * 8 * 256,
             );
-        }
-        if score_qm < score_base {
-            qm_elected = true;
-            arm = cand;
-            fh = fh_m;
-            params = params_m;
-            qp = qp_m;
+            if std::env::var_os("OXIDEAV_AV1_QM_DEBUG").is_some() {
+                eprintln!(
+                    "qm-frame oh={} lvl={} qm: tile {} B sse {} score {} | best so far {}",
+                    cfg.order_hint,
+                    lvl,
+                    cand.tile.len(),
+                    plain_sse(&cand.recon),
+                    score_qm,
+                    best_score,
+                );
+            }
+            if score_qm < best_score {
+                best_score = score_qm;
+                qm_elected = true;
+                arm = cand;
+                fh = fh_m;
+                params = params_m;
+                qp = qp_m;
+            }
+            // Refinement discipline: only a winning keyed level earns
+            // the neighbour's extra full search.
+            if QM_LADDER_REFINES_ONLY && !qm_elected {
+                break;
+            }
         }
     }
 

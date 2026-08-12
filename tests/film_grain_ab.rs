@@ -257,3 +257,31 @@ fn fg_ab_measurement_matrix() {
         }
     }
 }
+
+/// Env-gated staging dump (`OXIDEAV_AV1_FG_DIR`): a grain-elected
+/// GOP plus expected YUV for black-box reference-decoder validation
+/// and corpus pinning. Inert otherwise.
+#[test]
+fn fg_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_FG_DIR") else {
+        eprintln!("OXIDEAV_AV1_FG_DIR unset — skipping the film-grain staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| noisy_frame(128, 96, t, 6)).collect();
+    let enc = encode(&frames, 60, true);
+    assert!(enc.film_grain_elected, "staged GOP must elect film grain");
+    std::fs::write(
+        root.join("gop-128x96-q60-film-grain.ivf"),
+        &enc.gop.ivf_bytes,
+    )
+    .expect("write ivf");
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &enc.gop.recon {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("gop-128x96-q60-film-grain.yuv"), &yuv).expect("write yuv");
+}

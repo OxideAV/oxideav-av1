@@ -278,3 +278,54 @@ fn sr_ab_measurement_matrix() {
         }
     }
 }
+
+/// Env-gated staging dump (`OXIDEAV_AV1_SR_DIR`): a superres-elected
+/// GOP + expected YUV for black-box reference-decoder validation and
+/// corpus pinning. Inert otherwise.
+#[test]
+fn sr_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_SR_DIR") else {
+        eprintln!("OXIDEAV_AV1_SR_DIR unset — skipping the superres staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| smooth_frame(128, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        180,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning::default(),
+    )
+    .expect("gop encode");
+    // The KEY must have elected a §5.9.8 denominator.
+    let ivf = &enc.gop.ivf_bytes;
+    let mut seq = None;
+    let mut elected = false;
+    for desc in ObuIter::new(&enc.gop.temporal_units[0]) {
+        let desc = desc.expect("TU walks");
+        match desc.obu_type {
+            ObuType::SequenceHeader => {
+                seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+            }
+            ObuType::Frame => {
+                let fh =
+                    parse_frame_header(desc.payload, seq.as_ref().expect("SH")).expect("FH parses");
+                elected = fh.frame_size.expect("frame size").use_superres;
+            }
+            _ => {}
+        }
+    }
+    assert!(elected, "staged GOP must elect superres on the KEY");
+    std::fs::write(root.join("gop-128x96-q180-superres.ivf"), ivf).expect("write ivf");
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &enc.gop.recon {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("gop-128x96-q180-superres.yuv"), &yuv).expect("write yuv");
+}
