@@ -188,6 +188,16 @@ pub struct PyramidTuning {
     /// baseline; bit-identical to the pre-r439 streams). Inert on
     /// single-tile layouts or with [`Self::primary_ref`] off.
     pub ctx_update_elect: bool,
+    /// r444 — §5.9.8 SUPERRES election on the pyramid KEY (see
+    /// [`super::inter_frame::GopTuning::superres`]): inside the
+    /// measured win regime the KEY may code at a §5.9.8 downscaled
+    /// width; every later frame of the pyramid predicts from its
+    /// UPSCALED §7.20 reconstruction at the full extent (the KEY's
+    /// intra motion-field / carry seeds are extent-inert, exactly as
+    /// on the plain-GOP driver). Single-tile pyramids only (the KEY
+    /// election's own gate); `false` keeps the flat-width KEY (the
+    /// A/B baseline; bit-identical outside an elected win).
+    pub superres: bool,
 }
 
 impl Default for PyramidTuning {
@@ -206,6 +216,7 @@ impl Default for PyramidTuning {
             tiles: (0, 0),
             tile_groups: 1,
             ctx_update_elect: true,
+            superres: true,
         }
     }
 }
@@ -512,11 +523,12 @@ impl PyramidSession {
             true,
             // r439 — the KEY rides the pyramid's §5.9.12 QM switch.
             tuning.qm,
-            // r441 — the §5.9.8 superres election stays off the
-            // B-pyramid KEY this round (the out-of-order refresh
-            // graph's reference/motion-field bookkeeping around a
-            // downscaled KEY is unvalidated; a follow-up).
-            false,
+            // r444 — the §5.9.8 superres election rides the pyramid
+            // KEY: the out-of-order refresh graph reads only the
+            // KEY's UPSCALED reconstruction (full extent) and its
+            // extent-inert intra motion-field / carry seeds, exactly
+            // like the plain-GOP driver.
+            tuning.superres,
             // r439 — the KEY donates too: collect its per-tile end
             // CDFs so the first consumer can run the §6.8.14
             // election.

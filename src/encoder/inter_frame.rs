@@ -834,16 +834,21 @@ pub struct GopTuning {
     /// the pre-r436 streams). Inert on single-tile layouts or with
     /// [`Self::primary_ref`] off.
     pub ctx_update_elect: bool,
-    /// r441 — §5.9.8 SUPERRES election on the KEY frame of an
-    /// unsegmented single-tile GOP inside the measured win regime:
-    /// each candidate denominator codes the KEY at the §5.9.8
-    /// downscaled width, the reconstruction upscales through the
-    /// decoder's own §7.16 driver (the P chain predicts from the
-    /// upscaled reference, exactly the decoder's §7.20 store), and
-    /// the joint objective over original-extent SSE + exact realized
-    /// bytes keeps the winner. `false` keeps the flat-width shape on
-    /// every frame (the A/B baseline; bit-identical outside an
-    /// elected win).
+    /// r441 — §5.9.8 SUPERRES election on the KEY frame of a
+    /// single-tile GOP inside the measured win regime: each candidate
+    /// denominator codes the KEY at the §5.9.8 downscaled width, the
+    /// reconstruction upscales through the decoder's own §7.16
+    /// driver (the P chain predicts from the upscaled reference,
+    /// exactly the decoder's §7.20 store), and the joint objective
+    /// over original-extent SSE + exact realized bytes keeps the
+    /// winner. r444 — SEGMENTED GOPs ride the election too: the KEY
+    /// of a plain segmented GOP is itself unsegmented, and a
+    /// segmented P-frame's §5.11.19 temporal prediction over the
+    /// KEY's mi-grid-mismatched `SavedSegmentIds` takes the
+    /// §5.9.2 `load_previous_segment_ids()` all-zero arm both twins
+    /// already mirror. `false` keeps the flat-width shape on every
+    /// frame (the A/B baseline; bit-identical outside an elected
+    /// win).
     pub superres: bool,
     /// r441 — §5.9.30 FILM-GRAIN election on unsegmented lossy GOPs
     /// whose content passes the noise probe (energy + spatial
@@ -1428,11 +1433,15 @@ fn encode_gop_yuv_core_fg(
             // switch.
             delta_q: tuning.delta_q,
             qm: tuning.qm,
-            // r441 — §5.9.8 superres on the KEY (unsegmented GOPs
-            // only: a segmented P-frame's §5.11.19 temporal
-            // prediction would read the KEY's mi-grid-mismatched
-            // SavedSegmentIds).
-            superres_elect: tuning.superres && alt_q.is_empty(),
+            // r441 — §5.9.8 superres on the KEY. r444: segmented
+            // GOPs too — the KEY of a plain segmented GOP is itself
+            // unsegmented, and the P-frames' §5.11.19 temporal
+            // prediction over the KEY's mi-grid-mismatched
+            // SavedSegmentIds takes the spec's all-zero
+            // `load_previous_segment_ids()` arm, which BOTH the
+            // decode driver and the write mirror already derive
+            // (extent-checked carry).
+            superres_elect: tuning.superres,
             // r441 — the armed §5.9.30 parameter set (opens the
             // sequence gate for the whole GOP).
             film_grain: key_fg.as_ref(),

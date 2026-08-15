@@ -373,6 +373,147 @@ fn gop_with_superres_lr_key_decodes_bit_exact() {
     }
 }
 
+/// Extract the FIRST frame header (+ sequence header) of a stream's
+/// first temporal unit.
+fn first_frame_header(
+    tu: &[u8],
+) -> (
+    oxideav_av1::sequence_header::SequenceHeader,
+    oxideav_av1::frame_header::FrameHeader,
+) {
+    let mut seq = None;
+    let mut fh = None;
+    for desc in ObuIter::new(tu) {
+        let desc = desc.expect("TU walks");
+        match desc.obu_type {
+            ObuType::SequenceHeader => {
+                seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+            }
+            ObuType::Frame | ObuType::FrameHeader if fh.is_none() => {
+                fh = Some(
+                    parse_frame_header(desc.payload, seq.as_ref().expect("SH precedes"))
+                        .expect("FH parses"),
+                );
+            }
+            _ => {}
+        }
+    }
+    (seq.expect("SH present"), fh.expect("FH present"))
+}
+
+/// r444 — SEGMENTED GOP × superres: the KEY of a plain segmented GOP
+/// (itself unsegmented) elects the §5.9.8 arm; the segmented P chain
+/// predicts from the upscaled reference, its §5.11.19 temporal
+/// prediction rides the extent-checked all-zero
+/// `load_previous_segment_ids()` arm against the KEY's mi-mismatched
+/// map, and every frame decodes bit-exact.
+#[test]
+fn segmented_gop_with_superres_key_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| smooth_frame(128, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        180,
+        &[0, -60],
+        &[],
+        false,
+        None,
+        GopTuning::default(),
+    )
+    .expect("segmented gop encode");
+    let (seq, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+    assert!(
+        key_fh.frame_size.expect("frame size").use_superres,
+        "smooth coarse-q content must elect superres on the segmented GOP's KEY"
+    );
+    let p_fh = ObuIter::new(&enc.gop.temporal_units[1])
+        .filter_map(|d| {
+            let d = d.expect("TU walks");
+            (d.obu_type == ObuType::Frame)
+                .then(|| parse_frame_header(d.payload, &seq).expect("P FH parses"))
+        })
+        .next()
+        .expect("P frame OBU present");
+    assert!(
+        p_fh.segmentation_params.expect("P header").enabled,
+        "the P chain must stay segmented"
+    );
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+}
+
+/// r444 — B-PYRAMID × superres: the pyramid KEY elects the §5.9.8
+/// arm; the out-of-order refresh graph (ALT / MID / B roles, primary
+/// carries, backward references) rides the KEY's upscaled §7.20
+/// reconstruction and every display frame decodes bit-exact.
+#[test]
+fn pyramid_gop_with_superres_key_decodes_bit_exact() {
+    use oxideav_av1::encoder::{encode_pyramid_gop_yuv420_with_q_tuned, PyramidTuning};
+    let frames: Vec<Yuv420Frame> = (0..6).map(|t| smooth_frame(128, 96, t)).collect();
+    let enc = encode_pyramid_gop_yuv420_with_q_tuned(&frames, 180, PyramidTuning::default())
+        .expect("pyramid encode");
+    let (seq, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+    assert!(seq.enable_superres, "the pyramid sequence gate must open");
+    assert!(
+        key_fh.frame_size.expect("frame size").use_superres,
+        "smooth coarse-q content must elect superres on the pyramid KEY"
+    );
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+}
+
+/// r444 — TEMPORAL LADDER × superres: the §6.7.5 ladder KEY elects
+/// the §5.9.8 arm (the multi-OP repack preserves the elected
+/// sequence gate + upscaled maximum), every later layer frame codes
+/// its `use_superres = 0` bit under the repacked header, and the
+/// stream decodes bit-exact at the FULL operating point AND at a
+/// reduced one (the §5.3.1 drop rule composing with the upscaled
+/// KEY reference).
+#[test]
+fn temporal_ladder_with_superres_key_decodes_bit_exact() {
+    use oxideav_av1::decoder::decode_av1_spec_at_operating_point;
+    use oxideav_av1::encoder::encode_temporal_layered_gop_yuv420_with_q;
+    let frames: Vec<Yuv420Frame> = (0..6).map(|t| smooth_frame(128, 96, t)).collect();
+    let enc = encode_temporal_layered_gop_yuv420_with_q(&frames, 180, 3).expect("ladder encode");
+    let (seq, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+    assert!(seq.enable_superres, "the ladder sequence gate must open");
+    assert!(
+        key_fh.frame_size.expect("frame size").use_superres,
+        "smooth coarse-q content must elect superres on the ladder KEY"
+    );
+    // Full-point decode: every display frame bit-exact.
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+    // Reduced operating point 1: only frames whose temporal id
+    // survives, each bit-exact.
+    let reduced = decode_av1_spec_at_operating_point(&enc.gop.ivf_bytes, 1).expect("op-1 decode");
+    let keep: Vec<usize> = enc
+        .temporal_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, &tid)| tid <= 1)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(reduced.len(), keep.len(), "op-1 frame count");
+    for (k, &i) in keep.iter().enumerate() {
+        assert_eq!(reduced[k].planes[0], enc.gop.recon[i].y, "op-1 frame {i}");
+    }
+}
+
 /// Env-gated measurement matrix (`OXIDEAV_AV1_SR_AB=1`): elected vs
 /// flat baseline over content × q × geometry — the numbers behind the
 /// committed `superres_arm_allowed` window.

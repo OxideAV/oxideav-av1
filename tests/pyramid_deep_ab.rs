@@ -176,6 +176,9 @@ fn baseline_tuning() -> PyramidTuning {
         tiles: (0, 0),
         tile_groups: 1,
         ctx_update_elect: true,
+        // r444 — both A/B arms ride the same §5.9.8 KEY election so
+        // the pyramid-depth axis stays the only variable.
+        superres: true,
     }
 }
 

@@ -232,12 +232,16 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
         None,
         /* delta_q = */ true,
         /* qm = */ true,
-        // r441 — the §5.9.8 superres election stays off the §6.7.5
-        // temporal ladder this round (the KEY unit is repacked under
-        // a rebuilt multi-OP sequence header; an election-scoping
-        // choice, follow-up).
+        // r444 — the §5.9.8 superres election rides the ladder KEY:
+        // the multi-OP repack below rewrites ONLY the operating-point
+        // list of the KEY's own sequence header, so an elected arm's
+        // `enable_superres` gate + upscaled sequence maximum carry
+        // through, and every later ladder frame (coded under the
+        // repacked header) codes its §5.9.8 `use_superres = 0` bit
+        // exactly as the plain-GOP P chain does. An unelected KEY
+        // keeps the ladder bit-identical to the r430 shape.
         /* superres = */
-        false,
+        true,
         donor_armed,
     )?;
     let mut seq = key.seq.clone();
