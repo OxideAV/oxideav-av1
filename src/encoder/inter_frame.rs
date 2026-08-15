@@ -1223,44 +1223,53 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     denoised.extend(frames[2..].iter().map(fge::denoise_frame));
     let est = fge::noise_estimate(&frames[0], &denoised[0]);
     let bit_depth = frames[0].bit_depth;
-    let fg_base = fge::build_grain_params(&est, bit_depth);
-    let cand = encode_gop_yuv_core_fg(
-        &denoised,
-        base_q_idx,
-        alt_q,
-        regions,
-        auto_detect,
-        extras,
-        tuning,
-        explicit_tiles,
-        Some(&fg_base),
-    )?;
-    // The published output planes: the §7.18.3 synthesis through the
-    // decoder's own driver, per-frame seeds from the shared schedule.
     let (width, height) = (frames[0].width, frames[0].height);
     let format = frames[0].format;
     let (ssx, ssy) = format.subsampling();
     let num_planes = format.num_planes();
-    let mc = cand.gop.seq.color_config.matrix_coefficients;
-    let grained: Vec<GopFrameReconYuv> = cand
-        .gop
-        .recon
-        .iter()
-        .enumerate()
-        .map(|(k, rc)| {
-            let mut fg = fg_base.clone();
-            fg.grain_seed = fge::grain_seed_for(k as u32);
-            let (gy, gu, gv) = fge::apply_grain_to_recon(
-                &fg, &rc.y, &rc.u, &rc.v, width, height, bit_depth, ssx, ssy, num_planes, mc,
-            );
-            GopFrameReconYuv {
-                y: gy,
-                u: gu,
-                v: gv,
-            }
-        })
-        .collect();
-    // Perceptually-neutral-rate scoring (see the doc comment above).
+    let mc = plain.gop.seq.color_config.matrix_coefficients;
+    // r444 — the parameter-set CANDIDATE ladder. Candidate 0 is the
+    // r441 shape (white luma-only grain — bit-identical params on
+    // identical input); when the residual carries structure the spec
+    // can model, further sets add fitted §5.9.30 AR taps (lag 1 and
+    // lag 2 — each ring costs real parameter bytes on EVERY frame
+    // header, so the depth choice belongs to the score settlement,
+    // never to a fit statistic alone) and/or per-plane chroma
+    // scaling points (the chroma gate mirrors the luma probe at the
+    // chroma extent: energy + spatial modelability + temporal
+    // decorrelation, so moving chroma texture never masquerades as
+    // grain).
+    let chroma_cb =
+        num_planes > 1 && fge::chroma_noise_gate(&frames[..2], &denoised[..2], 1, est.cb_sigma16);
+    let chroma_cr =
+        num_planes > 1 && fge::chroma_noise_gate(&frames[..2], &denoised[..2], 2, est.cr_sigma16);
+    let fit1 = fge::fit_ar_lag(&frames[0], &denoised[0], 1);
+    let fit2 = fge::fit_ar_lag(&frames[0], &denoised[0], 2);
+    let mut cand_params: Vec<FilmGrainParams> = vec![fge::build_grain_params(
+        &est, bit_depth, ssx, ssy, mc, None, false, false,
+    )];
+    let chroma_only: Option<fge::ArFit> = ((chroma_cb || chroma_cr) && fit1.is_none())
+        .then(|| fge::fit_chroma_corr(&frames[0], &denoised[0]));
+    for fit in [fit1.as_ref(), fit2.as_ref(), chroma_only.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        cand_params.push(fge::build_grain_params(
+            &est,
+            bit_depth,
+            ssx,
+            ssy,
+            mc,
+            Some(fit),
+            chroma_cb,
+            chroma_cr,
+        ));
+    }
+    // Perceptually-neutral-rate scoring (see the doc comment above;
+    // r444 adds the chroma amplitude terms and a luma
+    // CORRELATION-match term — `samples · (ρ_src − ρ_syn)² · σ_src²`
+    // — so an AR candidate wins exactly where the white one leaves
+    // spatial structure unmodelled).
     let sse_pair = |a: &GopFrameReconYuv, f: &YuvFrame| -> u64 {
         let mut d = 0u64;
         for (x, y) in
@@ -1281,40 +1290,142 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         .zip(frames)
         .map(|(rc, f)| sse_pair(rc, f))
         .sum();
-    let mut d_grain: u64 = cand
-        .gop
-        .recon
-        .iter()
-        .zip(&denoised)
-        .map(|(rc, f)| sse_pair(rc, f))
-        .sum();
-    let shift = u32::from(bit_depth - 8);
-    for k in 0..frames.len() {
-        let sig_src = fge::luma_sigma16(&frames[k].y, &denoised[k].y, bit_depth);
-        let sig_syn = fge::luma_sigma16(&grained[k].y, &cand.gop.recon[k].y, bit_depth);
-        let diff = sig_src.abs_diff(sig_syn);
-        // (σ16 difference)² / 256 = σ² in 8-bit sample² units; scale
-        // back to the stream's raw sample² scale.
-        d_grain += (frames[k].y.len() as u64) * diff * diff * (1u64 << (2 * shift)) / 256;
-    }
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, bit_depth));
     let score_plain = score256(
         d_plain,
         lambda,
         (plain.gop.ivf_bytes.len() as u64) * 8 * 256,
     );
-    let score_grain = score256(d_grain, lambda, (cand.gop.ivf_bytes.len() as u64) * 8 * 256);
-    // The tool's mandate is RATE at perceptually-neutral quality: a
-    // grain arm that scores better only through the structure-side
-    // distortion asymmetry but realizes MORE bytes is not a win —
-    // demand both the joint-score win AND strictly fewer bytes.
-    if score_grain < score_plain && cand.gop.ivf_bytes.len() < plain.gop.ivf_bytes.len() {
-        let mut out = cand;
-        out.gop.recon = grained;
-        out.film_grain_elected = true;
-        Ok(out)
-    } else {
-        Ok(plain)
+    let shift = u32::from(bit_depth - 8);
+    let mut best: Option<(TunedGopYuv, Vec<GopFrameReconYuv>, u64)> = None;
+    for fg_base in &cand_params {
+        let cand = encode_gop_yuv_core_fg(
+            &denoised,
+            base_q_idx,
+            alt_q,
+            regions,
+            auto_detect,
+            extras,
+            tuning,
+            explicit_tiles,
+            Some(fg_base),
+        )?;
+        // The published output planes: the §7.18.3 synthesis through
+        // the decoder's own driver, per-frame seeds from the shared
+        // schedule.
+        let grained: Vec<GopFrameReconYuv> = cand
+            .gop
+            .recon
+            .iter()
+            .enumerate()
+            .map(|(k, rc)| {
+                let mut fg = fg_base.clone();
+                fg.grain_seed = fge::grain_seed_for(k as u32);
+                let (gy, gu, gv) = fge::apply_grain_to_recon(
+                    &fg, &rc.y, &rc.u, &rc.v, width, height, bit_depth, ssx, ssy, num_planes, mc,
+                );
+                GopFrameReconYuv {
+                    y: gy,
+                    u: gu,
+                    v: gv,
+                }
+            })
+            .collect();
+        let mut d_grain: u64 = cand
+            .gop
+            .recon
+            .iter()
+            .zip(&denoised)
+            .map(|(rc, f)| sse_pair(rc, f))
+            .sum();
+        for k in 0..frames.len() {
+            // Luma + chroma amplitude terms: (σ16 difference)² / 256
+            // = σ² in 8-bit sample² units; scale back to the
+            // stream's raw sample² scale.
+            type PlaneRefs<'p> = (&'p [u16], &'p [u16], &'p [u16], &'p [u16], usize);
+            let planes: [PlaneRefs<'_>; 3] = [
+                (
+                    &frames[k].y,
+                    &denoised[k].y,
+                    &grained[k].y,
+                    &cand.gop.recon[k].y,
+                    frames[k].y.len(),
+                ),
+                (
+                    &frames[k].u,
+                    &denoised[k].u,
+                    &grained[k].u,
+                    &cand.gop.recon[k].u,
+                    frames[k].u.len(),
+                ),
+                (
+                    &frames[k].v,
+                    &denoised[k].v,
+                    &grained[k].v,
+                    &cand.gop.recon[k].v,
+                    frames[k].v.len(),
+                ),
+            ];
+            for (src, den, syn, pre, samples) in planes {
+                if samples == 0 {
+                    continue;
+                }
+                let sig_src = fge::plane_sigma16(src, den, bit_depth);
+                let sig_syn = fge::plane_sigma16(syn, pre, bit_depth);
+                let diff = sig_src.abs_diff(sig_syn);
+                d_grain += (samples as u64) * diff * diff * (1u64 << (2 * shift)) / 256;
+            }
+            // Correlation-match term (luma): unmodelled spatial
+            // structure counts as noise energy times the squared
+            // correlation gap.
+            let w = width as usize;
+            let h = height as usize;
+            let rho_src = fge::lag1_h_rho(&frames[k].y, &denoised[k].y, w, h);
+            let rho_syn = fge::lag1_h_rho(&grained[k].y, &cand.gop.recon[k].y, w, h);
+            let sig_src = fge::plane_sigma16(&frames[k].y, &denoised[k].y, bit_depth);
+            let gap = (rho_src - rho_syn).abs();
+            let term = (frames[k].y.len() as f64) * gap * gap * ((sig_src * sig_src) as f64)
+                / 256.0
+                * f64::from(1u32 << (2 * shift));
+            d_grain += term.round() as u64;
+        }
+        let score = score256(d_grain, lambda, (cand.gop.ivf_bytes.len() as u64) * 8 * 256);
+        if std::env::var_os("OXIDEAV_AV1_FG_DEBUG").is_some() {
+            eprintln!(
+                "fg-elect cand: lag {} cb {} cr {} bytes {} d_grain {} score {} | plain bytes {} d {} score {}",
+                fg_base.ar_coeff_lag,
+                fg_base.num_cb_points,
+                fg_base.num_cr_points,
+                cand.gop.ivf_bytes.len(),
+                d_grain,
+                score,
+                plain.gop.ivf_bytes.len(),
+                d_plain,
+                score_plain
+            );
+        }
+        // The tool's mandate is RATE at perceptually-neutral quality:
+        // a candidate that scores better only through the
+        // structure-side distortion asymmetry but realizes MORE bytes
+        // than the plain arm is not a win — eligibility demands
+        // strictly fewer bytes PER CANDIDATE (r444: a deeper
+        // parameter set may outscore the white one on the neutrality
+        // terms yet forfeit the rate mandate; the white candidate
+        // stays eligible on its own bytes).
+        if cand.gop.ivf_bytes.len() < plain.gop.ivf_bytes.len()
+            && best.as_ref().map(|(_, _, s)| score < *s).unwrap_or(true)
+        {
+            best = Some((cand, grained, score));
+        }
+    }
+    match best {
+        Some((cand, grained, score_grain)) if score_grain < score_plain => {
+            let mut out = cand;
+            out.gop.recon = grained;
+            out.film_grain_elected = true;
+            Ok(out)
+        }
+        _ => Ok(plain),
     }
 }
 

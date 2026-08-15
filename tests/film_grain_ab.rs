@@ -285,3 +285,132 @@ fn fg_fixture_staging() {
     }
     std::fs::write(root.join("gop-128x96-q60-film-grain.yuv"), &yuv).expect("write yuv");
 }
+
+/// r444 — spatially CORRELATED grain, re-rolled per frame: the r441
+/// whiteness probe rejected it; the relaxed probe admits it, the AR
+/// fit recovers the correlation, and the fitted candidate lands
+/// `ar_coeff_lag >= 1` with real §5.9.30 taps on the wire. Bit-exact
+/// decode on every frame — the §7.18.3 synthesis mirror covers the
+/// AR grain generation path.
+#[test]
+fn correlated_noise_elects_ar_taps_and_decodes_bit_exact() {
+    let ar_frame = |w: u32, h: u32, t: usize| -> Yuv420Frame {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut f = Yuv420Frame::filled(w, h, 128);
+        let mut state = 0x51ed_2718u32.wrapping_add((t as u32).wrapping_mul(0x9e37_79b9));
+        let mut rnd = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(((state >> 23) & 255) as i32 - 128) * 6.0 / 128.0
+        };
+        for r in 0..hu {
+            // AR(1) along the row: n[x] = 0.55 n[x-1] + w — the
+            // §7.18.3 lag-1 causal neighbourhood models it.
+            let mut prev = 0.0f64;
+            for c in 0..wu {
+                let n = 0.55 * prev + rnd();
+                prev = n;
+                let v = base_value(wu, r, c, t) + n * 1.6;
+                f.y[r * wu + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let (cw, ch) = (wu / 2, hu / 2);
+        for r in 0..ch {
+            for c in 0..cw {
+                f.u[r * cw + c] = (116 + ((r + c + t) % 24)) as u8;
+                f.v[r * cw + c] = (132 + ((r * 2 + c) % 20)) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| ar_frame(128, 96, t)).collect();
+    let on = encode(&frames, 60, true);
+    let off = encode(&frames, 60, false);
+    assert!(
+        on.film_grain_elected,
+        "correlated temporally-decorrelated noise must elect the grain arm \
+         (grain {} B vs plain {} B)",
+        on.gop.ivf_bytes.len(),
+        off.gop.ivf_bytes.len()
+    );
+    let (fg_present, headers) = wire_headers(&on.gop.temporal_units);
+    assert!(fg_present, "sequence gate must open");
+    let fg = headers[0]
+        .film_grain_params
+        .as_ref()
+        .expect("KEY carries the §5.9.30 block");
+    assert!(
+        fg.ar_coeff_lag >= 1,
+        "the fitted AR taps must land on the wire (lag {})",
+        fg.ar_coeff_lag
+    );
+    let num_pos = 2 * usize::from(fg.ar_coeff_lag) * (usize::from(fg.ar_coeff_lag) + 1);
+    assert!(
+        fg.ar_coeffs_y_plus_128[..num_pos].iter().any(|&c| c != 128),
+        "at least one non-zero luma tap"
+    );
+    // The immediate-left tap (last lag-1 position) models the planted
+    // horizontal AR — it must be decisively positive.
+    assert!(
+        fg.ar_coeffs_y_plus_128[num_pos - 1] > 138,
+        "left tap models the planted correlation (got {})",
+        fg.ar_coeffs_y_plus_128[num_pos - 1]
+    );
+    assert_decodes_to_recons("fg-ar", &on);
+}
+
+/// r444 — grain on ALL THREE planes: the chroma noise profile elects
+/// per-plane §5.9.30 scaling points (identity index mults), and the
+/// grained output decodes bit-exact — the §7.18.3 chroma synthesis
+/// (own gaussian arrays, luma-correlation tap, cb/cr blend index)
+/// mirrors the decoder byte for byte.
+#[test]
+fn chroma_noise_elects_chroma_points_and_decodes_bit_exact() {
+    let chroma_noisy = |w: u32, h: u32, t: usize| -> Yuv420Frame {
+        let mut f = noisy_frame(w, h, t, 6);
+        let (cw, ch) = ((w as usize) / 2, (h as usize) / 2);
+        let mut state = 0x0bad_5eedu32.wrapping_add((t as u32).wrapping_mul(0x85eb_ca6b));
+        let mut rnd = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 24) & 31) as i32 - 16) / 2 * 3
+        };
+        for r in 0..ch {
+            for c in 0..cw {
+                let u = i32::from(f.u[r * cw + c]) + rnd();
+                let v = i32::from(f.v[r * cw + c]) + rnd();
+                f.u[r * cw + c] = u.clamp(0, 255) as u8;
+                f.v[r * cw + c] = v.clamp(0, 255) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| chroma_noisy(128, 96, t)).collect();
+    let on = encode(&frames, 60, true);
+    assert!(
+        on.film_grain_elected,
+        "three-plane noise must elect the grain arm"
+    );
+    let (fg_present, headers) = wire_headers(&on.gop.temporal_units);
+    assert!(fg_present, "sequence gate must open");
+    let fg = headers[0]
+        .film_grain_params
+        .as_ref()
+        .expect("KEY carries the §5.9.30 block");
+    assert!(
+        fg.num_cb_points > 0 && fg.num_cr_points > 0,
+        "chroma scaling points must land on the wire (cb {} cr {})",
+        fg.num_cb_points,
+        fg.num_cr_points
+    );
+    assert_eq!(
+        (fg.cb_mult, fg.cb_luma_mult, fg.cb_offset),
+        (192, 128, 256),
+        "identity §7.18.3 index mults"
+    );
+    assert!(
+        fg.point_cb_scaling[..usize::from(fg.num_cb_points)]
+            .iter()
+            .any(|&s| s > 0),
+        "real Cb scaling"
+    );
+    assert_decodes_to_recons("fg-chroma", &on);
+}
