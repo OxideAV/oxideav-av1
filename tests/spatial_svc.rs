@@ -570,3 +570,96 @@ fn svc_ctx_update_election_fires_and_operating_points_decode_bit_exact() {
         assert_eq!(planes[2], rc.v, "base instant {i} V");
     }
 }
+
+/// r444 — SVC × superres: on horizontally smooth coarse-q content
+/// each single-tile layer's pre-pass elects a §5.9.8 pair, the shared
+/// sequence header opens `enable_superres`, and BOTH opener shapes
+/// carry the arm — the base opener on the §5.9.5
+/// `frame_size_override_flag = 1` arm (the override fields code the
+/// layer's DISPLAY width, §5.9.8 re-derives the coded width) and the
+/// top-layer `INTRA_ONLY` opener on the `= 0` arm off the sequence
+/// maximum. Every operating point decodes bit-exact against the
+/// per-layer reconstructions (upscaled §7.20 payloads).
+#[test]
+fn spatial_layers_with_superres_openers_decode_bit_exact() {
+    fn smooth(w: u32, h: u32, t: usize) -> Yuv420Frame {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut f = Yuv420Frame::filled(w, h, 128);
+        for r in 0..hu {
+            for c in 0..wu {
+                let x = c as f64 + 1.4 * t as f64;
+                let y = r as f64 + 0.6 * t as f64;
+                let v = 118.0
+                    + 68.0 * (0.019 * x).sin() * (0.023 * y).cos()
+                    + 22.0 * (0.041 * (x + y)).sin();
+                f.y[r * wu + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        f
+    }
+    let layers: Vec<Vec<Yuv420Frame>> = vec![
+        (0..3).map(|t| smooth(96, 80, t)).collect(),
+        (0..3).map(|t| smooth(192, 160, t)).collect(),
+    ];
+    let enc = encode_spatial_layered_gop_yuv420_with_q(&layers, 180).expect("spatial encode");
+    assert!(
+        enc.seq.enable_superres,
+        "an elected layer must open the shared §5.9.8 sequence gate"
+    );
+
+    // Header audit on temporal unit 0: layer-0 KEY (override arm) and
+    // layer-1 INTRA_ONLY (sequence-maximum arm) both code
+    // `use_superres = 1` with the DISPLAY width on the §5.9.5 side.
+    let mut headers = Vec::new();
+    for desc in ObuIter::new(&enc.temporal_units[0]) {
+        let desc = desc.expect("TU walks");
+        if desc.obu_type == ObuType::Frame {
+            headers.push(
+                parse_frame_header_with_refs(desc.payload, &enc.seq, &RefInfo::default())
+                    .expect("FH parses"),
+            );
+        }
+    }
+    assert_eq!(headers.len(), 2, "one opener per layer in unit 0");
+    let base_fs = headers[0].frame_size.expect("base frame size");
+    assert_eq!(headers[0].frame_type, FrameType::Key);
+    assert!(
+        headers[0].frame_size_override_flag,
+        "base rides the override arm"
+    );
+    assert!(base_fs.use_superres, "base opener elects superres");
+    assert_eq!(
+        base_fs.upscaled_width, 96,
+        "override fields carry the display width"
+    );
+    assert!(
+        base_fs.frame_width < 96,
+        "§5.9.8 re-derives the coded width"
+    );
+    let top_fs = headers[1].frame_size.expect("top frame size");
+    assert_eq!(headers[1].frame_type, FrameType::IntraOnly);
+    assert!(top_fs.use_superres, "INTRA_ONLY opener elects superres");
+    assert_eq!(top_fs.upscaled_width, 192);
+    assert!(top_fs.frame_width < 192);
+
+    // Operating point 0 — both layers bit-exact at their DISPLAY dims.
+    let full = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 0).expect("full decode");
+    assert_eq!(full.len(), 6, "3 instants x 2 layers");
+    for i in 0..3 {
+        for s in 0..2 {
+            let (planes, w, h) = spec_planes(&full[i * 2 + s]);
+            assert_eq!((w, h), enc.layer_dims[s], "instant {i} layer {s} dims");
+            let rc = &enc.layer_recons[s][i];
+            assert_eq!(planes[0], rc.y, "instant {i} layer {s} luma");
+            assert_eq!(planes[1], rc.u, "instant {i} layer {s} U");
+            assert_eq!(planes[2], rc.v, "instant {i} layer {s} V");
+        }
+    }
+    // Operating point 1 — the base layer alone.
+    let base = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, 1).expect("base decode");
+    assert_eq!(base.len(), 3);
+    for (i, f) in base.iter().enumerate() {
+        let (planes, _, _) = spec_planes(f);
+        assert_eq!(planes[0], enc.layer_recons[0][i].y, "base instant {i} luma");
+    }
+}

@@ -1287,14 +1287,22 @@ fn encode_key_frame_yuv_core(
     // §5.9.8 derivation must land exactly on the coded width.
     let superres: Option<(u32, u32)> = extras.superres;
     if let Some((up_w, denom)) = superres {
-        if extras.seq_override.is_some()
-            || extras.intra_only_refresh.is_some()
-            || !(crate::frame_header::SUPERRES_DENOM_MIN..=16).contains(&denom)
+        if !(crate::frame_header::SUPERRES_DENOM_MIN..=16).contains(&denom)
             || crate::encoder::superres_elect::superres_coded_width(up_w, denom) != input.width
             || up_w <= input.width
             || up_w > KEY_FRAME_MAX_DIM
         {
             return Err(Error::PartitionWalkOutOfRange);
+        }
+        // r444 — the layered arm (`seq_override`, KEY or INTRA_ONLY
+        // opener alike): the shared header must open the §5.9.8 gate
+        // and its budget must cover the UPSCALED width — the §5.9.5
+        // override fields then carry `up_w` and §5.9.8 re-derives the
+        // coded width, exactly the flat-arm derivation.
+        if let Some(shared) = extras.seq_override {
+            if !shared.enable_superres || up_w > shared.max_frame_width_minus_1 + 1 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
         }
         // r444 — the arm carries the ORIGINAL source (the upscaled-
         // extent elections measure against it); shape-check it.
@@ -1366,9 +1374,12 @@ fn encode_key_frame_yuv_core(
         fh.film_grain_params = Some(fg.clone());
     }
     // r431 — §5.9.5: under a shared sequence header a smaller frame
-    // codes its dimensions explicitly.
+    // codes its dimensions explicitly. r444 — the coded fields carry
+    // the DISPLAY (upscaled) width on a §5.9.8 arm, so the override
+    // decision compares that, not the downscaled coding extent.
+    let display_w = superres.map_or(input.width, |(up_w, _)| up_w);
     fh.frame_size_override_flag = extras.seq_override.is_some()
-        && (input.width != seq.max_frame_width_minus_1 + 1
+        && (display_w != seq.max_frame_width_minus_1 + 1
             || input.height != seq.max_frame_height_minus_1 + 1);
     // r431 — §5.9.2 INTRA_ONLY arm: explicit refresh mask (never
     // `allFrames` — §5.9.2 bars it), no error resilience (the

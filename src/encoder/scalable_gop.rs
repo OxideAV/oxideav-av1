@@ -610,12 +610,66 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
         return Err(Error::PartitionWalkOutOfRange);
     }
 
+    // ---- r444: per-layer §5.9.8 superres PRE-PASS election. ----
+    // The shared sequence header's `enable_superres` gate must be
+    // decided before any layer codes, so each single-tile layer runs
+    // the KEY election ONCE standalone (probe + arming window first —
+    // outside the regime nothing is spent and the stream stays
+    // bit-identical); an elected `(UpscaledWidth, SuperresDenom)`
+    // pair is then FORCED onto that layer's opener under the shared
+    // header, whose §5.9.5 override fields carry the display width
+    // while §5.9.8 re-derives the coded width. An election-scoping
+    // choice: the pair is settled at the standalone header shape (the
+    // override fields shift the header by a few bits, never the tile
+    // payload).
+    let mut layer_sr: Vec<Option<(u32, u32)>> = vec![None; s_count];
+    if base_q_idx > 0 && tile_groups <= 1 {
+        for (s, layer) in layers.iter().enumerate() {
+            let f0 = &layer[0];
+            if tiles_of(s) != (0, 0)
+                || !crate::encoder::superres_elect::superres_arm_allowed(
+                    base_q_idx,
+                    f0.width as usize,
+                    f0.height as usize,
+                )
+                || !crate::encoder::superres_elect::superres_probe(f0)
+            {
+                continue;
+            }
+            let (pre, _) = crate::encoder::key_frame::encode_key_frame_yuv_full(
+                f0,
+                base_q_idx,
+                RateModel::Twin,
+                &[],
+                None,
+                true,
+                true,
+                true,
+                &crate::encoder::key_frame::KeyExtras {
+                    delta_q: true,
+                    qm: true,
+                    superres_elect: true,
+                    ..Default::default()
+                },
+            )?;
+            if let Some(fs) = pre.fh.frame_size.as_ref() {
+                if fs.use_superres {
+                    layer_sr[s] = Some((fs.upscaled_width, fs.superres_denom));
+                }
+            }
+        }
+    }
+
     // ---- The shared sequence header. ----
     let mut seq =
         crate::encoder::yuv_frame::build_intra_only_seq_yuv(top_w, top_h, bit_depth, format)?;
     // The same tool gates the per-frame drivers assume (see the KEY
     // driver's internal builder).
     seq.enable_filter_intra = true;
+    // r444 — open the §5.9.8 gate iff some layer elected (every frame
+    // then codes its `use_superres` bit; an unelected stream stays
+    // bit-identical to the r431 shape).
+    seq.enable_superres = layer_sr.iter().any(|p| p.is_some());
     seq.operating_points = spatial_operating_points_for(seq.operating_points[0], s_count as u8);
     seq.operating_points_cnt_minus_1 = (s_count - 1) as u8;
     let seq_payload = write_sequence_header_obu(&seq);
@@ -651,6 +705,15 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
         &seq_payload,
     );
     for (s, layer) in layers.iter().enumerate() {
+        // r444 — an armed §5.9.8 pair codes the DOWNSCALED opener;
+        // the original layer frame is the upscaled-extent election
+        // target (see [`KeyExtras::superres_source`]).
+        let sr_pair = layer_sr[s];
+        let downscaled: Option<YuvFrame> = sr_pair.map(|(up_w, denom)| {
+            let wd = crate::encoder::superres_elect::superres_coded_width(up_w, denom);
+            crate::encoder::superres_elect::downscale_width(&layer[0], wd)
+        });
+        let opener_input: &YuvFrame = downscaled.as_ref().unwrap_or(&layer[0]);
         let extras = crate::encoder::key_frame::KeyExtras {
             // r436 — the layer's OWN §5.9.15 layout + §5.11.1
             // packaging (validated against ITS dimensions).
@@ -673,16 +736,15 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // CDFs so the layer's first inter frame can run the
             // §6.8.14 election.
             collect_donor_cdfs: donor_armed_layer(s),
-            // r441 — the §5.9.8 superres election stays off the
-            // layered shape (per-layer §5.9.5 explicit sizes; an
-            // election-scoping choice).
+            // r444 — the pre-pass-elected §5.9.8 pair (None on
+            // unelected layers keeps the flat shape).
             superres_elect: false,
-            superres: None,
+            superres: sr_pair,
             film_grain: None,
-            superres_source: None,
+            superres_source: sr_pair.is_some().then(|| &layer[0]),
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
-            &layer[0],
+            opener_input,
             base_q_idx,
             RateModel::Twin,
             &[],
