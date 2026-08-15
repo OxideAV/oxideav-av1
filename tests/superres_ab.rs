@@ -599,3 +599,146 @@ fn sr_fixture_staging() {
     }
     std::fs::write(root.join("gop-128x96-q180-superres.yuv"), &yuv).expect("write yuv");
 }
+
+/// Env-gated staging dump (`OXIDEAV_AV1_SR444_DIR`): the r444
+/// election streams — LR × superres GOP, segmented-GOP superres, and
+/// the SVC superres openers — plus expected YUVs for black-box
+/// reference-decoder validation and corpus pinning. Inert otherwise.
+#[test]
+fn r444_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_SR444_DIR") else {
+        eprintln!("OXIDEAV_AV1_SR444_DIR unset — skipping the r444 staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let dump_yuv = |path: &std::path::Path, recon: &[oxideav_av1::encoder::GopFrameRecon]| {
+        let mut yuv: Vec<u8> = Vec::new();
+        for rc in recon {
+            yuv.extend_from_slice(&rc.y);
+            yuv.extend_from_slice(&rc.u);
+            yuv.extend_from_slice(&rc.v);
+        }
+        std::fs::write(path, &yuv).expect("write yuv");
+    };
+
+    // (1) LR × superres — the elected pairing witness content.
+    {
+        let (w, h) = (128u32, 96u32);
+        let mk = |t: usize| {
+            let mut f = smooth_frame(w, h, t);
+            let wu = w as usize;
+            for r in 0..h as usize {
+                let band = 25.0 * (1.3 * (r as f64 + 0.7 * t as f64)).sin();
+                for c in 0..wu {
+                    let base = f.y[r * wu + c] as f64;
+                    f.y[r * wu + c] = (base + band).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            f
+        };
+        let frames: Vec<Yuv420Frame> = (0..4).map(mk).collect();
+        let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+            &frames,
+            140,
+            &[],
+            &[],
+            false,
+            None,
+            GopTuning::default(),
+        )
+        .expect("gop encode");
+        let (_, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+        assert!(
+            key_fh.frame_size.expect("fs").use_superres,
+            "KEY elects superres"
+        );
+        assert!(key_fh.lr_params.expect("lr").uses_lr, "KEY pairs LR");
+        std::fs::write(
+            root.join("gop-128x96-q140-superres-lr.ivf"),
+            &enc.gop.ivf_bytes,
+        )
+        .expect("write ivf");
+        dump_yuv(
+            &root.join("gop-128x96-q140-superres-lr.yuv"),
+            &enc.gop.recon,
+        );
+    }
+
+    // (2) Segmented GOP whose KEY elects superres.
+    {
+        let frames: Vec<Yuv420Frame> = (0..4).map(|t| smooth_frame(128, 96, t)).collect();
+        let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+            &frames,
+            180,
+            &[0, -60],
+            &[],
+            false,
+            None,
+            GopTuning::default(),
+        )
+        .expect("segmented gop encode");
+        let (seq, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+        assert!(
+            key_fh.frame_size.expect("fs").use_superres,
+            "KEY elects superres"
+        );
+        let p_fh = ObuIter::new(&enc.gop.temporal_units[1])
+            .filter_map(|d| {
+                let d = d.expect("TU walks");
+                (d.obu_type == ObuType::Frame)
+                    .then(|| parse_frame_header(d.payload, &seq).expect("P FH parses"))
+            })
+            .next()
+            .expect("P frame OBU present");
+        assert!(
+            p_fh.segmentation_params.expect("P header").enabled,
+            "P stays segmented"
+        );
+        std::fs::write(
+            root.join("gop-128x96-q180-seg-superres.ivf"),
+            &enc.gop.ivf_bytes,
+        )
+        .expect("write ivf");
+        dump_yuv(
+            &root.join("gop-128x96-q180-seg-superres.yuv"),
+            &enc.gop.recon,
+        );
+    }
+
+    // (3) SVC with superres openers (the spatial_svc witness shape).
+    {
+        use oxideav_av1::encoder::encode_spatial_layered_gop_yuv420_with_q;
+        fn smooth(w: u32, h: u32, t: usize) -> Yuv420Frame {
+            smooth_frame(w, h, t)
+        }
+        let layers: Vec<Vec<Yuv420Frame>> = vec![
+            (0..3).map(|t| smooth(96, 80, t)).collect(),
+            (0..3).map(|t| smooth(192, 160, t)).collect(),
+        ];
+        let enc = encode_spatial_layered_gop_yuv420_with_q(&layers, 180).expect("svc encode");
+        assert!(enc.seq.enable_superres, "shared §5.9.8 gate open");
+        std::fs::write(root.join("svc-96-192-q180-superres.ivf"), &enc.ivf_bytes)
+            .expect("write ivf");
+        // Full-point decode order: layer 0 then layer 1 per instant.
+        let mut yuv: Vec<u8> = Vec::new();
+        for i in 0..3 {
+            for s in 0..2 {
+                let rc = &enc.layer_recons[s][i];
+                yuv.extend_from_slice(&rc.y);
+                yuv.extend_from_slice(&rc.u);
+                yuv.extend_from_slice(&rc.v);
+            }
+        }
+        std::fs::write(root.join("svc-96-192-q180-superres.yuv"), &yuv).expect("write yuv");
+        // Base-layer (operating point 1) expected output.
+        let mut yuv1: Vec<u8> = Vec::new();
+        for i in 0..3 {
+            let rc = &enc.layer_recons[0][i];
+            yuv1.extend_from_slice(&rc.y);
+            yuv1.extend_from_slice(&rc.u);
+            yuv1.extend_from_slice(&rc.v);
+        }
+        std::fs::write(root.join("svc-96-192-q180-superres-op1.yuv"), &yuv1).expect("write yuv");
+    }
+}

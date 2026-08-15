@@ -1242,56 +1242,84 @@ the neighbour runs only when the keyed level already won). Pinned:
 `segmentation_enabled = 1` with `using_qmatrix = 1`, byte-identical
 through three independent black-box reference decoders.
 
-### Superres election (r441)
+### Superres election (r441; every driver + the §7.17 pairing r444)
 
-The §5.9.8 write arm goes live. On an unsegmented lossy single-tile
-KEY frame inside the arming window (`base_q_idx` ≥ 60, extent ≥
-96×80, a horizontal-second-difference content probe — §7.16
-resamples columns only), each legal candidate denominator codes the
-frame at the §5.9.8 downscaled width (the QM / delta-q elections
-settle at the coded extent inside each arm), the reconstruction is
-upscaled through the decoder's own §7.16 driver, and the plain joint
-objective over ORIGINAL-extent SSE + exact realized bytes keeps the
-winner. Wire shape: `frame_size_override_flag = 0` seeds
-`FrameWidth` from the sequence maximum (the upscaled width) and
-§5.9.8 re-derives the coded width; `allow_intrabc` follows its
-§5.9.5 gate; LR stays off the arm (the §7.17 upscaled-extent pairing
-is open). A superres-elected KEY feeds the P chain its upscaled
-§7.20 reference. Measured (`tests/superres_ab.rs`): on probe-passing
-content the arm wins across the band — 128×96 q100 −9.3 % bytes at
-+1.09 dB, 192×128 q220 −20 %; horizontal-detail content collapses
-(18 → 14 dB) and stays probe-gated bit-identical.
-`GopTuning::superres` (default on, unsegmented GOPs); the pyramid /
-temporal-ladder / SVC drivers are conservatively off (follow-ups).
-Pinned: `self-gop-128x96-q180-superres` — the corpus's first
-self-encoded `use_superres = 1` stream (KEY at denominator 16, P
-frames off the upscaled reference), byte-identical through three
+The §5.9.8 write arm goes live. On a lossy single-tile KEY frame
+inside the arming window (`base_q_idx` ≥ 60, extent ≥ 96×80, a
+horizontal-second-difference content probe — §7.16 resamples columns
+only), each legal candidate denominator codes the frame at the
+§5.9.8 downscaled width, the reconstruction is upscaled through the
+decoder's own §7.16 driver, and the plain joint objective over
+ORIGINAL-extent SSE + exact realized bytes keeps the winner. Wire
+shape: `frame_size_override_flag = 0` seeds `FrameWidth` from the
+sequence maximum (the upscaled width) and §5.9.8 re-derives the
+coded width; `allow_intrabc` follows its §5.9.5 gate. A
+superres-elected KEY feeds the P chain its upscaled §7.20 reference.
+Measured (`tests/superres_ab.rs`): on probe-passing content the arm
+wins across the band — 128×96 q100 −9.3 % bytes at +1.09 dB,
+192×128 q220 −20 %; horizontal-detail content collapses (18 →
+14 dB) and stays probe-gated bit-identical.
+
+r444 closes the r441 scope tails. **LR × superres**: the intra core
+runs the §7.4 order end to end — CDEF settles at the coded extent,
+the reconstruction and the pre-CDEF stripe snapshot are
+§7.16-upscaled, and the §7.17 loop-restoration election fits, prices
+and applies at the UPSCALED extent against the original source (the
+§5.11.57 write window maps superblock columns through the §5.9.8
+denominator ratio; the inner QM / delta-q elections of a superres
+arm also score at the upscaled extent). **Every driver**: segmented
+GOPs (the segmented P chain's §5.11.19 temporal prediction rides the
+extent-checked all-zero `load_previous_segment_ids()` arm), the
+B-pyramid / adaptive driver (`PyramidTuning::superres`), the §6.7.5
+temporal ladder (the multi-OP repack preserves the elected sequence
+gate), and the spatial-SVC driver — a per-layer PRE-PASS election
+decides the shared header's `enable_superres` before any layer
+codes, and elected openers ride BOTH §5.9.5 arms
+(`frame_size_override_flag = 1` base KEY with the DISPLAY width in
+the override fields; `INTRA_ONLY` enhancement openers off the
+sequence maximum). Pinned: `self-gop-128x96-q180-superres` (r441),
+plus the r444 pins `self-gop-128x96-q140-superres-lr` (the first
+`use_superres = 1` stream with live §7.17 restoration),
+`self-gop-128x96-q180-seg-superres` (the first
+segmentation × superres pairing) and `self-svc-96-192-q180-superres`
+(the first spatially scalable stream with superres openers, digested
+at both operating points) — all byte-identical through three
 independent black-box reference decoders.
 
-### Film-grain election (r441)
+### Film-grain election (r441; AR taps + chroma points r444)
 
 The §5.9.30 write arm goes live with estimated parameters. On an
 unsegmented lossy GOP whose content passes the noise probe (real
 residual energy against a 3×3-binomial denoised twin, spatially
-white at lag 1, temporally decorrelated across the first two frames
-— static texture and clean content are rejected up front), the grain
-arm codes the DENOISED frames with a full §5.9.30 block on every
-header (white grain, eight luma scaling points calibrated through
-the decoder's own §7.18.3 synthesis, per-frame `grain_seed`
-schedule) and publishes §7.18.3-synthesized output planes while the
-reference chain stays pre-grain (§7.20). Elected under a documented
-"perceptually-neutral rate" objective — structure fidelity plus a
-noise-amplitude mismatch penalty against the plain arm's
+modelable at lag 1, temporally decorrelated across the first two
+frames — static texture and clean content are rejected up front),
+the grain arm codes the DENOISED frames with a full §5.9.30 block on
+every header (per-frame `grain_seed` schedule, scaling points
+calibrated through the decoder's own §7.18.3 synthesis) and
+publishes §7.18.3-synthesized output planes while the reference
+chain stays pre-grain (§7.20). Elected under a documented
+"perceptually-neutral rate" objective — structure fidelity plus
+noise-amplitude mismatch penalties against the plain arm's
 source-matched SSE — with a strict realized-bytes win required.
-Measured (`tests/film_grain_ab.rs`): −9.4 % bytes at amp-6 q60,
-−6.1 % at amp-3 q60, with the honest plain-PSNR trade reported
-(~1–2 dB vs the noisy source — definitional for synthetic grain);
-the elected KEY + P stream decodes bit-exact through the spec driver
-on every frame. `GopTuning::film_grain` (default on). Pinned:
-`self-gop-128x96-q60-film-grain` — the corpus's first self-encoded
-`apply_grain = 1` stream (corpus 129 with the three r441 pins),
-byte-identical through three independent black-box reference
-decoders.
+r444 grows the parameter surface into a CANDIDATE ladder: the r441
+white luma-only shape, plus fitted §7.18.3 causal-neighbourhood AR
+taps at lag 1 and lag 2 (each ring a separate candidate — the
+parameter bytes ride every header, so depth belongs to the score;
+chroma coefficient lists carry the jointly-fitted luma-correlation
+tap) and per-plane four-point chroma scaling under identity index
+mults, gated by a chroma twin of the luma probe with the §5.9.30
+4:2:0 both-or-neither rule enforced; the objective adds chroma
+amplitude terms and a luma correlation-match term, and the
+strictly-fewer-bytes mandate applies per candidate. Measured
+(`tests/film_grain_ab.rs`): −9.4 % bytes at amp-6 q60, −6.1 % at
+amp-3 q60, with the honest plain-PSNR trade reported (~1–2 dB vs
+the noisy source — definitional for synthetic grain).
+`GopTuning::film_grain` (default on). Pinned:
+`self-gop-128x96-q60-film-grain` (r441, white) and
+`self-gop-128x96-q60-film-grain-ar` (r444 — the corpus's first
+self-encoded `ar_coeff_lag > 0` stream), byte-identical through
+three independent black-box reference decoders (corpus 133 with the
+four r444 pins).
 
 ### Spatial scalability: the SVC write arm (r431)
 
@@ -1338,13 +1366,13 @@ decoders at both operating points.
   (conservative §7.12.2-note guard).
 - The §5.9.12 quantizer-matrix election stays off the §7.3
   camera-frame mode (r441 lifted the segmented-frame gate).
-- The §5.9.8 superres election is KEY-frame-scoped: LR stays off
-  the superres arm (§7.17 runs at the upscaled extent — pairing
-  open), segmented GOPs keep flat-width KEYs, and the pyramid /
-  temporal-ladder / SVC drivers are conservatively off.
+- The §5.9.8 superres election stays KEY/opener-scoped (inter
+  frames never elect a mid-GOP resize) and single-tile-frame-scoped;
+  multi-tile-group KEYs and the §7.3 camera mode keep flat widths.
 - The §5.9.30 film-grain election is plain-GOP-scoped (unsegmented,
-  ≥ 2 frames), luma-only white grain (`ar_coeff_lag = 0`; chroma
-  points and AR fitting open).
+  ≥ 2 frames); the AR ladder stops at `ar_coeff_lag = 2` (the lag-3
+  ring's 24 + 2×25 coefficient bytes per header never paid on the
+  measured extents) and `chroma_scaling_from_luma` stays unelected.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /

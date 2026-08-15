@@ -414,3 +414,64 @@ fn chroma_noise_elects_chroma_points_and_decodes_bit_exact() {
     );
     assert_decodes_to_recons("fg-chroma", &on);
 }
+
+/// Env-gated staging dump (`OXIDEAV_AV1_FG444_DIR`): the r444
+/// AR-taps + chroma-points film-grain stream + expected (grained)
+/// YUV for black-box reference-decoder validation and corpus
+/// pinning. Inert otherwise.
+#[test]
+fn fg_r444_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_FG444_DIR") else {
+        eprintln!("OXIDEAV_AV1_FG444_DIR unset — skipping the r444 fg staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let ar_frame = |w: u32, h: u32, t: usize| -> Yuv420Frame {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut f = Yuv420Frame::filled(w, h, 128);
+        let mut state = 0x51ed_2718u32.wrapping_add((t as u32).wrapping_mul(0x9e37_79b9));
+        let mut rnd = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(((state >> 23) & 255) as i32 - 128) * 6.0 / 128.0
+        };
+        for r in 0..hu {
+            let mut prev = 0.0f64;
+            for c in 0..wu {
+                let n = 0.55 * prev + rnd();
+                prev = n;
+                let v = base_value(wu, r, c, t) + n * 1.6;
+                f.y[r * wu + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let (cw, ch) = (wu / 2, hu / 2);
+        for r in 0..ch {
+            for c in 0..cw {
+                f.u[r * cw + c] = (116 + ((r + c + t) % 24)) as u8;
+                f.v[r * cw + c] = (132 + ((r * 2 + c) % 20)) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| ar_frame(128, 96, t)).collect();
+    let on = encode(&frames, 60, true);
+    assert!(on.film_grain_elected, "staged GOP must elect the grain arm");
+    let (_, headers) = wire_headers(&on.gop.temporal_units);
+    let fg = headers[0]
+        .film_grain_params
+        .as_ref()
+        .expect("KEY carries the §5.9.30 block");
+    assert!(fg.ar_coeff_lag >= 1, "staged stream carries AR taps");
+    std::fs::write(
+        root.join("gop-128x96-q60-film-grain-ar.ivf"),
+        &on.gop.ivf_bytes,
+    )
+    .expect("write ivf");
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &on.gop.recon {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("gop-128x96-q60-film-grain-ar.yuv"), &yuv).expect("write yuv");
+}

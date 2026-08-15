@@ -12237,3 +12237,177 @@ fn self_encoded_film_grain_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r444: LR × SUPERRES — the corpus's first stream pairing
+// `use_superres = 1` with live §7.17 loop restoration. The KEY codes
+// at the §5.9.8 denominator-16 width, §7.16 upscales BETWEEN CDEF
+// and LR per the §7.4 order, and the elected §5.9.20 restoration
+// filters at the UPSCALED extent — the §5.11.57 read_lr window maps
+// superblock columns through the superres denominator ratio.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q140_SUPERRES_LR_IVF: &str = concat!(
+    "444b4946000020004156303180006000190000000100000004000000000000009f0000000000",
+    "00000000000012000a0a0000000337fbe5dfdc02328e011601e518000006713e083ca3b6455b",
+    "a6d67bd8b47dc26301e9860f672a14d6f7b650f1da553cbaff0ad1577fd3294b47b0530e8ecb",
+    "04e1ffa1427bbe01d2dd7f4313ea1385fc228c5cb8c31606315ada00cb914c3e34f2cc045992",
+    "1d6dce72a034ca15b8e462073e42985856a18564cfb794e189e4e664110156e09597ded3b68f",
+    "2d1053c2a24dbff989583c9d806200000001000000000000001200325e3201002248249e9180",
+    "0000678381c000d285a17f1fee5fbd662e0607e2820db43a686b5f8c0474b09d088147a28b9a",
+    "49f9373263f169e4c6ed9790c3deb064054b8264c3b00b163920f68d79defb67c651d2593a68",
+    "231f5b56aa6df4c2ac350000000200000000000000120032313202004001001e91800000027d",
+    "81e000df7f8733d5046ed1bb630024ade64b909b864cee0c3796922e909d8d5f8268c8602c00",
+    "00000300000000000000120032283203002248249e91800000468281e00088cbcac28e45abfd",
+    "9092e2a88738d66cc83875c2b1e65780",
+);
+
+/// r444: LR × superres GOP (4-frame 128×96 at q140; the KEY elected
+/// denominator 16 AND per-unit self-guided/Wiener restoration at the
+/// upscaled extent; the P chain predicts from the upscaled RESTORED
+/// §7.20 reference) — the digest is the byte-identical output of
+/// THREE independent black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q140-superres-lr/`.
+#[test]
+fn self_encoded_superres_lr_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q140-superres-lr",
+        SELF_GOP_128X96_Q140_SUPERRES_LR_IVF,
+        "ea75ddc1c7211222c7fe4c91cb033cf98a53ae3f55840c961b4b4cc2dc924b7e",
+        4,
+    );
+}
+
+// ---------------------------------------------------------------------
+// r444: SEGMENTATION × SUPERRES — the corpus's first stream pairing
+// `segmentation_enabled = 1` P-frames with a `use_superres = 1` KEY.
+// The segmented P chain predicts from the upscaled reference; its
+// §5.11.19 temporal prediction rides the §5.9.2
+// `load_previous_segment_ids()` all-zero arm against the KEY's
+// mi-grid-mismatched SavedSegmentIds.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q180_SEG_SUPERRES_IVF: &str = concat!(
+    "444b494600002000415630318000600019000000010000000400000000000000430000000000",
+    "00000000000012000a0a0000000337fbe5dfdc0232331601e5680000067ff810c4050e2e7a7a",
+    "fe1ee943adaf1ddc3d5e69b1f8a366840cbd54f1f51237ce8b24848337b33c627e6b40320000",
+    "0001000000000000001200322e3201002248248e9681b0000f10000000000000000003329c0e",
+    "00d9c2e3251b0cb08de24b9a31525d80e1188d2e392100000002000000000000001200321d32",
+    "02004001000e9681b0000f1000000000000000000000000f009374502b000000030000000000",
+    "0000120032273203002248249e9681b0000f1000000000000000000000000f00dc03a7e40f7f",
+    "60fdb334bbc480",
+);
+
+/// r444: segmented GOP with a superres KEY (4-frame 128×96 at q180,
+/// SEG_LVL_ALT_Q table on every P header) — the digest is the
+/// byte-identical output of THREE independent black-box reference
+/// decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q180-seg-superres/`.
+#[test]
+fn self_encoded_seg_superres_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q180-seg-superres",
+        SELF_GOP_128X96_Q180_SEG_SUPERRES_IVF,
+        "b1ac480fe684b498b17b93751222fe6efcb36ee0ffbd34fbdd7073a7ff394af9",
+        4,
+    );
+}
+
+// ---------------------------------------------------------------------
+// r444: FILM GRAIN with AR TAPS — the corpus's first self-encoded
+// `ar_coeff_lag > 0` stream. Every §5.9.30 block carries fitted lag-1
+// auto-regressive coefficients (the §7.18.3 grain template runs the
+// causal-neighbourhood filter), per-frame seeds, and eight calibrated
+// luma scaling points; the §7.18.3 synthesis runs on the OUTPUT while
+// the §7.20 reference chain stays pre-grain.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q60_FILM_GRAIN_AR_IVF: &str = concat!(
+    "444b494600002000415630318000600019000000010000000400000000000000a70100000000",
+    "00000000000012000a0a0000000337fbe5dfcc06329603160021e038000307000aa3db0203e6",
+    "03ea03ce03f203d6045a03fe03e001796e758b08dc4242993fc8a8a73caed84a3d5590600edf",
+    "ae0b048dfe0a2188d421d21c897aa1828532a2e1994ff6811133c983351e422b7173e123be91",
+    "a10b1aca7ffe3ed06445681badf1e04d0d5c5bca9e96fe2c140c7faeff00f1b9fa11d48b6cae",
+    "a2024ce9f57ba5cad87704ed4eabaf1f1245a6237f046719ca41be4c7ca9ac286d337b9fa129",
+    "af52122a6c8f97f6243c7b471d17afb1349dced3238c72569ffe5e7736d6d94d31a2acdf4998",
+    "579c98ebf261e9150d71151ce71207331401c20492a905f8fd89e8378f35e0e3ca3a85bca8b0",
+    "feb587fdee0b24aadb03be4b27584afd2ead8be903dbc617275228074cc779cbc5518d8a0906",
+    "f8e37c9f79287588c3e1408a652c2075fe61c5f58e1f6e454c868161182a670bd734bc4e0865",
+    "cf1c5e01c15fbd7f35390384f710501e222345edf80007b5326acfb8a0774c30c3596afeaa21",
+    "91d8e7d5331a819d6eaf231a6be8bada02056ef3ec568b8e93666417cb1e13d80c3c79f8b023",
+    "6c3c4be1f3e2ee9bdff080a300000001000000000000001200329e01320100224824bd0f01c0",
+    "001958183807c0930203e603ea03ce03f203d6045a03fe03e001796e758b08d089d3d60a1d6b",
+    "5ada423f7d37689fdfb9647a1488815ded83b2f87649015db016f10a826a3360bcfc1f77b373",
+    "98d3649980b87f280f48be5eee8574d285f6ec0f8952c7dbe24d6b39bcce6461080f3cedb0a5",
+    "08bb7590b20a40a5668d90062b04f25a8ff9c4077a51b033dc7917fcef1d10d6637d62000000",
+    "02000000000000001200325e3202004001003d0f01c00000a0199e018e5bc080f980fa80f380",
+    "fc80f5811680ff80f8005e5b9d62c2d6476c329d3a69c5a480b6730e78220116c944ec040f3b",
+    "ee584ad5d9335e18e21a8cde4f68c2ce8429c9388e65eea8fabf7a310ad05c00000003000000",
+    "0000000012003258320300224824bd0f000000c0c3c1e012c92c080f980fa80f380fc80f5811",
+    "680ff80f8005e5b9d62c20c3d42d57ad5db4d9471da1aa5e18701dcd6b3733de11463611337e",
+    "37f6be92d98c7edc075988cd45a609750f81c508",
+);
+
+/// r444: AR-taps film-grain GOP (4-frame 128×96 at q60 over
+/// spatially-correlated, temporally re-rolled noise; the fitted
+/// lag-1 candidate won the neutrality score against the white shape
+/// and realized fewer bytes than the plain arm) — the digest is the
+/// byte-identical output of THREE independent black-box reference
+/// decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q60-film-grain-ar/`.
+#[test]
+fn self_encoded_film_grain_ar_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q60-film-grain-ar",
+        SELF_GOP_128X96_Q60_FILM_GRAIN_AR_IVF,
+        "c1020311f7938e2017207745931c095a747160f65b1ac5dbc5cb71b44088f830",
+        4,
+    );
+}
+
+// ---------------------------------------------------------------------
+// r444: SVC × SUPERRES — the corpus's first spatially scalable stream
+// whose layer openers code `use_superres = 1` on BOTH §5.9.5 arms:
+// the base KEY on the `frame_size_override_flag = 1` arm (override
+// fields carry the DISPLAY width, §5.9.8 re-derives the coded width)
+// and the top-layer INTRA_ONLY opener off the sequence maximum.
+// ---------------------------------------------------------------------
+
+const SELF_SVC_96_192_Q180_SUPERRES_IVF: &str = concat!(
+    "444b49460000200041563031c000a00019000000010000000300000000000000b10000000000",
+    "00000000000012000a0d001301008081defe7cbbfb80403600321700be9fe5680000066ff810",
+    "c4050e2e7a7afe1ee943adaf1f5ae5f245ad621e40982b3e498d4e1a06964a5e9d2bba88f0ac",
+    "36086853000cf25a0000019ffe04c4050e2e7a7afe1ee943adaf1ddc3d5e69b1f8a366840cbd",
+    "54f1f51237b23413a7314bbe3101fc522b56ea55467cafaf991a173dca9e531156625ed8e212",
+    "391aafcd25e94cebf84e14246adac155ba519d2674e6211b9e4f8ad070420960000000010000",
+    "0000000000120036001d328100400000005f4f1d2d000000c1cb028000ff82e1630b65fac154",
+    "6636083b3201010492490e968000006663814000fa2100d0224782c5fff0146d0a3914466c74",
+    "79ffdf3cf3f24265cce09f89b642ada4f6593ea62d7153ffe04e000000020000000000000012",
+    "0036001c328200224924805f4f3d2d0000000000028000fd6e117e21750ef2be36082a320200",
+    "86db6d9e9680000064eb814000fc9160d956410220a98d2051bb2b3acc37603e52573db09414",
+    "65",
+);
+
+/// r444: SVC stream with superres openers (two layers 96×80 / 192×160
+/// at q180, three time instants) — operating point 0 (the full
+/// interleave, 6 shown frames) and point 1 (the base layer alone, 3
+/// frames) both digest byte-identical to independent black-box
+/// reference decoders (all-layers + base-layer modes; a third
+/// reproduces the enhancement layer); notes under
+/// `docs/video/av1/fixtures/self-svc-96-192-q180-superres/`.
+#[test]
+fn self_encoded_svc_superres_stream_decodes_byte_exact_at_both_operating_points() {
+    assert_decodes_to_digest(
+        "self-svc-96-192-q180-superres",
+        SELF_SVC_96_192_Q180_SUPERRES_IVF,
+        "5e90882ed1fc19ff188b179beb8c9aa7b7c039c95565e3210c7c74f6d6da141a",
+        6,
+    );
+    assert_decodes_to_digest_at_op(
+        "self-svc-96-192-q180-superres",
+        SELF_SVC_96_192_Q180_SUPERRES_IVF,
+        1,
+        "6a5ad088eb74695b6dd9ac589c8ddab46cd21eb5ab817d5a106e093a4efd34f9",
+        3,
+    );
+}

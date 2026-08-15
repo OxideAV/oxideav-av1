@@ -1239,10 +1239,19 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     // chroma extent: energy + spatial modelability + temporal
     // decorrelation, so moving chroma texture never masquerades as
     // grain).
-    let chroma_cb =
+    let mut chroma_cb =
         num_planes > 1 && fge::chroma_noise_gate(&frames[..2], &denoised[..2], 1, est.cb_sigma16);
-    let chroma_cr =
+    let mut chroma_cr =
         num_planes > 1 && fge::chroma_noise_gate(&frames[..2], &denoised[..2], 2, est.cr_sigma16);
+    // §5.9.30 bitstream conformance: with 4:2:0 subsampling, film
+    // grain is applied to BOTH chroma components or to NEITHER
+    // (`num_cb_points == 0` ⇔ `num_cr_points == 0`) — couple the
+    // gates so a single-plane pass never puts a non-conformant
+    // header on the wire.
+    if ssx == 1 && ssy == 1 && !(chroma_cb && chroma_cr) {
+        chroma_cb = false;
+        chroma_cr = false;
+    }
     let fit1 = fge::fit_ar_lag(&frames[0], &denoised[0], 1);
     let fit2 = fge::fit_ar_lag(&frames[0], &denoised[0], 2);
     let mut cand_params: Vec<FilmGrainParams> = vec![fge::build_grain_params(
