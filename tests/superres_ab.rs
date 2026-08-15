@@ -244,6 +244,135 @@ fn gop_with_superres_key_decodes_bit_exact() {
     }
 }
 
+/// r444 — the LR × superres pairing (§7.4 order: CDEF → §7.16 →
+/// §7.17): a forced §5.9.8 arm on upscaler-blurred content ELECTS
+/// loop restoration operating at the UPSCALED extent — the §5.9.20
+/// header opens a non-NONE `FrameRestorationType`, the §5.11.57
+/// window maps superblock columns through the superres denominator
+/// ratio, and the stream decodes BIT-EXACT to the encoder's
+/// (upscaled, restored) reconstruction mirror.
+#[test]
+fn forced_superres_arm_elects_loop_restoration() {
+    // Vertically structured content with a mid-frequency horizontal
+    // swell: the §7.16 upscaler low-passes the columns, and a §7.17.4
+    // Wiener fit against the ORIGINAL source recovers part of the
+    // loss — worth its subexp taps at coarse quantisers.
+    let (w, h) = (128u32, 96u32);
+    let mut f = smooth_frame(w, h, 0);
+    let wu = w as usize;
+    for r in 0..h as usize {
+        for c in 0..wu {
+            let base = f.y[r * wu + c] as f64;
+            let ripple = 34.0 * (0.55 * c as f64).sin() * (0.16 * r as f64).cos();
+            f.y[r * wu + c] = (base + ripple).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    let enc = encode_key_frame_yuv420_with_q_sr_forced(&f, 140, 16).expect("forced sr encode");
+    let mut seq = None;
+    let mut fh = None;
+    for desc in ObuIter::new(&enc.temporal_unit_bytes) {
+        let desc = desc.expect("TU walks");
+        match desc.obu_type {
+            ObuType::SequenceHeader => {
+                seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+            }
+            ObuType::Frame => {
+                fh = Some(
+                    parse_frame_header(desc.payload, seq.as_ref().expect("SH precedes"))
+                        .expect("FH parses"),
+                );
+            }
+            _ => {}
+        }
+    }
+    let fh = fh.expect("FH present");
+    let fs = fh.frame_size.expect("frame size");
+    assert!(fs.use_superres, "the forced arm codes use_superres = 1");
+    let lrp = fh.lr_params.expect("lossy header carries lr_params");
+    assert!(
+        lrp.uses_lr,
+        "upscaler-blurred content must elect §7.17 restoration on the superres arm \
+         (frame_restoration_type {:?})",
+        lrp.frame_restoration_type
+    );
+    // Bit-exact decode at the upscaled extent, LR live.
+    let frames = decoded_frames(&enc.ivf_bytes);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].width, w, "output at UpscaledWidth");
+    assert_eq!(frames[0].planes[0], enc.recon_y, "luma recon mirror");
+    assert_eq!(frames[0].planes[1], enc.recon_u, "U recon mirror");
+    assert_eq!(frames[0].planes[2], enc.recon_v, "V recon mirror");
+}
+
+/// r444 — GOP composition of the pairing: a KEY that elects BOTH
+/// §5.9.8 superres and §7.17 restoration feeds the P chain its
+/// upscaled RESTORED reconstruction (the §7.20 payload) — every frame
+/// decodes bit-exact.
+#[test]
+fn gop_with_superres_lr_key_decodes_bit_exact() {
+    // Mostly smooth (the frame-mean §5.9.8 probe passes) with ONE
+    // narrow strip of mid-frequency horizontal ripple: the §7.16
+    // downscale blurs the strip, and the §7.17.4 horizontal Wiener
+    // taps recover part of it against the ORIGINAL source — the LR ×
+    // superres pairing's textbook win.
+    let (w, h) = (128u32, 96u32);
+    let mk = |t: usize| {
+        let mut f = smooth_frame(w, h, t);
+        let wu = w as usize;
+        for r in 0..h as usize {
+            let band = 25.0 * (1.3 * (r as f64 + 0.7 * t as f64)).sin();
+            for c in 0..wu {
+                let base = f.y[r * wu + c] as f64;
+                f.y[r * wu + c] = (base + band).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(mk).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        140,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning::default(),
+    )
+    .expect("gop encode");
+    let mut seq = None;
+    let mut key_fh = None;
+    for desc in ObuIter::new(&enc.gop.temporal_units[0]) {
+        let desc = desc.expect("TU walks");
+        match desc.obu_type {
+            ObuType::SequenceHeader => {
+                seq = Some(parse_sequence_header(desc.payload).expect("SH parses"));
+            }
+            ObuType::Frame => {
+                key_fh = Some(
+                    parse_frame_header(desc.payload, seq.as_ref().expect("SH")).expect("FH parses"),
+                );
+            }
+            _ => {}
+        }
+    }
+    let key_fh = key_fh.expect("KEY header present");
+    assert!(
+        key_fh.frame_size.expect("frame size").use_superres,
+        "the GOP KEY must elect superres on this content"
+    );
+    assert!(
+        key_fh.lr_params.expect("lr params").uses_lr,
+        "the GOP KEY must pair loop restoration with the superres arm"
+    );
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+}
+
 /// Env-gated measurement matrix (`OXIDEAV_AV1_SR_AB=1`): elected vs
 /// flat baseline over content × q × geometry — the numbers behind the
 /// committed `superres_arm_allowed` window.

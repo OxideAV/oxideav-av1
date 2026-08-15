@@ -675,6 +675,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             superres_elect: false,
             superres: None,
             film_grain: None,
+            superres_source: None,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &layer[0],

@@ -872,6 +872,13 @@ pub(crate) struct KeyExtras<'a> {
     /// §7.18.3 synthesis to the output planes it publishes. Callers
     /// outside the film-grain election leave it `None`.
     pub film_grain: Option<&'a FilmGrainParams>,
+    /// r444 — the ORIGINAL (upscaled-extent) source behind an armed
+    /// [`KeyExtras::superres`] pair: `input` is the downscaled frame,
+    /// and the in-core elections that operate at the §7.16 upscaled
+    /// extent (the §7.17 LR fit, the QM / delta-q settlement scores)
+    /// measure distortion against THIS frame. Set internally by
+    /// [`encode_key_frame_superres_arm`]; callers leave it `None`.
+    pub superres_source: Option<&'a YuvFrame>,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -1060,21 +1067,30 @@ pub(crate) fn encode_key_frame_yuv_full(
         superres_elect: false,
         superres: extras.superres,
         film_grain: extras.film_grain,
+        superres_source: extras.superres_source,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
         EncodedKeyFrameYuv,
         crate::encoder::inter_frame::RefSlotCarry,
     );
+    // r444 — on an armed §5.9.8 pair the core returns its
+    // reconstruction at the UPSCALED extent (LR runs there per §7.4),
+    // so the stage elections score against the ORIGINAL source — the
+    // same objective the outer superres election settles on.
+    let score_src: &YuvFrame = match (extras.superres, extras.superres_source) {
+        (Some(_), Some(orig)) => orig,
+        _ => input,
+    };
     // Stage 1 — §5.9.12 QM election under the plain joint objective.
     let plain_score = |k: &KeyOut| -> u64 {
         let mut d = 0u64;
         for (a, b) in
             k.0.recon_y
                 .iter()
-                .zip(&input.y)
-                .chain(k.0.recon_u.iter().zip(&input.u))
-                .chain(k.0.recon_v.iter().zip(&input.v))
+                .zip(&score_src.y)
+                .chain(k.0.recon_u.iter().zip(&score_src.u))
+                .chain(k.0.recon_v.iter().zip(&score_src.v))
         {
             let diff = i64::from(*a) - i64::from(*b);
             d += (diff * diff) as u64;
@@ -1137,7 +1153,17 @@ pub(crate) fn encode_key_frame_yuv_full(
         )?;
         let score = |k: &KeyOut| -> u64 {
             score256(
-                key_weighted_sse(input, &k.0.recon_y, &k.0.recon_u, &k.0.recon_v, plan),
+                key_weighted_sse(
+                    score_src,
+                    &k.0.recon_y,
+                    &k.0.recon_u,
+                    &k.0.recon_v,
+                    plan,
+                    (input.height / 4, input.width / 4),
+                    extras
+                        .superres
+                        .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
+                ),
                 lambda,
                 (k.0.temporal_unit_bytes.len() as u64) * 8 * 256,
             )
@@ -1152,12 +1178,15 @@ pub(crate) fn encode_key_frame_yuv_full(
 }
 
 /// r441 — one §5.9.8 superres candidate arm: downscale the source to
-/// the denominator's §5.9.8 coded width, run the COMPLETE dispatcher
-/// on the downscaled frame with the pair armed (the inner §5.9.12 /
-/// §5.9.17 elections settle at the coded extent), then upscale the
-/// in-loop reconstruction through the decoder's own §7.16 driver —
-/// the returned `recon_*` planes live at the UPSCALED extent, exactly
-/// what the decoder outputs and stores in the §7.20 reference slots.
+/// the denominator's §5.9.8 coded width, then run the COMPLETE
+/// dispatcher on the downscaled frame with the pair armed (the inner
+/// §5.9.12 / §5.9.17 elections settle inside the arm, scored at the
+/// upscaled extent against the ORIGINAL source). r444 — the CORE
+/// performs the §7.16 upscale itself, in §7.4 order between CDEF and
+/// LR, so the §7.17 loop-restoration election runs at the UPSCALED
+/// extent on this arm too; the returned `recon_*` planes live at the
+/// upscaled extent, exactly what the decoder outputs and stores in
+/// the §7.20 reference slots.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_key_frame_superres_arm(
     input: &YuvFrame,
@@ -1182,37 +1211,10 @@ pub(crate) fn encode_key_frame_superres_arm(
     let mut ex = *extras;
     ex.superres_elect = false;
     ex.superres = Some((input.width, denom));
-    let (mut k, carry) = encode_key_frame_yuv_full(
+    ex.superres_source = Some(input);
+    encode_key_frame_yuv_full(
         &down, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &ex,
-    )?;
-    let (frame_width, frame_height, upscaled_width, mi_cols) = {
-        let fs =
-            k.fh.frame_size
-                .as_ref()
-                .ok_or(Error::PartitionWalkOutOfRange)?;
-        (
-            fs.frame_width,
-            fs.frame_height,
-            fs.upscaled_width,
-            fs.mi_cols,
-        )
-    };
-    let (ssx, ssy) = input.format.subsampling();
-    let (uy, uu, uv) = crate::encoder::superres_elect::upscale_recon(
-        [&k.recon_y, &k.recon_u, &k.recon_v],
-        frame_width,
-        frame_height,
-        upscaled_width,
-        mi_cols,
-        input.bit_depth,
-        ssx,
-        ssy,
-        usize::from(input.format.num_planes()),
-    )?;
-    k.recon_y = uy;
-    k.recon_u = uu;
-    k.recon_v = uv;
-    Ok((k, carry))
+    )
 }
 
 /// r431 — the general-format intra-frame CORE (no delta-q election;
@@ -1293,6 +1295,16 @@ fn encode_key_frame_yuv_core(
             || up_w > KEY_FRAME_MAX_DIM
         {
             return Err(Error::PartitionWalkOutOfRange);
+        }
+        // r444 — the arm carries the ORIGINAL source (the upscaled-
+        // extent elections measure against it); shape-check it.
+        match extras.superres_source {
+            Some(s)
+                if s.width == up_w
+                    && s.height == input.height
+                    && s.bit_depth == input.bit_depth
+                    && s.format == input.format => {}
+            _ => return Err(Error::PartitionWalkOutOfRange),
         }
     }
 
@@ -1847,16 +1859,13 @@ fn encode_key_frame_yuv_core(
     // r429 — loop restoration needs the PRE-CDEF reconstruction
     // (§7.17 reads `CurrFrame` at stripe boundaries): snapshot before
     // the CDEF election below overwrites it.
-    // r441 — LR is scoped off the superres arm: §7.17 runs at the
-    // UPSCALED extent (§7.4 order — superres between CDEF and LR),
-    // while this election's fit/mirror operate at the coded extent.
-    // An election-scoping choice; the LR × superres pairing is open.
-    let lr_armed = lr
-        && base_q_idx > 0
-        && seq.enable_restoration
-        && !fh.allow_intrabc
-        && exact_mask.is_none()
-        && superres.is_none();
+    // r444 — the LR × superres pairing is live: on a §5.9.8 arm the
+    // reconstruction (and this snapshot) are §7.16-upscaled between
+    // the CDEF election and the LR election below, so §7.17 fits,
+    // prices and applies at the UPSCALED extent — exactly the §7.4
+    // order the decoder runs.
+    let lr_armed =
+        lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
     let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     // The §5.9.19 `cdef_bits` the FINAL committed tile was emitted
@@ -1982,16 +1991,61 @@ fn encode_key_frame_yuv_core(
         }
     }
 
+    // r444 — §7.4 steps 3-4 / §7.16 on the superres arm: upscale the
+    // post-CDEF reconstruction (and the pre-CDEF snapshot §7.17
+    // reads across stripe boundaries) to the upscaled extent through
+    // the decoder's OWN driver, BETWEEN the CDEF and LR elections.
+    // From here on the recon planes — the §7.20 reference payload —
+    // live at the upscaled extent.
+    let mut pre_cdef = pre_cdef;
+    let (lr_w, lr_chroma_w, lr_src): (usize, usize, &YuvFrame) = if let Some((up_w, _)) = superres {
+        let np = usize::from(num_planes);
+        let upscale = |y: &[u16], u: &[u16], v: &[u16]| {
+            crate::encoder::superres_elect::upscale_recon(
+                [y, u, v],
+                width as u32,
+                height as u32,
+                up_w,
+                mi_cols,
+                bit_depth,
+                ssx,
+                ssy,
+                np,
+            )
+        };
+        let (uy, uu, uv) = upscale(&recon.y, &recon.u, &recon.v)?;
+        recon.y = uy;
+        recon.u = uu;
+        recon.v = uv;
+        if let Some(pc) = pre_cdef.as_mut() {
+            let (py, pu, pv) = upscale(&pc.0, &pc.1, &pc.2)?;
+            *pc = (py, pu, pv);
+        }
+        let src = extras
+            .superres_source
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        (
+            up_w as usize,
+            ((up_w + u32::from(ssx)) >> ssx) as usize,
+            src,
+        )
+    } else {
+        (width, chroma_w, input)
+    };
+
     // r429 — §5.9.20/§5.11.57/§7.17 loop-restoration election: the
-    // LAST in-loop stage runs on the post-CDEF reconstruction. The
+    // LAST in-loop stage runs on the post-CDEF reconstruction (r444:
+    // post-§7.16 on a superres arm, at the upscaled extent, fitted
+    // against the ORIGINAL source). The
     // election fits per-64×64-unit Wiener / self-guided candidates
     // through the decoder's own §7.17 kernels, then the tile is
     // RE-EMITTED with the §5.11.57 `write_lr` interleave (one window
     // per superblock, the same §5.11.56 CDEF literals as the
-    // committed tile) and LR-on vs LR-off settles on EXACT realized
-    // bytes. On adoption the plan is applied through the §7.17 frame
-    // driver, so the stored reference planes equal the decoder's
-    // byte-for-byte.
+    // committed tile; on a superres frame the window maps superblock
+    // columns through the §5.9.8 denominator ratio) and LR-on vs
+    // LR-off settles on EXACT realized bytes. On adoption the plan
+    // is applied through the §7.17 frame driver, so the stored
+    // reference planes equal the decoder's byte-for-byte.
     if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
         let price_cdfs = {
             let mut c = TileCdfContext::new_from_defaults();
@@ -2000,16 +2054,16 @@ fn encode_key_frame_yuv_core(
         };
         if let Some(plan) =
             crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
-                input,
+                input: lr_src,
                 curr_y: pcy,
                 curr_u: pcu,
                 curr_v: pcv,
                 cdef_y: &recon.y,
                 cdef_u: &recon.u,
                 cdef_v: &recon.v,
-                width,
+                width: lr_w,
                 height,
-                chroma_w,
+                chroma_w: lr_chroma_w,
                 chroma_h,
                 bit_depth,
                 subsampling_x: ssx,
@@ -2020,6 +2074,8 @@ fn encode_key_frame_yuv_core(
                 lambda: lambda_for(&recon.qp),
                 price_cdfs: &price_cdfs,
                 disable_cdf_update: fh.disable_cdf_update,
+                use_superres: superres.is_some(),
+                superres_denom: superres.map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
             })
         {
             let mut lr_params_w = params.clone();
@@ -2051,16 +2107,16 @@ fn encode_key_frame_yuv_core(
                 state = re_state;
                 let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                     &plan,
-                    input,
+                    lr_src,
                     pcy,
                     pcu,
                     pcv,
                     &mut recon.y,
                     &mut recon.u,
                     &mut recon.v,
-                    width,
+                    lr_w,
                     height,
-                    chroma_w,
+                    lr_chroma_w,
                     chroma_h,
                     bit_depth,
                     ssx,
@@ -2228,52 +2284,67 @@ fn encode_key_frame_yuv_core(
 /// against the source weighted by `2^(-2·units)` from the delta-q
 /// probe plan — a flat superblock's error counts up (banding shows
 /// first where nothing masks it), a textured one's counts down.
+///
+/// r444 — `coded_mi` is the CODED frame's `(MiRows, MiCols)` (the
+/// grid the plan indexes) and `superres_denom` the §5.9.8 ratio: on
+/// a superres arm `src` / the recon planes live at the UPSCALED
+/// extent, and each upscaled column maps back to its coded
+/// superblock through `c · SUPERRES_NUM / SuperresDenom`. A
+/// flat-width caller passes `SUPERRES_NUM` (identity mapping).
 pub(crate) fn key_weighted_sse(
-    input: &YuvFrame,
+    src: &YuvFrame,
     ry: &[u16],
     ru: &[u16],
     rv: &[u16],
     plan: &[i32],
+    coded_mi: (u32, u32),
+    superres_denom: u32,
 ) -> u64 {
-    let w = input.width as usize;
-    let h = input.height as usize;
-    let (ssx, ssy) = input.format.subsampling();
-    let cw = input.chroma_width() as usize;
-    let ch = input.chroma_height() as usize;
-    let num_planes = input.format.num_planes();
-    let (mi_rows, mi_cols) = (input.height / 4, input.width / 4);
+    let w = src.width as usize;
+    let h = src.height as usize;
+    let (ssx, ssy) = src.format.subsampling();
+    let cw = src.chroma_width() as usize;
+    let ch = src.chroma_height() as usize;
+    let num_planes = src.format.num_planes();
+    let (mi_rows, mi_cols) = coded_mi;
+    let sb_rows = mi_rows.div_ceil(16) as usize;
+    let sb_cols = mi_cols.div_ceil(16) as usize;
+    debug_assert_eq!(
+        plan.len(),
+        sb_rows * sb_cols,
+        "plan is per coded superblock"
+    );
+    let num = u64::from(crate::frame_header::SUPERRES_NUM);
+    let den = u64::from(superres_denom);
+    let sb_col_of =
+        |c: usize| -> usize { (((c as u64 * num / den) / 64) as usize).min(sb_cols - 1) };
+    let sb_row_of = |r: usize| -> usize { (r / 64).min(sb_rows - 1) };
+    let mut sse = vec![0u64; sb_rows * sb_cols];
+    for r in 0..h {
+        let k_row = sb_row_of(r) * sb_cols;
+        for c in 0..w {
+            let diff = i64::from(ry[r * w + c]) - i64::from(src.y[r * w + c]);
+            sse[k_row + sb_col_of(c)] += (diff * diff) as u64;
+        }
+    }
+    if num_planes > 1 {
+        for r in 0..ch {
+            let k_row = sb_row_of(r << ssy) * sb_cols;
+            for c in 0..cw {
+                let k = k_row + sb_col_of(c << ssx);
+                let du = i64::from(ru[r * cw + c]) - i64::from(src.u[r * cw + c]);
+                let dv = i64::from(rv[r * cw + c]) - i64::from(src.v[r * cw + c]);
+                sse[k] += (du * du + dv * dv) as u64;
+            }
+        }
+    }
     let mut d = 0u64;
-    for (sb_index, &(sb_r, sb_c)) in sb_grid_origins(mi_rows, mi_cols).iter().enumerate() {
-        let units = plan[sb_index];
-        let y0 = (sb_r as usize) * 4;
-        let x0 = (sb_c as usize) * 4;
-        let y1 = (y0 + 64).min(h);
-        let x1 = (x0 + 64).min(w);
-        let mut sse = 0u64;
-        for r in y0..y1 {
-            for c in x0..x1 {
-                let diff = i64::from(ry[r * w + c]) - i64::from(input.y[r * w + c]);
-                sse += (diff * diff) as u64;
-            }
-        }
-        if num_planes > 1 {
-            let (cy0, cx0) = (y0 >> ssy, x0 >> ssx);
-            let (cy1, cx1) = (
-                (y1 + usize::from(ssy)) >> ssy,
-                (x1 + usize::from(ssx)) >> ssx,
-            );
-            for r in cy0..cy1.min(ch) {
-                for c in cx0..cx1.min(cw) {
-                    let du = i64::from(ru[r * cw + c]) - i64::from(input.u[r * cw + c]);
-                    let dv = i64::from(rv[r * cw + c]) - i64::from(input.v[r * cw + c]);
-                    sse += (du * du + dv * dv) as u64;
-                }
-            }
-        }
+    for (k, &s) in sse.iter().enumerate() {
+        let units = plan[k];
         d += if units >= 0 {
-            sse >> (2 * units)
+            s >> (2 * units)
         } else {
-            sse << (-2 * units)
+            s << (-2 * units)
         };
     }
     d

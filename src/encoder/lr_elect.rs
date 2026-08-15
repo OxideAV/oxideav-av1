@@ -2,12 +2,19 @@
 //! election (encoder ladder item 4).
 //!
 //! Loop restoration is the LAST in-loop stage (§7.4 order: deblock →
-//! CDEF → superres → LR; this encoder codes deblock level 0 and no
-//! superres, so LR input is exactly the post-CDEF reconstruction).
-//! Per restoration unit the bitstream carries a filter selection and
-//! (for Wiener / self-guided) its coefficients; the decoder filters
-//! `UpscaledCdefFrame` into `LrFrame`, which becomes the §7.20
-//! reference store.
+//! CDEF → superres → LR; this encoder codes deblock level 0, so on a
+//! flat-width frame LR input is exactly the post-CDEF
+//! reconstruction). Per restoration unit the bitstream carries a
+//! filter selection and (for Wiener / self-guided) its coefficients;
+//! the decoder filters `UpscaledCdefFrame` into `LrFrame`, which
+//! becomes the §7.20 reference store.
+//!
+//! r444 — on a `use_superres = 1` frame ([`LrElectInput::
+//! use_superres`]) the election runs at the UPSCALED extent, exactly
+//! where §7.17 operates: the caller feeds the §7.16-upscaled
+//! pre-CDEF and post-CDEF planes plus the ORIGINAL (full-width)
+//! source as the fit target, and the §5.11.57 write window maps
+//! superblock columns through the §5.9.8 `SuperresDenom` ratio.
 //!
 //! ## Election structure
 //!
@@ -109,6 +116,17 @@ pub(crate) struct LrElectInput<'a> {
     /// settled by the caller's re-emission).
     pub price_cdfs: &'a TileCdfContext,
     pub disable_cdf_update: bool,
+    /// r444 — §5.9.8 pairing: `true` when this frame codes
+    /// `use_superres = 1`. The election then operates at the
+    /// UPSCALED extent (`width` / `chroma_w` and every plane slice
+    /// are the §7.16 outputs; `mi_rows` / `mi_cols` stay the CODED
+    /// grid), and the §5.11.57 write-side window rides the
+    /// superres column mapping through
+    /// [`crate::cdf::LrParams::use_superres`].
+    pub use_superres: bool,
+    /// The §5.9.8 `SuperresDenom` (`SUPERRES_NUM` when
+    /// `use_superres` is `false`).
+    pub superres_denom: u32,
 }
 
 /// One unit's block list + covered rects (plane-local coordinates).
@@ -779,8 +797,8 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         subsampling_y: inp.subsampling_y,
         frame_height: ec.frame_height,
         upscaled_width: ec.upscaled_width,
-        use_superres: false,
-        superres_denom: crate::frame_header::SUPERRES_NUM,
+        use_superres: inp.use_superres,
+        superres_denom: inp.superres_denom,
         allow_intrabc: false,
     };
     Some(LrPlan {

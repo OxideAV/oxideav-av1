@@ -3841,6 +3841,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
                 price_cdfs: &price_cdfs,
                 disable_cdf_update: fh.disable_cdf_update,
+                // Inter frames never code §5.9.8 superres.
+                use_superres: false,
+                superres_denom: crate::frame_header::SUPERRES_NUM,
             })
         {
             let mut re_params = params.clone();
