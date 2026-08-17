@@ -358,6 +358,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             explicit_tiles: None,
             qm: true,
             film_grain: None,
+            s_frame: false,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -859,6 +860,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 explicit_tiles: None,
                 qm: true,
                 film_grain: None,
+                s_frame: false,
             };
             let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
                 &layer[i],

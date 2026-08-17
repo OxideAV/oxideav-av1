@@ -1321,6 +1321,33 @@ self-encoded `ar_coeff_lag > 0` stream), byte-identical through
 three independent black-box reference decoders (corpus 133 with the
 four r444 pins).
 
+### Switch frames: the §5.9.2 S-frame cadence (r447)
+
+`GopTuning::s_frame_period` codes every N-th inter frame as a
+`frame_type = SWITCH_FRAME` — the spec's chunk-boundary frame:
+all eight §7.20 slots overwritten without intra coding, so a
+same-geometry stream can splice its §7.5 temporal units in at the
+boundary. The wire rides the four §5.9.2 inferred (bit-free) fields
+— `error_resilient_mode = 1`, `frame_size_override_flag = 1` (the
+frame size codes explicitly), `refresh_frame_flags = allFrames`,
+`primary_ref_frame = PRIMARY_REF_NONE` — plus the coded
+`ref_order_hint[]` block over the true slot hints and the
+error-resilient derivations `use_ref_frame_mvs = 0` and
+`allow_warped_motion = 0` on both twins. Every cross-frame decode
+dependency except the reference SAMPLES re-anchors at the switch
+point (default CDFs; motion-field / segment-id / gm carries reload
+from the S-frame's own committed state), and the S-frame still rides
+the frame-level elections (hp-mv / delta-q / QM / CDEF / LR, tiles,
+film-grain headers). Witnesses (`tests/s_frames.rs`): cadence GOPs
+byte-exact through the spec driver, the SWITCH header shape parsed
+back off the wire, and a CROSS-RATE SPLICE — q60 units 0..3 + q140
+units 3.. decode end-to-end, byte-identical through three
+independent black-box reference decoders on the spliced bytes.
+Pinned: `self-gop-96x64-q80-sframes` (the corpus's first
+`SWITCH_FRAME` stream) and `self-splice-96x64-q60-q140-sframe` (the
+switch frame's symbols decoding against reference samples coded at
+a different rate) — corpus 135.
+
 ### Spatial scalability: the SVC write arm (r431)
 
 `encode_spatial_layered_gop_yuv{,420}_with_q` codes 2..=4

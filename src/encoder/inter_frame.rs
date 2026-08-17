@@ -92,7 +92,9 @@ use crate::encoder::yuv_frame::YuvFrame;
 use crate::encoder::yuv_frame::{
     build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
 };
-use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
+use crate::frame_header::{
+    FrameHeader, FrameType, InterFrameRefs, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
+};
 use crate::inter_pred::{
     reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
 };
@@ -859,6 +861,21 @@ pub struct GopTuning {
     /// keeps the no-grain shape on every frame (the A/B baseline;
     /// probe-failing content is bit-identical either way).
     pub film_grain: bool,
+    /// r447 — §5.9.2 SWITCH-frame cadence: every `s_frame_period`-th
+    /// inter frame (display positions `s_frame_period,
+    /// 2·s_frame_period, …`) codes `frame_type = SWITCH_FRAME` — the
+    /// spec's chunk-boundary frame (§ "Switch Frame" definition):
+    /// error-resilient (inferred `error_resilient_mode = 1`, no bit),
+    /// all eight §7.20 slots overwritten (inferred
+    /// `refresh_frame_flags = allFrames`, no bits), explicit frame
+    /// size (inferred `frame_size_override_flag = 1`), per-frame
+    /// default CDFs (inferred `primary_ref_frame = PRIMARY_REF_NONE`)
+    /// and `use_ref_frame_mvs = 0` — so every cross-frame decode
+    /// dependency except the reference SAMPLES re-anchors at the
+    /// switch point, and a same-geometry stream may splice its
+    /// temporal units in at that boundary. `0` keeps the all-P shape
+    /// (bit-identical).
+    pub s_frame_period: u32,
 }
 
 impl Default for GopTuning {
@@ -879,6 +896,7 @@ impl Default for GopTuning {
             ctx_update_elect: true,
             superres: true,
             film_grain: true,
+            s_frame_period: 0,
         }
     }
 }
@@ -1620,13 +1638,26 @@ fn encode_gop_yuv_core_fg(
     let mut lr_elections: Vec<bool> = Vec::new();
     let mut ctx_donor_elections: Vec<Option<u32>> = Vec::new();
 
+    // r447 — the all-slot-refresh FLOOR: the most recent frame that
+    // overwrote every §7.20 slot (the KEY at 0; each SWITCH frame
+    // advances it). Slots outside the two-slot rotation hold the
+    // floor frame — its hint, its motion field, its carry.
+    let mut floor: u32 = 0;
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
+        // r447 — the §5.9.2 SWITCH-frame cadence (see
+        // [`GopTuning::s_frame_period`]).
+        let is_s = tuning.s_frame_period > 0 && p_index % tuning.s_frame_period == 0;
         let prev = recon.last().expect("at least the KEY recon");
-        let prevprev = &recon[recon.len().saturating_sub(2)];
+        // GOLDEN's slot holds frame `max(floor, p_index - 2)` (the
+        // rotation refresher, unless the floor frame overwrote every
+        // slot more recently).
+        let prevprev = &recon[p_index.saturating_sub(2).max(floor) as usize];
         // r423 — the primary reference is LAST (ordinal 0): slot
-        // `p_index & 1`, holding frame `p_index - 1`.
-        let primary = if tuning.primary_ref {
+        // `p_index & 1`, holding frame `p_index - 1`. r447 — a
+        // SWITCH frame is error-resilient: PRIMARY_REF_NONE by
+        // §5.9.2 inference, so no carry is consumed.
+        let primary = if tuning.primary_ref && !is_s {
             Some(carry_store[(p_index & 1) as usize].clone())
         } else {
             None
@@ -1665,6 +1696,8 @@ fn encode_gop_yuv_core_fg(
             explicit_tiles,
             donor_armed,
             p_fg.as_ref(),
+            floor,
+            is_s,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1706,10 +1739,24 @@ fn encode_gop_yuv_core_fg(
         if !alt_q.is_empty() {
             p_segment_maps.push(carry.segment_ids.clone());
         }
-        // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
-        mf_store[((p_index - 1) & 1) as usize] = saved_mf;
-        carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
-        carry_tu[((p_index - 1) & 1) as usize] = p_index as usize;
+        // §7.20: a plain P-frame refreshed slot `(p_index - 1) & 1`;
+        // r447 — a SWITCH frame refreshed EVERY slot
+        // (`refresh_frame_flags = allFrames`): its motion field,
+        // carry and temporal-unit ordinal land in all eight, and the
+        // floor advances to it.
+        if is_s {
+            floor = p_index;
+            let carry_rc = std::rc::Rc::new(carry);
+            for slot in 0..8usize {
+                mf_store[slot] = saved_mf.clone();
+                carry_store[slot] = carry_rc.clone();
+                carry_tu[slot] = p_index as usize;
+            }
+        } else {
+            mf_store[((p_index - 1) & 1) as usize] = saved_mf;
+            carry_store[((p_index - 1) & 1) as usize] = std::rc::Rc::new(carry);
+            carry_tu[((p_index - 1) & 1) as usize] = p_index as usize;
+        }
     }
 
     // IVF v0 wrap.
@@ -1760,8 +1807,18 @@ fn encode_gop_yuv_core_fg(
 /// Output order hints of the two rotated references at P-frame
 /// `p_index = k` (1-based): LAST holds frame `k - 1`, GOLDEN frame
 /// `k - 2`, clamped at the KEY frame (hint 0).
+#[cfg(test)]
 fn gop_ref_hints(p_index: u32) -> (u32, u32) {
-    (p_index - 1, p_index.saturating_sub(2))
+    gop_ref_hints_floor(p_index, 0)
+}
+
+/// r447 — [`gop_ref_hints`] under an all-slot-refresh FLOOR: the
+/// most recent frame that overwrote every §7.20 slot (the KEY at 0,
+/// or the latest SWITCH frame). LAST always holds frame
+/// `p_index - 1`; GOLDEN's slot was last refreshed by the rotation
+/// at `p_index - 2` OR by the floor frame, whichever came later.
+fn gop_ref_hints_floor(p_index: u32, floor: u32) -> (u32, u32) {
+    (p_index - 1, p_index.saturating_sub(2).max(floor))
 }
 
 /// §5.9.2-derived [`FrameInterOrderHints`] for P-frame `p_index` —
@@ -1954,6 +2011,19 @@ pub(crate) struct InterFrameConfig<'a> {
     /// output planes. `None` keeps the pre-r441 header shape (the
     /// sequence gate is closed unless the KEY armed it).
     pub film_grain: Option<&'a FilmGrainParams>,
+    /// r447 — code this frame as a §5.9.2 SWITCH_FRAME: the header
+    /// rides the four inferred (bit-free) fields —
+    /// `error_resilient_mode = 1`, `frame_size_override_flag = 1`
+    /// (the frame size codes EXPLICITLY on the §5.9.5 arm; the
+    /// `frame_size_with_refs` branch is bypassed under error
+    /// resilience), `refresh_frame_flags = allFrames` and
+    /// `primary_ref_frame = PRIMARY_REF_NONE` — plus the derived
+    /// `use_ref_frame_mvs = 0` (no §7.9 projection on either twin)
+    /// and the coded §5.9.2 `ref_order_hint[]` block over the TRUE
+    /// [`Self::slot_hints`]. Requires `refresh_frame_flags = 0xff`,
+    /// `primary_ref_frame = PRIMARY_REF_NONE`, no `primary_carry`
+    /// and no `alt_primaries` (caller bug otherwise).
+    pub s_frame: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2064,8 +2134,31 @@ fn build_inter_frame_fh(
         // r430: derived from the sequence gates — an order-hint-free
         // sequence (the §7.3 camera-frame shape) infers 0 on the
         // parse side, so the writer twin must agree.
-        use_ref_frame_mvs: seq.enable_order_hint && seq.enable_ref_frame_mvs,
+        // r447: §5.9.2 forces `use_ref_frame_mvs = 0` under error
+        // resilience (the f(1) is not even coded) — the SWITCH-frame
+        // arm below flips `error_resilient_mode` on, so mirror the
+        // parse-side inference here.
+        use_ref_frame_mvs: seq.enable_order_hint && seq.enable_ref_frame_mvs && !cfg.s_frame,
     });
+    // r447 — the §5.9.2 SWITCH_FRAME shape: the four inferred fields
+    // plus the error-resilient derivations (see
+    // [`InterFrameConfig::s_frame`]). `frame_size_override_flag = 1`
+    // makes the §5.9.5 frame size EXPLICIT on the wire (the writer's
+    // `frame_size_with_refs` bypass takes the plain arm under error
+    // resilience), and the §5.9.2 `ref_order_hint[]` block fires —
+    // `fh.ref_order_hints` already carries the true slot state.
+    if cfg.s_frame {
+        fh.frame_type = FrameType::Switch;
+        fh.error_resilient_mode = true;
+        fh.frame_size_override_flag = true;
+        fh.refresh_frame_flags = ALL_FRAMES_PUB;
+        fh.primary_ref_frame = PRIMARY_REF_NONE;
+        // §5.9.2: `allow_warped_motion = 0` under error resilience
+        // (the f(1) is not coded) — the search ladder must not offer
+        // the WARPED_CAUSAL arm and every eligible leaf's §5.11.27
+        // `motion_mode` collapses to the two-way `use_obmc` S().
+        fh.allow_warped_motion = Some(false);
+    }
     // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — under
     // `PRIMARY_REF_NONE` the parser forces `update_map = 1`,
     // `temporal_update = 0`, `update_data = 1` (no bits for the three
@@ -2200,7 +2293,7 @@ fn p_frame_config<'a>(
     prevprev: &'a GopFrameReconYuv,
     p_index: u32,
 ) -> InterFrameConfig<'a> {
-    p_frame_config_primary(prev, prevprev, p_index, None)
+    p_frame_config_primary(prev, prevprev, p_index, None, 0, false)
 }
 
 /// r423 — [`p_frame_config`] with the primary-reference election:
@@ -2214,11 +2307,19 @@ fn p_frame_config_primary<'a>(
     prevprev: &'a GopFrameReconYuv,
     p_index: u32,
     primary_carry: Option<&'a RefSlotCarry>,
+    floor: u32,
+    s_frame: bool,
 ) -> InterFrameConfig<'a> {
     let last_slot = (p_index & 1) as usize;
     let golden_slot = ((p_index - 1) & 1) as usize;
-    let (last_hint, golden_hint) = gop_ref_hints(p_index);
-    let mut slot_hints = [0u32; 8];
+    let (last_hint, golden_hint) = gop_ref_hints_floor(p_index, floor);
+    // r447 — the TRUE per-slot §7.20 hint state: every slot outside
+    // the two-slot rotation still holds the last all-refresh frame
+    // (the KEY, hint 0, or the latest SWITCH frame — the floor). A
+    // SWITCH frame codes this whole array on the wire (§5.9.2
+    // `ref_order_hint[ i ]` must equal the decoder's stored
+    // `RefOrderHint[ i ]`, else the slot is marked invalid).
+    let mut slot_hints = [floor; 8];
     slot_hints[last_slot] = last_hint;
     slot_hints[golden_slot] = golden_hint;
     let mut ref_frame_idx = [last_slot as u8; REFS_PER_FRAME];
@@ -2229,19 +2330,23 @@ fn p_frame_config_primary<'a>(
     InterFrameConfig {
         order_hint: p_index,
         show_frame: true,
-        refresh_frame_flags: 1 << ((p_index - 1) & 1),
+        refresh_frame_flags: if s_frame {
+            ALL_FRAMES_PUB
+        } else {
+            1 << ((p_index - 1) & 1)
+        },
         ref_frame_idx,
         slot_hints,
         single_refs: vec![1, 4],
         compound_pairs: vec![[1, 4]],
         refs: vec![prev, prevprev],
         slot_to_plane,
-        primary_ref_frame: if primary_carry.is_some() {
+        primary_ref_frame: if primary_carry.is_some() && !s_frame {
             0 // LAST_FRAME ordinal — ref_frame_idx[ 0 ] = last_slot.
         } else {
             PRIMARY_REF_NONE
         },
-        primary_carry,
+        primary_carry: if s_frame { None } else { primary_carry },
         allow_temporal_seg: true,
         alt_primaries: Vec::new(),
         exact_mask: None,
@@ -2260,6 +2365,7 @@ fn p_frame_config_primary<'a>(
         collect_donor_cdfs: false,
         elect_donor: false,
         explicit_tiles: None,
+        s_frame,
     }
 }
 
@@ -2385,6 +2491,8 @@ fn encode_p_frame_yuv(
     explicit_tiles: Option<(&[u32], &[u32])>,
     donor_armed: bool,
     film_grain: Option<&FilmGrainParams>,
+    floor: u32,
+    s_frame: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -2395,7 +2503,10 @@ fn encode_p_frame_yuv(
     ),
     Error,
 > {
-    let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry);
+    // r447 — a SWITCH frame starts from per-frame default state
+    // (§5.9.2 infers PRIMARY_REF_NONE under error resilience).
+    let primary_carry = if s_frame { None } else { primary_carry };
+    let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry, floor, s_frame);
     // r441 — the armed §5.9.30 film-grain block for this frame.
     cfg.film_grain = film_grain;
     cfg.allow_temporal_seg = allow_temporal_seg;
@@ -2413,9 +2524,11 @@ fn encode_p_frame_yuv(
     cfg.explicit_tiles = explicit_tiles;
     // r436 — the §6.8.14 donor election arms both directions: this
     // frame ELECTS over its primary's donor set, and COLLECTS its
-    // own per-tile end CDFs for the next frame's election.
+    // own per-tile end CDFs for the next frame's election. r447 — a
+    // SWITCH frame has no primary to elect over (it still collects:
+    // the frames chaining off its slots elect on ITS donor set).
     cfg.collect_donor_cdfs = donor_armed;
-    cfg.elect_donor = donor_armed;
+    cfg.elect_donor = donor_armed && !s_frame;
     let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2494,6 +2607,19 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // the elected slot and a valid ordinal (`0..7`).
     if cfg.primary_ref_frame != PRIMARY_REF_NONE
         && (usize::from(cfg.primary_ref_frame) >= REFS_PER_FRAME || cfg.primary_carry.is_none())
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // r447 — a SWITCH frame is error-resilient by §5.9.2 inference:
+    // it must refresh every slot, start from per-frame default state
+    // (no primary carry — the ordinal is not even coded) and offer no
+    // replay candidates (the §5.9.24 recentering baseline is the
+    // setup_past_independence default, unique).
+    if cfg.s_frame
+        && (cfg.refresh_frame_flags != ALL_FRAMES_PUB
+            || cfg.primary_ref_frame != PRIMARY_REF_NONE
+            || cfg.primary_carry.is_some()
+            || !cfg.alt_primaries.is_empty())
     {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -2641,7 +2767,10 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // the header derivation: coded only when the sequence gate is
     // open (the header writer emits the f(1) under the same gate).
     ip.is_motion_mode_switchable = true;
-    ip.allow_warped_motion = seq.enable_warped_motion;
+    // r447: §5.9.2 infers `allow_warped_motion = 0` under error
+    // resilience (the SWITCH-frame shape) — mirror the parse-side
+    // derivation exactly as the header writer's bit gate does.
+    ip.allow_warped_motion = seq.enable_warped_motion && !fh.error_resilient_mode;
     // §5.9.2 order hints — `OrderHints[ ref ]` =
     // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` over the
     // config's slot state.
@@ -2722,8 +2851,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // r430: mirrors the header derivation — an order-hint-free
     // sequence codes (and infers) `use_ref_frame_mvs = 0`, so the
     // §7.9 projection must not run (the walker keeps the invalid
-    // motion-field default on both sides).
-    ip.use_ref_frame_mvs = seq.enable_order_hint && seq.enable_ref_frame_mvs;
+    // motion-field default on both sides). r447: the §5.9.2
+    // error-resilient inference (`use_ref_frame_mvs = 0`, no bit) is
+    // mirrored too — the SWITCH-frame arm rides it.
+    ip.use_ref_frame_mvs =
+        seq.enable_order_hint && seq.enable_ref_frame_mvs && !fh.error_resilient_mode;
     if ip.use_ref_frame_mvs {
         use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
         let ref_frame_idx = cfg.ref_frame_idx;
@@ -9577,6 +9709,8 @@ mod tests {
             None,
             false,
             None,
+            0,
+            false,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
