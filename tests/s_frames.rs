@@ -166,6 +166,54 @@ fn s_frame_composes_with_tiles_and_elections() {
     assert_s_frame_round_trip(&frames, 100, tuned(2, (1, 0)));
 }
 
+/// The cadence composes with the §5.9.30 film-grain election: the
+/// S-frame's error-resilient header carries a full grain block
+/// (`update_grain = 1` — no `film_grain_params_ref_idx` load), the
+/// per-frame seed schedule rides through the switch point, and the
+/// grained output decodes byte-exact.
+#[test]
+fn s_frame_composes_with_film_grain() {
+    // Deterministic re-rolled noise over a smooth moving base — the
+    // §5.9.30 probe's use case.
+    let noisy = |t: usize| -> Yuv420Frame {
+        let (w, h) = (128u32, 96u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut f = Yuv420Frame::filled(w, h, 128);
+        let mut state = 0x2454_1013u32.wrapping_add((t as u32).wrapping_mul(0x9e37_79b9));
+        let mut rnd = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 23) & 255) as i32 - 128) * 8 / 128
+        };
+        for r in 0..hu {
+            for c in 0..wu {
+                let x = c as f64 + 1.1 * t as f64;
+                let y = r as f64 + 0.5 * t as f64;
+                let base = 120.0
+                    + 60.0 * (0.021 * x).sin() * (0.026 * y).cos()
+                    + 18.0 * (0.047 * (x + y)).sin();
+                f.y[r * wu + c] = (base + f64::from(rnd())).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(noisy).collect();
+    let enc = encode_gop_yuv420_with_q_seg_tuned(&frames, 60, &[], tuned(2, (0, 0)))
+        .expect("film-grain S-frame GOP encodes");
+    let headers = wire_headers(&enc.gop.temporal_units);
+    assert_eq!(headers[2].0, FrameType::Switch, "frame 2 codes SWITCH");
+    let decoded = decode_av1_spec(&enc.gop.ivf_bytes).expect("spec driver decodes");
+    assert_eq!(decoded.len(), 4);
+    for (idx, f) in decoded.iter().enumerate() {
+        let rc = &enc.gop.recon[idx];
+        assert_eq!(
+            f.planes[0], rc.y,
+            "frame {idx}: luma decode != published recon"
+        );
+        assert_eq!(f.planes[1], rc.u, "frame {idx}: U");
+        assert_eq!(f.planes[2], rc.v, "frame {idx}: V");
+    }
+}
+
 /// Cross-rate SPLICE at the switch point: chunk 1 of the q60 stream +
 /// chunks 2+ of the q140 stream (same source, same cadence) — the
 /// §7.5 temporal units concatenate into a stream the spec driver
