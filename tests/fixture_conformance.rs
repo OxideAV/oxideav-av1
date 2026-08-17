@@ -12588,3 +12588,40 @@ fn self_encoded_film_grain_csfl_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r447: SUPERRES × MULTI-TILE — the corpus's first stream pairing
+// `use_superres = 1` with a multi-tile layout. The KEY codes two
+// §5.9.15 tile columns AT THE DOWNSCALED width (per-tile §8.2 symbol
+// partitions over the coded extent, §7.16 upscaling between CDEF and
+// LR), under the Annex A rule that every non-rightmost tile of a
+// `use_superres = 1` frame is at least 128 luma samples wide; the
+// tiled P chain predicts from the upscaled §7.20 reference.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_320X96_Q180_SUPERRES_TILES_IVF: &str = concat!(
+    "444b494600002000415630314001600019000000010000000400000000000000940000000000",
+    "00000000000012000a0b0000000434fef977f700803282011601e60b407000067ff8100052c1",
+    "cf2da27785a4b2ed59e853436b7f957fb8dcbcaea9efdcfb9bd268fd44193eb8c80aaa982327",
+    "cbe163388f0e9bf5b290623b55d21d737ab6a28a1094f6a8d8f0b94b25d1de9b59d284a2a67a",
+    "43bd9621cf40e144efbce4aeded7f7550b6f067f1b4dbc03084e5443618b5d53dfee2711ae46",
+    "c68a4300000001000000000000001200323f3201002248248ec16800000677f81c00001af9bb",
+    "60fc495ab125ec6a803463166dcb8acc49998e28438de19e40f304e3b7fc135097ba8db16123",
+    "586f8025ec3100000002000000000000001200322d3202004001001ec96800000667381e0000",
+    "0dfce7fd144b5a4e2ac266086e9828e8a2f4989f6d4984ef21b9cfac20000000030000000000",
+    "00001200321c3203002248249ec16800000000001e00000285fce0efe190d62e7040",
+);
+
+/// r447: superres × tiles GOP (4-frame 320×96 at q180; the KEY
+/// elected a §5.9.8 denominator with a two-column §5.9.15 layout at
+/// the coded width) — the digest is the byte-identical output of
+/// THREE independent black-box reference decoders.
+#[test]
+fn self_encoded_superres_tiles_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-320x96-q180-superres-tiles",
+        SELF_GOP_320X96_Q180_SUPERRES_TILES_IVF,
+        "241b29df07af70d3cea41535f958b2da139add22eec4c0ecf190d7df8554fa82",
+        4,
+    );
+}

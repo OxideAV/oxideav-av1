@@ -914,23 +914,60 @@ pub(crate) fn encode_key_frame_yuv_full(
     // (the flat arm on ties: streams outside an elected win stay
     // bit-identical to the pre-r441 baseline).
     if extras.superres_elect && extras.superres.is_none() {
+        // r447 — the single-tile-frame scope is lifted: uniform
+        // multi-tile layouts and §5.11.1 tile-group packaging ride
+        // the election (each candidate codes its tiles at the §5.9.8
+        // downscaled width — legality re-checked per denominator
+        // below; the tile-group split is framing-only and clamps to
+        // the realized tile count). EXPLICIT layouts stay out: their
+        // per-column superblock widths are bound to the full-width
+        // geometry and have no defined §5.9.8 remapping.
         let sr_ok = base_q_idx > 0
             && alt_q.is_empty()
             && exact_mask.is_none()
             && model == RateModel::Twin
             && extras.seq_override.is_none()
             && extras.intra_only_refresh.is_none()
-            && extras.tiles == (0, 0)
             && extras.explicit_tiles.is_none()
-            && extras.tile_groups <= 1
             && crate::encoder::superres_elect::superres_arm_allowed(
                 base_q_idx,
                 input.width as usize,
                 input.height as usize,
             )
             && crate::encoder::superres_elect::superres_probe(input);
-        let candidates = if sr_ok {
+        let candidates: Vec<u32> = if sr_ok {
             crate::encoder::superres_elect::candidate_denoms(input.width)
+                .into_iter()
+                .filter(|&denom| {
+                    // r447 — a multi-tile layout must stay inside the
+                    // §5.9.15 legality window AT THE DOWNSCALED width
+                    // (`MiCols` shrinks with the coded width; rows are
+                    // untouched — §7.16 resamples columns only), AND
+                    // inside the Annex A tile-width conformance rule:
+                    // on a `use_superres = 1` frame every tile except
+                    // the right-most must be at least 128 luma
+                    // samples wide (64 on flat frames — reference
+                    // decoders enforce it).
+                    if extras.tiles == (0, 0) {
+                        return true;
+                    }
+                    let wd =
+                        crate::encoder::superres_elect::superres_coded_width(input.width, denom);
+                    let Some(ti) = crate::tile_info::TileInfo::uniform_layout(
+                        wd / 4,
+                        input.height / 4,
+                        false,
+                        extras.tiles.0,
+                        extras.tiles.1,
+                    ) else {
+                        return false;
+                    };
+                    ti.mi_col_starts
+                        .windows(2)
+                        .take(ti.tile_cols.saturating_sub(1) as usize)
+                        .all(|w| (w[1] - w[0]) * 4 >= 128)
+                })
+                .collect()
         } else {
             Vec::new()
         };

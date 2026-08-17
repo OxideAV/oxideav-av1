@@ -1286,6 +1286,15 @@ segmentation × superres pairing) and `self-svc-96-192-q180-superres`
 at both operating points) — all byte-identical through three
 independent black-box reference decoders.
 
+r447 lifts the single-tile-frame scope: uniform §5.9.15 layouts and
+tile-group packaging ride the arm — each candidate re-validates its
+layout at the DOWNSCALED width and against the Annex A rule that a
+`use_superres = 1` frame's non-rightmost tiles are ≥ 128 luma
+samples wide (reference decoders enforce it; layouts violating it
+are filtered per denominator). Pinned:
+`self-gop-320x96-q180-superres-tiles` — the first
+superres × multi-tile stream.
+
 ### Film-grain election (r441; AR taps + chroma points r444)
 
 The §5.9.30 write arm goes live with estimated parameters. On an
@@ -1406,8 +1415,11 @@ decoders at both operating points.
 - The §5.9.12 quantizer-matrix election stays off the §7.3
   camera-frame mode (r441 lifted the segmented-frame gate).
 - The §5.9.8 superres election stays KEY/opener-scoped (inter
-  frames never elect a mid-GOP resize) and single-tile-frame-scoped;
-  multi-tile-group KEYs and the §7.3 camera mode keep flat widths.
+  frames never elect a mid-GOP resize); explicit (non-uniform) tile
+  layouts keep flat widths (their per-column superblock widths are
+  bound to the full-width geometry), and the §7.3 camera mode is
+  SPEC-BARRED from the pairing (§7.3.1 requires
+  `enable_superres = 0`).
 - The §5.9.30 film-grain election is plain-GOP-scoped (unsegmented,
   ≥ 2 frames); the AR ladder stops at `ar_coeff_lag = 2` (the lag-3
   ring's 24 + 2×25 coefficient bytes per header never paid on the

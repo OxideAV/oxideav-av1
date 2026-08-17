@@ -514,6 +514,98 @@ fn temporal_ladder_with_superres_key_decodes_bit_exact() {
     }
 }
 
+/// r447 — MULTI-TILE KEY × superres: the single-tile-frame scope is
+/// lifted. A `(1, 0)` two-column GOP elects the §5.9.8 arm on its
+/// KEY — the tile layout re-derives at the DOWNSCALED width (§5.9.15
+/// legality re-checked per candidate denominator; MiCols shrinks
+/// with the coded width), the per-tile §8.2 partitions ride the
+/// downscaled walk, and the P chain (tiled at the full width)
+/// predicts from the upscaled §7.20 reference.
+#[test]
+fn tiled_gop_with_superres_key_decodes_bit_exact() {
+    // 320 wide: denominators 10 and 16 land on multiple-of-8 coded
+    // widths (256 / 160) whose two-column layouts keep every
+    // non-rightmost tile >= 128 luma samples — the Annex A
+    // `use_superres = 1` tile-width rule (a 192-wide frame has no
+    // conformant tiled candidate at all: only 128 / 96 land on
+    // multiples of 8, both leaving a 64-wide left tile).
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| smooth_frame(320, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        180,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning {
+            tiles: (1, 0),
+            ..GopTuning::default()
+        },
+    )
+    .expect("tiled gop encode");
+    let (seq, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+    assert!(seq.enable_superres, "sequence gate must open");
+    let fs = key_fh.frame_size.expect("frame size");
+    assert!(
+        fs.use_superres,
+        "smooth coarse-q content must elect superres on the tiled KEY"
+    );
+    assert!(fs.frame_width < fs.upscaled_width, "coded < upscaled");
+    let ti = key_fh.tile_info.expect("tile info");
+    assert_eq!(ti.tile_cols, 2, "two tile columns at the coded width");
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+}
+
+/// r447 — TILE-GROUP KEY × superres: the §5.11.1 split packaging
+/// (standalone `OBU_FRAME_HEADER` + two `OBU_TILE_GROUP` OBUs) rides
+/// the elected §5.9.8 arm — framing only, the per-tile entropy
+/// payloads are the single-group stream's.
+#[test]
+fn tile_group_gop_with_superres_key_decodes_bit_exact() {
+    let frames: Vec<Yuv420Frame> = (0..3).map(|t| smooth_frame(320, 96, t)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        180,
+        &[],
+        &[],
+        false,
+        None,
+        GopTuning {
+            tiles: (1, 0),
+            tile_groups: 2,
+            ..GopTuning::default()
+        },
+    )
+    .expect("tile-group gop encode");
+    let (_, key_fh) = first_frame_header(&enc.gop.temporal_units[0]);
+    assert!(
+        key_fh.frame_size.expect("frame size").use_superres,
+        "the split-packaged KEY must still elect superres"
+    );
+    // The KEY's unit must carry the split shape: a standalone
+    // frame-header OBU followed by tile-group OBUs.
+    let kinds: Vec<ObuType> = ObuIter::new(&enc.gop.temporal_units[0])
+        .map(|d| d.expect("TU walks").obu_type)
+        .collect();
+    assert!(
+        kinds.contains(&ObuType::FrameHeader) && kinds.contains(&ObuType::TileGroup),
+        "split packaging on the superres KEY (got {kinds:?})"
+    );
+    let decoded = decoded_frames(&enc.gop.ivf_bytes);
+    assert_eq!(decoded.len(), enc.gop.recon.len());
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.gop.recon[i].y, "frame {i} luma");
+        assert_eq!(f.planes[1], enc.gop.recon[i].u, "frame {i} U");
+        assert_eq!(f.planes[2], enc.gop.recon[i].v, "frame {i} V");
+    }
+}
+
 /// Env-gated measurement matrix (`OXIDEAV_AV1_SR_AB=1`): elected vs
 /// flat baseline over content × q × geometry — the numbers behind the
 /// committed `superres_arm_allowed` window.
