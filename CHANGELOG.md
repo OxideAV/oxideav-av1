@@ -4,6 +4,57 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/OxideAV/oxideav-av1/compare/v0.1.16...v0.1.17) - 2026-08-17
+
+### Other
+
+- *(s_frames)* film-grain x S-frame composition witness
+- r447 superres x multi-tile — lift the single-tile election scope; corpus 136 -> 137
+- r447 §5.9.30 chroma_scaling_from_luma election — csfl twins in the film-grain ladder; corpus 135 -> 136
+- r447 §5.9.2 SWITCH frames — s_frame_period cadence + cross-rate splice; corpus 133 -> 135
+- pin the four r444 election streams — corpus 129 -> 133; §5.9.30 4:2:0 chroma-gate coupling fix
+- r444 §5.9.30 film-grain chroma points + AR-tap fitting
+- r444 superres on the spatial-SVC driver — pre-pass election + layered §5.9.8 wire arms
+- r444 superres on segmented / pyramid / temporal-ladder drivers
+- r444 LR x superres pairing — §7.17 election at the upscaled extent
+- pin the three r441 election streams — corpus 126 -> 129
+- r441 multi-level QM ladder + README rollup + staging dumps
+- r441 §5.9.30 film-grain election — estimated params, output-only synthesis mirror
+- r441 §5.9.8 superres election — downscaled-width KEY arm through the §7.16 mirror
+- r441 §5.9.12 QM × segmentation — per-segment SegQMLevel bundle threading
+- optimised dev/test codegen for the conformance suite
+- scope the §5.9.12 QM arm to its measured win regime
+- *(ctx_update_elect)* adaptive-driver donor election survives trial cloning
+- pin the four r439 election streams — corpus 122 -> 126
+- r439 §5.9.12 quantizer-matrix election + §6.8.14 donor election on the pyramid/SVC drivers
+- r436 segmented loop restoration — the last in-loop pairing, corpus pin 122
+- r436 §6.8.14 donor election on the temporal ladder — freeze-at-first-consumption discipline
+- r436 segmentation pairings — delta-q + CDEF on segmented frames, §7.12.2 seg-bundle fix, corpus pins 120+121
+- r436 §6.8.14 context_update_tile_id election — exact-bytes donor replay, wire patch-back, corpus pin 119
+- r436 per-layer tile layouts + tile-group packaging on the spatial-SVC driver, corpus pin 118
+- *(camera_frame)* the geometry-envelope unit test tracks the r433 2-D grid envelope
+- r429-r433 status — multi-tile write arm, tile-group split framing, non-uniform layouts, spatial SVC, per-unit CDEF/LR, KEY delta-q
+- tile layouts through the pyramid/adaptive + temporal-ladder drivers, §7.3 camera tile GRIDS, corpus pins 116 + 117
+- §5.11.1 multi-tile-group frames (both arms) + §5.9.15 non-uniform tile layouts (write arm)
+- RUST_MIN_STACK=16MiB via .cargo/config [env] — fix windows-debug test stack overflow
+- *(cdef_unit_ab)* isolate the CDEF axis from the §5.9.17 delta-q confound
+- KEY-frame §5.9.17 per-superblock delta-q election + corpus pin 115
+- pin the first multi-tile and first spatially scalable streams (corpus 113 + 114)
+- spatial-scalability write arm — independent spatial layers, spatial_id extension headers, nested §6.7.5 operating points
+- §5.9.15 multi-tile WRITE arm — KEY + generic inter drivers, camera-frame tile columns
+- pin the first temporally scalable stream (corpus 112) — digested at every operating point
+- §7.3 camera-frame write arm — LST material end to end
+- tile list: §5.12 OBU parse/write + the §7.3 large-scale-tile decoding process
+- temporally scalable GOP arm — §6.7.5 operating points + §5.3.3 extension headers on the wire
+- operating-point selection (§5.5.1/§6.7.5) + the §5.3.1 drop_obu rule
+- tier the test matrix — full suite on ubuntu/macos, lib-tests smoke on windows
+- 10-bit depth-axis tripwire — election + byte-exact round trip at BitDepth 10
+- pin the first loop-restoration stream (corpus 111)
+- loop-restoration election — §5.9.20/§5.11.57/§7.17 per-unit Wiener + self-guided with exact-bytes settlement
+- pin the first per-unit CDEF stream (corpus 110)
+- per-64x64 CDEF strengths — cdef_bits > 0 election with exact-bytes settlement
+- seg_qp derives the frame's real bit depth — segmented >8-bit GOPs fix + corpus-109 pin
+
 - §5.9.8 SUPERRES × MULTI-TILE (r447): the election's single-tile-frame scope is lifted — uniform §5.9.15 layouts and §5.11.1 tile-group packaging now ride the superres arm. Each candidate denominator re-validates the layout AT THE DOWNSCALED width (`MiCols` shrinks with the coded width; §7.16 resamples columns only) AND against the Annex A tile-width conformance rule found the hard way: on a `use_superres = 1` frame every non-rightmost tile must be at least 128 luma samples wide — a reference decoder rejected the first draft's 96-wide coded frame split 64 + 32 ("minimum tile width requirement not satisfied"), so candidates whose layout leaves a narrower non-rightmost column are filtered out up front (a 192-wide frame has NO conformant tiled candidate: only 128 / 96 land on multiples of 8, both leaving a 64-wide left tile). EXPLICIT layouts stay out — their per-column superblock widths are bound to the full-width geometry with no defined §5.9.8 remapping. Witnesses (`tests/superres_ab.rs`): a 320×96 two-column GOP elects superres on its KEY (two §5.9.15 tile columns at the coded width, tiled P chain off the upscaled §7.20 reference) and the split-packaged (`OBU_FRAME_HEADER` + two `OBU_TILE_GROUP` OBUs) KEY elects too, both byte-exact through the spec driver. Pin `self-gop-320x96-q180-superres-tiles` (corpus 136 → 137): the first stream pairing `use_superres = 1` with a multi-tile layout, byte-identical through THREE independent black-box reference decoders
 - §5.9.30 `chroma_scaling_from_luma` election (r447): the film-grain ladder's last unelected §5.9.30 field goes on the wire — each fitted AR shape now offers a csfl TWIN beside its per-plane-points candidate: `chroma_scaling_from_luma = 1` codes NO chroma points and no mult/offset fields (the §7.18.3.4 scaling lookup reads the LUMA points for all three planes; the §7.18.3.5 blend indexes the chroma noise at the co-located average luma), while the chroma AR coefficient lists still ride the §5.9.30 `chroma_scaling_from_luma || num_cb_points` gates — so the whole per-plane point surface is saved exactly where the chroma noise amplitude TRACKS luma. Offered only when BOTH chroma noise gates fire (csfl synthesizes grain on both planes), settled by the same neutrality score + strictly-fewer-bytes-per-candidate mandate: on luma-tracking three-plane noise the csfl lag-1 candidate wins (measured 670 B vs 763 B for the points shape at a better score) and on the r444 witness content (chroma noise ≫ luma) the amplitude-mismatch terms keep the points shape elected — that stream is unchanged. Witness (`tests/film_grain_ab.rs`): csfl lands on the wire (no points, csfl flag parsed back) and the grained output decodes bit-exact through the §7.18.3 synthesis mirror. Pin `self-gop-128x96-q60-film-grain-csfl` (corpus 135 → 136): the corpus's first `chroma_scaling_from_luma = 1` stream, byte-identical through THREE independent black-box reference decoders
 - §5.9.2 SWITCH FRAMES (r447): the encoder's first `frame_type = SWITCH_FRAME` write arm — `GopTuning::s_frame_period` codes every N-th inter frame as the spec's chunk-boundary switch frame (the § "Switch Frame" streaming shape: overwrite all eight §7.20 slots WITHOUT intra coding so a same-geometry stream can splice its temporal units in at the boundary). Wire shape per §5.9.2, all four inferred fields bit-free: `error_resilient_mode = 1`, `frame_size_override_flag = 1` (the frame size codes EXPLICITLY — the `frame_size_with_refs` branch is bypassed under error resilience), `refresh_frame_flags = allFrames`, `primary_ref_frame = PRIMARY_REF_NONE` (per-frame default CDFs), plus the coded §5.9.2 `ref_order_hint[ i ]` block over the TRUE slot hints (each value must equal the decoder's stored `RefOrderHint[ i ]` — the GOP driver now tracks the all-slot-refresh FLOOR so slots outside the two-slot rotation surface the last SWITCH/KEY hint) and the error-resilient derivations `use_ref_frame_mvs = 0` (no §7.9 projection on either twin) and `allow_warped_motion = 0` — the last one found the hard way: the search ladder initially kept the warp arm while the parser inferred 0, collapsing the reader's §5.11.27 3-way `motion_mode` S() to the 2-way `use_obmc` and desyncing the arithmetic decoder mid-tile. After an S-frame the driver re-anchors everything: the §7.20 motion-field store, the r423 carry and the §6.8.14 donor-patch unit ordinals land in ALL eight slots, GOLDEN resolves to `max(floor, k - 2)`, and the S-frame itself still rides every frame-level election (hp-mv / delta-q / QM / CDEF / LR replay elections, tiles + tile groups, film-grain headers). `tests/s_frames.rs`: cadence GOPs byte-exact through the spec driver (lossy + lossless == input), the SWITCH header shape parsed back off the wire, tiles + elections composition, and a CROSS-RATE SPLICE witness — §7.5 units 0..3 of the q60 encode + units 3.. of the q140 encode decode end-to-end (the §5.9.2 parse-independence contract), byte-identical through THREE independent black-box reference decoders on the spliced bytes
