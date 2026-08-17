@@ -608,6 +608,20 @@ pub(crate) fn grain_seed_for(order_hint: u32) -> u16 {
 ///   `cb_luma_mult = 128`, `cb_offset = 256` — §7.18.3 then derives
 ///   `merged = orig`), so the bins index the chroma sample directly.
 ///
+/// r447 adds the third §5.9.30 chroma shape:
+///
+/// * **`chroma_scaling_from_luma`** (`csfl`) — chroma rides the LUMA
+///   scaling function (§7.18.3.4 `get_x`/`get_y` read the luma
+///   points for every plane; the §7.18.3.5 blend indexes it at the
+///   co-located average luma), so `num_cb_points = num_cr_points =
+///   0` and the mult/offset fields never reach the wire — the whole
+///   per-plane point surface is saved where the chroma noise
+///   amplitude tracks luma. The chroma AR coefficient lists are
+///   still coded per the §5.9.30 `chroma_scaling_from_luma ||
+///   num_cb_points` gates (the fitted taps land exactly as on the
+///   points arm). Mutually exclusive with `chroma_cb` / `chroma_cr`
+///   (caller bug otherwise).
+///
 /// Every probe is the decoder's OWN §7.18.3 synthesis on a flat
 /// mid-gray patch — requested amplitudes land in output units.
 #[must_use]
@@ -621,7 +635,12 @@ pub(crate) fn build_grain_params(
     ar: Option<&ArFit>,
     chroma_cb: bool,
     chroma_cr: bool,
+    csfl: bool,
 ) -> FilmGrainParams {
+    debug_assert!(
+        !(csfl && (chroma_cb || chroma_cr)),
+        "chroma_scaling_from_luma replaces the per-plane point surface"
+    );
     let mut fg = FilmGrainParams::reset();
     fg.apply_grain = true;
     fg.update_grain = true;
@@ -630,12 +649,13 @@ pub(crate) fn build_grain_params(
     fg.ar_coeff_shift = 6;
     fg.grain_scale_shift = 0;
     fg.overlap_flag = true;
+    fg.chroma_scaling_from_luma = csfl;
     if let Some(fit) = ar {
         fg.ar_coeff_lag = fit.lag;
         for (i, &c) in fit.y.iter().enumerate() {
             fg.ar_coeffs_y_plus_128[i] = (c + 128) as u8;
         }
-        if chroma_cb || chroma_cr {
+        if chroma_cb || chroma_cr || csfl {
             for (i, &c) in fit.cb.iter().enumerate() {
                 fg.ar_coeffs_cb_plus_128[i] = (c + 128) as u8;
             }
@@ -916,8 +936,8 @@ mod tests {
     /// point scaling roughly doubles the realized sigma.
     #[test]
     fn calibration_is_positive_and_scaling_monotone() {
-        let lo = build_grain_params(&est_flat(16, 0), 8, 1, 1, 2, None, false, false);
-        let hi = build_grain_params(&est_flat(32, 0), 8, 1, 1, 2, None, false, false);
+        let lo = build_grain_params(&est_flat(16, 0), 8, 1, 1, 2, None, false, false, false);
+        let hi = build_grain_params(&est_flat(32, 0), 8, 1, 1, 2, None, false, false, false);
         assert!(lo.point_y_scaling[0] > 0);
         assert!(hi.point_y_scaling[0] > lo.point_y_scaling[0]);
     }
@@ -927,7 +947,7 @@ mod tests {
     /// lands the fitted taps on the parameter block.
     #[test]
     fn chroma_points_and_ar_taps_land() {
-        let fg = build_grain_params(&est_flat(24, 12), 8, 1, 1, 2, None, true, true);
+        let fg = build_grain_params(&est_flat(24, 12), 8, 1, 1, 2, None, true, true, false);
         assert_eq!(fg.num_cb_points, 4);
         assert_eq!(fg.num_cr_points, 4);
         assert_eq!(fg.point_cb_value[..4], [32, 96, 160, 224]);
@@ -939,7 +959,7 @@ mod tests {
             cb: vec![5, -6, 7, 8, 32],
             cr: vec![0, 0, 0, 0, -32],
         };
-        let fg = build_grain_params(&est_flat(24, 12), 8, 1, 1, 2, Some(&ar), true, true);
+        let fg = build_grain_params(&est_flat(24, 12), 8, 1, 1, 2, Some(&ar), true, true, false);
         assert_eq!(fg.ar_coeff_lag, 1);
         assert_eq!(fg.ar_coeffs_y_plus_128[..4], [138, 108, 158, 168]);
         assert_eq!(fg.ar_coeffs_cb_plus_128[4], 160, "luma-corr tap last");

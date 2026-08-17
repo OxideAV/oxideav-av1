@@ -12541,3 +12541,50 @@ fn self_encoded_cross_rate_s_frame_splice_decodes_byte_exact() {
         6,
     );
 }
+
+// ---------------------------------------------------------------------
+// r447: FILM GRAIN with `chroma_scaling_from_luma` — the corpus's
+// first `chroma_scaling_from_luma = 1` stream. Every §5.9.30 block
+// codes NO chroma points and no mult/offset fields; the §7.18.3.4
+// scaling lookup reads the LUMA points for all three planes and the
+// §7.18.3.5 blend indexes the chroma noise at the co-located average
+// luma, with the fitted lag-1 chroma AR coefficient lists (still
+// coded under the §5.9.30 csfl gate) carrying the luma-correlation
+// tap.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q60_FILM_GRAIN_CSFL_IVF: &str = concat!(
+    "444b4946000020004156303180006000190000000100000004000000000000004f0100000000",
+    "00000000000012000a0a0000000337fbe5dfcc0632be02160021e0380003070c0aa3db020486",
+    "048a048e04b2047604fa049e04916f67756a6f68766c816e6775698508dc4211ac996b41cfd2",
+    "a91c2f79bb85c8917dc0d1858cc613902ecfd1c763e20da7601ba5b5b41ffe6239ce244d648b",
+    "77fecba407bde6c5d552a38909de3a19e1c535a6275547efcece844be3caa1cf03509d6cae41",
+    "e5d1482976190aa0eb86d940b3548de5102e56acca4928d4556888b1084c05f2b2450ac77d74",
+    "d46ff416c3319142168f506c1bef7a8425b46c99a6f7bbe97357700f2e1b52a3e0a2f3236491",
+    "fd4e2269b7324731e6cf7e03c7652ae0808f152368c6acfc1aec2880f92cb93c05e88a5c1f30",
+    "fb2301b8ff96173b356b25448f07bc2d7a6e8c10db2c04f0c53e4d9625285d99edbe651e3e39",
+    "61c578d472ad7d60a9c063c39e702d6a812e29e79c89151e773ed4e5d51a426e15460e0d307e",
+    "00000001000000000000001200327a320100224824bd0f01c00019fe60700f812604090c0914",
+    "091c096408ec09f4093c0922deceead4ded0ecd902dcceead30a10dc1a79ee71123038c6793e",
+    "910a34e1d16d13fc953f7e09e2add6801ed52742fada865ba894f223b0afab326646f552d5d3",
+    "8f95be2c272a08e50307add1d36d041bb19f29732154f8490000000200000000000000120032",
+    "453202004001003d0f000000000003c031cb7810243024502470259023b027d024f0248b7b3b",
+    "ab537b43b3640b733bab4c2840cadc28f5a1cfd8a466b4bd8aef14e6028d6b19380000000300",
+    "000000000000120032343203002248249d0f000000000003c025925810243024502470259023",
+    "b027d024f0248b7b3bab537b43b3640b733bab4c2840849c",
+);
+
+/// r447: csfl film-grain GOP (4-frame 128×96 at q60 over
+/// luma-amplitude-tracking three-plane noise; the csfl candidate won
+/// the neutrality score at strictly fewer bytes than every per-plane
+/// points shape) — the digest is the byte-identical output of THREE
+/// independent black-box reference decoders.
+#[test]
+fn self_encoded_film_grain_csfl_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q60-film-grain-csfl",
+        SELF_GOP_128X96_Q60_FILM_GRAIN_CSFL_IVF,
+        "454b97c6dca9d6206dccbc08527234f2adec8ce01ac4684a5cc50e8cb4e4c933",
+        4,
+    );
+}

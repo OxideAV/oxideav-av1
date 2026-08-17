@@ -415,6 +415,74 @@ fn chroma_noise_elects_chroma_points_and_decodes_bit_exact() {
     assert_decodes_to_recons("fg-chroma", &on);
 }
 
+/// r447 — luma-tracking chroma noise elects
+/// `chroma_scaling_from_luma = 1`: when the chroma noise amplitude
+/// matches luma's, the csfl candidate models it through the LUMA
+/// scaling function alone (§7.18.3.4 reads the luma points for every
+/// plane; the §7.18.3.5 blend indexes at the co-located average
+/// luma), saving the whole per-plane point + mult/offset surface on
+/// every header — strictly fewer bytes at a matching amplitude, so
+/// the score + rate mandate settle on it. The grained output decodes
+/// bit-exact (the corpus's first exercise of the csfl synthesis path
+/// on a self-encoded stream).
+#[test]
+fn luma_tracking_chroma_noise_elects_csfl_and_decodes_bit_exact() {
+    let csfl_noisy = |w: u32, h: u32, t: usize| -> Yuv420Frame {
+        let mut f = noisy_frame(w, h, t, 12);
+        let (cw, ch) = ((w as usize) / 2, (h as usize) / 2);
+        let mut state = 0x0bad_5eedu32.wrapping_add((t as u32).wrapping_mul(0x85eb_ca6b));
+        // The SAME amplitude shape as the luma noise (±12) — the csfl
+        // arm's forced luma-LUT amplitude is a match, and the
+        // per-plane point surface buys nothing.
+        let mut rnd = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 23) & 255) as i32 - 128) * 12 / 128
+        };
+        // Smooth chroma base (no sawtooth wrap edges — the residual
+        // against the denoised twin must be the NOISE, not pattern
+        // edges the low-amplitude noise cannot drown).
+        for r in 0..ch {
+            for c in 0..cw {
+                let base_u = 116.0 + 8.0 * (0.05 * (r as f64 + c as f64)).sin();
+                let base_v = 132.0 + 8.0 * (0.04 * (r as f64 * 2.0 + c as f64)).cos();
+                let u = base_u.round() as i32 + rnd();
+                let v = base_v.round() as i32 + rnd();
+                f.u[r * cw + c] = u.clamp(0, 255) as u8;
+                f.v[r * cw + c] = v.clamp(0, 255) as u8;
+            }
+        }
+        f
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| csfl_noisy(128, 96, t)).collect();
+    let on = encode(&frames, 60, true);
+    assert!(
+        on.film_grain_elected,
+        "luma-tracking three-plane noise must elect the grain arm"
+    );
+    let (fg_present, headers) = wire_headers(&on.gop.temporal_units);
+    assert!(fg_present, "sequence gate must open");
+    let fg = headers[0]
+        .film_grain_params
+        .as_ref()
+        .expect("KEY carries the §5.9.30 block");
+    assert!(
+        fg.chroma_scaling_from_luma,
+        "csfl must land on the wire (cb {} cr {} lag {})",
+        fg.num_cb_points, fg.num_cr_points, fg.ar_coeff_lag
+    );
+    assert_eq!(fg.num_cb_points, 0, "§5.9.30: csfl codes no cb points");
+    assert_eq!(fg.num_cr_points, 0, "§5.9.30: csfl codes no cr points");
+    // Field-level audit on the KEY + first P only (later headers'
+    // §5.9.25 gm coefficients recenter against the carried
+    // PrevGmParams, so a stateless parse desyncs before §5.9.30);
+    // the bit-exact decode below is the per-frame witness.
+    for h in headers.iter().take(2) {
+        let fg = h.film_grain_params.as_ref().expect("every header armed");
+        assert!(fg.chroma_scaling_from_luma, "csfl on every frame header");
+    }
+    assert_decodes_to_recons("fg-csfl", &on);
+}
+
 /// Env-gated staging dump (`OXIDEAV_AV1_FG444_DIR`): the r444
 /// AR-taps + chroma-points film-grain stream + expected (grained)
 /// YUV for black-box reference-decoder validation and corpus

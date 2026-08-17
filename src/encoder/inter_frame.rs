@@ -1270,11 +1270,21 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         chroma_cb = false;
         chroma_cr = false;
     }
+    if std::env::var_os("OXIDEAV_AV1_FG_DEBUG").is_some() {
+        eprintln!(
+            "fg-elect gates: cb {} cr {} (sigma16 y {} cb {} cr {})",
+            chroma_cb, chroma_cr, est.sigma16, est.cb_sigma16, est.cr_sigma16
+        );
+    }
     let fit1 = fge::fit_ar_lag(&frames[0], &denoised[0], 1);
     let fit2 = fge::fit_ar_lag(&frames[0], &denoised[0], 2);
     let mut cand_params: Vec<FilmGrainParams> = vec![fge::build_grain_params(
-        &est, bit_depth, ssx, ssy, mc, None, false, false,
+        &est, bit_depth, ssx, ssy, mc, None, false, false, false,
     )];
+    // r447 — the `chroma_scaling_from_luma` shape needs the chroma AR
+    // lists on the wire too, so the white-grain csfl candidate rides
+    // the lag-0 correlation-tap fit exactly like the points arm.
+    let csfl_ok = chroma_cb && chroma_cr;
     let chroma_only: Option<fge::ArFit> = ((chroma_cb || chroma_cr) && fit1.is_none())
         .then(|| fge::fit_chroma_corr(&frames[0], &denoised[0]));
     for fit in [fit1.as_ref(), fit2.as_ref(), chroma_only.as_ref()]
@@ -1290,7 +1300,30 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
             Some(fit),
             chroma_cb,
             chroma_cr,
+            false,
         ));
+        // r447 — the csfl twin of each fitted shape: chroma rides the
+        // LUMA scaling function (§7.18.3.4 reads the luma points for
+        // every plane, the §7.18.3.5 blend indexes it at the
+        // co-located average luma), `num_cb_points = num_cr_points =
+        // 0` and no mult/offset fields — the whole per-plane point
+        // surface is saved where the chroma noise amplitude tracks
+        // luma. Offered only when BOTH chroma gates fire (csfl
+        // synthesizes grain on both planes) and settled by the same
+        // score + strictly-fewer-bytes mandate as every candidate.
+        if csfl_ok {
+            cand_params.push(fge::build_grain_params(
+                &est,
+                bit_depth,
+                ssx,
+                ssy,
+                mc,
+                Some(fit),
+                false,
+                false,
+                true,
+            ));
+        }
     }
     // Perceptually-neutral-rate scoring (see the doc comment above;
     // r444 adds the chroma amplitude terms and a luma
@@ -1419,10 +1452,11 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         let score = score256(d_grain, lambda, (cand.gop.ivf_bytes.len() as u64) * 8 * 256);
         if std::env::var_os("OXIDEAV_AV1_FG_DEBUG").is_some() {
             eprintln!(
-                "fg-elect cand: lag {} cb {} cr {} bytes {} d_grain {} score {} | plain bytes {} d {} score {}",
+                "fg-elect cand: lag {} cb {} cr {} csfl {} bytes {} d_grain {} score {} | plain bytes {} d {} score {}",
                 fg_base.ar_coeff_lag,
                 fg_base.num_cb_points,
                 fg_base.num_cr_points,
+                fg_base.chroma_scaling_from_luma,
                 cand.gop.ivf_bytes.len(),
                 d_grain,
                 score,

@@ -1321,6 +1321,18 @@ self-encoded `ar_coeff_lag > 0` stream), byte-identical through
 three independent black-box reference decoders (corpus 133 with the
 four r444 pins).
 
+r447 closes the ladder's last §5.9.30 field: each fitted AR shape
+offers a `chroma_scaling_from_luma` TWIN — no chroma points, no
+mult/offset fields (§7.18.3.4 reads the LUMA points for all three
+planes; the blend indexes at the co-located average luma), the
+chroma AR lists still coded per the §5.9.30 csfl gates. Offered when
+both chroma noise gates fire, settled by the same score +
+strictly-fewer-bytes mandate: luma-tracking three-plane noise elects
+csfl (670 B vs 763 B for the points shape); chroma-dominant noise
+keeps the points shape via the amplitude-mismatch terms. Pinned:
+`self-gop-128x96-q60-film-grain-csfl` — the corpus's first
+`chroma_scaling_from_luma = 1` stream.
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a
@@ -1399,7 +1411,7 @@ decoders at both operating points.
 - The §5.9.30 film-grain election is plain-GOP-scoped (unsegmented,
   ≥ 2 frames); the AR ladder stops at `ar_coeff_lag = 2` (the lag-3
   ring's 24 + 2×25 coefficient bytes per header never paid on the
-  measured extents) and `chroma_scaling_from_luma` stays unelected.
+  measured extents).
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /
