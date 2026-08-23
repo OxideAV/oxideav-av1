@@ -4,6 +4,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- SEGMENTATION × FILM GRAIN (r450): the §5.9.30 election's unsegmented gate is lifted for plain SEG_LVL_ALT_Q ladders — the grain arm codes the denoised frames under the same §5.9.14 table, so P headers carry BOTH the feature table and the full grain block; ladders carrying a lossless segment keep the plain shape (exactness contract). New witness in `tests/film_grain_ab.rs`; its wire audit now tracks §7.20 reference state across frames (the ref-less parse mis-derived §5.9.22 `skipModeAllowed`'s two-forward fallback and desynced one bit — a harness fix, the streams were always conformant). Pin `self-gop-128x96-q60-seg-film-grain` (corpus 150 → 151), byte-identical through THREE independent black-box reference decoders — the corpus's first segmentation × grain stream
+
 - THREE-operating-point SVC pin (r450): `self-svc3-64-128-q84` — a 3-spatial-layer stream (64×64 / 128×64 / 128×128, §6.7.5 idc `0x701 / 0x301 / 0x101`) whose output at EVERY operating point is byte-identical through two independent black-box reference decoders at that point; new 3-layer staging dump in `tests/spatial_svc.rs`. With the seven external-battery pins, corpus 142 → 150
 
 - §5.9.12 QM × §7.3 camera-frame mode (r450): `encode_camera_frame_yuv420_tiles_qm` arms the quantizer-matrix election on the large-scale-tile write arm — §7.3.1's constraint list never bars `using_qmatrix`, and the §7.3.2 camera-tile decode dequantizes through the same frame header. Witness in `tests/large_scale_tile.rs`: natural-texture camera pair elects the §9.5.3 tables on the ladder, the elected tile reassembles byte-exact through `decode_tile_list`, and the `qm = false` twin stays bit-identical to the historical entry points

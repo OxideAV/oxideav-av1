@@ -13904,3 +13904,51 @@ fn self_encoded_three_layer_spatial_stream_decodes_byte_exact_at_all_three_opera
         3,
     );
 }
+
+// ---------------------------------------------------------------------
+// r450: SEGMENTATION × FILM GRAIN — the corpus's first stream whose
+// P headers carry BOTH a §5.9.14 SEG_LVL_ALT_Q feature table and a
+// full §5.9.30 grain block (the election's unsegmented gate lifted
+// for the plain delta ladder).
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q60_SEG_FILM_GRAIN_IVF: &str = concat!(
+    "444b494600002000415630318000600019000000010000000400000000000000700100000000",
+    "00000000000012000a0a0000000337fbe5dfcc0632df02160021e03800033f000aa3db020306",
+    "030a030e031202f6033a031e0300017067756b08dad434b71d96a22f3220c83d677acf416f9d",
+    "36f7c614eee1bb8862f7530ced9deef0a86f8cb4048447e2ac2cc9433726e0ad4e8fc7ac1f49",
+    "a2ec9fba4daa163736cdc014ae40badca46cf51a0d4e1e14ee55b8d783def8ec528a2538f3c6",
+    "4a61a204fff314bb210598b9dc45fa58e4f8ee14bc2a0ee1fe81c62843fa07f598d8f10fb9a8",
+    "6fd5e21fe7911fadf784c6f7d6e5cfcb43fac102302fb4bccc96d84e1c2ef9e6ed9501a6e986",
+    "0ad4c140e09cead0bf26fdf136a8b6efb1c83bfdc95dce7e6aa111665286df2d9c4304c08e47",
+    "17a4b4f8baf9a592ea4045523b3418861053e491cc4b3ce3a8bfb892640e04354c8a94614d79",
+    "1674f2a238cbb17992fbe5db448a9459415f7749e750004c97103ce500b2c04a3209d4335bbb",
+    "5f4b7be69fe3a2d290b32f707b99861b1f0e5beff9ee84e3eedc13d384252d50980000000100",
+    "0000000000001200329301320100224824bd0f0360001f000000000000000e0000cfc003807c",
+    "093020306030a030e031202f6033a031e0300017067756b080e2b406cc091d48213f690033d7",
+    "7d80c9026886a6469891d4c029202fd3d72060edc306bb11eb828942c7f4483a9857eb3cd4e6",
+    "794c960db1dd07b56d8a8aedb6b1f17858458a64611aee8ee15839514f09de5ee7eb8cbc1bda",
+    "5d210810d15a4200000002000000000000001200323e3202004001001d0f0360001f00000000",
+    "0000000e0000000003c031cb7810183018501870189017b019d018f018000b833bab58409374",
+    "ff711761fe15d2a8470000000300000000000000120032433203002248249d0f0360001f0000",
+    "00000000000e000000000cf009649604060c0614061c062405ec0674063c060002e0ceead610",
+    "d089d39461f1e2059916e0df75e95c",
+);
+
+/// r450: segmentation × film-grain GOP (4-frame 128×96 at q60 under
+/// a two-segment ALT_Q ladder [0, −32]; the grain arm codes the
+/// denoised frames under the SAME §5.9.14 table, every header
+/// carries a full §5.9.30 block with per-frame seeds, and §7.18.3
+/// synthesizes onto the output while the §7.20 chain stays
+/// pre-grain) — the digest is the byte-identical output of THREE
+/// independent black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q60-seg-film-grain/`.
+#[test]
+fn self_encoded_seg_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q60-seg-film-grain",
+        SELF_GOP_128X96_Q60_SEG_FILM_GRAIN_IVF,
+        "7bc7422a1eac1568a1736c2fb971b5334afa3d1869eac2cc6f94e8fd59095b95",
+        4,
+    );
+}

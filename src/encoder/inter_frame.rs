@@ -1244,18 +1244,30 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         explicit_tiles,
         None,
     )?;
-    // r441 — §5.9.30 film-grain election gates: unsegmented lossy
-    // twin-model GOPs of at least two frames (the probe needs a
-    // temporal-decorrelation witness).
+    // r441 — §5.9.30 film-grain election gates: lossy twin-model
+    // GOPs of at least two frames (the probe needs a
+    // temporal-decorrelation witness). r450 lifts the unsegmented
+    // gate for the plain SEG_LVL_ALT_Q ladder: the grain arm codes
+    // the DENOISED frames under the same §5.9.14 table (the KEY of a
+    // segmented GOP is itself unsegmented, so the grain block and
+    // the feature table ride together only on the P headers).
+    // Feature-extra segmentation (SEG_LVL_REF_FRAME / SKIP /
+    // GLOBALMV), lossless regions and exactness demands stay out —
+    // grain synthesis on an exactness-contracted region would break
+    // the pixel contract.
     if !(tuning.film_grain
         && base_q_idx > 0
-        && alt_q.is_empty()
         && regions.is_empty()
         && !auto_detect
         && extras.is_none()
         && tuning.model == RateModel::Twin
         && frames.len() >= 2)
     {
+        return Ok(plain);
+    }
+    // A segmented ladder with any lossless segment keeps the plain
+    // shape (same exactness-contract reasoning as `regions`).
+    if !alt_q.is_empty() && seg_lossless_array(base_q_idx, alt_q).iter().any(|&b| b) {
         return Ok(plain);
     }
     use crate::encoder::film_grain_elect as fge;

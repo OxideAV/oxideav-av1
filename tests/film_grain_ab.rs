@@ -26,7 +26,7 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_extras_tuned, GopTuning, Yuv420Frame};
-use oxideav_av1::frame_header::{parse_frame_header, FrameHeader};
+use oxideav_av1::frame_header::FrameHeader;
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -90,6 +90,12 @@ fn wire_headers(tus: &[Vec<u8>]) -> (bool, Vec<FrameHeader>) {
     let mut seq = None;
     let mut out = Vec::new();
     let mut fg_present = false;
+    // §7.20-tracked reference state: the §5.9.22 skipModeAllowed
+    // derivation (which GATES the skip_mode_present bit) reads the
+    // TRUE per-slot order hints, so a ref-less parse desyncs on any
+    // frame whose slots hold two distinct forward hints (r450 —
+    // caught by the segmented grain witness).
+    let mut ref_info = oxideav_av1::frame_header::RefInfo::default();
     for tu in tus {
         for desc in ObuIter::new(tu) {
             let desc = desc.expect("TU walks");
@@ -100,10 +106,25 @@ fn wire_headers(tus: &[Vec<u8>]) -> (bool, Vec<FrameHeader>) {
                     seq = Some(s);
                 }
                 ObuType::Frame => {
-                    out.push(
-                        parse_frame_header(desc.payload, seq.as_ref().expect("SH precedes"))
-                            .expect("FH parses"),
-                    );
+                    let sq = seq.as_ref().expect("SH precedes");
+                    let fh = oxideav_av1::frame_header::parse_frame_header_with_refs(
+                        desc.payload,
+                        sq,
+                        &ref_info,
+                    )
+                    .expect("FH parses");
+                    let fs = fh.frame_size.as_ref().expect("sized header");
+                    for slot in 0..8 {
+                        if fh.refresh_frame_flags & (1 << slot) != 0 {
+                            ref_info.valid[slot] = true;
+                            ref_info.order_hint[slot] = fh.order_hint;
+                            ref_info.upscaled_width[slot] = fs.upscaled_width;
+                            ref_info.frame_height[slot] = fs.frame_height;
+                            ref_info.frame_type_is_key[slot] =
+                                fh.frame_type == oxideav_av1::frame_header::FrameType::Key;
+                        }
+                    }
+                    out.push(fh);
                 }
                 _ => {}
             }
@@ -542,4 +563,130 @@ fn fg_r444_fixture_staging() {
         yuv.extend_from_slice(&rc.v);
     }
     std::fs::write(root.join("gop-128x96-q60-film-grain-ar.yuv"), &yuv).expect("write yuv");
+}
+
+// ---------------------------------------------------------------------
+// r450 — the §5.9.30 election on SEGMENTED (SEG_LVL_ALT_Q ladder)
+// GOPs: the unsegmented gate is lifted for the plain delta ladder,
+// so a P header may carry BOTH the §5.9.14 feature table and the
+// full §5.9.30 grain block.
+// ---------------------------------------------------------------------
+
+/// Segmented noisy content elects the grain arm: the grain twin
+/// codes the DENOISED frames under the same two-segment ALT_Q
+/// ladder, every P header carries the §5.9.14 table AND the grain
+/// block, and the grained output decodes bit-exact.
+#[test]
+fn segmented_ladder_noise_elects_grain_and_decodes_bit_exact() {
+    let seg_encode = |frames: &[Yuv420Frame], fg: bool| -> oxideav_av1::encoder::TunedGop {
+        encode_gop_yuv420_with_q_seg_extras_tuned(
+            frames,
+            60,
+            &[0, -32],
+            &[],
+            false,
+            None,
+            GopTuning {
+                film_grain: fg,
+                ..GopTuning::default()
+            },
+        )
+        .expect("segmented gop encode")
+    };
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| noisy_frame(128, 96, t, 8)).collect();
+    let on = seg_encode(&frames, true);
+    let off = seg_encode(&frames, false);
+    assert!(
+        on.film_grain_elected,
+        "segmented noisy GOP must elect the grain arm (grain {} B vs plain {} B)",
+        on.gop.ivf_bytes.len(),
+        off.gop.ivf_bytes.len()
+    );
+    assert_decodes_to_recons("seg-fg", &on);
+    let (fg_present, headers) = wire_headers(&on.gop.temporal_units);
+    assert!(fg_present, "sequence gate must open");
+    for (k, fh) in headers.iter().enumerate() {
+        if std::env::var_os("OXIDEAV_AV1_FG_DEBUG").is_some() {
+            eprintln!(
+                "hdr {k}: type {:?} fg {:?} seg_en {:?} temporal {:?} primary {}",
+                fh.frame_type,
+                fh.film_grain_params.as_ref().map(|g| (
+                    g.apply_grain,
+                    g.update_grain,
+                    g.grain_seed
+                )),
+                fh.segmentation_params.as_ref().map(|x| x.enabled),
+                fh.segmentation_params.as_ref().map(|x| x.temporal_update),
+                fh.primary_ref_frame,
+            );
+        }
+        let fg = fh
+            .film_grain_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("frame {k} carries the §5.9.30 block"));
+        assert!(fg.apply_grain, "frame {k}: apply_grain");
+        if k > 0 {
+            let sp = fh
+                .segmentation_params
+                .as_ref()
+                .unwrap_or_else(|| panic!("frame {k} carries the §5.9.14 table"));
+            assert!(
+                sp.enabled,
+                "frame {k}: segmentation and film grain must ride the SAME header"
+            );
+        }
+    }
+    // Clean segmented content keeps the plain shape bit-identical.
+    let clean: Vec<Yuv420Frame> = (0..4).map(|t| clean_frame(128, 96, t)).collect();
+    let c_on = seg_encode(&clean, true);
+    let c_off = seg_encode(&clean, false);
+    assert!(
+        !c_on.film_grain_elected,
+        "clean segmented GOP must not elect"
+    );
+    assert_eq!(
+        c_on.gop.ivf_bytes, c_off.gop.ivf_bytes,
+        "non-elected segmented arm must be bit-identical to the baseline"
+    );
+}
+
+/// Env-gated staging dump (`OXIDEAV_AV1_FG_SEG_DIR`): the
+/// segmentation × film-grain GOP plus expected YUV for black-box
+/// reference-decoder validation and corpus pinning. Inert
+/// otherwise.
+#[test]
+fn fg_seg_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_FG_SEG_DIR") else {
+        eprintln!("OXIDEAV_AV1_FG_SEG_DIR unset — skipping the seg-grain staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let frames: Vec<Yuv420Frame> = (0..4).map(|t| noisy_frame(128, 96, t, 8)).collect();
+    let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
+        &frames,
+        60,
+        &[0, -32],
+        &[],
+        false,
+        None,
+        GopTuning {
+            film_grain: true,
+            ..GopTuning::default()
+        },
+    )
+    .expect("segmented gop encode");
+    assert!(enc.film_grain_elected, "staged GOP must elect");
+    std::fs::write(
+        root.join("gop-128x96-q60-seg-film-grain.ivf"),
+        &enc.gop.ivf_bytes,
+    )
+    .expect("write ivf");
+    let mut yuv: Vec<u8> = Vec::new();
+    for rc in &enc.gop.recon {
+        yuv.extend_from_slice(&rc.y);
+        yuv.extend_from_slice(&rc.u);
+        yuv.extend_from_slice(&rc.v);
+    }
+    std::fs::write(root.join("gop-128x96-q60-seg-film-grain.yuv"), &yuv).expect("write yuv");
 }

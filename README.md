@@ -1366,6 +1366,18 @@ Pinned: `self-gop-96x80-q40-mono-film-grain`,
 first >8-bit and first single-chroma-plane grain streams (corpus
 140).
 
+r450 also lifts the election's UNSEGMENTED gate for the plain
+SEG_LVL_ALT_Q ladder: the grain arm codes the denoised frames under
+the same §5.9.14 table, so a P header carries BOTH the feature
+table and the full §5.9.30 block (ladders with a lossless segment
+keep the plain shape — grain on an exactness-contracted region
+would break the pixel contract). The witness also caught a HARNESS
+desync: the ref-less header parse mis-derived §5.9.22
+`skipModeAllowed` (its two-forward fallback needs true slot hints),
+so the wire audit now tracks §7.20 reference state across frames.
+Pinned: `self-gop-128x96-q60-seg-film-grain` — the corpus's first
+segmentation × grain stream (corpus 151).
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a
@@ -1499,10 +1511,11 @@ corpus stands at 150.
   bound to the full-width geometry), and the §7.3 camera mode is
   SPEC-BARRED from the pairing (§7.3.1 requires
   `enable_superres = 0`).
-- The §5.9.30 film-grain election is plain-GOP-scoped (unsegmented,
-  ≥ 2 frames); the AR ladder stops at `ar_coeff_lag = 2` (the lag-3
-  ring's 24 + 2×25 coefficient bytes per header never paid on the
-  measured extents).
+- The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames; r450
+  admits plain SEG_LVL_ALT_Q ladders — feature-extra segmentation,
+  lossless regions/segments and the pyramid drivers stay out); the
+  AR ladder stops at `ar_coeff_lag = 2` (the lag-3 ring's 24 + 2×25
+  coefficient bytes per header never paid on the measured extents).
 - Intra-block-copy × superres is SPEC-BARRED (§5.9.2 reads
   `allow_intrabc` only when `UpscaledWidth == FrameWidth`), so the
   composition never appears on either side of the crate.
