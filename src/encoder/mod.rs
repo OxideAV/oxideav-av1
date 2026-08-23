@@ -322,7 +322,7 @@ pub use block_mode_info::{
 #[doc(hidden)]
 pub use camera_frame::{
     build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420, encode_camera_frame_yuv420_tiles,
-    CameraFrameEncode,
+    encode_camera_frame_yuv420_tiles_qm, CameraFrameEncode,
 };
 #[doc(hidden)]
 pub use coefficients::{

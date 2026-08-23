@@ -254,6 +254,44 @@ fn spatial_fixture_staging() {
     std::fs::write(root.join(format!("{name}.full.yuv")), &full).expect("write yuv");
 }
 
+/// r450 — env-gated staging dump (`OXIDEAV_AV1_SVC3_DIR`): a
+/// THREE-layer stream + per-operating-point expected YUV for
+/// black-box reference-decoder validation at each of the three
+/// nested §6.7.5 points. Inert otherwise.
+#[test]
+fn spatial_three_layer_fixture_staging() {
+    let Ok(dir) = std::env::var("OXIDEAV_AV1_SVC3_DIR") else {
+        eprintln!("OXIDEAV_AV1_SVC3_DIR unset — skipping the 3-layer staging dump");
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    std::fs::create_dir_all(root).expect("create out dir");
+    let layers = vec![
+        (0..3).map(|t| moving(64, 64, t, 3)).collect::<Vec<_>>(),
+        (0..3).map(|t| moving(128, 64, t, 4)).collect::<Vec<_>>(),
+        (0..3).map(|t| moving(128, 128, t, 5)).collect::<Vec<_>>(),
+    ];
+    let enc = encode_spatial_layered_gop_yuv420_with_q(&layers, 84).expect("3-layer encode");
+    let name = "svc-s3-64-128-q84";
+    std::fs::write(root.join(format!("{name}.ivf")), &enc.ivf_bytes).expect("write ivf");
+    // Per-operating-point expected output: op k keeps spatial layers
+    // 0 ..= 2-k (nested prefixes), shown frames interleaved per
+    // temporal unit in decode order.
+    for k in 0..3usize {
+        let live = 3 - k;
+        let mut yuv: Vec<u8> = Vec::new();
+        for i in 0..3 {
+            for lr in enc.layer_recons.iter().take(live) {
+                let rc = &lr[i];
+                yuv.extend_from_slice(&rc.y);
+                yuv.extend_from_slice(&rc.u);
+                yuv.extend_from_slice(&rc.v);
+            }
+        }
+        std::fs::write(root.join(format!("{name}.op{k}.yuv")), &yuv).expect("write yuv");
+    }
+}
+
 // ---------------------------------------------------------------------
 // r436 — PER-LAYER tile layouts + tile-group packaging.
 // ---------------------------------------------------------------------

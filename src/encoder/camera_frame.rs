@@ -142,6 +142,23 @@ pub fn encode_camera_frame_yuv420_tiles(
     base_q_idx: u8,
     tile_cols_log2: u32,
 ) -> Result<CameraFrameEncode, Error> {
+    encode_camera_frame_yuv420_tiles_qm(input, anchor, base_q_idx, tile_cols_log2, false)
+}
+
+/// r450 — [`encode_camera_frame_yuv420_tiles`] with the §5.9.12
+/// quantizer-matrix ELECTION armed (`qm = true`): §7.3.1's
+/// constraint list never bars `using_qmatrix`, so a camera frame may
+/// ride the elected §9.5.3 dequant tables like any inter frame — the
+/// §7.3.2 camera-tile decode dequantizes through the same frame
+/// header. `qm = false` is bit-identical to the historical shape
+/// (the flat-quantiser default every existing caller keeps).
+pub fn encode_camera_frame_yuv420_tiles_qm(
+    input: &Yuv420Frame,
+    anchor: &Yuv420Frame,
+    base_q_idx: u8,
+    tile_cols_log2: u32,
+    qm: bool,
+) -> Result<CameraFrameEncode, Error> {
     if input.width != anchor.width
         || input.height != anchor.height
         || input.height == 0
@@ -209,10 +226,10 @@ pub fn encode_camera_frame_yuv420_tiles(
         tile_groups: 1,
         collect_donor_cdfs: false,
         elect_donor: false,
-        // r439 — the §7.3 camera-frame shape stays on the flat
-        // quantiser (the frozen-CDF conformance mode keeps its
-        // minimal header surface).
-        qm: false,
+        // r439 — the flat quantiser by default; r450 — the §5.9.12
+        // election may be armed (§7.3.1 never bars `using_qmatrix`,
+        // and the §7.3.2 dequant reads the same frame header).
+        qm,
         explicit_tiles: None,
         film_grain: None,
         s_frame: false,

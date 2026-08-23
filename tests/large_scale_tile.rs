@@ -411,3 +411,101 @@ fn lossless_camera_tile_rows_reproduce_the_source() {
     assert_eq!(out.planes[1], cam.u, "lossless rows: U");
     assert_eq!(out.planes[2], cam.v, "lossless rows: V");
 }
+
+/// r450 — the §5.9.12 QUANTIZER-MATRIX election on the §7.3 camera
+/// arm: §7.3.1's constraint list never bars `using_qmatrix`, so a
+/// textured camera frame may elect the §9.5.3 dequant tables; the
+/// §7.3.2 camera-tile decode dequantizes through the same frame
+/// header and must reproduce the encoder reconstruction
+/// byte-for-byte. The `qm = false` twin stays bit-identical to the
+/// historical flat-quantiser shape.
+#[test]
+fn qm_camera_frame_elects_and_reassembles() {
+    use oxideav_av1::encoder::encode_camera_frame_yuv420_tiles_qm;
+    // "Natural" texture (smooth waves + per-frame re-rolled grain,
+    // the measured QM-election regime from `tests/qm_ab.rs`): the
+    // anchor is the t = 0 field, the view the t = 1 field — the
+    // camera pair motion-compensates the waves but the re-rolled
+    // grain leaves a textured residual a §9.5.3 matrix can reshape.
+    // (The plain `textured`/`camera_view` shift pair's residual is
+    // near-zero — the election correctly stays off there, which the
+    // ladder's non-elected assert also witnesses.)
+    let natural = |t: usize| -> Yuv420Frame {
+        let (w, h) = (128u32, 64u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut f = Yuv420Frame::filled(w, h, 128);
+        let mut lcg = 0x2545_f491u32.wrapping_add((t as u32).wrapping_mul(0x9e37_79b9));
+        let mut noise = vec![0i32; (wu + 32) * (hu + 32)];
+        for n in noise.iter_mut() {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *n = ((lcg >> 24) as i32 & 15) - 8;
+        }
+        for r in 0..hu {
+            for c in 0..wu {
+                let (sr, sc) = (r as f64, (c + 2 * t) as f64);
+                let base = 128.0
+                    + 46.0 * (0.041 * sr).sin() * (0.057 * sc).cos()
+                    + 22.0 * (0.013 * (sr + sc)).sin();
+                let g = noise[(r + t) * (wu + 32) + c + 2 * t];
+                f.y[r * wu + c] = (base as i32 + g).clamp(0, 255) as u8;
+            }
+        }
+        let (cw, ch) = (wu / 2, hu / 2);
+        for r in 0..ch {
+            for c in 0..cw {
+                f.u[r * cw + c] = (120 + ((r + c + t) % 17)) as u8;
+                f.v[r * cw + c] = (132 + ((2 * r + c + t) % 13)) as u8;
+            }
+        }
+        f
+    };
+    let anchor = natural(0);
+    let view = natural(1);
+    // The election is content/q-dependent; walk a small q ladder and
+    // require the arm to fire at least once (measured: it does).
+    let mut elected = None;
+    for &q in &[100u8, 140, 180] {
+        let on = encode_camera_frame_yuv420_tiles_qm(&view, &anchor, q, 0, true)
+            .expect("camera encode (qm armed)");
+        let off = encode_camera_frame_yuv420_tiles_qm(&view, &anchor, q, 0, false)
+            .expect("camera encode (baseline)");
+        let off2 = oxideav_av1::encoder::encode_camera_frame_yuv420(&view, &anchor, q)
+            .expect("historical entry");
+        assert_eq!(
+            off.coded_tile_data, off2.coded_tile_data,
+            "q{q}: qm=false twin must stay bit-identical to the historical shape"
+        );
+        let qp = on
+            .fh
+            .quantization_params
+            .as_ref()
+            .expect("camera header carries q params");
+        if qp.using_qmatrix {
+            elected = Some((q, on));
+            break;
+        }
+        assert_eq!(
+            on.coded_tile_data, off.coded_tile_data,
+            "q{q}: a non-elected qm arm must keep the baseline bytes"
+        );
+    }
+    let (q, e) = elected.expect("textured content must elect QM somewhere on the ladder");
+    // §7.3.2 reassembly at the elected header: one whole-frame tile
+    // (128×64 is a single 2-SB-wide, 1-SB-high §7.3.1 tile row of
+    // two tiles? no — tile_cols_log2 = 0 keeps ONE 128-wide tile).
+    let tl = TileListObu {
+        output_frame_width_in_tiles_minus_1: 0,
+        output_frame_height_in_tiles_minus_1: 0,
+        entries: vec![TileListEntry {
+            anchor_frame_idx: 0,
+            anchor_tile_row: 0,
+            anchor_tile_col: 0,
+            coded_tile_data: e.coded_tile_data.clone(),
+        }],
+    };
+    let out = decode_tile_list(&e.seq, &e.fh, &[anchor_spec_frame(&anchor)], &tl)
+        .unwrap_or_else(|err| panic!("q{q}: QM camera tile decodes: {err:?}"));
+    assert_eq!(out.planes[0], e.recon.y, "q{q}: luma");
+    assert_eq!(out.planes[1], e.recon.u, "q{q}: U");
+    assert_eq!(out.planes[2], e.recon.v, "q{q}: V");
+}

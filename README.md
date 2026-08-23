@@ -1214,7 +1214,11 @@ inside the MEASURED win regime (`base_q_idx` 88..=176, luma extent
 distortion the flat lattice already serves, at very coarse ones it
 essentially never fires): an election-scoping choice, not a
 conformance constraint. Default-on for every conformance-grade
-driver except the §7.3 camera mode; `GopTuning::qm` /
+driver; the §7.3 camera mode arms it through
+`encode_camera_frame_yuv420_tiles_qm` (r450 — §7.3.1's constraint
+list never bars `using_qmatrix`, and the §7.3.2 camera-tile decode
+dequantizes through the same header, witnessed byte-exact in
+`tests/large_scale_tile.rs`); `GopTuning::qm` /
 `PyramidTuning::qm` A/B switches, `tests/qm_ab.rs` harness. Measured
 on the committed natural-texture matrix: up to **−14.85% bytes at
 −0.067 dB** (96×80 q100 GOP) and −5.39% at **+0.20 dB** (128×128
@@ -1452,6 +1456,32 @@ frame-carrying OBU per §7.5. Corpus stream 118
 byte-identical through three independent black-box reference
 decoders at both operating points.
 
+r450 pins the first THREE-operating-point stream:
+`self-svc3-64-128-q84` (64×64 / 128×64 / 128×128 spatial layers,
+§6.7.5 idc masks `0x701 / 0x301 / 0x101`) — every point's output
+byte-identical through two independent black-box reference decoders
+AT THAT POINT (full interleave, two-layer prefix, base layer).
+
+### External tool-combination battery (r450)
+
+The r450 decode-tail sweep (`tests/external_sweep.rs`, an env-gated
+harness that decodes `<name>.ivf` / `<name>.yuv` pairs through the
+public entry and localizes the first diverging frame/plane) ran an
+independent-encoder battery over previously untested pairings —
+every stream decoded byte-exact on the FIRST run, zero fixes
+needed, and all seven are pinned: coded
+`error_resilient_mode` inter chains with hidden ALTREFs
+(`ext-erm`), frame-parallel CDF freezing
+(`disable_frame_end_update_cdf = 1`, `ext-frame-parallel`),
+film-grain × reference scaling (`ext-grain-resize`), monochrome
+INTER with `show_existing_frame` repeats (`ext-mono-inter`),
+reference scaling × §5.9.8 superres on the SAME frame — two
+downscales, three live extents, inside the 2× conformance bound
+(`ext-resize-ss`), reference scaling × multi-tile
+(`ext-resize-tiles`), and a 4:4:4 10-bit INTER chain
+(`ext-444-10bit-inter`). With the 3-operating-point SVC pin the
+corpus stands at 150.
+
 ### Not yet supported
 
 - No black-box cross-check exists for assembled §5.12 tile-list
@@ -1463,8 +1493,6 @@ decoders at both operating points.
   `anchor_tile_col`.)
 - Delta-q stays off tables carrying a lossless segment
   (conservative §7.12.2-note guard).
-- The §5.9.12 quantizer-matrix election stays off the §7.3
-  camera-frame mode (r441 lifted the segmented-frame gate).
 - The §5.9.8 superres election stays KEY/opener-scoped (inter
   frames never elect a mid-GOP resize); explicit (non-uniform) tile
   layouts keep flat widths (their per-column superblock widths are
@@ -1475,6 +1503,9 @@ decoders at both operating points.
   ≥ 2 frames); the AR ladder stops at `ar_coeff_lag = 2` (the lag-3
   ring's 24 + 2×25 coefficient bytes per header never paid on the
   measured extents).
+- Intra-block-copy × superres is SPEC-BARRED (§5.9.2 reads
+  `allow_intrabc` only when `UpscaledWidth == FrameWidth`), so the
+  composition never appears on either side of the crate.
 - Conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /
