@@ -321,6 +321,46 @@ pub(crate) fn split_whole_frame_body(
     Ok(out)
 }
 
+/// r450 — re-frame a whole-frame §5.11.1 body into ONE tile group
+/// that CODES its span: `tile_start_and_end_present_flag = 1` with
+/// `tg_start = 0`, `tg_end = NumTiles - 1`. Legal §5.11.1 wire on a
+/// multi-tile frame packaged as `OBU_FRAME_HEADER` +
+/// `OBU_TILE_GROUP` (the §5.10 `OBU_FRAME` packing REQUIRES the
+/// flag to be 0, so callers must take the split framing); the
+/// per-tile entropy payloads are byte-identical to the flag-0 body
+/// — only the group prologue changes.
+pub(crate) fn single_group_with_spans(
+    body: &[u8],
+    num_tiles: u32,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    tile_size_bytes: u32,
+) -> Result<Vec<u8>, Error> {
+    if num_tiles <= 1 {
+        // §5.11.1: the flag is not even coded on a single-tile frame.
+        return Ok(body.to_vec());
+    }
+    let parsed = parse_tile_group_obu_body(
+        body,
+        num_tiles,
+        tile_cols_log2,
+        tile_rows_log2,
+        tile_size_bytes,
+    )?;
+    debug_assert_eq!(parsed.tg_start, 0, "whole-frame body expected");
+    debug_assert_eq!(parsed.tg_end + 1, num_tiles, "whole-frame body expected");
+    write_tile_group_obu(&TileGroupObu {
+        num_tiles,
+        tile_cols_log2,
+        tile_rows_log2,
+        tile_size_bytes,
+        tg_start: 0,
+        tg_end: num_tiles - 1,
+        start_and_end_present: true,
+        tiles: parsed.tiles,
+    })
+}
+
 /// Parser counterpart for round-trip tests: walks a §5.11.1
 /// `tile_group_obu` body and surfaces the same fields the writer
 /// emitted. Lives next to the writer because no production caller

@@ -1389,6 +1389,39 @@ Pinned: `self-gop-96x64-q80-sframes` (the corpus's first
 switch frame's symbols decoding against reference samples coded at
 a different rate) — corpus 135.
 
+### Coded error resilience: mid-GOP re-anchor frames (r450)
+
+`GopTuning::error_resilient_period` codes every N-th inter frame
+with the §5.9.2 `error_resilient_mode` f(1) set — the SWITCH
+frame's re-anchor semantics WITHOUT the switch shape: the frame
+stays a plain INTER frame (ordinary single-slot
+`refresh_frame_flags`, references predicting across the boundary,
+every frame-level election riding), but every cross-frame DECODE
+dependency resets: §5.9.2 infers `primary_ref_frame =
+PRIMARY_REF_NONE` (the f(3) is not coded — default CDFs +
+`setup_past_independence`), `use_ref_frame_mvs = 0` and
+`allow_warped_motion = 0` (neither f(1) coded), the
+`ref_order_hint[]` block goes on the wire over the true §7.20 slot
+hints (a mismatch marks the slot invalid), and the writer bypasses
+`frame_size_with_refs`. Witnesses (`tests/error_resilient.rs`):
+cadence GOPs byte-exact (lossy + lossless), the coded shape parsed
+back off the wire, composition with the SWITCH cadence and with
+tiles/elections. Pinned: `self-gop-96x80-q72-erm` — the corpus's
+first CODED `error_resilient_mode = 1` stream (corpus 141).
+
+### Explicit tile spans: the §5.11.1 flag-1 single group (r450)
+
+`GopTuning::tile_spans` closes a read-only wire shape:
+`tile_start_and_end_present_flag = 1` on a SINGLE tile group
+covering the whole frame (`tg_start = 0`, `tg_end = NumTiles − 1`).
+§5.10 requires the flag to be 0 inside an `OBU_FRAME`, so the arm
+takes the split packaging — `OBU_FRAME_HEADER` + one
+`OBU_TILE_GROUP` coding its span. The per-tile entropy payloads are
+byte-identical to the flag-0 twin (witnessed), single-tile frames
+and `tile_groups > 1` splits stay bit-identical to their baselines,
+and the shape decodes byte-exact (`tests/tile_spans.rs`). Pinned:
+`self-gop-128x128-q100-tilespans` (corpus 142).
+
 ### Spatial scalability: the SVC write arm (r431)
 
 `encode_spatial_layered_gop_yuv{,420}_with_q` codes 2..=4
@@ -1428,8 +1461,6 @@ decoders at both operating points.
   in multiples of 64 force one §7.3.1-conformant tile row per
   superblock row, addressed via `anchor_tile_row` /
   `anchor_tile_col`.)
-- `tile_start_and_end_present_flag = 1` single-group frames are
-  read but never emitted.
 - Delta-q stays off tables carrying a lossless segment
   (conservative §7.12.2-note guard).
 - The §5.9.12 quantizer-matrix election stays off the §7.3

@@ -795,6 +795,11 @@ pub(crate) struct KeyExtras<'a> {
     /// per-tile entropy payloads are byte-identical either way — only
     /// the §5.2 OBU framing changes.
     pub tile_groups: u32,
+    /// r450 — see [`crate::encoder::inter_frame::GopTuning::tile_spans`]:
+    /// a single-group multi-tile KEY codes
+    /// `tile_start_and_end_present_flag = 1` under the split
+    /// (`OBU_FRAME_HEADER` + `OBU_TILE_GROUP`) framing.
+    pub tile_spans: bool,
     /// r433 — §5.9.15 NON-UNIFORM (explicit) tile layout: per-column
     /// widths and per-row heights in superblock units
     /// (`uniform_tile_spacing_flag = 0` on the wire, coded through
@@ -1090,6 +1095,7 @@ pub(crate) fn encode_key_frame_yuv_full(
     let flat_extras = KeyExtras {
         tiles: extras.tiles,
         tile_groups: extras.tile_groups,
+        tile_spans: extras.tile_spans,
         explicit_tiles: extras.explicit_tiles,
         seq_override: extras.seq_override,
         intra_only_refresh: extras.intra_only_refresh,
@@ -2239,16 +2245,31 @@ fn encode_key_frame_yuv_core(
     //     `tg_start ..= tg_end` slices (§6.10.1).
     let sh_body = write_sequence_header_obu(&seq);
     let effective_groups = extras.tile_groups.clamp(1, num_tiles);
-    let temporal_unit_bytes = if effective_groups > 1 {
+    // r450 — `extras.tile_spans` forces the split framing on a
+    // single-group multi-tile frame so the group can CODE its span
+    // (`tile_start_and_end_present_flag = 1`; the §5.10 `OBU_FRAME`
+    // packing requires the flag to be 0).
+    let spans_split = extras.tile_spans && effective_groups == 1 && num_tiles > 1;
+    let temporal_unit_bytes = if effective_groups > 1 || spans_split {
         let fh_payload = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
-        let tg_bodies = crate::encoder::tile_group_obu::split_whole_frame_body(
-            &tile_group_body,
-            num_tiles,
-            ti.tile_cols_log2,
-            ti.tile_rows_log2,
-            u32::from(ti.tile_size_bytes),
-            effective_groups,
-        )?;
+        let tg_bodies = if spans_split {
+            vec![crate::encoder::tile_group_obu::single_group_with_spans(
+                &tile_group_body,
+                num_tiles,
+                ti.tile_cols_log2,
+                ti.tile_rows_log2,
+                u32::from(ti.tile_size_bytes),
+            )?]
+        } else {
+            crate::encoder::tile_group_obu::split_whole_frame_body(
+                &tile_group_body,
+                num_tiles,
+                ti.tile_cols_log2,
+                ti.tile_rows_log2,
+                u32::from(ti.tile_size_bytes),
+                effective_groups,
+            )?
+        };
         let mut obus = vec![ObuFrame::new(ObuType::FrameHeader, fh_payload)];
         obus.extend(
             tg_bodies

@@ -359,6 +359,8 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             qm: true,
             film_grain: None,
             s_frame: false,
+            error_resilient: false,
+            tile_spans: false,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -720,6 +722,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // packaging (validated against ITS dimensions).
             tiles: tiles_of(s),
             tile_groups,
+            tile_spans: false,
             explicit_tiles: None,
             seq_override: Some(&seq),
             // Layer 0: a true KEY (refreshes ALL slots — §5.9.2
@@ -861,6 +864,8 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 qm: true,
                 film_grain: None,
                 s_frame: false,
+                error_resilient: false,
+                tile_spans: false,
             };
             let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
                 &layer[i],

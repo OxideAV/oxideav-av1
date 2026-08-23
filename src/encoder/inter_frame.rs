@@ -876,6 +876,30 @@ pub struct GopTuning {
     /// temporal units in at that boundary. `0` keeps the all-P shape
     /// (bit-identical).
     pub s_frame_period: u32,
+    /// r450 — §5.9.2 CODED error-resilient cadence: every
+    /// `error_resilient_period`-th inter frame (display positions
+    /// `error_resilient_period, 2·error_resilient_period, …`;
+    /// S-frame positions keep the SWITCH shape — the flag is
+    /// inferred there) codes `error_resilient_mode = 1` on the wire
+    /// while staying a plain INTER frame: normal
+    /// `refresh_frame_flags`, references predicting across the
+    /// boundary, every frame-level election still riding — but every
+    /// cross-frame DECODE dependency (CDFs, motion fields, segment
+    /// ids, loop-filter deltas, gm carry) re-anchors at per-frame
+    /// defaults, the §5.9.2 `ref_order_hint[]` block goes on the
+    /// wire, and `use_ref_frame_mvs = allow_warped_motion = 0` per
+    /// the parse-side inferences. `0` = never (the default).
+    pub error_resilient_period: u32,
+    /// r450 — §5.11.1 EXPLICIT tile spans: on multi-tile frames the
+    /// single tile group codes `tile_start_and_end_present_flag = 1`
+    /// with its full `tg_start = 0 ..= tg_end = NumTiles − 1` span,
+    /// packaged as `OBU_FRAME_HEADER` + `OBU_TILE_GROUP` (the §5.10
+    /// `OBU_FRAME` packing requires the flag to be 0). The per-tile
+    /// entropy payloads are byte-identical to the flag-0 shape —
+    /// only the OBU framing and the group prologue change. Inert on
+    /// single-tile frames and when `tile_groups > 1` already splits
+    /// the frame (each split group codes the flag anyway).
+    pub tile_spans: bool,
 }
 
 impl Default for GopTuning {
@@ -897,6 +921,8 @@ impl Default for GopTuning {
             superres: true,
             film_grain: true,
             s_frame_period: 0,
+            error_resilient_period: 0,
+            tile_spans: false,
         }
     }
 }
@@ -1599,6 +1625,7 @@ fn encode_gop_yuv_core_fg(
             // the GOP-wide §5.11.1 tile-group packaging.
             tiles: tuning.tiles,
             tile_groups: tuning.tile_groups,
+            tile_spans: tuning.tile_spans,
             explicit_tiles,
             // r431 — the KEY frame rides the same §5.9.17 delta-q
             // switch as the P-frames; r439 — and the §5.9.12 QM
@@ -1682,6 +1709,12 @@ fn encode_gop_yuv_core_fg(
         // r447 — the §5.9.2 SWITCH-frame cadence (see
         // [`GopTuning::s_frame_period`]).
         let is_s = tuning.s_frame_period > 0 && p_index % tuning.s_frame_period == 0;
+        // r450 — the CODED error-resilient cadence (see
+        // [`GopTuning::error_resilient_period`]); an S-frame position
+        // keeps the SWITCH shape (the flag is inferred there).
+        let is_er = !is_s
+            && tuning.error_resilient_period > 0
+            && p_index % tuning.error_resilient_period == 0;
         let prev = recon.last().expect("at least the KEY recon");
         // GOLDEN's slot holds frame `max(floor, p_index - 2)` (the
         // rotation refresher, unless the floor frame overwrote every
@@ -1691,7 +1724,7 @@ fn encode_gop_yuv_core_fg(
         // `p_index & 1`, holding frame `p_index - 1`. r447 — a
         // SWITCH frame is error-resilient: PRIMARY_REF_NONE by
         // §5.9.2 inference, so no carry is consumed.
-        let primary = if tuning.primary_ref && !is_s {
+        let primary = if tuning.primary_ref && !is_s && !is_er {
             Some(carry_store[(p_index & 1) as usize].clone())
         } else {
             None
@@ -1727,11 +1760,13 @@ fn encode_gop_yuv_core_fg(
             tuning.lr,
             tuning.tiles,
             tuning.tile_groups,
+            tuning.tile_spans,
             explicit_tiles,
             donor_armed,
             p_fg.as_ref(),
             floor,
             is_s,
+            is_er,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -2058,6 +2093,28 @@ pub(crate) struct InterFrameConfig<'a> {
     /// `primary_ref_frame = PRIMARY_REF_NONE`, no `primary_carry`
     /// and no `alt_primaries` (caller bug otherwise).
     pub s_frame: bool,
+    /// r450 — code this frame as a regular INTER frame with the
+    /// §5.9.2 `error_resilient_mode` f(1) CODED as 1 (unlike a
+    /// SWITCH frame, where the flag is inferred bit-free): the
+    /// parse-side inferences follow — `primary_ref_frame =
+    /// PRIMARY_REF_NONE` (the f(3) is not coded; per-frame default
+    /// CDFs + `setup_past_independence`), `use_ref_frame_mvs = 0`
+    /// and `allow_warped_motion = 0` (neither f(1) coded), the
+    /// §5.9.2 `ref_order_hint[]` block fires over the TRUE
+    /// [`Self::slot_hints`], and the writer's `frame_size_with_refs`
+    /// branch is bypassed. Everything else keeps the plain INTER
+    /// shape: `frame_type = INTER`, the ordinary
+    /// `refresh_frame_flags`, the reference SAMPLES still predicting
+    /// across the boundary, and every frame-level election (hp-mv /
+    /// delta-q / QM / CDEF / LR, tiles, film grain) still riding.
+    /// Implied by [`Self::s_frame`]. Requires `primary_ref_frame =
+    /// PRIMARY_REF_NONE`, no `primary_carry` and no `alt_primaries`
+    /// (caller bug otherwise).
+    pub error_resilient: bool,
+    /// r450 — see [`GopTuning::tile_spans`]: single-group multi-tile
+    /// frames code `tile_start_and_end_present_flag = 1` under the
+    /// split (`OBU_FRAME_HEADER` + `OBU_TILE_GROUP`) framing.
+    pub tile_spans: bool,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2172,8 +2229,22 @@ fn build_inter_frame_fh(
         // resilience (the f(1) is not even coded) — the SWITCH-frame
         // arm below flips `error_resilient_mode` on, so mirror the
         // parse-side inference here.
-        use_ref_frame_mvs: seq.enable_order_hint && seq.enable_ref_frame_mvs && !cfg.s_frame,
+        use_ref_frame_mvs: seq.enable_order_hint
+            && seq.enable_ref_frame_mvs
+            && !cfg.error_resilient,
     });
+    // r450 — the CODED error-resilient arm (see
+    // [`InterFrameConfig::error_resilient`]): the §5.9.2 f(1) goes on
+    // the wire as 1 and the parse-side inferences mirror —
+    // `primary_ref_frame = PRIMARY_REF_NONE` (f(3) not coded) and
+    // `allow_warped_motion = 0` (f(1) not coded). The frame stays a
+    // plain INTER frame otherwise (type, refresh, explicit-size
+    // handling untouched — the SWITCH arm below adds its own shape).
+    if cfg.error_resilient {
+        fh.error_resilient_mode = true;
+        fh.primary_ref_frame = PRIMARY_REF_NONE;
+        fh.allow_warped_motion = Some(false);
+    }
     // r447 — the §5.9.2 SWITCH_FRAME shape: the four inferred fields
     // plus the error-resilient derivations (see
     // [`InterFrameConfig::s_frame`]). `frame_size_override_flag = 1`
@@ -2400,6 +2471,8 @@ fn p_frame_config_primary<'a>(
         elect_donor: false,
         explicit_tiles: None,
         s_frame,
+        error_resilient: s_frame,
+        tile_spans: false,
     }
 }
 
@@ -2522,11 +2595,13 @@ fn encode_p_frame_yuv(
     lr: bool,
     tiles: (u32, u32),
     tile_groups: u32,
+    tile_spans: bool,
     explicit_tiles: Option<(&[u32], &[u32])>,
     donor_armed: bool,
     film_grain: Option<&FilmGrainParams>,
     floor: u32,
     s_frame: bool,
+    error_resilient: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -2538,9 +2613,12 @@ fn encode_p_frame_yuv(
     Error,
 > {
     // r447 — a SWITCH frame starts from per-frame default state
-    // (§5.9.2 infers PRIMARY_REF_NONE under error resilience).
-    let primary_carry = if s_frame { None } else { primary_carry };
+    // (§5.9.2 infers PRIMARY_REF_NONE under error resilience);
+    // r450 — so does a CODED error-resilient INTER frame.
+    let error_resilient = error_resilient || s_frame;
+    let primary_carry = if error_resilient { None } else { primary_carry };
     let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry, floor, s_frame);
+    cfg.error_resilient = error_resilient;
     // r441 — the armed §5.9.30 film-grain block for this frame.
     cfg.film_grain = film_grain;
     cfg.allow_temporal_seg = allow_temporal_seg;
@@ -2555,6 +2633,7 @@ fn encode_p_frame_yuv(
     cfg.lr = lr;
     cfg.tiles = tiles;
     cfg.tile_groups = tile_groups;
+    cfg.tile_spans = tile_spans;
     cfg.explicit_tiles = explicit_tiles;
     // r436 — the §6.8.14 donor election arms both directions: this
     // frame ELECTS over its primary's donor set, and COLLECTS its
@@ -2562,7 +2641,10 @@ fn encode_p_frame_yuv(
     // SWITCH frame has no primary to elect over (it still collects:
     // the frames chaining off its slots elect on ITS donor set).
     cfg.collect_donor_cdfs = donor_armed;
-    cfg.elect_donor = donor_armed && !s_frame;
+    // A SWITCH or coded error-resilient frame has no primary to
+    // elect over (it still collects: the frames chaining off its
+    // slots elect on ITS donor set).
+    cfg.elect_donor = donor_armed && !error_resilient;
     let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2649,9 +2731,16 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // (no primary carry — the ordinal is not even coded) and offer no
     // replay candidates (the §5.9.24 recentering baseline is the
     // setup_past_independence default, unique).
-    if cfg.s_frame
-        && (cfg.refresh_frame_flags != ALL_FRAMES_PUB
-            || cfg.primary_ref_frame != PRIMARY_REF_NONE
+    if cfg.s_frame && (cfg.refresh_frame_flags != ALL_FRAMES_PUB || !cfg.error_resilient) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // r450 — every error-resilient frame (SWITCH or coded) starts
+    // from per-frame default state: §5.9.2 infers PRIMARY_REF_NONE
+    // (the ordinal is not even coded) and no replay candidate can
+    // exist (the §5.9.24 recentering baseline is the
+    // setup_past_independence default, unique).
+    if cfg.error_resilient
+        && (cfg.primary_ref_frame != PRIMARY_REF_NONE
             || cfg.primary_carry.is_some()
             || !cfg.alt_primaries.is_empty())
     {
@@ -4285,21 +4374,36 @@ pub(crate) fn encode_inter_frame_generic_gm(
         );
     };
     let effective_groups = cfg.tile_groups.clamp(1, num_tiles);
-    let frame_obus: Vec<ObuFrame> = if effective_groups > 1 {
+    // r450 — `cfg.tile_spans` forces the split framing on a
+    // single-group multi-tile frame so the group can CODE its span
+    // (`tile_start_and_end_present_flag = 1`; the §5.10 `OBU_FRAME`
+    // packing requires the flag to be 0).
+    let spans_split = cfg.tile_spans && effective_groups == 1 && num_tiles > 1;
+    let frame_obus: Vec<ObuFrame> = if effective_groups > 1 || spans_split {
         let fh_payload = {
             let mut bw = crate::encoder::bitwriter::BitWriter::new();
             write_fh_bits(&mut bw);
             bw.trailing_bits_to_alignment();
             bw.finish()
         };
-        let tg_bodies = crate::encoder::tile_group_obu::split_whole_frame_body(
-            &tile_group_body,
-            num_tiles,
-            ti.tile_cols_log2,
-            ti.tile_rows_log2,
-            u32::from(ti.tile_size_bytes),
-            effective_groups,
-        )?;
+        let tg_bodies = if spans_split {
+            vec![crate::encoder::tile_group_obu::single_group_with_spans(
+                &tile_group_body,
+                num_tiles,
+                ti.tile_cols_log2,
+                ti.tile_rows_log2,
+                u32::from(ti.tile_size_bytes),
+            )?]
+        } else {
+            crate::encoder::tile_group_obu::split_whole_frame_body(
+                &tile_group_body,
+                num_tiles,
+                ti.tile_cols_log2,
+                ti.tile_rows_log2,
+                u32::from(ti.tile_size_bytes),
+                effective_groups,
+            )?
+        };
         let mut obus = vec![ObuFrame::new(ObuType::FrameHeader, fh_payload)];
         obus.extend(
             tg_bodies
@@ -9740,10 +9844,12 @@ mod tests {
             true,
             (0, 0),
             1,
+            false,
             None,
             false,
             None,
             0,
+            false,
             false,
         )
         .unwrap();

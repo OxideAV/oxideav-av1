@@ -679,6 +679,8 @@ impl PyramidSession {
                         qm: self.tuning.qm,
                         film_grain: None,
                         s_frame: false,
+                        error_resilient: false,
+                        tile_spans: false,
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
