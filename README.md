@@ -1342,6 +1342,26 @@ keeps the points shape via the amplitude-mismatch terms. Pinned:
 `self-gop-128x96-q60-film-grain-csfl` — the corpus's first
 `chroma_scaling_from_luma = 1` stream.
 
+r450 walks the election across the §6.4.1 chroma/bit-depth axis —
+no encoder change needed beyond witnesses (the estimation runs in
+8-bit-normalized units and the synthesis mirror is the decoder's
+own depth-aware §7.18.3 driver): MONOCHROME grain (the §5.9.30
+header suppresses the `chroma_scaling_from_luma` bit and the whole
+chroma surface; luma-only synthesis; −44 % bytes at amp-12 q40),
+10/12-bit grain (`generate_grain` seeds at the `12 − bit_depth`
+shift, the §7.18.3.4 LUT interpolates through the `bit_depth − 8`
+index split, the blend clips at depth range), and 4:2:2 / 4:4:4
+grain with the per-plane chroma gates UNCOUPLED (the
+both-or-neither rule binds only 4:2:0), putting a legal
+`num_cb_points > 0, num_cr_points == 0` header on the wire.
+Witnesses (`tests/film_grain_formats.rs`) cover mono 8/12-bit,
+4:2:0 10-bit, 4:2:2 Cb-only and 4:4:4 12-bit, all bit-exact.
+Pinned: `self-gop-96x80-q40-mono-film-grain`,
+`self-gop-96x80-q60-10bit-film-grain` and
+`self-gop-96x80-q60-422-cb-film-grain` — the corpus's first mono,
+first >8-bit and first single-chroma-plane grain streams (corpus
+140).
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a

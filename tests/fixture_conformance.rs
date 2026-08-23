@@ -12625,3 +12625,121 @@ fn self_encoded_superres_tiles_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r450: the §5.9.30 FILM-GRAIN election on the §6.4.1 format axis —
+// monochrome (the chroma surface suppressed from the header
+// entirely), 10-bit 4:2:0 (depth-scaled synthesis + LUT
+// interpolation), and 4:2:2 with a SINGLE chroma plane carrying
+// grain (the both-or-neither constraint binds only 4:2:0).
+// ---------------------------------------------------------------------
+
+const SELF_GOP_96X80_Q40_MONO_FILM_GRAIN_IVF: &str = concat!(
+    "444b494600002000415630316000500019000000010000000400000000000000d40000000000",
+    "00000000000012000a0a0000000335f9e5dfcd3032c3011000850380003079547b604090c091",
+    "409dc0924092c0974093c0905bda1d5a82fd505019af66c83010bb020b1421601a322f93bc1d",
+    "853f5f1bcc635d4e74054c4ce225bd3395635ebd3bd8df93a143a191f708d1e15c87d66ab281",
+    "577d4c6f757f79966374db52c002919260d4d689a6b3fe1feff0c00b56ea34afd63bdc4a14c3",
+    "6b3de532af7ca2d39cdec99d85107bcc4791aedb0dfc252e3366664ef34b04e18c13270144b6",
+    "4a351ec24c5511c6af85f397d102e5c7b4813606e55f3356fd13f6804b000000010000000000",
+    "0000120032473002004490497a140e0000003700f812604090c091409dc0924092c0974093c0",
+    "905bda1d5a82c10953c95f33a60af3928381ccc42b82e720eff9d6b9a69a59151e967ec1d936",
+    "604100000002000000000000001200323d3004008002007a14000000007806396f020486048a",
+    "04ee0492049604ba049e0482ded0ead410da0def99607390f909b8593470ddb0f5dea7efb73b",
+    "65803100000003000000000000001200322d3006004490497a140e0000000f009649604090c0",
+    "91409dc0924092c0974093c0905bda1d5a828f3729236efb80",
+);
+
+/// r450: MONOCHROME film-grain GOP (4-frame 96×80 8-bit mono at
+/// q40; every header carries a §5.9.30 block with luma points only —
+/// `mono_chrome` suppresses the `chroma_scaling_from_luma` bit and
+/// the whole chroma point/mult/offset surface; §7.18.3 synthesizes
+/// luma grain on the single output plane while the §7.20 reference
+/// chain stays pre-grain) — the digest is the byte-identical output
+/// of THREE independent black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q40-mono-film-grain/`.
+#[test]
+fn self_encoded_mono_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q40-mono-film-grain",
+        SELF_GOP_96X80_Q40_MONO_FILM_GRAIN_IVF,
+        "b5e54fad768be614c4a4126e017dc66a31d2908e64739bb5c7cbff8f8d74e051",
+        4,
+    );
+}
+
+const SELF_GOP_96X80_Q60_10BIT_FILM_GRAIN_IVF: &str = concat!(
+    "444b494600002000415630316000500019000000010000000400000000000000010100000000",
+    "00000000000012000a0a0000000335f9e5dfce0632f00110008780e0000c1c3c1547b6040a4c",
+    "0a540bdc0a640a6c0a740a7c0a400010d089d3d1c2f0847d13fe89b612197d946a0a8d297c68",
+    "6e35067ceefa6e55158b0983f5fed6811ee0e2bfd385254549252c4577bb3f0e8eb4c5acaf12",
+    "ca9fae066f761e1ff27a5a0090620f2eec05601b42e9cc7e3774cb53eed56e475fab3674cc3d",
+    "fc61d476d025ed7f1b88369b1bb923ea6967c92d3459052d28f4457ebe2c0af1d38345762581",
+    "434dbe438e34d436d13ad58e20b0581c575929cb1c565514b532ef29e069dfdb35fe5c38013b",
+    "6596205254867c0fe1115a0c18b53d049474147401c731983e7c6682b1ca12bdb0c7f05c0000",
+    "000100000000000000120032583002004490497a1e00000193820700f8126040a4c0a540bdc0",
+    "a640a6c0a740a7c0a4000100da5535987f0698083102d51f395c9ebf89cc95559b7647a19e80",
+    "f4b90ad7a41e8aa8bee61ffd86db7ac757fb32fd6caf09001048000000020000000000000012",
+    "0032443004008002007a1e03800003c2707806396f020526052a05ee05320536053a053e0520",
+    "0008d089d3d3d25d56c5bfe57dfc1e0f463d5ecc462ccb0028b0de9b69112ad4804a00000003",
+    "00000000000000120032463006004490497a1e000000168007804b24b020526052a05ee05320",
+    "536053a053e052000080c84ec54c59c4876d0788cf35cb1f26faec3fe442613b2a66d6bab7fa",
+    "c5f0eb0b60",
+);
+
+/// r450: 10-BIT film-grain GOP (4-frame 96×80 10-bit 4:2:0 at q60
+/// with three-plane grain; `generate_grain` seeds at the
+/// `12 − bit_depth (+ grain_scale_shift)` shift, the §7.18.3.4
+/// scaling LUT interpolates through the `bit_depth − 8` index split,
+/// and the §7.18.3.5 blend clips at the 10-bit range; output planes
+/// little-endian) — the digest is the byte-identical output of THREE
+/// independent black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q60-10bit-film-grain/`.
+#[test]
+fn self_encoded_10bit_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q60-10bit-film-grain",
+        SELF_GOP_96X80_Q60_10BIT_FILM_GRAIN_IVF,
+        "d87f29b7bac6247d313e0f1fc152d6bb61175ccbb0d613b1b3361eedf2c5a930",
+        4,
+    );
+}
+
+const SELF_GOP_96X80_Q60_422_CB_FILM_GRAIN_IVF: &str = concat!(
+    "444b494600002000415630316000500019000000010000000400000000000000320100000000",
+    "00000000000012000a0a4000000335f9e5dfcc1832a10210008780e0000c3c3c1547b604060c",
+    "0614065c0624062c0634063c06084058c055406bc05802ded0ead4deceecd30218101008c8c9",
+    "93cc42b30d5998bf53ad7f34192e1d82d5dcf7cfb00583330e687fe4ac03db7e338d2b30954c",
+    "93443db3cf8eea5776b1a1ec4928342eea3aa284f2f8d53b8332f92e20080ddfa11dbed39e94",
+    "efd0eecc92380e6fd5e973a04db8a93d7cdb9eb4cff67df42b9ab56f8207350286ba5ec61626",
+    "842f34e7871e36d6bc52cfc9a82817ea7e2e718c6445a558c3a9a9dbd5ddd1f790fb0bd75816",
+    "fd97bff1d2612ec0bcb0d25f27e424290d6ae1bfdadaaa3bf5878383f9f7a57e15e26b43eaf8",
+    "86ca29163913dca441107fddd0c2dc1d49617fdafc4ce0c4e1a5f895ee6687a2a5d01fc284d4",
+    "e6a6c523969492e09b000000010000000000000012003296013002004490493a1e0380003270",
+    "40e01f024c080c180c280cb80c480c580c680c780c1080b180aa80d780b005bda1d5a9bd9dd9",
+    "a60430202010db275c35aa5fe07f7a3b0ea7430d6f069ca67557f6e1505b6e34e535ce2b458b",
+    "c1fcbfb1d1a0f866a263974a2802a80a8e4bb16d4d6744c735ba1fbb730f2dee5a270d5c6a87",
+    "cbd57313e5d8fa0a6fa51f8518f9a49f39fe577f576380410000000200000000000000120032",
+    "3d3004008002003a1e000000000007806396f020306030a032e03120316031a031e0304202c6",
+    "02aa035e02c016f68756a6f677669810c0808040939c1be04000000003000000000000001200",
+    "323c3006004490493a1e000000000007804b24b020306030a032e03120316031a031e0304202",
+    "c602aa035e02c016f68756a6f677669810c0808040957908",
+);
+
+/// r450: 4:2:2 SINGLE-CHROMA-PLANE film-grain GOP (4-frame 96×80
+/// 8-bit 4:2:2 at q60; luma + Cb carry §5.9.30 scaling points while
+/// `num_cr_points == 0` — legal wire outside 4:2:0, where the
+/// both-or-neither constraint does not bind; §7.18.3 synthesizes
+/// grain on exactly two of the three planes) — the digest is the
+/// byte-identical output of THREE independent black-box reference
+/// decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-96x80-q60-422-cb-film-grain/`.
+#[test]
+fn self_encoded_422_cb_only_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x80-q60-422-cb-film-grain",
+        SELF_GOP_96X80_Q60_422_CB_FILM_GRAIN_IVF,
+        "5b6e709fa6e5b5a8326655bc83ad164212ea8871eb8309d738bdfaee3989dfb2",
+        4,
+    );
+}
