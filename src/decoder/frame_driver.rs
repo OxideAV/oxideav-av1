@@ -1246,14 +1246,36 @@ fn motion_field_estimation(
 /// split via [`FrameHeader::bits_consumed`]). Padding and metadata OBUs
 /// are skipped.
 pub fn decode_av1_spec(input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
-    let reader = IvfReader::new(input).map_err(|_| Error::UnexpectedEnd)?;
-    let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
-    let mut session = SpecDecodeSession::new();
-    let mut out = Vec::new();
-    for record in records {
-        out.extend(session.decode_temporal_unit(&record.payload)?);
+    SpecDecodeSession::new().decode_ivf(input)
+}
+
+/// r452 — default picture-size ceiling (luma samples,
+/// `UpscaledWidth * FrameHeight`) a session accepts before reserving
+/// frame-sized storage.
+///
+/// Annex A §A.3 bounds every DEFINED level's picture by `MaxPicSize`;
+/// the largest defined value (levels 6.0–6.3) is 35 651 584 samples
+/// (16384 × 2176, or 8192 × 4352). For `seq_level_idx = 31`
+/// ("maximum parameters") the spec's note leaves the bound to the
+/// decoder maker, and reserved level indices carry no table row at
+/// all — this crate applies the largest defined `MaxPicSize` uniformly
+/// as its documented ceiling rather than trusting the header's level
+/// field (encoders routinely under-declare it). A header past the
+/// ceiling surfaces [`Error::PictureSizeExceedsLimit`] before any
+/// `MiRows * MiCols` grid or plane buffer is allocated.
+pub const MAX_PICTURE_SIZE: u32 = 35_651_584;
+
+/// The Annex A picture-size gate: `UpscaledWidth * FrameHeight` must
+/// not exceed `cap`. Runs on the parsed header before any frame-sized
+/// reservation.
+fn check_picture_size(fh: &FrameHeader, cap: u32) -> Result<(), Error> {
+    if let Some(fs) = fh.frame_size.as_ref() {
+        let samples = u64::from(fs.upscaled_width) * u64::from(fs.frame_height);
+        if samples > u64::from(cap) {
+            return Err(Error::PictureSizeExceedsLimit);
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// r430 — [`decode_av1_spec`] at an externally selected operating
@@ -1272,15 +1294,9 @@ pub fn decode_av1_spec_at_operating_point(
     input: &[u8],
     operating_point: u8,
 ) -> Result<Vec<SpecFrame>, Error> {
-    let reader = IvfReader::new(input).map_err(|_| Error::UnexpectedEnd)?;
-    let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
     let mut session = SpecDecodeSession::new();
     session.set_operating_point(operating_point)?;
-    let mut out = Vec::new();
-    for record in records {
-        out.extend(session.decode_temporal_unit(&record.payload)?);
-    }
-    Ok(out)
+    session.decode_ivf(input)
 }
 
 /// Cross-packet decode session — the §7.20 reference-frame store, the
@@ -1305,6 +1321,10 @@ pub struct SpecDecodeSession {
     /// `0` = scalability not in use (the §5.3.1 `drop_obu()` arm
     /// never fires).
     op_idc: u16,
+    /// r452 — the picture-size ceiling (luma samples) enforced on
+    /// every parsed frame header before frame-sized storage is
+    /// reserved. Defaults to [`MAX_PICTURE_SIZE`].
+    max_picture_size: u32,
 }
 
 impl Default for SpecDecodeSession {
@@ -1322,7 +1342,45 @@ impl SpecDecodeSession {
             refs: SpecRefState::new(),
             chosen_op: 0,
             op_idc: 0,
+            max_picture_size: MAX_PICTURE_SIZE,
         }
+    }
+
+    /// r452 — lower (or raise) the picture-size ceiling
+    /// ([`MAX_PICTURE_SIZE`] by default) applied to every frame
+    /// header this session parses: a header whose
+    /// `UpscaledWidth * FrameHeight` exceeds `max_samples` is rejected
+    /// with [`Error::PictureSizeExceedsLimit`] before any frame-sized
+    /// buffer is reserved. Memory-constrained hosts (and the fuzz
+    /// harness, which runs under a hard RSS limit) bound their
+    /// worst-case reservation here.
+    pub fn set_max_picture_size(&mut self, max_samples: u32) {
+        self.max_picture_size = max_samples;
+    }
+
+    /// The session's current picture-size ceiling (luma samples).
+    #[must_use]
+    pub fn max_picture_size(&self) -> u32 {
+        self.max_picture_size
+    }
+
+    /// Decode a whole IVF v0 buffer through this session — the
+    /// one-shot [`decode_av1_spec`] walk (every IVF record is one §7.5
+    /// temporal unit) over a caller-configured session, so the
+    /// operating point and picture-size ceiling apply.
+    ///
+    /// ## Errors
+    ///
+    /// [`Error::UnexpectedEnd`] on a malformed IVF wrapper, plus every
+    /// [`Self::decode_temporal_unit`] error surface.
+    pub fn decode_ivf(&mut self, input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
+        let reader = IvfReader::new(input).map_err(|_| Error::UnexpectedEnd)?;
+        let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
+        let mut out = Vec::new();
+        for record in records {
+            out.extend(self.decode_temporal_unit(&record.payload)?);
+        }
+        Ok(out)
     }
 
     /// r430 — select the operating point (§6.7.5) by external means.
@@ -1390,6 +1448,7 @@ impl SpecDecodeSession {
             &mut out,
             self.chosen_op,
             &mut self.op_idc,
+            self.max_picture_size,
         )?;
         Ok(out)
     }
@@ -1594,6 +1653,7 @@ fn decode_temporal_unit_spec(
     out: &mut Vec<SpecFrame>,
     chosen_op: u8,
     op_idc: &mut u16,
+    max_picture_size: u32,
 ) -> Result<(), Error> {
     // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
     // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
@@ -1675,6 +1735,7 @@ fn decode_temporal_unit_spec(
                 }
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
+                check_picture_size(&fh, max_picture_size)?;
                 if fh.show_existing_frame {
                     out.push(output_existing_frame(refs, &fh, s)?);
                     // §7.4 / §7.21: a shown KEY frame re-loads the
@@ -1784,6 +1845,7 @@ fn decode_temporal_unit_spec(
                 pending = None;
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
+                check_picture_size(&fh, max_picture_size)?;
                 let tg_offset = fh.bits_consumed.div_ceil(8);
                 if tg_offset > desc.payload.len() {
                     return Err(Error::UnexpectedEnd);

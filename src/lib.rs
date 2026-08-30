@@ -2457,6 +2457,18 @@ pub enum Error {
     /// not cover the whole frame with
     /// `tile_start_and_end_present_flag == 0` (§6.10.1).
     TileGroupInvalid,
+    /// r452 — a frame header declares a picture whose
+    /// `UpscaledWidth * FrameHeight` exceeds the decoder's picture-size
+    /// ceiling ([`decoder::MAX_PICTURE_SIZE`] by default, or the value
+    /// set through [`decoder::SpecDecodeSession::set_max_picture_size`]).
+    /// Annex A's "maximum parameters" note (level 31) leaves the
+    /// bound to the decoder maker: "a decoder would typically decode
+    /// pictures up to a certain maximum uncompressed picture size ...
+    /// and not decode anything bigger than that". The check runs
+    /// before any frame-sized buffer is reserved, so a hostile header
+    /// cannot commit gigabytes of `MiRows * MiCols` / plane storage
+    /// off a few dozen bytes of input.
+    PictureSizeExceedsLimit,
 }
 
 impl core::fmt::Display for Error {
@@ -2619,6 +2631,10 @@ impl core::fmt::Display for Error {
             Self::TileGroupInvalid => write!(
                 f,
                 "oxideav-av1: tile-group OBU sequence violates the §5.11.1/§6.8.1/§6.10.1 conformance rules (ordering, coverage, or frame-header copy discipline)"
+            ),
+            Self::PictureSizeExceedsLimit => write!(
+                f,
+                "oxideav-av1: UpscaledWidth * FrameHeight exceeds the decoder's picture-size ceiling (Annex A level-31 note; see decoder::MAX_PICTURE_SIZE)"
             ),
         }
     }

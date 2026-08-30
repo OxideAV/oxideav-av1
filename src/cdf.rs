@@ -32798,9 +32798,12 @@ impl PartitionWalker {
                     )
                 };
                 let plane_tx_type = {
-                    // Pull TxTypes[] reads through a closure that
-                    // bypasses the borrow of `self`.
-                    let tx_types_grid = self.tx_types.clone();
+                    // Pull TxTypes[] reads through a closure over a
+                    // shared borrow of the grid (never a copy: the grid
+                    // is `MiRows * MiCols` bytes and this runs once per
+                    // transform block, so a per-block copy is quadratic
+                    // in frame area — the r452 fuzz OOM).
+                    let tx_types_grid = &self.tx_types;
                     let mi_cols = self.mi_cols;
                     let mi_rows = self.mi_rows;
                     compute_tx_type(

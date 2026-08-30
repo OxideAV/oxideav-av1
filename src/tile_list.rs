@@ -664,6 +664,12 @@ pub fn decode_tile_list(
     }
     let output_w = width_in_tiles * geom.tile_width;
     let output_h = height_in_tiles * geom.tile_height;
+    // r452 — the same picture-size ceiling the frame driver applies
+    // (Annex A level-31 note): the output frame is reserved from the
+    // tile-count fields alone, so gate it before the allocation.
+    if u64::from(output_w) * u64::from(output_h) > u64::from(crate::decoder::MAX_PICTURE_SIZE) {
+        return Err(Error::PictureSizeExceedsLimit);
+    }
     let sub_x = u8::from(cc.subsampling_x);
     let sub_y = u8::from(cc.subsampling_y);
     let num_planes = cc.num_planes as usize;

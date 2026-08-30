@@ -1539,8 +1539,12 @@ pipelines.
 `fuzz/` holds three `cargo fuzz` libFuzzer targets, each driving only
 this crate's public Rust API (no external decoder / oracle linked):
 
-- `decode` — attacker bytes through `decode_av1` (IVF → OBU walk →
-  headers → tile / partition / reconstruction).
+- `decode` — attacker bytes through the `SpecDecodeSession` IVF entry
+  (IVF → OBU walk → headers → tile / partition / reconstruction),
+  capped at a 2^20-luma-sample picture ceiling so the harness's RSS
+  limit measures panics rather than legitimate frame storage (the
+  library default is `decoder::MAX_PICTURE_SIZE`, Annex A's largest
+  defined `MaxPicSize`).
 - `obu` — the framing layer in isolation (`parse_leb128`, `parse_obu`,
   `ObuIter`, `parse_sequence_header`).
 - `roundtrip` — derives dimensions from input bytes, encodes a YUV
