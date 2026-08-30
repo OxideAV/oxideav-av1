@@ -56,6 +56,7 @@ use crate::uncompressed_header_tail::{
 };
 use crate::Error;
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
+use std::sync::Arc;
 
 /// One frame decoded by the spec-faithful driver. Planes are surfaced
 /// at their §5.9.8 cropped extents (`FrameWidth` × `FrameHeight` for
@@ -144,7 +145,13 @@ struct SpecRefSlot {
 #[derive(Debug, Clone)]
 struct SpecRefState {
     info: RefInfo,
-    slots: [Option<SpecRefSlot>; NUM_REF_FRAMES as usize],
+    /// r453 — `Arc`-shared: §7.20 stores the SAME immutable payload
+    /// into every slot `refresh_frame_flags` selects (and the §7.21
+    /// show-existing re-store copies a stored one wholesale), so an
+    /// all-refresh KEY frame keeps ONE payload alive instead of
+    /// eight deep copies of planes + grids + CDFs. Nothing mutates a
+    /// stored payload in place.
+    slots: [Option<Arc<SpecRefSlot>>; NUM_REF_FRAMES as usize],
 }
 
 impl SpecRefState {
@@ -802,11 +809,12 @@ fn decode_frame_spec_tiles(
     let mut plane_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_planes);
     let mut plane_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
     for plane in 0..num_planes {
-        let src = walker
-            .curr_frame(plane)
-            .ok_or(Error::PartitionWalkOutOfRange)?;
-        let (rows, cols) = walker
-            .curr_frame_dims(plane)
+        // r453 — MOVE the plane out of the walker (the §7.14/§7.15/
+        // §7.16/§7.17 in-loop passes below operate on these caller-
+        // owned buffers; nothing in the walker reads `CurrFrame`
+        // after the tile walk), saving a full-frame `i32` copy.
+        let (rows, cols, src) = walker
+            .take_curr_frame_plane(plane)
             .ok_or(Error::PartitionWalkOutOfRange)?;
         let (pw, ph) = if plane == 0 {
             (fs.frame_width, fs.frame_height)
@@ -819,7 +827,7 @@ fn decode_frame_spec_tiles(
         if rows < ph || cols < pw {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        plane_bufs.push(src.to_vec());
+        plane_bufs.push(src);
         plane_dims.push((cols, rows));
     }
 
@@ -861,16 +869,22 @@ fn decode_frame_spec_tiles(
     // `UpscaledCurrFrame` — no superres on this path) and the CDEF
     // output (`UpscaledCdefFrame`), so keep the pre-CDEF copy around
     // when restoration is active.
-    let deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
+    let mut deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
         Some(plane_bufs.clone())
     } else {
         None
     };
     if let Some(cdef) = fh.cdef_params.as_ref() {
         if !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited {
-            // §7.15 filters from the deblocked frame into a fresh copy.
-            let src_bufs_data: Vec<Vec<i32>> = plane_bufs.clone();
-            let mut src_owned = src_bufs_data;
+            // §7.15 filters from the deblocked frame. r453 — when
+            // §7.17 is active the `deblocked` copy above IS that
+            // frame (CDEF only reads its source), so borrow it
+            // instead of cloning a third full-frame buffer.
+            let mut fallback: Option<Vec<Vec<i32>>> = None;
+            let src_owned: &mut Vec<Vec<i32>> = match deblocked {
+                Some(ref mut d) => d,
+                None => fallback.insert(plane_bufs.clone()),
+            };
             let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
                 src.push(PlaneBuffer {
@@ -902,7 +916,6 @@ fn decode_frame_spec_tiles(
     // CDEF output (`plane_bufs` → UpscaledCdefFrame) and the post-
     // deblock copy (`deblocked` → UpscaledCurrFrame), ahead of loop
     // restoration. No-op when `use_superres == 0`.
-    let mut deblocked = deblocked;
     if fs.use_superres && fs.upscaled_width > fs.frame_width {
         let sr_ctx = crate::superres::SuperresFrameContext {
             use_superres: true,
@@ -1468,10 +1481,10 @@ impl SpecDecodeSession {
 fn reference_frame_update(
     refs: &mut SpecRefState,
     fh: &FrameHeader,
-    decoded: &DecodedFrameInternal,
-) -> Result<(), Error> {
+    decoded: DecodedFrameInternal,
+) -> Result<SpecFrame, Error> {
     if fh.refresh_frame_flags == 0 {
-        return Ok(());
+        return Ok(decoded.frame);
     }
     let fs = fh
         .frame_size
@@ -1506,24 +1519,40 @@ fn reference_frame_update(
             [[0i16; crate::uncompressed_header_tail::SEG_LVL_MAX];
                 crate::uncompressed_header_tail::MAX_SEGMENTS],
         ));
-    let payload = SpecRefSlot {
-        planes: decoded.ref_planes.clone(),
-        plane_dims: decoded.ref_plane_dims.clone(),
-        mf_mvs: decoded.mf_mvs.clone(),
-        mf_ref_frames: decoded.mf_ref_frames.clone(),
-        saved_order_hints: decoded.order_hints_by_ref,
-        mi_rows: decoded.mi_rows,
-        mi_cols: decoded.mi_cols,
+    // r453 — the payload MOVES out of the decode result (the surfaced
+    // output frame is a separate buffer) and is Arc-shared across the
+    // selected slots.
+    let DecodedFrameInternal {
+        frame,
+        ref_planes,
+        ref_plane_dims,
+        mf_mvs,
+        mf_ref_frames,
+        order_hints_by_ref,
+        end_cdfs,
+        mi_rows,
+        mi_cols,
+        segment_ids,
+        grain_params,
+    } = decoded;
+    let payload = Arc::new(SpecRefSlot {
+        planes: ref_planes,
+        plane_dims: ref_plane_dims,
+        mf_mvs,
+        mf_ref_frames,
+        saved_order_hints: order_hints_by_ref,
+        mi_rows,
+        mi_cols,
         frame_is_intra: fh.frame_is_intra,
         frame_type_is_key: matches!(fh.frame_type, crate::frame_header::FrameType::Key),
-        bit_depth: decoded.frame.bit_depth,
-        cdfs: decoded.end_cdfs.clone(),
+        bit_depth: frame.bit_depth,
+        cdfs: end_cdfs,
         gm_params,
         lf_ref_deltas,
         lf_mode_deltas,
-        segment_ids: decoded.segment_ids.clone(),
-        grain_params: decoded.grain_params.clone(),
-    };
+        segment_ids,
+        grain_params,
+    });
     for i in 0..NUM_REF_FRAMES as usize {
         if (fh.refresh_frame_flags >> i) & 1 != 0 {
             refs.info.valid[i] = true;
@@ -1539,10 +1568,10 @@ fn reference_frame_update(
             refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
             refs.info.saved_seg_feature_active[i] = seg_active;
             refs.info.saved_seg_feature_data[i] = seg_data;
-            refs.slots[i] = Some(payload.clone());
+            refs.slots[i] = Some(Arc::clone(&payload));
         }
     }
-    Ok(())
+    Ok(frame)
 }
 
 /// §7.21-adjacent `show_existing_frame` output: surface the stored
@@ -1827,9 +1856,9 @@ fn decode_temporal_unit_spec(
                 if parsed.tg_end + 1 == num_tiles {
                     let pf = pending.take().expect("pending frame checked above");
                     let decoded = decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs))?;
-                    reference_frame_update(refs, &pf.fh, &decoded)?;
+                    let frame = reference_frame_update(refs, &pf.fh, decoded)?;
                     if pf.fh.show_frame {
-                        out.push(decoded.frame);
+                        out.push(frame);
                     }
                 }
             }
@@ -1857,9 +1886,9 @@ fn decode_temporal_unit_spec(
                     .ok_or(Error::PartitionWalkOutOfRange)?;
                 let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
                 let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs))?;
-                reference_frame_update(refs, &fh, &decoded)?;
+                let frame = reference_frame_update(refs, &fh, decoded)?;
                 if fh.show_frame {
-                    out.push(decoded.frame);
+                    out.push(frame);
                 }
             }
             _ => return Err(Error::PartitionWalkOutOfRange),

@@ -15482,10 +15482,11 @@ pub struct PartitionWalker {
     /// value over its `bh4 * bw4` footprint; the §7.14.4 deblock then reads
     /// the per-mi snapshot. Entries are `0` for not-yet-decoded cells (the
     /// §5.9.18 zero default, which is also the whole grid when
-    /// `delta_lf_present == 0`). Held as `i32` because the §5.11.13
-    /// accumulator is signed and clamped to `-MAX_LOOP_FILTER ..=
-    /// MAX_LOOP_FILTER`.
-    delta_lfs: Vec<i32>,
+    /// `delta_lf_present == 0`). Stored as `i8` (r453): the §5.11.13
+    /// update clamps every stamped value to `-MAX_LOOP_FILTER ..=
+    /// MAX_LOOP_FILTER` (`-63..=63`), so the spec-bounded width is a
+    /// byte — only the running accumulator needs the pre-Clip3 `i32`.
+    delta_lfs: Vec<i8>,
     /// `cdef_idx[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer (av1-spec §5.11.55 / §5.11.56 / §6.10.40
     /// p.179, av1-spec p.104). Entries are `-1` for cells that no
@@ -16171,7 +16172,7 @@ pub(crate) struct EncoderStampSnapshot {
     ref_frames: Vec<i8>,
     interp_filters: Vec<u8>,
     mvs: Vec<i16>,
-    delta_lfs: Vec<i32>,
+    delta_lfs: Vec<i8>,
     palette_sizes: Vec<u8>,
     palette_colors: Vec<u16>,
     comp_group_idxs: Vec<u8>,
@@ -16393,10 +16394,12 @@ impl PartitionWalker {
         // with 0. Unused slots stay at 0; the §5.11.49 cache walk reads
         // only the first `PaletteSizes[plane][..][..]` entries per cell
         // so the pre-fill value is unobserved on the conformant path.
-        let area3_colors = area3.checked_mul(PALETTE_COLORS)?;
-        let mut palette_colors: Vec<u16> = Vec::new();
-        palette_colors.try_reserve_exact(area3_colors).ok()?;
-        palette_colors.resize(area3_colors, 0);
+        // r453 — the `PaletteColors[]` grid (the walker's LARGEST
+        // buffer: `3 * area * PALETTE_COLORS` u16) is materialized
+        // lazily by [`Self::ensure_palette_colors`] the first time a
+        // §5.11.46 palette actually lands; the readers treat the
+        // empty grid as the all-zero pre-fill.
+        let palette_colors: Vec<u16> = Vec::new();
         // §5.11.5 / §5.11.31 / §7.10: pre-fill `Mvs[r][c][list][comp]`
         // with `0`. Four `i16` slots per `(row, col)` cell — two lists
         // × two components. The §7.10.2.7 gate (`IsInters[mvRow][mvCol]
@@ -16460,7 +16463,7 @@ impl PartitionWalker {
         // §5.11.5 `DeltaLFs[ r ][ c ][ i ]` per-mi snapshot grid —
         // `area * FRAME_LF_COUNT` slots, pre-filled `0` (the §5.9.18
         // zero default). Stamped per block via `stamp_delta_lfs`.
-        let mut delta_lfs: Vec<i32> = Vec::new();
+        let mut delta_lfs: Vec<i8> = Vec::new();
         delta_lfs.try_reserve_exact(area * FRAME_LF_COUNT).ok()?;
         delta_lfs.resize(area * FRAME_LF_COUNT, 0);
         // §5.11.x / §8.3.2: pre-fill `InterpFilters[r][c][0..2]` with
@@ -16676,6 +16679,20 @@ impl PartitionWalker {
         self.curr_frame
             .get(plane)
             .and_then(|p| p.as_ref().map(|cp| cp.samples.as_slice()))
+    }
+
+    /// r453 — MOVE the per-plane `CurrFrame[ plane ]` buffer out of
+    /// the walker once the tile walk is complete: the §7.14 / §7.15 /
+    /// §7.16 / §7.17 in-loop passes operate on caller-owned buffers
+    /// and nothing in the walker reads `CurrFrame` after the walk, so
+    /// the frame driver takes ownership instead of copying the
+    /// full-frame `i32` buffer. Returns `(rows, cols, samples)`; the
+    /// plane's slot is left unallocated (as before the first merge).
+    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<i32>)> {
+        self.curr_frame
+            .get_mut(plane)
+            .and_then(|p| p.take())
+            .map(|cp| (cp.rows, cp.cols, cp.samples))
     }
 
     /// `(rows, cols)` of the per-plane `CurrFrame[ plane ]` buffer.
@@ -19471,7 +19488,9 @@ impl PartitionWalker {
         }
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
-        let acc = self.current_delta_lf;
+        // §5.11.13 clamps every accumulator slot to ±MAX_LOOP_FILTER
+        // (±63) before it lands here, so the i8 narrowing is lossless.
+        let acc: [i8; FRAME_LF_COUNT] = core::array::from_fn(|i| self.current_delta_lf[i] as i8);
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -19501,13 +19520,14 @@ impl PartitionWalker {
         if r >= self.mi_rows || c >= self.mi_cols {
             return 0;
         }
-        self.delta_lfs[((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx]
+        i32::from(self.delta_lfs[((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx])
     }
 
     /// View of the §5.11.5 `DeltaLFs[]` grid after the walk —
-    /// `delta_lfs()[ (r * MiCols + c) * FRAME_LF_COUNT + i ]`.
+    /// `delta_lfs()[ (r * MiCols + c) * FRAME_LF_COUNT + i ]`. Values
+    /// are the §5.11.13 post-Clip3 deltas (`-63..=63`, stored `i8`).
     #[must_use]
-    pub fn delta_lfs(&self) -> &[i32] {
+    pub fn delta_lfs(&self) -> &[i8] {
         &self.delta_lfs
     }
 
@@ -20968,9 +20988,21 @@ impl PartitionWalker {
     /// footprint of a §5.11.46 decoded block carry the sorted palette
     /// entries (range `0..(1 << BitDepth)`); slots `idx >=
     /// palette_sizes()[ … ]` stay at `0`.
+    /// NOTE (r453): the grid is materialized lazily — on a walk where
+    /// no §5.11.46 palette landed the returned slice is EMPTY (the
+    /// all-zero pre-fill was never allocated).
     #[must_use]
     pub fn palette_colors(&self) -> &[u16] {
         &self.palette_colors
+    }
+
+    /// r453 — materialize the `PaletteColors[]` grid on the first
+    /// real §5.11.46 palette write (see the constructor note).
+    fn ensure_palette_colors(&mut self) {
+        if self.palette_colors.is_empty() {
+            let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+            self.palette_colors.resize(3 * area * PALETTE_COLORS, 0);
+        }
     }
 
     /// `#[cfg(test)]` helper — stamp a §5.11.46 palette into a
@@ -20996,6 +21028,7 @@ impl PartitionWalker {
         }
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
         let cell = plane * area + (mi_row as usize) * (self.mi_cols as usize) + (mi_col as usize);
+        self.ensure_palette_colors();
         self.palette_sizes[cell] = entries.len() as u8;
         let base = cell * PALETTE_COLORS;
         for (i, &v) in entries.iter().enumerate() {
@@ -21109,6 +21142,7 @@ impl PartitionWalker {
                     self.interintra_wedge_indices[cell] = s.interintra_wedge_index;
                 }
                 if s.palette_size_y > 0 {
+                    self.ensure_palette_colors();
                     self.palette_sizes[cell] = s.palette_size_y;
                     let base = cell * PALETTE_COLORS;
                     for (i, &v) in s
@@ -21121,6 +21155,7 @@ impl PartitionWalker {
                     }
                 }
                 if s.palette_size_uv > 0 {
+                    self.ensure_palette_colors();
                     for (plane, colors) in
                         [(1usize, s.palette_colors_u), (2usize, s.palette_colors_v)]
                     {
@@ -21259,9 +21294,17 @@ impl PartitionWalker {
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     snap.palette_sizes.push(self.palette_sizes[pcell]);
-                    snap.palette_colors.extend_from_slice(
-                        &self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS],
-                    );
+                    if self.palette_colors.is_empty() {
+                        // Lazily-materialized grid never touched:
+                        // snapshot the all-zero pre-fill.
+                        let n = snap.palette_colors.len();
+                        snap.palette_colors.resize(n + PALETTE_COLORS, 0);
+                    } else {
+                        snap.palette_colors.extend_from_slice(
+                            &self.palette_colors
+                                [pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS],
+                        );
+                    }
                 }
                 snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
                 snap.compound_idxs.push(self.compound_idxs[cell]);
@@ -21310,11 +21353,15 @@ impl PartitionWalker {
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     self.palette_sizes[pcell] = snap.palette_sizes[i * 3 + plane];
-                    self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS]
-                        .copy_from_slice(
-                            &snap.palette_colors[(i * 3 + plane) * PALETTE_COLORS
-                                ..(i * 3 + plane + 1) * PALETTE_COLORS],
-                        );
+                    let src = &snap.palette_colors
+                        [(i * 3 + plane) * PALETTE_COLORS..(i * 3 + plane + 1) * PALETTE_COLORS];
+                    if !self.palette_colors.is_empty() || src.iter().any(|&v| v != 0) {
+                        // Writing all-zero into a never-materialized
+                        // grid is the identity — skip the allocation.
+                        self.ensure_palette_colors();
+                        self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS]
+                            .copy_from_slice(src);
+                    }
                 }
                 self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
                 self.compound_idxs[cell] = snap.compound_idxs[i];
@@ -21365,6 +21412,10 @@ impl PartitionWalker {
         }
         let (r, c) = (r as u32, c as u32);
         if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        if self.palette_colors.is_empty() {
+            // Lazily-materialized grid never touched: all-zero pre-fill.
             return 0;
         }
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
@@ -25498,6 +25549,7 @@ impl PartitionWalker {
                     let cell = (rr as usize) * (self.mi_cols as usize) + (cc as usize);
                     // Luma plane.
                     if let Some(entries) = palette_colors_y_out {
+                        self.ensure_palette_colors();
                         self.palette_sizes[cell] = palette_size_y as u8;
                         let base = cell * PALETTE_COLORS;
                         for (i, &v) in entries.iter().enumerate().take(PALETTE_COLORS) {
@@ -25506,6 +25558,7 @@ impl PartitionWalker {
                     }
                     // U plane.
                     if let Some(entries) = palette_colors_u_out {
+                        self.ensure_palette_colors();
                         let plane_cell = area + cell;
                         self.palette_sizes[plane_cell] = palette_size_uv as u8;
                         let base = plane_cell * PALETTE_COLORS;
@@ -25515,6 +25568,7 @@ impl PartitionWalker {
                     }
                     // V plane.
                     if let Some(entries) = palette_colors_v_out {
+                        self.ensure_palette_colors();
                         let plane_cell = 2 * area + cell;
                         self.palette_sizes[plane_cell] = palette_size_uv as u8;
                         let base = plane_cell * PALETTE_COLORS;
@@ -52266,12 +52320,14 @@ mod tests {
         let cell: usize = 0;
         let _ = mi_cols;
         walker.palette_sizes[cell] = 3;
+        walker.ensure_palette_colors();
         walker.palette_colors[cell * PALETTE_COLORS] = 10;
         walker.palette_colors[cell * PALETTE_COLORS + 1] = 50;
         walker.palette_colors[cell * PALETTE_COLORS + 2] = 200;
         // U plane also gets a 2-entry palette so we can verify plane
         // separation.
         walker.palette_sizes[area + cell] = 2;
+        walker.ensure_palette_colors();
         walker.palette_colors[(area + cell) * PALETTE_COLORS] = 30;
         walker.palette_colors[(area + cell) * PALETTE_COLORS + 1] = 70;
         // Reading from neighbour (0, 1): mi_row=0 ⇒ above gated out
@@ -52310,11 +52366,13 @@ mod tests {
         // and mi_row=1 ⇒ 1*4 % 64 = 4 ≠ 0 (above gate open).
         let above_cell: usize = 1; // (0, 1) ⇒ 0 * mi_cols + 1
         walker.palette_sizes[above_cell] = 2;
+        walker.ensure_palette_colors();
         walker.palette_colors[above_cell * PALETTE_COLORS] = 5;
         walker.palette_colors[above_cell * PALETTE_COLORS + 1] = 30;
         // Stamp left palette at (mi_row=1, mi_col=0).
         let left_cell: usize = mi_cols;
         walker.palette_sizes[left_cell] = 3;
+        walker.ensure_palette_colors();
         walker.palette_colors[left_cell * PALETTE_COLORS] = 10;
         walker.palette_colors[left_cell * PALETTE_COLORS + 1] = 30;
         walker.palette_colors[left_cell * PALETTE_COLORS + 2] = 50;
@@ -52345,6 +52403,7 @@ mod tests {
         // (mi_row=0, mi_col=0) ⇒ flat index 0.
         let cell: usize = 0;
         walker.palette_sizes[cell] = 2;
+        walker.ensure_palette_colors();
         walker.palette_colors[cell * PALETTE_COLORS] = 11;
         walker.palette_colors[cell * PALETTE_COLORS + 1] = 22;
         // A subsequent block at (0, 1) sees this as the left neighbour

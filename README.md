@@ -1434,6 +1434,23 @@ same adoption. Pinned: `self-pyr-96x80-q60-shortrefs` — the corpus's
 first short-signaled out-of-order stream, byte-identical through
 three black-box reference decoders (corpus 154).
 
+### Decoder memory footprint (r453)
+
+Peak decode RSS on a 1080p stream dropped ~35 % with byte-identical
+output (measured 171.5 MB → 100–118 MB across runs on a 4-frame
+1920×1080 inter stream; 5.36 MB → 4.34 MB on the largest corpus
+stream): the §7.20 reference stores share ONE immutable payload per
+`refresh_frame_flags` set (`Arc`, an all-refresh KEY no longer holds
+eight deep copies of planes + grids + CDFs) and the store payload
+moves out of the decode result instead of being cloned; the frame
+driver takes ownership of the walker's `CurrFrame[]` planes after the
+tile walk instead of copying them, and borrows the §7.17 deblocked
+copy as the §7.15 CDEF source instead of cloning a third full-frame
+buffer; the `DeltaLFs[]` grid stores the §5.11.13 post-Clip3 deltas
+at their spec-bounded width (`i8`, ±63), and `PaletteColors[]` — the
+walker's largest grid — is materialized only when a §5.11.46 palette
+actually lands.
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a
