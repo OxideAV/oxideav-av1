@@ -649,6 +649,7 @@ impl PyramidSession {
                         show_frame: role.show,
                         refresh_frame_flags: role.refresh.map_or(0, |s| 1u8 << s),
                         ref_frame_idx: rfi,
+                        short_ref_signaling: false,
                         slot_hints: self.slot_hints,
                         single_refs: role.singles.clone(),
                         compound_pairs: role.pairs.clone(),

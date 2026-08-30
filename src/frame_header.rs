@@ -1543,7 +1543,7 @@ fn get_relative_dist(a: i64, b: i64, order_hint_bits: u8, enable_order_hint: boo
 ///   3. The remaining `Ref_Frame_List` slots = forward refs in
 ///      anti-chronological order.
 ///   4. Any still-unset entry = the ref with the smallest output order.
-fn set_frame_refs(
+pub(crate) fn set_frame_refs(
     last_frame_idx: u8,
     gold_frame_idx: u8,
     order_hint: u32,

@@ -189,6 +189,7 @@ pub fn encode_camera_frame_yuv420_tiles_qm(
         show_frame: true,
         refresh_frame_flags: 0,
         ref_frame_idx: [0u8; 7],
+        short_ref_signaling: false,
         slot_hints: [0u32; 8],
         single_refs: vec![1],
         compound_pairs: Vec::new(),

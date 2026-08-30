@@ -103,6 +103,7 @@ use crate::sequence_header::SequenceHeader;
 use crate::uncompressed_header_tail::{
     FilmGrainParams, InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
 };
+use crate::uncompressed_header_tail::{GOLDEN_FRAME, LAST_FRAME};
 use crate::Error;
 
 /// One frame's reconstructed planes (row-major; U/V at
@@ -900,6 +901,24 @@ pub struct GopTuning {
     /// single-tile frames and when `tile_groups > 1` already splits
     /// the frame (each split group codes the flag anyway).
     pub tile_spans: bool,
+    /// r452 — §5.9.2 `frame_refs_short_signaling = 1` on plain INTER
+    /// frames: the header codes only `last_frame_idx` /
+    /// `gold_frame_idx` (3 bits each) and the DECODER derives the
+    /// whole seven-entry `ref_frame_idx[]` through §7.8
+    /// `set_frame_refs()` from its stored `RefOrderHint[]` state —
+    /// 7 wire bits replace 22. The encoder ADOPTS the §7.8
+    /// derivation as its own reference map (the same slots land on
+    /// the LAST / GOLDEN ordinals the RD ladder actually codes —
+    /// §7.8 seeds them from the two explicit indices — while the
+    /// unsearched ordinals move to the spec-derived slots, which
+    /// feeds every downstream twin: §7.8 sign bias, §5.9.22 skip
+    /// mode, §7.9 motion-field projection), so the write side and
+    /// the parse side run the identical algorithm in lockstep.
+    /// SWITCH-cadence and coded-error-resilient positions keep the
+    /// explicit shape (their re-anchoring semantics are the point of
+    /// those frames). `false` keeps the explicit 22-bit shape on
+    /// every frame (the A/B baseline; bit-identical).
+    pub short_ref_signaling: bool,
 }
 
 impl Default for GopTuning {
@@ -923,6 +942,7 @@ impl Default for GopTuning {
             s_frame_period: 0,
             error_resilient_period: 0,
             tile_spans: false,
+            short_ref_signaling: false,
         }
     }
 }
@@ -1777,8 +1797,10 @@ fn encode_gop_yuv_core_fg(
             donor_armed,
             p_fg.as_ref(),
             floor,
+            &recon[floor as usize],
             is_s,
             is_er,
+            tuning.short_ref_signaling,
         )?;
         temporal_units.push(tu);
         recon.push(rc);
@@ -1938,6 +1960,13 @@ pub(crate) struct InterFrameConfig<'a> {
     pub refresh_frame_flags: u8,
     /// §5.9.2 `ref_frame_idx[ 0..7 ]` — per-reference §7.20 slot.
     pub ref_frame_idx: [u8; 7],
+    /// r452 — code the header with `frame_refs_short_signaling = 1`
+    /// (§5.9.2): `ref_frame_idx` above must already BE the §7.8
+    /// `set_frame_refs()` derivation for this frame's
+    /// `last_frame_idx = ref_frame_idx[ 0 ]` / `gold_frame_idx =
+    /// ref_frame_idx[ 3 ]` over `slot_hints` (the caller adopts the
+    /// derivation — see [`GopTuning::short_ref_signaling`]).
+    pub short_ref_signaling: bool,
     /// The TRUE per-slot stored `RefOrderHint[ i ]` state at this
     /// frame's header (drives the §5.9.22 twin + §7.8 sign bias).
     pub slot_hints: [u32; 8],
@@ -2216,9 +2245,16 @@ fn build_inter_frame_fh(
     // the RD ladder may commit WARPED_CAUSAL leaves.
     fh.allow_warped_motion = Some(seq.enable_warped_motion);
     fh.inter_refs = Some(InterFrameRefs {
-        frame_refs_short_signaling: false,
-        last_frame_idx: None,
-        gold_frame_idx: None,
+        // r452 — the §7.8 short-signaling twin: the config's
+        // `ref_frame_idx` IS the `set_frame_refs()` derivation over
+        // the two explicit indices (see
+        // [`InterFrameConfig::short_ref_signaling`]), so the wire
+        // carries only `last_frame_idx` / `gold_frame_idx`.
+        frame_refs_short_signaling: cfg.short_ref_signaling,
+        last_frame_idx: cfg.short_ref_signaling.then_some(cfg.ref_frame_idx[0]),
+        gold_frame_idx: cfg
+            .short_ref_signaling
+            .then_some(cfg.ref_frame_idx[GOLDEN_FRAME - LAST_FRAME]),
         ref_frame_idx: cfg.ref_frame_idx,
         // r428 — the eighth-pel arm (§5.9.2; force_integer_mv is 0 on
         // every header this builder emits, so the f(1) is always
@@ -2453,6 +2489,7 @@ fn p_frame_config_primary<'a>(
             1 << ((p_index - 1) & 1)
         },
         ref_frame_idx,
+        short_ref_signaling: false,
         slot_hints,
         single_refs: vec![1, 4],
         compound_pairs: vec![[1, 4]],
@@ -2612,8 +2649,10 @@ fn encode_p_frame_yuv(
     donor_armed: bool,
     film_grain: Option<&FilmGrainParams>,
     floor: u32,
+    floor_recon: &GopFrameReconYuv,
     s_frame: bool,
     error_resilient: bool,
+    short_ref_signaling: bool,
 ) -> Result<
     (
         Vec<u8>,
@@ -2631,6 +2670,39 @@ fn encode_p_frame_yuv(
     let primary_carry = if error_resilient { None } else { primary_carry };
     let mut cfg = p_frame_config_primary(prev, prevprev, p_index, primary_carry, floor, s_frame);
     cfg.error_resilient = error_resilient;
+    // r452 — §5.9.2 `frame_refs_short_signaling` (see
+    // [`GopTuning::short_ref_signaling`]): on a plain INTER frame the
+    // encoder adopts the §7.8 `set_frame_refs()` derivation over the
+    // LAST / GOLDEN slots and the TRUE stored hints as its reference
+    // map, so the decoder's derivation reproduces it in lockstep.
+    // The f(1) is only coded under `enable_order_hint` (§5.9.2).
+    if short_ref_signaling && !error_resilient && seq.enable_order_hint {
+        cfg.ref_frame_idx = crate::frame_header::set_frame_refs(
+            cfg.ref_frame_idx[0],
+            cfg.ref_frame_idx[GOLDEN_FRAME - LAST_FRAME],
+            cfg.order_hint,
+            seq.order_hint_bits,
+            seq.enable_order_hint,
+            &cfg.slot_hints,
+        );
+        cfg.short_ref_signaling = true;
+        // The derived map may name slots OUTSIDE the two-slot
+        // rotation (every one holds the all-refresh FLOOR frame — the
+        // KEY or the latest SWITCH frame), and the §5.9.22 skip-mode
+        // twin resolves its second forward reference by ORDINAL order
+        // over equal hints, so such a slot can be predicted from:
+        // give it the floor reconstruction, exactly what the decoder's
+        // §7.20 store holds there.
+        cfg.refs.push(floor_recon);
+        let floor_plane = cfg.refs.len() - 1;
+        let last_slot = cfg.ref_frame_idx[0] as usize;
+        let gold_slot = cfg.ref_frame_idx[GOLDEN_FRAME - LAST_FRAME] as usize;
+        for (slot, plane) in cfg.slot_to_plane.iter_mut().enumerate() {
+            if slot != last_slot && slot != gold_slot {
+                *plane = floor_plane;
+            }
+        }
+    }
     // r441 — the armed §5.9.30 film-grain block for this frame.
     cfg.film_grain = film_grain;
     cfg.allow_temporal_seg = allow_temporal_seg;
@@ -9861,6 +9933,8 @@ mod tests {
             false,
             None,
             0,
+            &key_recon,
+            false,
             false,
             false,
         )

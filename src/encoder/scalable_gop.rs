@@ -330,6 +330,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
                 0
             },
             ref_frame_idx,
+            short_ref_signaling: false,
             slot_hints,
             single_refs: singles,
             compound_pairs: Vec::new(),
@@ -833,6 +834,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 show_frame: true,
                 refresh_frame_flags: 1u8 << refresh_slot,
                 ref_frame_idx: [last_slot as u8; 7],
+                short_ref_signaling: false,
                 slot_hints,
                 single_refs: vec![1],
                 compound_pairs: Vec::new(),

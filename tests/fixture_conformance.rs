@@ -13952,3 +13952,66 @@ fn self_encoded_seg_film_grain_gop_decodes_byte_exact() {
         4,
     );
 }
+
+// ---------------------------------------------------------------------
+// r452: §5.9.2 `frame_refs_short_signaling = 1` — the header codes only
+// `last_frame_idx` / `gold_frame_idx` and the decoder derives the full
+// `ref_frame_idx[]` through §7.8 `set_frame_refs()` from its stored
+// `RefOrderHint[]` state.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_96X64_Q80_SHORTREFS_IVF: &str = concat!(
+    "444b4946000020004156303160004000190000000100000007000000000000008b0300000000",
+    "00000000000012000a0a000000032dffcbbf980432fa0616002500000033df0080ccc43d593b",
+    "0fff34dfffec0bee93affddde7d7be2d842de78dcf081da98d9c91a3be38dafaeb38df79437e",
+    "25b365bf4ab346aca4b9c483d3d35d2b5e1dfffffffffbf1433e8794edb08045b8b6fb3ff701",
+    "4f100447ea3c3d000000000000000000ce4c5892d85721f7158e83f090524b1464ced3262cce",
+    "1fffffffffffffffc016bc4afffff87881bfffffffa68131e11ae0545362208692e66f9e8881",
+    "e3760d038391ccb5b00000000000000281e200142333591b1ae11051246c6bd4cccccccd646c",
+    "6c205a46c6bd4ccd7596d733591b1af8837e000010a2f4602d4f91d30442e56874a2150956ab",
+    "91800b051144119a23daf769247560dfffffffffffffffbd727acd678bb1dd2cbed3aae4e2ae",
+    "3a9aaa6b70dd6716140f97480000000000000000000000000000411621055dddddddded3047e",
+    "dddddddddddddddddddde07df3cf3cefa1d37a31fc54abd33a25d75642204e03070413179f00",
+    "fac904b96f6ffb7d69a463e9fe5b0e8a0fffea376436ffdab6b92430b2d6ccbb4800001426b8",
+    "a4e29aef7f09b95328993581440000000000000000000000298cdcbd48bc2c997849ca09f316",
+    "ed487005aacad4a049edccf1af926c89c1256e0658c147197f8b8a9966ebbf835058334ebea2",
+    "e68f11d01df3cd399a58a852e91a656b27b0a0bd31c6f45f5666fbda2c49f8aa069305bce864",
+    "3a2bd96c0bbd2ac31308b9ec1cec9400ff970895f2927c2fc08ee50eec450fe777d37a80216b",
+    "54fcc99d17845adc80147ad913555900004930d311adba0000061457ef071e66ffff836ef9d7",
+    "8c35ca173777cda40fa53749e5b914d58a637f778c8974f979cde637859740de3a6c9a4a8df4",
+    "2819882f60510f2b7b0a2c5bf83063860872d74225eea182186a15804834f3e80cf907155479",
+    "458370b56ce0c225f3d900f53e4d3a37eb3b6a9b59415a64489a5e4bea9431ddae8e7af6fe98",
+    "377c1a54a3fd499f1c226527c9a675744a161c8d56e44b94d79a764592895dcf05942620178c",
+    "4d63f28d60c31146c0d22fc0bf3d5577ef142b313c57c4405e0bde2aa48298bcdcc50ec33a34",
+    "f5cf5e2567a6c8adefadc69fff1af1908807a4be169d0000005ad1e50209deb2b1a4dec1035e",
+    "8bcb934d5c262ffe67756dcf864c944318062fcf44d6d5c816b49c1fe8d34dd2c966e4473765",
+    "21e971049fcfe1a863e91fd1dbc64f1f314901af9fa1dd88c000000000000000000041cdb0c7",
+    "586300000001000000000000001200325f320100320e94000000cf3f038000b266646048d7b4",
+    "042ee63995528077f7b69bb1dc8d37961b6a9c351be8b2894dbee1d5be32005f2e5a3d4d4974",
+    "906759c99fbc58801c638c31f11bc1b1c7568f948ca033df01e09db7723847e1d4abe5784800",
+    "0000020000000000000012003244320200504e94000000ce0303c000abe019f17c6d2e9bafa3",
+    "62493875f4057b43cfd1f21009589a646afdff0b1d0ca0a40b47eeb177efee2f8efa54ce18db",
+    "df41cb94d2902d000000030000000000000012003229320300320e940000004f0403c000a95d",
+    "168f10cb9f1a3c4f788a9065e2ad5e6642303b096e359056c026000000040000000000000012",
+    "003222320400504e94000000ca0303c000c1c9184cbba3990b76317f5b0bac00b8d4133d6927",
+    "000000050000000000000012003223320500320e94000000c70303c000beb18dd1e746467737",
+    "1d20ad96e3197ccd8a5c7f0e27000000060000000000000012003223320600504e94000000cf",
+    "0303c000b897ea35e0ced1a6e15fee788f59ca21afb6b49f80",
+);
+
+/// r452: short-signaled GOP (7-frame 96×64 at q80; every P-frame codes
+/// `frame_refs_short_signaling = 1` with the LAST / GOLDEN rotation
+/// slots as the two explicit indices, the remaining five ordinals
+/// derived by §7.8 on both sides — the corpus's first stream on that
+/// arm) — the digest is the byte-identical output of THREE independent
+/// black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-96x64-q80-shortrefs/`.
+#[test]
+fn self_encoded_short_ref_signaling_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-96x64-q80-shortrefs",
+        SELF_GOP_96X64_Q80_SHORTREFS_IVF,
+        "f5b4e303de881feaf6cb9411df1cef02b4889ff2ed43e8d92c298c5f2a9d56ee",
+        7,
+    );
+}

@@ -1378,6 +1378,26 @@ so the wire audit now tracks §7.20 reference state across frames.
 Pinned: `self-gop-128x96-q60-seg-film-grain` — the corpus's first
 segmentation × grain stream (corpus 151).
 
+### Short reference signaling: the §7.8 `set_frame_refs()` write twin (r452)
+
+`GopTuning::short_ref_signaling` codes plain P-frames with
+`frame_refs_short_signaling = 1`: only `last_frame_idx` /
+`gold_frame_idx` go on the wire (7 bits instead of the explicit
+22) and the decoder derives the whole seven-entry `ref_frame_idx[]`
+through §7.8 from its stored `RefOrderHint[]`. The encoder ADOPTS
+that derivation as its own reference map — LAST / GOLDEN stay on the
+rotation slots (§7.8 seeds them from the explicit indices), the
+unsearched ordinals land on the derived slots, and every downstream
+twin (§7.8 sign bias, §5.9.22 skip mode, §7.9 projection) runs over
+the adopted map. The §5.9.22 skip-mode twin resolves its second
+forward reference by ORDINAL order over equal hints, so a derived
+ordinal can name an out-of-rotation slot: those slots carry the
+all-refresh FLOOR reconstruction, exactly the decoder's §7.20 store.
+SWITCH / coded-error-resilient positions keep the explicit shape.
+Pinned: `self-gop-96x64-q80-shortrefs` — the corpus's first stream
+on the short arm, byte-identical through three black-box reference
+decoders (corpus 152).
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a
