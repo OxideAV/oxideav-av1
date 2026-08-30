@@ -1451,6 +1451,28 @@ at their spec-bounded width (`i8`, ±63), and `PaletteColors[]` — the
 walker's largest grid — is materialized only when a §5.11.46 palette
 actually lands.
 
+### Delta-q on lossless-segment tables: the exact §7.12.2 guard (r453)
+
+The conservative r436 rule (any lossless segment ⇒ single-quantiser
+arm) is replaced by the exact §7.12.2 condition: `LosslessArray[]` is
+derived with `ignoreDeltaQ = 1` (`base_q_idx + data`) while a block
+dequantizes at `get_qindex( 0, segmentId ) = Clip3( 0, 255,
+CurrentQIndex + data )`, so a lossless segment stays lossless under
+delta-q exactly when every realized `CurrentQIndex` keeps
+`CurrentQIndex + data <= 0`. The plan is absolute, so its upward units
+are capped at `floor(((-data) - base_q_idx) / (1 << delta_q_res))`
+over the lossless segments — a `-255` table (the spec note's
+approach) keeps the full ±2 span, a table whose lossless data sits
+exactly at `-base_q_idx` keeps only the downward (refining) swings,
+and the cap is never negative. Witnesses in
+`tests/delta_q_lossless_seg.rs` (the delta arm elected on every
+P-frame of a `-255` table with an exactness-demand region coded
+pixel-exact inside the walk; the headroom-0 table; the off arm).
+Pinned: `self-gop-128x128-q100-dq-lossless-seg` — the corpus's first
+`delta_q_present = 1` stream on a lossless-segment table,
+byte-identical through three black-box reference decoders (corpus
+155).
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a
@@ -1576,8 +1598,6 @@ corpus stands at 150.
   in multiples of 64 force one §7.3.1-conformant tile row per
   superblock row, addressed via `anchor_tile_row` /
   `anchor_tile_col`.)
-- Delta-q stays off tables carrying a lossless segment
-  (conservative §7.12.2-note guard).
 - The §5.9.8 superres election stays KEY/opener-scoped (inter
   frames never elect a mid-GOP resize); explicit (non-uniform) tile
   layouts keep flat widths (their per-column superblock widths are

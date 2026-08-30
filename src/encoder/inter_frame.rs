@@ -2474,6 +2474,31 @@ pub(crate) fn seg_lossless_array(
     })
 }
 
+/// r453 — the EXACT §7.12.2 delta-q ceiling over a SEG_LVL_ALT_Q
+/// table: the largest upward plan unit (in `1 << DELTA_Q_RES` steps
+/// above `base_q_idx`) such that every LOSSLESS segment's block still
+/// dequantizes at `get_qindex( 0, segmentId ) = Clip3( 0, 255,
+/// CurrentQIndex + data ) == 0`, i.e. `CurrentQIndex <= -data`.
+/// `2` (the probe's full span) when the table carries no lossless
+/// segment or every lossless `data` sits far enough below
+/// `-base_q_idx` (the spec note's `-255` always does); `0` when a
+/// lossless `data` sits exactly at `-base_q_idx` (only the downward,
+/// refining swings survive). Never negative: lossless means
+/// `base_q_idx + data <= 0`.
+#[must_use]
+pub(crate) fn delta_q_lossless_up_cap(base_q_idx: u8, alt_q: &[i16]) -> i32 {
+    let ll = seg_lossless_array(base_q_idx, alt_q);
+    let step = 1i32 << DELTA_Q_RES;
+    alt_q
+        .iter()
+        .enumerate()
+        .filter(|&(sid, _)| ll[sid])
+        .map(|(_, &d)| ((-i32::from(d)) - i32::from(base_q_idx)) / step)
+        .min()
+        .unwrap_or(2)
+        .clamp(0, 2)
+}
+
 /// The r412/r413 two-slot P-frame [`InterFrameConfig`] for P-frame
 /// `p_index` (see [`gop_ref_hints`] for the rotation).
 #[cfg(test)]
@@ -3252,19 +3277,30 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // SEG_LVL_ALT_Q data on top of the running §5.11.13
     // `CurrentQIndex` (both the search twin and the decoder ride the
     // same shared derivation), so the plan and the segment map are
-    // orthogonal on the wire. Conservative guard per the §7.12.2
-    // note: tables carrying a LOSSLESS segment stay on the
-    // single-quantiser arm — a `CurrentQIndex` swing must never lift
-    // a lossless segment off qindex 0 (`CodedLossless` frames are
-    // excluded by `!lossless` and the §5.9.17 `base_q_idx > 0` read
-    // gate; the exactness-demand/auto-lossless paths carry such a
-    // segment by construction and stay off with it).
-    let seg_lossless_free = alt_q.is_empty()
-        || !seg_lossless_array(base_q_idx, alt_q)[..alt_q.len()]
-            .iter()
-            .any(|&l| l);
-    let delta_plan: Option<Vec<i32>> = if cfg.delta_q && !lossless && seg_lossless_free {
-        delta_q_plan_units(input, mi_rows, mi_cols)
+    // orthogonal on the wire.
+    // r453 — the lossless-segment guard is EXACT per §7.12.2 (it
+    // replaced the conservative r436 "any lossless segment ⇒ single
+    // quantiser" rule): `LosslessArray[]` is derived with
+    // `ignoreDeltaQ = 1` (`base_q_idx + data`) while a block
+    // dequantizes at `get_qindex( 0, segmentId ) = Clip3( 0, 255,
+    // CurrentQIndex + data )`, so a lossless segment stays lossless
+    // under delta-q exactly when EVERY realized `CurrentQIndex`
+    // satisfies `CurrentQIndex + data <= 0` (the spec's note reaches
+    // the same place with `data = -255`). The plan is absolute
+    // (`base_q_idx + units << delta_q_res`), so its UPWARD units are
+    // capped by [`delta_q_lossless_up_cap`] and the arm keeps the
+    // refining swings (`CodedLossless` frames stay excluded by
+    // `!lossless` and the §5.9.17 `base_q_idx > 0` read gate).
+    let ll_up_cap = delta_q_lossless_up_cap(base_q_idx, alt_q);
+    let delta_plan: Option<Vec<i32>> = if cfg.delta_q && !lossless {
+        delta_q_plan_units(input, mi_rows, mi_cols).and_then(|mut units| {
+            if ll_up_cap < 2 {
+                for u in units.iter_mut() {
+                    *u = (*u).min(ll_up_cap);
+                }
+            }
+            units.iter().any(|&u| u != 0).then_some(units)
+        })
     } else {
         None
     };
@@ -12264,5 +12300,24 @@ mod tests {
             let enc = encode_gop_yuv_with_q(&[f0, f1, f2], base_q_idx).unwrap();
             dump("self-gop-64x64-q60-fi-cfl", &enc);
         }
+    }
+}
+
+#[cfg(test)]
+mod delta_q_lossless_cap_tests {
+    use super::delta_q_lossless_up_cap;
+
+    /// §7.12.2: a lossless `data` exactly at `-base_q_idx` leaves no
+    /// headroom (only downward swings); `-255` (the spec note) keeps
+    /// the full span; a table without a lossless segment is unbound.
+    #[test]
+    fn cap_follows_the_lossless_headroom() {
+        assert_eq!(delta_q_lossless_up_cap(60, &[0, -60]), 0);
+        assert_eq!(delta_q_lossless_up_cap(60, &[0, -68]), 1);
+        assert_eq!(delta_q_lossless_up_cap(60, &[0, -76]), 2);
+        assert_eq!(delta_q_lossless_up_cap(100, &[0, -255]), 2);
+        assert_eq!(delta_q_lossless_up_cap(72, &[0, 24, -72]), 0);
+        assert_eq!(delta_q_lossless_up_cap(80, &[0, -40]), 2);
+        assert_eq!(delta_q_lossless_up_cap(80, &[]), 2);
     }
 }
