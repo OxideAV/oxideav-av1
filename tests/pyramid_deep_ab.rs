@@ -179,6 +179,7 @@ fn baseline_tuning() -> PyramidTuning {
         // r444 — both A/B arms ride the same §5.9.8 KEY election so
         // the pyramid-depth axis stays the only variable.
         superres: true,
+        film_grain: false,
     }
 }
 

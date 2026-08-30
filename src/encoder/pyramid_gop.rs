@@ -97,13 +97,15 @@
 use std::rc::Rc;
 
 use crate::cdf::QuantizerParams;
+use crate::encoder::film_grain_elect::grain_seed_for;
 use crate::encoder::frame_obu::write_frame_header_obu;
 use crate::encoder::inter_frame::{
-    encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv, GopFrameReconYuv,
-    InterFrameConfig, RefSlotCarry, SavedMotionField, GOP_MAX_FRAMES,
+    elect_film_grain, encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv,
+    GopFrameReconYuv, InterFrameConfig, RefSlotCarry, SavedMotionField, GOP_MAX_FRAMES,
 };
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::lambda_for;
+use crate::encoder::key_frame::KeyExtras;
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::rate_twin::RateModel;
 use crate::encoder::yuv_frame::YuvFrame;
@@ -111,6 +113,7 @@ use crate::encoder::yuv_frame::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Fr
 use crate::frame_header::{FrameHeader, FrameType, PRIMARY_REF_NONE};
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
+use crate::uncompressed_header_tail::FilmGrainParams;
 use crate::Error;
 
 /// r424 — the B-pyramid encoder's tuning switches, kept public
@@ -198,6 +201,19 @@ pub struct PyramidTuning {
     /// election's own gate); `false` keeps the flat-width KEY (the
     /// A/B baseline; bit-identical outside an elected win).
     pub superres: bool,
+    /// r452 — §5.9.30 FILM-GRAIN election on lossy pyramids whose
+    /// content passes the noise probe (see
+    /// [`super::inter_frame::GopTuning::film_grain`]): the grain arm
+    /// re-runs the WHOLE out-of-order refresh graph over the DENOISED
+    /// frames with full §5.9.30 parameters on every coded header
+    /// (KEY, ALT, MID, B — each seeded at its own `order_hint`, so a
+    /// decoded-not-shown frame's later `show_existing_frame` output
+    /// carries the §7.21 `load_grain_params()` synthesis of THAT
+    /// frame) and publishes §7.18.3-synthesized output planes; the
+    /// perceptually-neutral-rate objective settles it. `false` keeps
+    /// the no-grain shape (the A/B baseline; probe-failing content
+    /// is bit-identical either way).
+    pub film_grain: bool,
 }
 
 impl Default for PyramidTuning {
@@ -217,6 +233,7 @@ impl Default for PyramidTuning {
             tile_groups: 1,
             ctx_update_elect: true,
             superres: true,
+            film_grain: true,
         }
     }
 }
@@ -229,6 +246,9 @@ impl Default for PyramidTuning {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TunedPyramidGop {
+    /// r452 — the §5.9.30 film-grain arm won (see
+    /// [`PyramidTuning::film_grain`]).
+    pub film_grain_elected: bool,
     pub gop: EncodedGop,
     pub chunk_lengths: Vec<usize>,
     pub primary_elections: Vec<(u32, u8)>,
@@ -244,6 +264,9 @@ pub struct TunedPyramidGop {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TunedPyramidGopYuv {
+    /// r452 — the §5.9.30 film-grain arm won (see
+    /// [`PyramidTuning::film_grain`]).
+    pub film_grain_elected: bool,
     pub gop: EncodedGopYuv,
     pub chunk_lengths: Vec<usize>,
     pub primary_elections: Vec<(u32, u8)>,
@@ -467,6 +490,9 @@ fn plan_mini_gop(pos: usize, l: usize, anchor_slot: usize) -> (Vec<Step>, usize)
 /// driver's trial chunks (the carry store is `Rc`-shared).
 #[derive(Clone)]
 struct PyramidSession {
+    /// r452 — the armed §5.9.30 parameter set (per-frame seeds are
+    /// stamped at each role's `order_hint`); `None` = no grain.
+    film_grain: Option<FilmGrainParams>,
     seq: SequenceHeader,
     base_q: u8,
     tuning: PyramidTuning,
@@ -502,10 +528,23 @@ impl PyramidSession {
     }
 
     /// Encode the KEY frame and seed every §7.20 slot with its state.
-    fn new(frames: &[YuvFrame], base_q: u8, tuning: PyramidTuning) -> Result<Self, Error> {
+    fn new(
+        frames: &[YuvFrame],
+        base_q: u8,
+        tuning: PyramidTuning,
+        film_grain: Option<&FilmGrainParams>,
+    ) -> Result<Self, Error> {
         let n = frames.len();
         let (width, height) = (frames[0].width, frames[0].height);
-        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles(
+        // r452 — the KEY's per-frame §5.9.30 seed rides the shared
+        // schedule at display position 0 (opening the sequence gate
+        // for the whole pyramid).
+        let key_fg: Option<FilmGrainParams> = film_grain.map(|base| {
+            let mut f = base.clone();
+            f.grain_seed = grain_seed_for(0);
+            f
+        });
+        let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             &frames[0],
             base_q,
             tuning.model,
@@ -514,25 +553,30 @@ impl PyramidSession {
             tuning.cdef,
             tuning.cdef_units,
             tuning.lr,
-            // r433 — the pyramid-wide §5.9.15 tile layout + §5.11.1
-            // tile-group packaging (KEY delta-q stays default-on, as
-            // the pre-r433 `encode_key_frame_yuv_seg_carry` shape).
-            tuning.tiles,
-            tuning.tile_groups,
-            None,
-            true,
-            // r439 — the KEY rides the pyramid's §5.9.12 QM switch.
-            tuning.qm,
-            // r444 — the §5.9.8 superres election rides the pyramid
-            // KEY: the out-of-order refresh graph reads only the
-            // KEY's UPSCALED reconstruction (full extent) and its
-            // extent-inert intra motion-field / carry seeds, exactly
-            // like the plain-GOP driver.
-            tuning.superres,
-            // r439 — the KEY donates too: collect its per-tile end
-            // CDFs so the first consumer can run the §6.8.14
-            // election.
-            Self::donor_armed(&tuning),
+            &KeyExtras {
+                // r433 — the pyramid-wide §5.9.15 tile layout +
+                // §5.11.1 tile-group packaging (KEY delta-q stays
+                // default-on, as the pre-r433
+                // `encode_key_frame_yuv_seg_carry` shape).
+                tiles: tuning.tiles,
+                tile_groups: tuning.tile_groups,
+                delta_q: true,
+                // r439 — the KEY rides the pyramid's §5.9.12 QM switch.
+                qm: tuning.qm,
+                // r444 — the §5.9.8 superres election rides the
+                // pyramid KEY: the out-of-order refresh graph reads
+                // only the KEY's UPSCALED reconstruction (full extent)
+                // and its extent-inert intra motion-field / carry
+                // seeds, exactly like the plain-GOP driver.
+                superres_elect: tuning.superres,
+                // r452 — the armed §5.9.30 parameter set.
+                film_grain: key_fg.as_ref(),
+                // r439 — the KEY donates too: collect its per-tile end
+                // CDFs so the first consumer can run the §6.8.14
+                // election.
+                collect_donor_cdfs: Self::donor_armed(&tuning),
+                ..KeyExtras::default()
+            },
         )?;
         let seq = key.seq.clone();
         let mut recons: Vec<Option<GopFrameReconYuv>> = (0..n).map(|_| None).collect();
@@ -548,6 +592,7 @@ impl PyramidSession {
         };
         let key_carry = Rc::new(key_carry);
         Ok(PyramidSession {
+            film_grain: film_grain.cloned(),
             seq,
             base_q,
             tuning,
@@ -644,6 +689,13 @@ impl PyramidSession {
                         } else {
                             (PRIMARY_REF_NONE, None, Vec::new())
                         };
+                    // r452 — the role's per-frame §5.9.30 seed rides
+                    // the shared schedule at its own order_hint.
+                    let role_fg: Option<FilmGrainParams> = self.film_grain.as_ref().map(|b| {
+                        let mut f = b.clone();
+                        f.grain_seed = grain_seed_for(role.display as u32);
+                        f
+                    });
                     let cfg = InterFrameConfig {
                         order_hint: role.display as u32,
                         show_frame: role.show,
@@ -678,7 +730,7 @@ impl PyramidSession {
                         elect_donor: donor_armed,
                         explicit_tiles: None,
                         qm: self.tuning.qm,
-                        film_grain: None,
+                        film_grain: role_fg.as_ref(),
                         s_frame: false,
                         error_resilient: false,
                         tile_spans: false,
@@ -882,6 +934,7 @@ impl PyramidSession {
                 .map_err(|_| Error::PartitionWalkOutOfRange)?;
         }
         Ok(TunedPyramidGopYuv {
+            film_grain_elected: false,
             gop: EncodedGopYuv {
                 ivf_bytes,
                 temporal_units: self.temporal_units,
@@ -977,6 +1030,7 @@ pub fn encode_pyramid_gop_yuv420_with_q_tuned(
     let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
     let t = encode_pyramid_gop_yuv_with_q_tuned(&wide, base_q_idx, tuning)?;
     Ok(TunedPyramidGop {
+        film_grain_elected: t.film_grain_elected,
         gop: narrow_gop_8bit(t.gop),
         chunk_lengths: t.chunk_lengths,
         primary_elections: t.primary_elections,
@@ -1002,12 +1056,71 @@ pub fn encode_pyramid_gop_yuv_with_q_tuned(
     base_q_idx: u8,
     tuning: PyramidTuning,
 ) -> Result<TunedPyramidGopYuv, Error> {
+    let plain = encode_pyramid_core(frames, base_q_idx, tuning, None)?;
+    film_grain_settle(frames, base_q_idx, tuning, plain, |denoised, fg| {
+        encode_pyramid_core(denoised, base_q_idx, tuning, Some(fg))
+    })
+}
+
+/// r452 — the §5.9.30 film-grain settlement shared by the pyramid
+/// and adaptive drivers: gates (the tuning switch, a lossy
+/// twin-model encode of at least two frames), then the
+/// driver-agnostic [`elect_film_grain`] ladder over `encode_arm`
+/// (the same driver re-run on the DENOISED frames with an armed
+/// parameter set). A win publishes the §7.18.3-synthesized planes
+/// as the reconstruction and flags `film_grain_elected`.
+fn film_grain_settle<F>(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    tuning: PyramidTuning,
+    plain: TunedPyramidGopYuv,
+    encode_arm: F,
+) -> Result<TunedPyramidGopYuv, Error>
+where
+    F: FnMut(&[YuvFrame], &FilmGrainParams) -> Result<TunedPyramidGopYuv, Error>,
+{
+    if !(tuning.film_grain
+        && base_q_idx > 0
+        && tuning.model == RateModel::Twin
+        && frames.len() >= 2)
+    {
+        return Ok(plain);
+    }
+    let elected = elect_film_grain(
+        frames,
+        base_q_idx,
+        plain.gop.seq.color_config.matrix_coefficients,
+        plain.gop.ivf_bytes.len(),
+        &plain.gop.recon,
+        encode_arm,
+        |c: &TunedPyramidGopYuv| (c.gop.ivf_bytes.len(), c.gop.recon.as_slice()),
+    )?;
+    match elected {
+        Some((cand, grained)) => {
+            let mut out = cand;
+            out.gop.recon = grained;
+            out.film_grain_elected = true;
+            Ok(out)
+        }
+        None => Ok(plain),
+    }
+}
+
+/// One complete pyramid encode (KEY + every mini-GOP) with an optional
+/// armed §5.9.30 parameter set riding every coded header;
+/// reconstructions stay PRE-grain.
+fn encode_pyramid_core(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    tuning: PyramidTuning,
+    film_grain: Option<&FilmGrainParams>,
+) -> Result<TunedPyramidGopYuv, Error> {
     let (width, height) = validate_gop_input(frames)?;
     if tuning.max_mini_gop == 0 || tuning.max_mini_gop > 32 {
         return Err(Error::PartitionWalkOutOfRange);
     }
     let n = frames.len();
-    let mut session = PyramidSession::new(frames, base_q_idx, tuning)?;
+    let mut session = PyramidSession::new(frames, base_q_idx, tuning, film_grain)?;
     let mut pos = 1usize;
     while pos < n {
         let l = (n - pos).min(tuning.max_mini_gop);
@@ -1047,6 +1160,9 @@ impl Default for AdaptiveTuning {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TunedAdaptiveGopYuv {
+    /// r452 — the §5.9.30 film-grain arm won (see
+    /// [`PyramidTuning::film_grain`]).
+    pub film_grain_elected: bool,
     pub gop: EncodedGopYuv,
     pub chunk_lengths: Vec<usize>,
     pub mc_mads: Vec<f64>,
@@ -1061,6 +1177,9 @@ pub struct TunedAdaptiveGopYuv {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TunedAdaptiveGop {
+    /// r452 — the §5.9.30 film-grain arm won (see
+    /// [`PyramidTuning::film_grain`]).
+    pub film_grain_elected: bool,
     pub gop: EncodedGop,
     /// Committed mini-GOP lengths, in order.
     pub chunk_lengths: Vec<usize>,
@@ -1173,6 +1292,7 @@ pub fn encode_adaptive_gop_yuv420_with_q_tuned(
     let wide: Vec<YuvFrame> = frames.iter().map(YuvFrame::from_yuv420_8bit).collect();
     let t = encode_adaptive_gop_yuv_with_q_tuned(&wide, base_q_idx, tuning)?;
     Ok(TunedAdaptiveGop {
+        film_grain_elected: t.film_grain_elected,
         gop: narrow_gop_8bit(t.gop),
         chunk_lengths: t.chunk_lengths,
         mc_mads: t.mc_mads,
@@ -1203,6 +1323,60 @@ pub fn encode_adaptive_gop_yuv_with_q_tuned(
     base_q_idx: u8,
     tuning: AdaptiveTuning,
 ) -> Result<TunedAdaptiveGopYuv, Error> {
+    let plain = encode_adaptive_core(frames, base_q_idx, tuning, None)?;
+    // r452 — the §5.9.30 election over the adaptive driver: the arm
+    // re-runs the whole cut / mini-GOP election over the DENOISED
+    // frames (its motion probe sees the denoised content, exactly
+    // what the grain arm codes).
+    let plain_pyr = TunedPyramidGopYuv {
+        film_grain_elected: false,
+        gop: plain.gop,
+        chunk_lengths: plain.chunk_lengths,
+        primary_elections: plain.primary_elections,
+        ctx_donor_elections: plain.ctx_donor_elections,
+    };
+    let (mc_mads, cuts, elections) = (plain.mc_mads, plain.cuts, plain.elections);
+    let mut arm_trace: Option<AdaptiveTrace> = None;
+    let settled = film_grain_settle(frames, base_q_idx, tuning.pyramid, plain_pyr, |den, fg| {
+        let t = encode_adaptive_core(den, base_q_idx, tuning, Some(fg))?;
+        arm_trace = Some((t.mc_mads, t.cuts, t.elections));
+        Ok(TunedPyramidGopYuv {
+            film_grain_elected: false,
+            gop: t.gop,
+            chunk_lengths: t.chunk_lengths,
+            primary_elections: t.primary_elections,
+            ctx_donor_elections: t.ctx_donor_elections,
+        })
+    })?;
+    let (mc_mads, cuts, elections) = if settled.film_grain_elected {
+        arm_trace.expect("an elected arm ran the adaptive driver")
+    } else {
+        (mc_mads, cuts, elections)
+    };
+    Ok(TunedAdaptiveGopYuv {
+        film_grain_elected: settled.film_grain_elected,
+        gop: settled.gop,
+        chunk_lengths: settled.chunk_lengths,
+        mc_mads,
+        cuts,
+        elections,
+        primary_elections: settled.primary_elections,
+        ctx_donor_elections: settled.ctx_donor_elections,
+    })
+}
+
+/// The adaptive driver's per-run election trace: `(mc_mads, cuts,
+/// elections)` (see [`TunedAdaptiveGopYuv`]).
+type AdaptiveTrace = (Vec<f64>, Vec<bool>, Vec<(usize, usize, usize, usize)>);
+
+/// One complete adaptive encode with an optional armed §5.9.30
+/// parameter set (see [`encode_pyramid_core`]).
+fn encode_adaptive_core(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    tuning: AdaptiveTuning,
+    film_grain: Option<&FilmGrainParams>,
+) -> Result<TunedAdaptiveGopYuv, Error> {
     let (width, height) = validate_gop_input(frames)?;
     if tuning.pyramid.max_mini_gop == 0 || tuning.pyramid.max_mini_gop > 32 {
         return Err(Error::PartitionWalkOutOfRange);
@@ -1222,7 +1396,7 @@ pub fn encode_adaptive_gop_yuv_with_q_tuned(
     let cuts: Vec<bool> = mc_mads.iter().map(|&m| m > CUT_MC_MAD).collect();
 
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, frames[0].bit_depth));
-    let mut session = PyramidSession::new(frames, base_q_idx, tuning.pyramid)?;
+    let mut session = PyramidSession::new(frames, base_q_idx, tuning.pyramid, film_grain)?;
     let mut elections: Vec<(usize, usize, usize, usize)> = Vec::new();
 
     let mut pos = 1usize;
@@ -1278,6 +1452,7 @@ pub fn encode_adaptive_gop_yuv_with_q_tuned(
 
     let tuned = session.finish(width, height)?;
     Ok(TunedAdaptiveGopYuv {
+        film_grain_elected: false,
         gop: tuned.gop,
         chunk_lengths: tuned.chunk_lengths,
         mc_mads,

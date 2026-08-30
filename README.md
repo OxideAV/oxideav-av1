@@ -1378,6 +1378,21 @@ so the wire audit now tracks §7.20 reference state across frames.
 Pinned: `self-gop-128x96-q60-seg-film-grain` — the corpus's first
 segmentation × grain stream (corpus 151).
 
+### Film grain on the pyramid drivers (r452)
+
+The election is now driver-agnostic (`elect_film_grain`: probe,
+candidate ladder, perceptually-neutral-rate settlement) and
+`PyramidTuning::film_grain` (default on) rides it on the B-pyramid
+and adaptive drivers: the arm re-runs the whole out-of-order refresh
+graph over the denoised frames with full §5.9.30 parameters on every
+coded header — KEY, ALT, MID and B alike, each seeded at its own
+`order_hint`, so a `show_existing_frame` output carries the §7.21
+`load_grain_params()` synthesis of the frame it displays. Pinned:
+`self-pyr-96x80-q40-film-grain` — the corpus's first grained
+out-of-order stream, 16 201 → 1 885 bytes at a better neutrality
+score, byte-identical through three black-box reference decoders
+(corpus 153).
+
 ### Short reference signaling: the §7.8 `set_frame_refs()` write twin (r452)
 
 `GopTuning::short_ref_signaling` codes plain P-frames with

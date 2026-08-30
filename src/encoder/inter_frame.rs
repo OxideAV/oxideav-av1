@@ -1290,10 +1290,71 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     if !alt_q.is_empty() && seg_lossless_array(base_q_idx, alt_q).iter().any(|&b| b) {
         return Ok(plain);
     }
+    let elected = elect_film_grain(
+        frames,
+        base_q_idx,
+        plain.gop.seq.color_config.matrix_coefficients,
+        plain.gop.ivf_bytes.len(),
+        &plain.gop.recon,
+        |denoised, fg| {
+            encode_gop_yuv_core_fg(
+                denoised,
+                base_q_idx,
+                alt_q,
+                regions,
+                auto_detect,
+                extras,
+                tuning,
+                explicit_tiles,
+                Some(fg),
+            )
+        },
+        |c: &TunedGopYuv| (c.gop.ivf_bytes.len(), c.gop.recon.as_slice()),
+    )?;
+    match elected {
+        Some((cand, grained)) => {
+            let mut out = cand;
+            out.gop.recon = grained;
+            out.film_grain_elected = true;
+            Ok(out)
+        }
+        None => Ok(plain),
+    }
+}
+
+/// r452 — the §5.9.30 film-grain ELECTION, driver-agnostic: the r441
+/// probe, the r444/r447 parameter-set candidate ladder and the
+/// perceptually-neutral-rate settlement (see
+/// [`encode_gop_yuv_seg_extras_tuned_layout`]) over any driver that
+/// can re-encode the DENOISED frames with an armed parameter set.
+/// `encode(denoised, params)` runs the driver under the arm;
+/// `view(&t)` exposes its realized IVF byte count and DISPLAY-order
+/// pre-grain reconstructions. Returns the winning arm plus its
+/// §7.18.3-synthesized output planes, or `None` when the plain arm
+/// stands (probe failure, no candidate strictly under the plain
+/// bytes, or no score win). `plain_bytes` / `plain_recon` describe
+/// the caller's already-encoded plain arm; `mc` is the sequence's
+/// `matrix_coefficients`.
+pub(crate) fn elect_film_grain<T, F, V>(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    mc: u8,
+    plain_bytes: usize,
+    plain_recon: &[GopFrameReconYuv],
+    mut encode: F,
+    view: V,
+) -> Result<Option<(T, Vec<GopFrameReconYuv>)>, Error>
+where
+    F: FnMut(&[YuvFrame], &FilmGrainParams) -> Result<T, Error>,
+    V: Fn(&T) -> (usize, &[GopFrameReconYuv]),
+{
+    if frames.len() < 2 {
+        return Ok(None);
+    }
     use crate::encoder::film_grain_elect as fge;
     let dn01: Vec<YuvFrame> = frames[..2].iter().map(fge::denoise_frame).collect();
     if !fge::film_grain_probe(&frames[..2], &dn01) {
-        return Ok(plain);
+        return Ok(None);
     }
     let mut denoised = dn01;
     denoised.extend(frames[2..].iter().map(fge::denoise_frame));
@@ -1303,7 +1364,6 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     let format = frames[0].format;
     let (ssx, ssy) = format.subsampling();
     let num_planes = format.num_planes();
-    let mc = plain.gop.seq.color_config.matrix_coefficients;
     // r444 — the parameter-set CANDIDATE ladder. Candidate 0 is the
     // r441 shape (white luma-only grain — bit-identical params on
     // identical input); when the residual carries structure the spec
@@ -1401,39 +1461,22 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         }
         d
     };
-    let d_plain: u64 = plain
-        .gop
-        .recon
+    let d_plain: u64 = plain_recon
         .iter()
         .zip(frames)
         .map(|(rc, f)| sse_pair(rc, f))
         .sum();
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, bit_depth));
-    let score_plain = score256(
-        d_plain,
-        lambda,
-        (plain.gop.ivf_bytes.len() as u64) * 8 * 256,
-    );
+    let score_plain = score256(d_plain, lambda, (plain_bytes as u64) * 8 * 256);
     let shift = u32::from(bit_depth - 8);
-    let mut best: Option<(TunedGopYuv, Vec<GopFrameReconYuv>, u64)> = None;
+    let mut best: Option<(T, Vec<GopFrameReconYuv>, u64)> = None;
     for fg_base in &cand_params {
-        let cand = encode_gop_yuv_core_fg(
-            &denoised,
-            base_q_idx,
-            alt_q,
-            regions,
-            auto_detect,
-            extras,
-            tuning,
-            explicit_tiles,
-            Some(fg_base),
-        )?;
+        let cand = encode(&denoised, fg_base)?;
+        let (cand_bytes, cand_recon) = view(&cand);
         // The published output planes: the §7.18.3 synthesis through
         // the decoder's own driver, per-frame seeds from the shared
         // schedule.
-        let grained: Vec<GopFrameReconYuv> = cand
-            .gop
-            .recon
+        let grained: Vec<GopFrameReconYuv> = cand_recon
             .iter()
             .enumerate()
             .map(|(k, rc)| {
@@ -1449,9 +1492,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                 }
             })
             .collect();
-        let mut d_grain: u64 = cand
-            .gop
-            .recon
+        let mut d_grain: u64 = cand_recon
             .iter()
             .zip(&denoised)
             .map(|(rc, f)| sse_pair(rc, f))
@@ -1466,21 +1507,21 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                     &frames[k].y,
                     &denoised[k].y,
                     &grained[k].y,
-                    &cand.gop.recon[k].y,
+                    &cand_recon[k].y,
                     frames[k].y.len(),
                 ),
                 (
                     &frames[k].u,
                     &denoised[k].u,
                     &grained[k].u,
-                    &cand.gop.recon[k].u,
+                    &cand_recon[k].u,
                     frames[k].u.len(),
                 ),
                 (
                     &frames[k].v,
                     &denoised[k].v,
                     &grained[k].v,
-                    &cand.gop.recon[k].v,
+                    &cand_recon[k].v,
                     frames[k].v.len(),
                 ),
             ];
@@ -1499,7 +1540,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
             let w = width as usize;
             let h = height as usize;
             let rho_src = fge::lag1_h_rho(&frames[k].y, &denoised[k].y, w, h);
-            let rho_syn = fge::lag1_h_rho(&grained[k].y, &cand.gop.recon[k].y, w, h);
+            let rho_syn = fge::lag1_h_rho(&grained[k].y, &cand_recon[k].y, w, h);
             let sig_src = fge::plane_sigma16(&frames[k].y, &denoised[k].y, bit_depth);
             let gap = (rho_src - rho_syn).abs();
             let term = (frames[k].y.len() as f64) * gap * gap * ((sig_src * sig_src) as f64)
@@ -1507,7 +1548,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                 * f64::from(1u32 << (2 * shift));
             d_grain += term.round() as u64;
         }
-        let score = score256(d_grain, lambda, (cand.gop.ivf_bytes.len() as u64) * 8 * 256);
+        let score = score256(d_grain, lambda, (cand_bytes as u64) * 8 * 256);
         if std::env::var_os("OXIDEAV_AV1_FG_DEBUG").is_some() {
             eprintln!(
                 "fg-elect cand: lag {} cb {} cr {} csfl {} bytes {} d_grain {} score {} | plain bytes {} d {} score {}",
@@ -1515,10 +1556,10 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                 fg_base.num_cb_points,
                 fg_base.num_cr_points,
                 fg_base.chroma_scaling_from_luma,
-                cand.gop.ivf_bytes.len(),
+                cand_bytes,
                 d_grain,
                 score,
-                plain.gop.ivf_bytes.len(),
+                plain_bytes,
                 d_plain,
                 score_plain
             );
@@ -1531,20 +1572,15 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         // parameter set may outscore the white one on the neutrality
         // terms yet forfeit the rate mandate; the white candidate
         // stays eligible on its own bytes).
-        if cand.gop.ivf_bytes.len() < plain.gop.ivf_bytes.len()
-            && best.as_ref().map(|(_, _, s)| score < *s).unwrap_or(true)
-        {
+        if cand_bytes < plain_bytes && best.as_ref().map(|(_, _, s)| score < *s).unwrap_or(true) {
             best = Some((cand, grained, score));
         }
     }
     match best {
         Some((cand, grained, score_grain)) if score_grain < score_plain => {
-            let mut out = cand;
-            out.gop.recon = grained;
-            out.film_grain_elected = true;
-            Ok(out)
+            Ok(Some((cand, grained)))
         }
-        _ => Ok(plain),
+        _ => Ok(None),
     }
 }
 
