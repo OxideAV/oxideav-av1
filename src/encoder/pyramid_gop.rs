@@ -214,6 +214,23 @@ pub struct PyramidTuning {
     /// the no-grain shape (the A/B baseline; probe-failing content
     /// is bit-identical either way).
     pub film_grain: bool,
+    /// r453 — §5.9.2 `frame_refs_short_signaling = 1` through the
+    /// out-of-order refresh graph (the pyramid sibling of
+    /// [`super::inter_frame::GopTuning::short_ref_signaling`]): a
+    /// coded role whose §7.8 `set_frame_refs()` derivation over the
+    /// TRUE stored `RefOrderHint[]` state — seeded from the role's
+    /// LAST / GOLDEN slot — still NAMES every slot the role's RD
+    /// ladder searches (the ALT anchor, the nearest backward
+    /// midpoint, the enclosing midpoint) adopts the derived map and
+    /// re-addresses its search ordinals, primary-reference candidates
+    /// and §6.8.14 donor settlement onto the ordinals the derivation
+    /// gave those slots; the header then codes only `last_frame_idx`
+    /// / `gold_frame_idx` (7 wire bits replace the explicit 22) and
+    /// both sides run the identical §7.8 algorithm in lockstep. A
+    /// role whose searched slot the derivation cannot reach keeps the
+    /// explicit shape. `false` keeps the explicit map on every frame
+    /// (the A/B baseline; bit-identical to the pre-r453 streams).
+    pub short_ref_signaling: bool,
 }
 
 impl Default for PyramidTuning {
@@ -234,6 +251,7 @@ impl Default for PyramidTuning {
             ctx_update_elect: true,
             superres: true,
             film_grain: true,
+            short_ref_signaling: true,
         }
     }
 }
@@ -612,6 +630,68 @@ impl PyramidSession {
         })
     }
 
+    /// r453 — the §7.8 `set_frame_refs()` adoption: derive the map
+    /// the DECODER will compute from `rfi[ 0 ]` / `rfi[ 3 ]` over the
+    /// true stored hints and, when every slot the ladder searches
+    /// (each ordinal of `singles` / `pairs`, and the nearest-backward
+    /// slot at `bwd_ordinal`) is still reachable on the derived map,
+    /// commit it: `rfi` becomes the derivation and the ordinals are
+    /// re-addressed (same ordinal when it still names the slot, else
+    /// the first ordinal that does). Returns `false` — nothing
+    /// touched — when a searched slot is unreachable.
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_short_refs(
+        rfi: &mut [u8; 7],
+        singles: &mut Vec<i8>,
+        pairs: &mut Vec<[i8; 2]>,
+        bwd_ordinal: &mut u8,
+        order_hint: u32,
+        order_hint_bits: u8,
+        slot_hints: &[u32; 8],
+    ) -> bool {
+        let derived = crate::frame_header::set_frame_refs(
+            rfi[0],
+            rfi[3],
+            order_hint,
+            order_hint_bits,
+            true,
+            slot_hints,
+        );
+        // Ordinal (1-based, `LAST_FRAME..=ALTREF_FRAME`) on the
+        // derived map that names the slot the explicit ordinal `o`
+        // holds.
+        let remap = |o: i8| -> Option<i8> {
+            let slot = rfi[(o - 1) as usize];
+            if derived[(o - 1) as usize] == slot {
+                Some(o)
+            } else {
+                derived.iter().position(|&d| d == slot).map(|i| i as i8 + 1)
+            }
+        };
+        let mut new_singles = Vec::with_capacity(singles.len());
+        for &o in singles.iter() {
+            match remap(o) {
+                Some(n) => new_singles.push(n),
+                None => return false,
+            }
+        }
+        let mut new_pairs = Vec::with_capacity(pairs.len());
+        for &[a, b] in pairs.iter() {
+            match (remap(a), remap(b)) {
+                (Some(x), Some(y)) if x != y => new_pairs.push([x, y]),
+                _ => return false,
+            }
+        }
+        let Some(new_bwd) = remap(*bwd_ordinal as i8 + 1) else {
+            return false;
+        };
+        *rfi = derived;
+        *singles = new_singles;
+        *pairs = new_pairs;
+        *bwd_ordinal = (new_bwd - 1) as u8;
+        true
+    }
+
     /// The role's frame quantiser (per-layer offsets, clamped to the
     /// lossy range; inert at `base_q == 0`).
     fn role_q(&self, role: &Role) -> u8 {
@@ -650,6 +730,28 @@ impl PyramidSession {
                     if let Some(a) = role.alt_ref_slot.or(role.bwd_slot) {
                         rfi[6] = a as u8;
                     }
+                    // r453 — §5.9.2 short signaling (see
+                    // [`PyramidTuning::short_ref_signaling`]): adopt
+                    // the §7.8 derivation whenever it still names
+                    // every slot the ladder searches, re-addressing
+                    // the ordinals onto the derived map.
+                    let mut singles = role.singles.clone();
+                    let mut pairs = role.pairs.clone();
+                    // §5.9.2 primary-reference ordinal naming the
+                    // nearest-backward slot (`ref_frame_idx[ 4 ]` =
+                    // BWDREF on the explicit map).
+                    let mut bwd_ordinal: u8 = 4;
+                    let short_ref_signaling = self.tuning.short_ref_signaling
+                        && self.seq.enable_order_hint
+                        && Self::adopt_short_refs(
+                            &mut rfi,
+                            &mut singles,
+                            &mut pairs,
+                            &mut bwd_ordinal,
+                            role.display as u32,
+                            self.seq.order_hint_bits,
+                            &self.slot_hints,
+                        );
                     // Distinct reference reconstructions + the full
                     // 8-slot map onto them (each slot resolves to the
                     // display frame it truly holds).
@@ -681,7 +783,7 @@ impl PyramidSession {
                             match role.bwd_slot {
                                 Some(b) if b != role.last_slot => {
                                     bwd_carry = self.carry_store[b].clone();
-                                    alts.push((4, Some(&*bwd_carry)));
+                                    alts.push((bwd_ordinal, Some(&*bwd_carry)));
                                 }
                                 _ => {}
                             }
@@ -701,10 +803,10 @@ impl PyramidSession {
                         show_frame: role.show,
                         refresh_frame_flags: role.refresh.map_or(0, |s| 1u8 << s),
                         ref_frame_idx: rfi,
-                        short_ref_signaling: false,
+                        short_ref_signaling,
                         slot_hints: self.slot_hints,
-                        single_refs: role.singles.clone(),
-                        compound_pairs: role.pairs.clone(),
+                        single_refs: singles,
+                        compound_pairs: pairs,
                         refs,
                         slot_to_plane,
                         primary_ref_frame,
@@ -763,11 +865,12 @@ impl PyramidSession {
                     // still-open temporal unit or an already-flushed
                     // one — and every §7.20 slot holding the same
                     // frame's carry is swept by pointer identity.
+                    // (r453: the ordinal resolves through the CODED
+                    // map — explicit or §7.8-derived alike.)
                     let consumed_slot: Option<usize> = if self.tuning.primary_ref {
                         match aux.primary_ref {
-                            0 => Some(role.last_slot),
-                            4 => role.bwd_slot,
-                            _ => None,
+                            PRIMARY_REF_NONE => None,
+                            o => Some(rfi[o as usize] as usize),
                         }
                     } else {
                         None

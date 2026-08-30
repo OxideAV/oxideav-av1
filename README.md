@@ -1413,6 +1413,27 @@ Pinned: `self-gop-96x64-q80-shortrefs` — the corpus's first stream
 on the short arm, byte-identical through three black-box reference
 decoders (corpus 152).
 
+### Short reference signaling through the B-pyramid (r453)
+
+`PyramidTuning::short_ref_signaling` (default on) carries the §7.8
+lockstep into the out-of-order refresh graph: a coded role whose
+`set_frame_refs()` derivation over the TRUE stored `RefOrderHint[]`
+state — seeded from the role's LAST / GOLDEN slot — still names every
+slot its RD ladder searches (the mini-GOP ALT, the nearest backward
+midpoint, the enclosing midpoint) adopts the derived map, re-addresses
+its search ordinals, primary-reference candidates and §6.8.14 donor
+settlement onto the ordinals the derivation gave those slots, and
+codes only `last_frame_idx` / `gold_frame_idx` (7 wire bits replace
+the explicit 22) — decoded-not-shown ALT / MID frames included. On
+the pyramid's role geometry the derivation lands the backward chain
+exactly (ALT is the latest backward, the nearest midpoint the
+earliest, the enclosing midpoint the next earliest), so every non-KEY
+frame rides the short arm; a role whose searched slot the derivation
+cannot reach keeps the explicit shape. The adaptive driver rides the
+same adoption. Pinned: `self-pyr-96x80-q60-shortrefs` — the corpus's
+first short-signaled out-of-order stream, byte-identical through
+three black-box reference decoders (corpus 154).
+
 ### Switch frames: the §5.9.2 S-frame cadence (r447)
 
 `GopTuning::s_frame_period` codes every N-th inter frame as a

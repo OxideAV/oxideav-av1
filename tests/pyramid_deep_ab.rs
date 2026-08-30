@@ -180,6 +180,9 @@ fn baseline_tuning() -> PyramidTuning {
         // the pyramid-depth axis stays the only variable.
         superres: true,
         film_grain: false,
+        // r453 — both A/B arms ride the same §5.9.2 short-signaling
+        // adoption so the pyramid-depth axis stays the only variable.
+        short_ref_signaling: true,
     }
 }
 
