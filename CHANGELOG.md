@@ -4,6 +4,68 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/OxideAV/oxideav-av1/compare/v0.1.16...v0.1.17) - 2026-08-30
+
+### Other
+
+- r453 §5.9.17 delta-q on lossless-segment tables under the exact §7.12.2 guard; corpus 154 -> 155
+- r453 memory footprint — Arc-shared §7.20 payloads, moved CurrFrame planes, borrowed CDEF source, DeltaLFs i8 + lazy PaletteColors; 1080p peak RSS -35% byte-identical
+- r453 §5.9.2 frame_refs_short_signaling through the B-pyramid + adaptive drivers; corpus 153 -> 154
+- r452 — ar_coeff_lag = 3 ring measured on the election ladder, not adopted (never outscores lag 1 under the objective's lag-1 correlation term)
+- r452 §5.9.30 film grain on the pyramid + adaptive drivers — driver-agnostic election ladder; corpus 152 -> 153
+- r452 §5.9.2 frame_refs_short_signaling write twin — §7.8 set_frame_refs() adopted on plain P-frames; corpus 151 -> 152
+- r452 fuzz OOM — per-transform-block TxTypes[] grid copy removed + Annex A picture-size ceiling
+- r450 segmentation x film grain — the §5.9.30 election joins the SEG_LVL_ALT_Q ladder; corpus 150 -> 151
+- r450 external tool-combination battery + 3-op-point SVC pin + QM x camera lift; corpus 142 -> 150
+- r450 coded error-resilient inter frames + §5.11.1 explicit tile spans; corpus 140 -> 142
+- r450 film-grain x format axis — mono / 10-bit / single-chroma-plane grain; corpus 137 -> 140
+- *(s_frames)* film-grain x S-frame composition witness
+- r447 superres x multi-tile — lift the single-tile election scope; corpus 136 -> 137
+- r447 §5.9.30 chroma_scaling_from_luma election — csfl twins in the film-grain ladder; corpus 135 -> 136
+- r447 §5.9.2 SWITCH frames — s_frame_period cadence + cross-rate splice; corpus 133 -> 135
+- pin the four r444 election streams — corpus 129 -> 133; §5.9.30 4:2:0 chroma-gate coupling fix
+- r444 §5.9.30 film-grain chroma points + AR-tap fitting
+- r444 superres on the spatial-SVC driver — pre-pass election + layered §5.9.8 wire arms
+- r444 superres on segmented / pyramid / temporal-ladder drivers
+- r444 LR x superres pairing — §7.17 election at the upscaled extent
+- pin the three r441 election streams — corpus 126 -> 129
+- r441 multi-level QM ladder + README rollup + staging dumps
+- r441 §5.9.30 film-grain election — estimated params, output-only synthesis mirror
+- r441 §5.9.8 superres election — downscaled-width KEY arm through the §7.16 mirror
+- r441 §5.9.12 QM × segmentation — per-segment SegQMLevel bundle threading
+- optimised dev/test codegen for the conformance suite
+- scope the §5.9.12 QM arm to its measured win regime
+- *(ctx_update_elect)* adaptive-driver donor election survives trial cloning
+- pin the four r439 election streams — corpus 122 -> 126
+- r439 §5.9.12 quantizer-matrix election + §6.8.14 donor election on the pyramid/SVC drivers
+- r436 segmented loop restoration — the last in-loop pairing, corpus pin 122
+- r436 §6.8.14 donor election on the temporal ladder — freeze-at-first-consumption discipline
+- r436 segmentation pairings — delta-q + CDEF on segmented frames, §7.12.2 seg-bundle fix, corpus pins 120+121
+- r436 §6.8.14 context_update_tile_id election — exact-bytes donor replay, wire patch-back, corpus pin 119
+- r436 per-layer tile layouts + tile-group packaging on the spatial-SVC driver, corpus pin 118
+- *(camera_frame)* the geometry-envelope unit test tracks the r433 2-D grid envelope
+- r429-r433 status — multi-tile write arm, tile-group split framing, non-uniform layouts, spatial SVC, per-unit CDEF/LR, KEY delta-q
+- tile layouts through the pyramid/adaptive + temporal-ladder drivers, §7.3 camera tile GRIDS, corpus pins 116 + 117
+- §5.11.1 multi-tile-group frames (both arms) + §5.9.15 non-uniform tile layouts (write arm)
+- RUST_MIN_STACK=16MiB via .cargo/config [env] — fix windows-debug test stack overflow
+- *(cdef_unit_ab)* isolate the CDEF axis from the §5.9.17 delta-q confound
+- KEY-frame §5.9.17 per-superblock delta-q election + corpus pin 115
+- pin the first multi-tile and first spatially scalable streams (corpus 113 + 114)
+- spatial-scalability write arm — independent spatial layers, spatial_id extension headers, nested §6.7.5 operating points
+- §5.9.15 multi-tile WRITE arm — KEY + generic inter drivers, camera-frame tile columns
+- pin the first temporally scalable stream (corpus 112) — digested at every operating point
+- §7.3 camera-frame write arm — LST material end to end
+- tile list: §5.12 OBU parse/write + the §7.3 large-scale-tile decoding process
+- temporally scalable GOP arm — §6.7.5 operating points + §5.3.3 extension headers on the wire
+- operating-point selection (§5.5.1/§6.7.5) + the §5.3.1 drop_obu rule
+- tier the test matrix — full suite on ubuntu/macos, lib-tests smoke on windows
+- 10-bit depth-axis tripwire — election + byte-exact round trip at BitDepth 10
+- pin the first loop-restoration stream (corpus 111)
+- loop-restoration election — §5.9.20/§5.11.57/§7.17 per-unit Wiener + self-guided with exact-bytes settlement
+- pin the first per-unit CDEF stream (corpus 110)
+- per-64x64 CDEF strengths — cdef_bits > 0 election with exact-bytes settlement
+- seg_qp derives the frame's real bit depth — segmented >8-bit GOPs fix + corpus-109 pin
+
 - DELTA-Q × LOSSLESS SEGMENTS, exact §7.12.2 guard (r453): the conservative r436 rule (a SEG_LVL_ALT_Q table carrying a lossless segment kept the whole frame on the single-quantiser arm) is replaced by the exact condition — `LosslessArray[]` is derived with `ignoreDeltaQ = 1` while a block dequantizes at `Clip3( 0, 255, CurrentQIndex + data )`, so a lossless segment stays lossless under delta-q exactly when every realized `CurrentQIndex` keeps `CurrentQIndex + data <= 0`. `delta_q_lossless_up_cap` caps the absolute plan's upward units at `floor(((-data) - base_q_idx) / (1 << delta_q_res))` over the lossless segments (a `-255` table keeps the full span, a table at exactly `-base_q_idx` keeps only the refining swings; never negative). Witnesses in `tests/delta_q_lossless_seg.rs`; pin `self-gop-128x128-q100-dq-lossless-seg` (corpus 154 → 155), byte-identical through THREE independent black-box reference decoders — the corpus's first `delta_q_present = 1` stream whose table carries a lossless segment
 
 - DECODER MEMORY FOOTPRINT (r453): peak decode RSS on a 1080p inter stream drops ~35 % with byte-identical output (171.5 MB → 100–118 MB measured; the largest corpus stream 5.36 MB → 4.34 MB). §7.20 slots now share ONE `Arc`-held immutable payload per `refresh_frame_flags` set (an all-refresh KEY kept eight deep copies of planes + motion-field grids + CDF snapshots) and `reference_frame_update()` MOVES the payload out of the decode result; the frame driver takes ownership of the walker's `CurrFrame[]` planes after the tile walk (nothing in the walker reads them afterwards) instead of copying, and borrows the §7.17 deblocked copy as the §7.15 CDEF source instead of cloning a third full-frame buffer. Grid narrowing to spec-bounded widths: `DeltaLFs[]` stores the §5.11.13 post-Clip3 deltas as `i8` (±63; `PartitionWalker::delta_lfs()` now returns `&[i8]`), and `PaletteColors[]` — the walker's largest grid, `3 · area · PALETTE_COLORS` u16 — is materialized lazily on the first real §5.11.46 palette write (`palette_colors()` returns an EMPTY slice when no palette landed; readers treat that as the all-zero pre-fill)
