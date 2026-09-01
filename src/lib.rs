@@ -1523,6 +1523,8 @@ mod bitreader;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod cdef;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cdf;
 pub mod decoder;
 pub mod encoder;
