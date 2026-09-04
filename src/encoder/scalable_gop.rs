@@ -475,6 +475,14 @@ pub struct SpatialLayeredGopYuv {
     pub layer_recons: Vec<Vec<GopFrameReconYuv>>,
     /// Per-layer `(width, height)`.
     pub layer_dims: Vec<(u32, u32)>,
+    /// r456 — §5.3.3 `temporal_id` per time instant (all `0` on the
+    /// spatial-only shape; the dyadic ladder of
+    /// [`encode_spatial_temporal_layered_gop_yuv_with_q`] otherwise).
+    pub temporal_ids: Vec<u8>,
+    /// r456 — the §6.7.5 operating points as `(spatial layers,
+    /// temporal layers)` counts, in `operating_point_idc` order (entry
+    /// `k` of `seq.operating_points`).
+    pub operating_points: Vec<(u8, u8)>,
 }
 
 /// 8-bit 4:2:0 sibling of [`SpatialLayeredGopYuv`].
@@ -486,6 +494,10 @@ pub struct SpatialLayeredGop {
     /// `layer_recons[ s ][ i ]`, 8-bit planes.
     pub layer_recons: Vec<Vec<crate::encoder::inter_frame::GopFrameRecon>>,
     pub layer_dims: Vec<(u32, u32)>,
+    /// §5.3.3 `temporal_id` per time instant (see [`SpatialLayeredGopYuv::temporal_ids`]).
+    pub temporal_ids: Vec<u8>,
+    /// The §6.7.5 operating points as `(spatial, temporal)` layer counts.
+    pub operating_points: Vec<(u8, u8)>,
 }
 
 /// The §6.7.5 operating-point list for `s_count` INDEPENDENTLY CODED
@@ -583,7 +595,81 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
     layer_tiles: Option<&[(u32, u32)]>,
     tile_groups: u32,
 ) -> Result<SpatialLayeredGopYuv, Error> {
+    encode_spatial_layered_core(layers, base_q_idx, layer_tiles, tile_groups, 1)
+}
+
+/// r456 — SPATIAL × TEMPORAL scalability: the independently coded
+/// spatial layers of [`encode_spatial_layered_gop_yuv_with_q`], each
+/// carrying the dyadic `temporal_layers`-deep ladder of
+/// [`encode_temporal_layered_gop_yuv_with_q`] (`2..=4`; display
+/// position `i` rides `temporal_layer_of( i, temporal_layers )` in
+/// EVERY spatial layer, so each §7.5 temporal unit is homogeneous in
+/// `temporal_id`). §7.20 slots are partitioned `8 / S` per spatial
+/// layer: temporal layer `t < T - 1` refreshes the layer's slot `t`,
+/// top-layer frames are non-reference, every frame predicts LAST-only
+/// from its own layer's frame at `i - (1 << (T - 1 - t))` with the
+/// §8.3.1 primary-reference CDF chain riding the same slot — so any
+/// spatial-layer SUFFIX and any temporal-layer SUFFIX (or both) drop
+/// cleanly. The sequence header lists `S × T` §6.7.5 operating points,
+/// `operating_point_idc = (spatial mask << 8) | temporal mask` for
+/// every `(S - k, T - j)` pair (point 0 the full stream; the last the
+/// base spatial layer's base temporal layer). Decoding at point `p`
+/// yields the shown frames of spatial layers `< S - k` at temporal
+/// layers `< T - j`, each byte-identical to `layer_recons[ s ][ i ]`.
+///
+/// ## Errors
+///
+/// Every [`encode_spatial_layered_gop_yuv_with_q`] reject, plus
+/// `temporal_layers` outside `2..=4` or deeper than the per-layer slot
+/// budget (`T - 1 <= 8 / S`: two spatial layers admit four temporal
+/// layers, three or four spatial layers admit three).
+pub fn encode_spatial_temporal_layered_gop_yuv_with_q(
+    layers: &[Vec<YuvFrame>],
+    base_q_idx: u8,
+    temporal_layers: u8,
+) -> Result<SpatialLayeredGopYuv, Error> {
+    if !(2..=4).contains(&temporal_layers) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    encode_spatial_layered_core(layers, base_q_idx, None, 1, temporal_layers)
+}
+
+/// 8-bit 4:2:0 entry point of
+/// [`encode_spatial_temporal_layered_gop_yuv_with_q`].
+pub fn encode_spatial_temporal_layered_gop_yuv420_with_q(
+    layers: &[Vec<Yuv420Frame>],
+    base_q_idx: u8,
+    temporal_layers: u8,
+) -> Result<SpatialLayeredGop, Error> {
+    let wide: Vec<Vec<YuvFrame>> = layers
+        .iter()
+        .map(|l| l.iter().map(YuvFrame::from_yuv420_8bit).collect())
+        .collect();
+    encode_spatial_temporal_layered_gop_yuv_with_q(&wide, base_q_idx, temporal_layers)
+        .map(narrow_spatial_gop)
+}
+
+/// The shared spatial / spatial × temporal core (`temporal_layers = 1`
+/// is the pure spatial shape, bit for bit).
+fn encode_spatial_layered_core(
+    layers: &[Vec<YuvFrame>],
+    base_q_idx: u8,
+    layer_tiles: Option<&[(u32, u32)]>,
+    tile_groups: u32,
+    temporal_layers: u8,
+) -> Result<SpatialLayeredGopYuv, Error> {
     let s_count = layers.len();
+    // r456 — the per-spatial-layer §7.20 slot budget: the pure spatial
+    // shape keeps its two-slot rotation; a temporal ladder takes
+    // `8 / S` slots (one per reference temporal layer).
+    let budget: usize = if temporal_layers <= 1 {
+        2
+    } else {
+        8 / s_count.max(2)
+    };
+    if temporal_layers > 1 && usize::from(temporal_layers) - 1 > budget {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
     if !(2..=4).contains(&s_count) {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -676,8 +762,31 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
     // then codes its `use_superres` bit; an unelected stream stays
     // bit-identical to the r431 shape).
     seq.enable_superres = layer_sr.iter().any(|p| p.is_some());
-    seq.operating_points = spatial_operating_points_for(seq.operating_points[0], s_count as u8);
-    seq.operating_points_cnt_minus_1 = (s_count - 1) as u8;
+    let op_counts: Vec<(u8, u8)> = if temporal_layers <= 1 {
+        (0..s_count as u8).map(|k| (s_count as u8 - k, 1)).collect()
+    } else {
+        // r456 — every (spatial suffix drop, temporal suffix drop)
+        // pair; point 0 is the full stream, the last the base layer's
+        // base temporal layer.
+        (0..s_count as u8)
+            .flat_map(|k| {
+                (0..temporal_layers).map(move |j| (s_count as u8 - k, temporal_layers - j))
+            })
+            .collect()
+    };
+    seq.operating_points = if temporal_layers <= 1 {
+        spatial_operating_points_for(seq.operating_points[0], s_count as u8)
+    } else {
+        let base = seq.operating_points[0];
+        op_counts
+            .iter()
+            .map(|&(sc, tc)| OperatingPoint {
+                operating_point_idc: (((1u16 << sc) - 1) << 8) | ((1u16 << tc) - 1),
+                ..base
+            })
+            .collect()
+    };
+    seq.operating_points_cnt_minus_1 = (op_counts.len() - 1) as u8;
     let seq_payload = write_sequence_header_obu(&seq);
 
     // ---- Session state: §7.20 slots partitioned two per layer. ----
@@ -697,6 +806,10 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
     // don't shift it).
     let donor_armed_layer = |s: usize| tiles_of(s) != (0, 0);
     let mut carry_wire: [Option<(usize, usize)>; 8] = [None; 8];
+    // r456 — the display instant each slot holds (the temporal ladder
+    // resolves its LAST reference by instant).
+    let mut slot_display = [0usize; 8];
+    let mut temporal_ids: Vec<u8> = vec![0];
 
     // ---- Time instant 0: the layer-0 KEY + enhancement INTRA_ONLYs. ----
     let mut tu0: Vec<u8> = Vec::new();
@@ -731,7 +844,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             // Layer 0: a true KEY (refreshes ALL slots — §5.9.2
             // derives allFrames); enhancement layers: INTRA_ONLY
             // refreshing only their own pair.
-            intra_only_refresh: (s > 0).then_some(0b11u8 << (2 * s)),
+            intra_only_refresh: (s > 0).then_some(((1u8 << budget) - 1) << (budget * s)),
             // r431 — the same §5.9.17 delta-q election as every
             // default intra entry.
             delta_q: true,
@@ -777,11 +890,11 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             slot_hints = [0; 8];
             carry_wire = [Some((0, 0)); 8];
         } else {
-            for b in 0..2usize {
-                mf_store[2 * s + b] = SavedMotionField::intra(mi_rows, mi_cols);
-                carry_store[2 * s + b] = Some(carry.clone());
-                slot_hints[2 * s + b] = 0;
-                carry_wire[2 * s + b] = Some((0, s));
+            for b in 0..budget {
+                mf_store[budget * s + b] = SavedMotionField::intra(mi_rows, mi_cols);
+                carry_store[budget * s + b] = Some(carry.clone());
+                slot_hints[budget * s + b] = 0;
+                carry_wire[budget * s + b] = Some((0, s));
             }
         }
         // Extract the frame-carrying OBUs from the driver's own
@@ -822,12 +935,30 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             &crate::encoder::obu::ObuHeader::new(ObuType::TemporalDelimiter),
             &[],
         );
+        // r456 — the instant's temporal layer (0 on the pure spatial
+        // shape), shared by every spatial layer's frame in this unit.
+        let tid = temporal_layer_of(i, temporal_layers.max(1));
+        temporal_ids.push(tid);
         for (s, layer) in layers.iter().enumerate() {
-            // Own-layer slot rotation: frame i-1 sits in slot
-            // `2s + ((i-1) & 1)`; this frame refreshes the other one.
-            let last_slot = 2 * s + ((i - 1) & 1);
-            let refresh_slot = 2 * s + (i & 1);
-            let prev = layer_recons[s].last().expect("instant i-1 encoded").clone();
+            // Own-layer slot policy. Pure spatial: frame i-1 sits in
+            // slot `2s + ((i-1) & 1)`, this frame refreshes the other
+            // one. r456 spatial × temporal: LAST is the layer's slot
+            // holding instant `i - (1 << (T - 1 - tid))`, temporal
+            // layer `tid < T - 1` refreshes the layer's slot `tid`,
+            // the top layer refreshes nothing.
+            let (last_slot, refresh_slot, last_display): (usize, Option<usize>, usize) =
+                if temporal_layers <= 1 {
+                    (2 * s + ((i - 1) & 1), Some(2 * s + (i & 1)), i - 1)
+                } else {
+                    let want = i - (1usize << (temporal_layers - 1 - tid));
+                    let base = budget * s;
+                    let ls = (base..base + budget)
+                        .find(|&slot| slot_display[slot] == want)
+                        .ok_or(Error::PartitionWalkOutOfRange)?;
+                    let rs = (tid + 1 < temporal_layers).then_some(base + usize::from(tid));
+                    (ls, rs, want)
+                };
+            let prev = layer_recons[s][last_display].clone();
             let last_carry = carry_store[last_slot]
                 .clone()
                 .expect("layer slots seeded at instant 0");
@@ -835,7 +966,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             let cfg = InterFrameConfig {
                 order_hint: i as u32,
                 show_frame: true,
-                refresh_frame_flags: 1u8 << refresh_slot,
+                refresh_frame_flags: refresh_slot.map_or(0, |rs| 1u8 << rs),
                 ref_frame_idx: [last_slot as u8; 7],
                 short_ref_signaling: false,
                 slot_hints,
@@ -874,15 +1005,16 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 superres: None,
                 superres_source: None,
             };
-            let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
-                &layer[i],
-                &seq,
-                base_q_idx,
-                &cfg,
-                &[],
-                &mf,
-                RateModel::Twin,
-            )?;
+            // r456 — per-temporal-layer quantiser offset (anchors
+            // finest, leaves coarsest; inert on the pure spatial
+            // shape and at `base_q_idx == 0`).
+            let q = if base_q_idx == 0 {
+                0
+            } else {
+                (i32::from(base_q_idx) + layer_q_off(tid)).clamp(1, 255) as u8
+            };
+            let (obus, recon, saved, carry, aux) =
+                encode_inter_frame_generic(&layer[i], &seq, q, &cfg, &[], &mf, RateModel::Twin)?;
             // r439 — §6.8.14 donor settlement (same multi-consumer
             // discipline as the temporal ladder: the consumed slot's
             // donor set freezes at first consumption whether or not
@@ -927,14 +1059,17 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 }
             }
             for mut obu in obus {
-                obu.header.extension = Some(ObuExtensionHeader::new(0, s as u8));
+                obu.header.extension = Some(ObuExtensionHeader::new(tid, s as u8));
                 write_obu_with_size(&mut tu, &obu.header, &obu.body);
             }
             layer_recons[s].push(recon);
-            mf_store[refresh_slot] = saved;
-            carry_store[refresh_slot] = Some(Rc::new(carry));
-            slot_hints[refresh_slot] = i as u32;
-            carry_wire[refresh_slot] = Some((i, s));
+            if let Some(rs) = refresh_slot {
+                mf_store[rs] = saved;
+                carry_store[rs] = Some(Rc::new(carry));
+                slot_hints[rs] = i as u32;
+                carry_wire[rs] = Some((i, s));
+                slot_display[rs] = i;
+            }
         }
         temporal_units.push(tu);
     }
@@ -959,6 +1094,8 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
         seq,
         layer_recons,
         layer_dims: layers.iter().map(|l| (l[0].width, l[0].height)).collect(),
+        temporal_ids,
+        operating_points: op_counts,
     })
 }
 
@@ -983,10 +1120,14 @@ pub fn encode_spatial_layered_gop_yuv420_with_q_tiles(
         .iter()
         .map(|l| l.iter().map(YuvFrame::from_yuv420_8bit).collect())
         .collect();
-    let s =
-        encode_spatial_layered_gop_yuv_with_q_tiles(&wide, base_q_idx, layer_tiles, tile_groups)?;
+    encode_spatial_layered_gop_yuv_with_q_tiles(&wide, base_q_idx, layer_tiles, tile_groups)
+        .map(narrow_spatial_gop)
+}
+
+/// Narrow a general-format spatial result to 8-bit planes.
+fn narrow_spatial_gop(s: SpatialLayeredGopYuv) -> SpatialLayeredGop {
     let narrow = |p: &[u16]| p.iter().map(|&v| v as u8).collect::<Vec<u8>>();
-    Ok(SpatialLayeredGop {
+    SpatialLayeredGop {
         ivf_bytes: s.ivf_bytes,
         temporal_units: s.temporal_units,
         seq: s.seq,
@@ -1004,7 +1145,9 @@ pub fn encode_spatial_layered_gop_yuv420_with_q_tiles(
             })
             .collect(),
         layer_dims: s.layer_dims,
-    })
+        temporal_ids: s.temporal_ids,
+        operating_points: s.operating_points,
+    }
 }
 
 /// 8-bit 4:2:0 entry point of

@@ -467,6 +467,8 @@ pub use scalable_gop::{
 // spatial-SVC driver.
 pub use scalable_gop::{
     encode_spatial_layered_gop_yuv420_with_q_tiles, encode_spatial_layered_gop_yuv_with_q_tiles,
+    encode_spatial_temporal_layered_gop_yuv420_with_q,
+    encode_spatial_temporal_layered_gop_yuv_with_q,
 };
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;

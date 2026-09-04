@@ -1652,6 +1652,33 @@ r450 pins the first THREE-operating-point stream:
 byte-identical through two independent black-box reference decoders
 AT THAT POINT (full interleave, two-layer prefix, base layer).
 
+### Spatial × temporal scalability: the §6.7.5 product ladder (r456)
+
+`encoder::encode_spatial_temporal_layered_gop_yuv{420,}_with_q(layers,
+q, temporal_layers)` composes the two r430/r431 shapes: the
+independently coded spatial layers each carry the dyadic
+`temporal_layers`-deep ladder (display position `i` rides
+`temporal_layer_of( i, T )` in every spatial layer, so each §7.5
+temporal unit is homogeneous in `temporal_id`), §7.20 slots are
+partitioned `8 / S` per spatial layer (temporal layer `t < T - 1`
+refreshes the layer's slot `t`, top-layer frames are non-reference,
+every frame predicts LAST-only from its own layer's frame at `i -
+(1 << (T - 1 - t))` with the §8.3.1 primary chain on the same slot),
+and the sequence header lists the `S × T` product of §6.7.5 points —
+`operating_point_idc = (spatial mask << 8) | temporal mask` for every
+`(S - k, T - j)` pair — so any spatial suffix, any temporal suffix or
+both drop cleanly (two spatial layers admit four temporal layers,
+three or four admit three). The pure spatial driver is the same core
+at `T = 1`, bit for bit; results grow `temporal_ids` and
+`operating_points`. Witnesses in `tests/spatial_temporal_svc.rs`
+(2×2, 2×3 and 3×2 ladders decoded at EVERY operating point against
+the per-layer reconstructions, extension-header + idc wire audit,
+budget rejects). Pinned: `self-svc-st-64-128-q84-t2` (4 points) and
+`self-svc-st-64-128-q72-t3` (6 points) — the corpus's first product
+operating-point lists, every point byte-identical through two
+independent black-box reference decoders at that point (corpus
+161).
+
 ### External tool-combination battery (r450)
 
 The r450 decode-tail sweep (`tests/external_sweep.rs`, an env-gated
