@@ -4,6 +4,17 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.17...v0.2.0) - 2026-09-04
+
+### Other
+
+- r456 spatial-SVC inter-layer prediction — per-reference extents in the search context, the next-lower layer as a scaled GOLDEN reference; corpus 162 -> 164
+- r456 §5.9.30 ar_coeff_lag = 3 adopted — multi-lag correlation-match term + gated 24-tap candidate; corpus 161 -> 162
+- r456 spatial × temporal scalability — the §6.7.5 product operating-point ladder on the spatial-SVC core; corpus 159 -> 161
+- r456 §5.9.30 film grain × feature-extra / lossless-segment tables — the r450 gates lifted; corpus 157 -> 159
+- r456 §5.9.8 superres on INTER frames — the §7.11.3.3 scaled-reference arm + mid-GOP election, explicit layouts remapped onto the coded grid (writer last-column ceiling fix); corpus 155 -> 157
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 - SPATIAL SCALABILITY WITH INTER-LAYER PREDICTION (r456): `encode_spatial_layered_gop_yuv{420,}_with_q_inter_layer(layers, q, temporal_layers)` — every enhancement-layer inter frame carries the next-lower layer's reconstruction of the same instant as GOLDEN (`ref_frame_idx[ 3 ]` = the lower layer's §7.20 slot, refreshed earlier in the same temporal unit) alongside its own LAST; the reference sits at the lower layer's own extent, so the search context's `FrameStore` views carry PER-REFERENCE extents (`InterFrameConfig::ref_dims`, `PSearchCtx::ref_dims`; `is_scaled` per reference ordinal; per-reference bilinear search resamples; §5.9.24 identity models on scaled frames) and every candidate prediction runs the decoder's §7.11.3.3 scaled path in both axes (the 2× upscale side of the §6.8.2 bounds). Lower layers never reference upper ones (spatial-suffix drops stay bit-identical); top-temporal-layer instants predict within their own layer; openers stay `INTRA_ONLY`. Witnesses in `tests/spatial_inter_layer.rs`; measured: fresh-texture-per-instant content 4 682 → 2 433 bytes (−48 %), smooth pan 1 713 → 1 736 (+1.3 %, the extra reference's signalling — reported honestly). Pins `self-svc-il-64-128-q84-cuts` (2 points) and `self-svc-il-64-128-q84-t2` (4 points; corpus 162 → 164), every point byte-identical through TWO independent black-box reference decoders — the corpus's first streams whose enhancement layers predict from a scaled lower layer
 
 - §5.9.30 `ar_coeff_lag = 3` ADOPTED on the election ladder (r456): the correlation-match term scores horizontal lags 1..=3 (`fge::lag_h_rho`; white / lag-1 content leaves the deeper gaps at ~0, so the r444 settlement is unchanged there) and the 24-tap ring is offered as a candidate where the first frame's residual carries distance-3 structure (`|ρ(3)| >= 0.2`). Reverses the r452 "measured, not adopted" finding on its own terms: on grain correlated only three columns apart the ring now wins — 192×160 q60, 1 415 → 1 228 bytes (−13.2 %) at the ladder's best neutrality score — while on a 4-frame 128×96 GOP it outscores every shallower ring yet forfeits the strictly-fewer-bytes rate mandate (four lag-3 headers outrun the denoising saving) and a shallower ring is elected. Witnesses in `tests/film_grain_lag3.rs`; pin `self-gop-192x160-q60-film-grain-lag3` (corpus 161 → 162), byte-identical through THREE independent black-box reference decoders — the corpus's first self-encoded `ar_coeff_lag = 3` stream
