@@ -1299,6 +1299,69 @@ are filtered per denominator). Pinned:
 `self-gop-320x96-q180-superres-tiles` — the first
 superres × multi-tile stream.
 
+### Superres on inter frames: the §7.11.3.3 scaled-reference arm (r456)
+
+The election leaves the opener. The P-frame driver grows a §5.9.8
+arm (`InterFrameConfig::superres`): the frame codes at the
+downscaled width while every reference stays at the UPSCALED extent
+the §7.20 store holds, so `is_scaled( refFrame )` (§5.11.27) fires
+for all seven references — the search context carries the
+references' own `RefUpscaledWidth` / `RefFrameHeight` into the
+decoder's `FrameStore` views, every prediction the RD ladder scores
+(single, compound, OBMC, inter-intra, sub-pel refinement) runs
+through the decoder's own §7.11.3.3 scaled sampling path, the
+`motion_mode` read collapses to the `use_obmc` arm exactly as the
+syntax twin prices it, the §7.11.3.1 step-7 global warp is barred
+(the §5.9.24 election keeps identity models), and the integer-pel
+SSD walk reads a coded-extent resample of each reference (a
+selection aid only). The wire codes `use_superres = 1` +
+`coded_denom` on the §5.9.5 implicit arm (the sequence maximum is
+the upscaled width); the reconstruction is §7.16-upscaled between
+the CDEF and §7.17 stages — the LR election fits at the upscaled
+extent against the original source — and the returned mirror lives
+at the upscaled extent, so the next frame's references are exactly
+the decoder's. The §7.9 motion-field projection and the §5.11.19
+segment-map carry already take the spec's extent-checked arms
+across the mi-grid mismatch. Mid-GOP election on the GOP driver
+(`GopTuning::superres`, the KEY switch): inside the KEY arm's regime,
+each probe-passing P-frame trials a bounded candidate set (the
+KEY-elected denominator or the ladder midpoint, plus the strongest
+legal ratio — every one inside the §6.8.2 `2 * FrameWidth >=
+RefUpscaledWidth` bound and the Annex A superres tile-width rule)
+and the joint objective over original-extent SSE + exact realized
+temporal-unit bytes keeps the winner; arming opens the sequence gate
+for the whole GOP, probe-failing content stays bit-identical.
+Witnesses in `tests/superres_inter.rs` (election + wire audit
+against the references' true stored extents + bit-exact decode; the
+off arm; detail content bit-identical to the off tuning). Measured
+on the designed 128×96 q180 drift: every P-frame elects
+`SuperresDenom = 16`, 364 → 335 bytes (−8.0 %) at −0.84 dB luma PSNR
+(36.87 → 36.03 — the joint objective's trade, reported honestly).
+Pinned: `self-gop-128x96-q180-superres-inter` — the corpus's first
+self-encoded stream whose inter frames predict through scaled
+references, byte-identical through three independent black-box
+reference decoders (corpus 156).
+
+**Explicit (non-uniform) layouts ride both superres arms** (r456):
+a §5.9.15 explicit column layout is remapped per candidate
+denominator onto the DOWNSCALED superblock grid — proportional
+widths, column count preserved (a primary frame's per-tile donor
+CDFs keep lining up), every non-rightmost column at least 128 luma
+samples per the Annex A superres rule, the §5.9.15 legality window
+re-validated at the coded width; candidates with no legal remap are
+filtered. Witness in `tests/superres_inter.rs` (the 320-wide
+`[3, 2]` layout: `[2, 1]` at 160, `[2, 2]` at 256, three P-frames
+elected at denominators 16 / 16 / 10). En route a latent writer bug:
+the explicit tile-info writer took the superblock FLOOR of the last
+column / row and underflowed on every frame whose extent is not a
+superblock multiple (§5.9.15 sets `MiColStarts[ TileCols ] =
+MiCols`, so the coded size is the CEILING) — fixed, regression in
+`tests/non_uniform_tiles.rs`. Pinned:
+`self-gop-320x96-q180-superres-explicit-tiles` — the corpus's first
+non-uniform-layout stream carrying `use_superres = 1` frames,
+byte-identical through three black-box reference decoders (corpus
+157).
+
 ### Film-grain election (r441; AR taps + chroma points r444)
 
 The §5.9.30 write arm goes live with estimated parameters. On an
@@ -1598,10 +1661,9 @@ corpus stands at 150.
   in multiples of 64 force one §7.3.1-conformant tile row per
   superblock row, addressed via `anchor_tile_row` /
   `anchor_tile_col`.)
-- The §5.9.8 superres election stays KEY/opener-scoped (inter
-  frames never elect a mid-GOP resize); explicit (non-uniform) tile
-  layouts keep flat widths (their per-column superblock widths are
-  bound to the full-width geometry), and the §7.3 camera mode is
+- The §5.9.8 superres election on INTER frames is GOP-driver-scoped
+  (the B-pyramid / adaptive / temporal-ladder / spatial-SVC drivers
+  keep the opener-only election), and the §7.3 camera mode is
   SPEC-BARRED from the pairing (§7.3.1 requires
   `enable_superres = 0`).
 - The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames; r450

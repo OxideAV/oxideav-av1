@@ -362,6 +362,8 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             s_frame: false,
             error_resilient: false,
             tile_spans: false,
+            superres: None,
+            superres_source: None,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -747,6 +749,7 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
             superres: sr_pair,
             film_grain: None,
             superres_source: sr_pair.is_some().then(|| &layer[0]),
+            superres_gate: false,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             opener_input,
@@ -868,6 +871,8 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
                 s_frame: false,
                 error_resilient: false,
                 tile_spans: false,
+                superres: None,
+                superres_source: None,
             };
             let (obus, recon, saved, carry, aux) = encode_inter_frame_generic(
                 &layer[i],

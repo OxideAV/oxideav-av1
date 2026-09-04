@@ -884,6 +884,13 @@ pub(crate) struct KeyExtras<'a> {
     /// measure distortion against THIS frame. Set internally by
     /// [`encode_key_frame_superres_arm`]; callers leave it `None`.
     pub superres_source: Option<&'a YuvFrame>,
+    /// r456 — open the sequence-level `enable_superres` gate WITHOUT
+    /// arming a KEY-side pair: the GOP driver's mid-GOP inter
+    /// election needs every frame header to carry the §5.9.8
+    /// `use_superres` bit under ONE sequence header, so the KEY is
+    /// coded under the open gate (its own election / plain shape
+    /// unchanged otherwise). Inert under `seq_override`.
+    pub superres_gate: bool,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -953,24 +960,12 @@ pub(crate) fn encode_key_frame_yuv_full(
                     // the right-most must be at least 128 luma
                     // samples wide (64 on flat frames — reference
                     // decoders enforce it).
-                    if extras.tiles == (0, 0) {
-                        return true;
-                    }
-                    let wd =
-                        crate::encoder::superres_elect::superres_coded_width(input.width, denom);
-                    let Some(ti) = crate::tile_info::TileInfo::uniform_layout(
-                        wd / 4,
-                        input.height / 4,
-                        false,
-                        extras.tiles.0,
-                        extras.tiles.1,
-                    ) else {
-                        return false;
-                    };
-                    ti.mi_col_starts
-                        .windows(2)
-                        .take(ti.tile_cols.saturating_sub(1) as usize)
-                        .all(|w| (w[1] - w[0]) * 4 >= 128)
+                    crate::encoder::superres_elect::denom_tile_ok(
+                        input.width,
+                        input.height,
+                        denom,
+                        extras.tiles,
+                    )
                 })
                 .collect()
         } else {
@@ -1111,6 +1106,7 @@ pub(crate) fn encode_key_frame_yuv_full(
         superres: extras.superres,
         film_grain: extras.film_grain,
         superres_source: extras.superres_source,
+        superres_gate: extras.superres_gate,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -1383,7 +1379,7 @@ fn encode_key_frame_yuv_core(
             // on eligible luma blocks (the historical mirror drivers
             // build their own sequence headers and stay unaffected).
             s.enable_filter_intra = true;
-            s.enable_superres = superres.is_some();
+            s.enable_superres = superres.is_some() || extras.superres_gate;
             // r441 — the §5.9.30 sequence gate (see
             // [`KeyExtras::film_grain`]).
             s.film_grain_params_present = extras.film_grain.is_some();

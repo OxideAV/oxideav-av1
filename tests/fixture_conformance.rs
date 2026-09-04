@@ -14288,3 +14288,77 @@ fn self_encoded_delta_q_lossless_segment_gop_decodes_byte_exact() {
         3,
     );
 }
+
+// ---------------------------------------------------------------------
+// r456: §5.9.8 superres on INTER frames — every P-frame of the GOP codes
+// `use_superres = 1` (SuperresDenom 16, coded width 64 against
+// 128-wide upscaled-extent references: the §7.11.3.3 scaled sampling
+// path, §5.11.27 `is_scaled` collapse, §7.16 upscale before §7.17).
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q180_SUPERRES_INTER_IVF: &str = concat!(
+    "444b4946000020004156303180006000190000000100000006000000000000004c0000000000",
+    "00000000000012000a0a0000000337fbe5dfdc02323c1601e5680000066f3010d2da30f35d60",
+    "4d1b43aae36ca54a869e52c6d2868e6673fd6c08cabdb1b1e4f8053efdb702b434b8b0494310",
+    "e884df560b802300000001000000000000001200321f320100224824f9d5a00000199ce07000",
+    "d60c3746b93dd8defde9bda3b769d01b0000000200000000000000120032173202004001007b",
+    "d5a000000000007800938efd957924b82000000003000000000000001200321c320300224824",
+    "fbd5a0000019fce07800ca16c94198566acccc7259402000000004000000000000001200321c",
+    "3204004001007bd5a0000019ffe07800ee65f9dfc21e89ace0a35cdb1d000000050000000000",
+    "000012003219320500224824fbd5a0000019f9e07800bfadd1cc80a78b5e60",
+);
+
+/// r456: superres on INTER frames (6-frame 128×96 at q180; the KEY and
+/// all five P-frames elect SuperresDenom 16 — the corpus's first
+/// self-encoded stream whose inter frames predict through §7.11.3.3
+/// scaled references) — the digest is the byte-identical output of
+/// THREE independent black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q180-superres-inter/`.
+#[test]
+fn self_encoded_superres_inter_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q180-superres-inter",
+        SELF_GOP_128X96_Q180_SUPERRES_INTER_IVF,
+        "43b14267a71bfb4a3266ea7791a5015f16bde447de321149badcc5e9f5fe2498",
+        6,
+    );
+}
+
+// ---------------------------------------------------------------------
+// r456: superres × EXPLICIT (non-uniform) tile layout — the 320-wide
+// `[3, 2]` column layout remapped per frame onto the downscaled
+// superblock grid (`[2, 1]` at 160, `[2, 2]` at 256), inter frames on
+// the §7.11.3.3 scaled path, `uniform_tile_spacing_flag = 0` on every
+// header.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_320X96_Q180_SUPERRES_EXPLICIT_TILES_IVF: &str = concat!(
+    "444b494600002000415630314001600019000000010000000400000000000000d30000000000",
+    "00000000000012000a0b0000000434fef977f7008032c10116000b1680000066ff81000060c3",
+    "523e3d08717d6bacefc13c5cc20c2addda857080f4da365da200c9d4c817d1a822115cd92dfc",
+    "892fcad5c0c4d9c4ad9ed81bfac0138f3d4744d3c8487da3f411f7926d47bb1dca0f88fb593f",
+    "b3ae86c06d5842ac1d8a3158b6e8edd74bc8ef80d282c13b82d8f9a9d1940c3d182309bf3246",
+    "6e6dacc10170a519471e35bacbb6b3154a65dfff54599767adc529c8ecc0e0484bf82d57ea04",
+    "db4370cfbeeb89eb06d5dcdb83a3e40784a04087245c5177a013642900000001000000000000",
+    "0012003225320100224824fbca2d0000000000038000000bf7c96e41f0d6c6ac845f86d0db74",
+    "979c3140260000000200000000000000120032223202004001007bcb2d000000000003c00000",
+    "07ccde21afed8630a0e0d57d1610771048000000030000000000000012003244320300224824",
+    "cbc71680e0000cfff03c000017f5b0cf60e1c9eb95fb5da5c1b4e658527b8895fd57fea0d0c2",
+    "6b71850b894fba5b3fa056e043df061b8bbc43005a541404",
+);
+
+/// r456: superres × explicit tile layout (4-frame 320×96 at q180; the
+/// `[3, 2]` layout rides P-frames elected at SuperresDenom 16 / 16 /
+/// 10 with remapped widths — the corpus's first non-uniform-layout
+/// stream with `use_superres = 1` frames) — the digest is the byte-identical output of THREE independent
+/// black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-320x96-q180-superres-explicit-tiles/`.
+#[test]
+fn self_encoded_superres_explicit_tiles_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-320x96-q180-superres-explicit-tiles",
+        SELF_GOP_320X96_Q180_SUPERRES_EXPLICIT_TILES_IVF,
+        "883ab0d36d0b30a9172b27a79f2abba286c4150cc8600eaf6fe48e24aa3fa8b4",
+        4,
+    );
+}

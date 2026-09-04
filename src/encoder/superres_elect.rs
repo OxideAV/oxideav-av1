@@ -44,6 +44,173 @@ pub(crate) fn candidate_denoms(width: u32) -> Vec<u32> {
         .collect()
 }
 
+/// §5.11.27 `is_scaled( refFrame )` over luma extents: the §7.11.3.3
+/// scale factors `xScale = ((RefUpscaledWidth << REF_SCALE_SHIFT) +
+/// (FrameWidth / 2)) / FrameWidth` (and the height twin) differ from
+/// `1 << REF_SCALE_SHIFT`. r456 — the inter superres arm codes every
+/// frame against references held at the UPSCALED extent, so this is
+/// the gate that collapses the §5.11.27 `motion_mode` read to the
+/// `use_obmc` arm and bars the §7.11.3.1 step-7 global warp.
+#[must_use]
+pub(crate) fn is_scaled(ref_upscaled_width: u32, ref_height: u32, width: u32, height: u32) -> bool {
+    const SHIFT: u32 = crate::inter_pred::REF_SCALE_SHIFT;
+    let x_scale =
+        ((u64::from(ref_upscaled_width) << SHIFT) + u64::from(width / 2)) / u64::from(width);
+    let y_scale = ((u64::from(ref_height) << SHIFT) + u64::from(height / 2)) / u64::from(height);
+    x_scale != (1u64 << SHIFT) || y_scale != (1u64 << SHIFT)
+}
+
+/// The §5.9.8 tile-width conformance gate on a candidate denominator
+/// (Annex A: "if use_superres is equal to 1 and RightMostTile is
+/// equal to 0, then TileWidth is greater than or equal to 128"): a
+/// uniform `(TileColsLog2, TileRowsLog2)` layout at the DOWNSCALED
+/// width must keep every non-rightmost tile column at least 128 luma
+/// samples wide. `tiles == (0, 0)` always passes.
+#[must_use]
+pub(crate) fn denom_tile_ok(width: u32, height: u32, denom: u32, tiles: (u32, u32)) -> bool {
+    if tiles == (0, 0) {
+        return true;
+    }
+    let wd = superres_coded_width(width, denom);
+    let Some(ti) =
+        crate::tile_info::TileInfo::uniform_layout(wd / 4, height / 4, false, tiles.0, tiles.1)
+    else {
+        return false;
+    };
+    ti.mi_col_starts
+        .windows(2)
+        .take(ti.tile_cols.saturating_sub(1) as usize)
+        .all(|w| (w[1] - w[0]) * 4 >= 128)
+}
+
+/// r456 — remap an explicit (§5.9.15 non-uniform) column layout onto
+/// the DOWNSCALED superblock grid: the widths (superblock units,
+/// summing to `sb_cols_full`) scale proportionally onto
+/// `sb_cols_coded` columns with the column COUNT preserved (so a
+/// primary frame's per-tile donor CDFs still line up), every column
+/// at least one superblock, the rounding residue settled on the
+/// widest columns, and — the Annex A superres rule — every
+/// non-rightmost column at least `min_sb` superblocks (128 luma
+/// samples on 64-sample superblocks). `None` when no such layout
+/// exists.
+#[must_use]
+pub(crate) fn remap_explicit_widths(
+    widths_sb: &[u32],
+    sb_cols_full: u32,
+    sb_cols_coded: u32,
+    min_sb: u32,
+) -> Option<Vec<u32>> {
+    let n = widths_sb.len();
+    if n == 0 || widths_sb.contains(&0) || widths_sb.iter().sum::<u32>() != sb_cols_full {
+        return None;
+    }
+    let floor_total: u32 = (n as u32 - 1) * min_sb + 1;
+    if sb_cols_coded < floor_total {
+        return None;
+    }
+    let mut out: Vec<u32> = widths_sb
+        .iter()
+        .map(|&w| ((w * sb_cols_coded + sb_cols_full / 2) / sb_cols_full).max(1))
+        .collect();
+    for (i, w) in out.iter_mut().enumerate() {
+        if i + 1 < n && *w < min_sb {
+            *w = min_sb;
+        }
+    }
+    // Settle the residue: shrink the widest column that can still give
+    // (respecting its floor), grow the widest column.
+    loop {
+        let sum: u32 = out.iter().sum();
+        if sum == sb_cols_coded {
+            break;
+        }
+        if sum > sb_cols_coded {
+            let floor_of = |i: usize| if i + 1 < n { min_sb } else { 1 };
+            let idx = (0..n)
+                .filter(|&i| out[i] > floor_of(i))
+                .max_by_key(|&i| (out[i], std::cmp::Reverse(i)))?;
+            out[idx] -= 1;
+        } else {
+            let idx = (0..n)
+                .max_by_key(|&i| (out[i], std::cmp::Reverse(i)))
+                .expect("non-empty");
+            out[idx] += 1;
+        }
+    }
+    Some(out)
+}
+
+/// r456 — the explicit-layout twin of [`denom_tile_ok`]: the remapped
+/// column widths for a candidate denominator when the layout stays
+/// inside the §5.9.15 legal window at the downscaled width AND the
+/// Annex A superres tile-width rule; `None` filters the candidate.
+/// (64-sample superblocks — every conformance-grade driver's shape.)
+#[must_use]
+pub(crate) fn denom_explicit_ok(
+    width: u32,
+    height: u32,
+    denom: u32,
+    widths_sb: &[u32],
+    heights_sb: &[u32],
+) -> Option<Vec<u32>> {
+    let wd = superres_coded_width(width, denom);
+    let sb_full = (2 * ((width + 7) >> 3)).div_ceil(16);
+    let sb_coded = (2 * ((wd + 7) >> 3)).div_ceil(16);
+    let remapped = remap_explicit_widths(widths_sb, sb_full, sb_coded, 2)?;
+    let ti = crate::tile_info::TileInfo::explicit_layout(
+        2 * ((wd + 7) >> 3),
+        2 * ((height + 7) >> 3),
+        false,
+        &remapped,
+        heights_sb,
+    )?;
+    ti.mi_col_starts
+        .windows(2)
+        .take(ti.tile_cols.saturating_sub(1) as usize)
+        .all(|w| (w[1] - w[0]) * 4 >= 128)
+        .then_some(remapped)
+}
+
+/// r456 — the INTER-frame candidate set (bounded: each candidate is a
+/// full P-frame search): the KEY-elected denominator when the KEY
+/// took the arm (the GOP's proven ratio), else the legal denominator
+/// nearest the ladder's midpoint (12), plus the strongest legal
+/// downscale (16 — the §6.8.2 `2 * FrameWidth >= RefUpscaledWidth`
+/// bound is met at every legal ratio). At most two entries.
+#[must_use]
+pub(crate) fn inter_candidate_denoms(
+    width: u32,
+    height: u32,
+    tiles: (u32, u32),
+    explicit: Option<(&[u32], &[u32])>,
+    key_denom: Option<u32>,
+) -> Vec<u32> {
+    let legal: Vec<u32> = candidate_denoms(width)
+        .into_iter()
+        .filter(|&d| match explicit {
+            Some((ws, hs)) => denom_explicit_ok(width, height, d, ws, hs).is_some(),
+            None => denom_tile_ok(width, height, d, tiles),
+        })
+        .filter(|&d| 2 * superres_coded_width(width, d) >= width)
+        .collect();
+    if legal.is_empty() {
+        return Vec::new();
+    }
+    let first = match key_denom {
+        Some(d) if legal.contains(&d) => d,
+        _ => *legal
+            .iter()
+            .min_by_key(|&&d| (d as i64 - 12).unsigned_abs())
+            .expect("non-empty"),
+    };
+    let mut out = vec![first];
+    let strongest = *legal.iter().max().expect("non-empty");
+    if strongest != first {
+        out.push(strongest);
+    }
+    out
+}
+
 /// r441 — the superres arm's ARMING WINDOW (the measured regime; see
 /// `tests/superres_ab.rs`). On probe-passing content the arm wins
 /// across the whole measured quantiser band (q60..q220: −5 % to −20 %
@@ -122,7 +289,7 @@ pub(crate) fn downscale_width(input: &YuvFrame, coded_width: u32) -> YuvFrame {
     }
 }
 
-fn downscale_plane_width(src: &[u16], w_src: usize, h: usize, w_dst: usize) -> Vec<u16> {
+pub(crate) fn downscale_plane_width(src: &[u16], w_src: usize, h: usize, w_dst: usize) -> Vec<u16> {
     debug_assert!(w_dst < w_src && w_dst > 0);
     let mut out = vec![0u16; w_dst * h];
     let mut lp = vec![0u32; w_src];
@@ -231,6 +398,53 @@ pub(crate) fn upscale_recon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r456 — explicit column remap: count preserved, sums land on the
+    /// coded grid, the Annex A floor holds on every non-rightmost
+    /// column, infeasible grids return `None`.
+    #[test]
+    fn explicit_remap_preserves_count_and_floors() {
+        assert_eq!(remap_explicit_widths(&[3, 2], 5, 3, 2), Some(vec![2, 1]));
+        assert_eq!(remap_explicit_widths(&[3, 2], 5, 4, 2), Some(vec![2, 2]));
+        // Three columns need 2 + 2 + 1 = 5 superblocks: the 5-wide
+        // grid keeps the identity, a 6-wide grid grows the widest.
+        assert_eq!(
+            remap_explicit_widths(&[1, 3, 1], 5, 5, 2),
+            Some(vec![2, 2, 1])
+        );
+        assert_eq!(
+            remap_explicit_widths(&[1, 3, 1], 5, 6, 2),
+            Some(vec![2, 3, 1])
+        );
+        // 5 columns of a 2-superblock floor cannot fit in 4.
+        assert_eq!(remap_explicit_widths(&[1, 1, 1], 3, 4, 2), None);
+        assert_eq!(remap_explicit_widths(&[2, 2], 4, 2, 2), None);
+        // Zero-width or mis-summed inputs reject.
+        assert_eq!(remap_explicit_widths(&[0, 4], 4, 3, 2), None);
+        assert_eq!(remap_explicit_widths(&[2, 1], 4, 3, 2), None);
+        // Identity when the grids coincide.
+        assert_eq!(remap_explicit_widths(&[2, 3], 5, 5, 2), Some(vec![2, 3]));
+    }
+
+    /// r456 — the 320-wide `[3, 2]` layout survives the 16 and 10
+    /// denominators (`[2, 1]` at 160, `[2, 2]` at 256) and fails the
+    /// ratios whose coded width leaves fewer than 3 superblocks.
+    #[test]
+    fn explicit_denom_filter_on_the_320_layout() {
+        assert_eq!(
+            denom_explicit_ok(320, 96, 16, &[3, 2], &[2]),
+            Some(vec![2, 1])
+        );
+        assert_eq!(
+            denom_explicit_ok(320, 96, 10, &[3, 2], &[2]),
+            Some(vec![2, 2])
+        );
+        let cands = inter_candidate_denoms(320, 96, (0, 0), Some((&[3, 2], &[2])), None);
+        assert!(cands
+            .iter()
+            .all(|&d| denom_explicit_ok(320, 96, d, &[3, 2], &[2]).is_some()));
+        assert!(cands.contains(&16));
+    }
 
     /// §5.9.8 width derivation on the denominator ladder.
     #[test]

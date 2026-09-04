@@ -236,6 +236,8 @@ pub fn encode_camera_frame_yuv420_tiles_qm(
         s_frame: false,
         error_resilient: false,
         tile_spans: false,
+        superres: None,
+        superres_source: None,
     };
     let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
         &wide,

@@ -212,6 +212,30 @@ fn uneven_gop_round_trips_pixel_exact() {
 
 /// Layouts outside the legal window are rejected up front: wrong
 /// column sum, a zero-width tile, wrong row sum.
+/// r456 — a frame whose width / height is NOT a superblock multiple:
+/// the explicit writer codes the LAST column / row as the superblock
+/// CEILING of its mi extent (§5.9.15 sets `MiColStarts[ TileCols ] =
+/// MiCols`), so a 160-wide frame (2.5 superblocks) splits `[2, 1]` and
+/// `[1, 2]` and a 96-high one (1.5 superblocks) splits `[1, 1]`.
+/// (Before r456 the writer took the floor and underflowed on every
+/// such frame — surfaced by the superres × explicit-layout pairing,
+/// whose 160-wide coded extent is exactly this shape.)
+#[test]
+fn non_superblock_multiple_extents_round_trip() {
+    let frame = noise(160, 96, 5);
+    assert_key_round_trip(&frame, 72, &[2, 1], &[2], "160x96 [2,1]");
+    assert_key_round_trip(&frame, 72, &[1, 2], &[1, 1], "160x96 [1,2] rows [1,1]");
+    let frames: Vec<Yuv420Frame> = (0..3).map(|t| noise(160, 96, 40 + t)).collect();
+    let enc = encode_gop_yuv420_with_q_tile_layout(&frames, 72, &[2, 1], &[1, 1])
+        .expect("160x96 GOP with the [2,1]x[1,1] layout encodes");
+    let decoded = spec_frames(&enc.ivf_bytes, 3, "160x96 gop");
+    for (i, f) in decoded.iter().enumerate() {
+        assert_eq!(f.planes[0], enc.recon[i].y, "160x96 gop frame {i}: luma");
+        assert_eq!(f.planes[1], enc.recon[i].u, "160x96 gop frame {i}: U");
+        assert_eq!(f.planes[2], enc.recon[i].v, "160x96 gop frame {i}: V");
+    }
+}
+
 #[test]
 fn illegal_explicit_layouts_are_rejected() {
     let frame = noise(192, 128, 9);

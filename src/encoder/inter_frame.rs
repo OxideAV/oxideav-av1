@@ -180,6 +180,11 @@ pub struct TunedGopYuv {
     /// election (the `recon` planes then carry the §7.18.3 synthesis,
     /// exactly the decoder's output).
     pub film_grain_elected: bool,
+    /// r456 — each P-frame's §5.9.8 INTER superres election:
+    /// `Some(SuperresDenom)` when the frame coded at the downscaled
+    /// width against its upscaled-extent references, `None` on the
+    /// flat shape (index 0 is the first P-frame).
+    pub superres_inter_elections: Vec<Option<u32>>,
 }
 
 /// Result of [`encode_gop_yuv420_with_q`].
@@ -238,6 +243,11 @@ pub struct TunedGop {
     /// r441 — whether the §5.9.30 film-grain arm won (see
     /// [`TunedGopYuv::film_grain_elected`]).
     pub film_grain_elected: bool,
+    /// r456 — each P-frame's §5.9.8 INTER superres election:
+    /// `Some(SuperresDenom)` when the frame coded at the downscaled
+    /// width against its upscaled-extent references, `None` on the
+    /// flat shape (index 0 is the first P-frame).
+    pub superres_inter_elections: Vec<Option<u32>>,
 }
 
 /// GOP length bound (KEY + P-frames).
@@ -1121,6 +1131,7 @@ pub fn encode_gop_yuv420_with_q_seg_extras_tuned(
         lr_elections: t.lr_elections,
         ctx_donor_elections: t.ctx_donor_elections,
         film_grain_elected: t.film_grain_elected,
+        superres_inter_elections: t.superres_inter_elections,
     })
 }
 
@@ -1670,6 +1681,31 @@ fn encode_gop_yuv_core_fg(
         f.grain_seed = crate::encoder::film_grain_elect::grain_seed_for(0);
         f
     });
+    // r456 — the mid-GOP §5.9.8 INTER superres election arms under the
+    // KEY arm's own regime (quantiser window, extent, the horizontal
+    // smoothness probe on at least one P-frame's source) on plain
+    // GOPs — no segmentation table (the §5.11.19 map inherits across
+    // an mi-grid mismatch), no exactness demand, twin pricing; an
+    // explicit tile layout remaps its column widths per candidate.
+    // Arming opens the sequence gate for the WHOLE GOP
+    // (every frame header then carries its `use_superres` bit, the
+    // KEY included); content failing the probe on every frame stays
+    // bit-identical to the pre-r456 shape.
+    let sr_inter_armed = tuning.superres
+        && base_q_idx > 0
+        && alt_q.is_empty()
+        && regions.is_empty()
+        && !auto_detect
+        && model == RateModel::Twin
+        && crate::encoder::superres_elect::superres_arm_allowed(
+            base_q_idx,
+            width as usize,
+            height as usize,
+        )
+        && frames
+            .iter()
+            .skip(1)
+            .any(crate::encoder::superres_elect::superres_probe);
     let (key, key_carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
         &frames[0],
         base_q_idx,
@@ -1715,10 +1751,21 @@ fn encode_gop_yuv_core_fg(
             // r436 — the KEY donates too: collect its per-tile end
             // CDFs.
             collect_donor_cdfs: donor_armed,
+            // r456 — the mid-GOP inter election's sequence gate.
+            superres_gate: sr_inter_armed,
             ..crate::encoder::key_frame::KeyExtras::default()
         },
     )?;
     let seq = key.seq.clone();
+    // r456 — the KEY-elected §5.9.8 denominator seeds the inter
+    // candidate set (see `inter_candidate_denoms`).
+    let key_sr_denom: Option<u32> = key
+        .fh
+        .frame_size
+        .as_ref()
+        .and_then(|fs| fs.use_superres.then_some(fs.superres_denom));
+    let sr_lambda =
+        crate::encoder::key_frame::lambda_for(&QuantizerParams::neutral(base_q_idx, bit_depth));
     let mut temporal_units = vec![key.temporal_unit_bytes.clone()];
     let mut recon = vec![GopFrameReconYuv {
         y: key.recon_y,
@@ -1766,6 +1813,7 @@ fn encode_gop_yuv_core_fg(
     let mut cdef_elections: Vec<bool> = Vec::new();
     let mut lr_elections: Vec<bool> = Vec::new();
     let mut ctx_donor_elections: Vec<Option<u32>> = Vec::new();
+    let mut superres_inter_elections: Vec<Option<u32>> = Vec::new();
 
     // r447 — the all-slot-refresh FLOOR: the most recent frame that
     // overwrote every §7.20 slot (the KEY at 0; each SWITCH frame
@@ -1804,40 +1852,93 @@ fn encode_gop_yuv_core_fg(
             f.grain_seed = crate::encoder::film_grain_elect::grain_seed_for(p_index);
             f
         });
-        let (tu, rc, saved_mf, carry, aux) = encode_p_frame_yuv(
-            input,
-            prev,
-            prevprev,
-            &seq,
-            base_q_idx,
-            p_index,
-            alt_q,
-            &mf_store,
-            model,
-            global_motion,
-            primary.as_deref(),
-            tuning.temporal_seg,
-            exact_mask.as_deref(),
-            auto_detect,
-            extras,
-            tuning.high_precision_mv,
-            tuning.delta_q,
-            tuning.qm,
-            tuning.cdef,
-            tuning.cdef_units,
-            tuning.lr,
-            tuning.tiles,
-            tuning.tile_groups,
-            tuning.tile_spans,
-            explicit_tiles,
-            donor_armed,
-            p_fg.as_ref(),
-            floor,
-            &recon[floor as usize],
-            is_s,
-            is_er,
-            tuning.short_ref_signaling,
-        )?;
+        let encode_arm = |arm_input: &YuvFrame, superres: Option<(u32, u32)>| {
+            encode_p_frame_yuv(
+                arm_input,
+                prev,
+                prevprev,
+                &seq,
+                base_q_idx,
+                p_index,
+                alt_q,
+                &mf_store,
+                model,
+                global_motion,
+                primary.as_deref(),
+                tuning.temporal_seg,
+                exact_mask.as_deref(),
+                auto_detect,
+                extras,
+                tuning.high_precision_mv,
+                tuning.delta_q,
+                tuning.qm,
+                tuning.cdef,
+                tuning.cdef_units,
+                tuning.lr,
+                tuning.tiles,
+                tuning.tile_groups,
+                tuning.tile_spans,
+                explicit_tiles,
+                donor_armed,
+                p_fg.as_ref(),
+                floor,
+                &recon[floor as usize],
+                is_s,
+                is_er,
+                tuning.short_ref_signaling,
+                superres,
+                superres.is_some().then_some(input),
+            )
+        };
+        let mut best = encode_arm(input, None)?;
+        let mut sr_elected: Option<u32> = None;
+        // r456 — the mid-GOP §5.9.8 INTER election: on probe-passing
+        // P-frames each bounded candidate denominator codes the
+        // DOWNSCALED source against the upscaled-extent references
+        // (the §7.11.3.3 scaled path), the reconstruction comes back
+        // §7.16-upscaled, and the joint objective over ORIGINAL-extent
+        // SSE + exact realized temporal-unit bytes keeps the winner —
+        // the same settlement the KEY arm uses. SWITCH / coded
+        // error-resilient positions keep the flat shape.
+        if sr_inter_armed
+            && !is_s
+            && !is_er
+            && crate::encoder::superres_elect::superres_probe(input)
+        {
+            let sr_score = |tu: &[u8], rc: &GopFrameReconYuv| -> u64 {
+                let mut d = 0u64;
+                for (a, b) in
+                    rc.y.iter()
+                        .zip(&input.y)
+                        .chain(rc.u.iter().zip(&input.u))
+                        .chain(rc.v.iter().zip(&input.v))
+                {
+                    let diff = i64::from(*a) - i64::from(*b);
+                    d += (diff * diff) as u64;
+                }
+                score256(d, sr_lambda, (tu.len() as u64) * 8 * 256)
+            };
+            let mut best_score = sr_score(&best.0, &best.1);
+            for denom in crate::encoder::superres_elect::inter_candidate_denoms(
+                width,
+                height,
+                tuning.tiles,
+                explicit_tiles,
+                key_sr_denom,
+            ) {
+                let wd = crate::encoder::superres_elect::superres_coded_width(width, denom);
+                let down = crate::encoder::superres_elect::downscale_width(input, wd);
+                let cand = encode_arm(&down, Some((width, denom)))?;
+                let sc = sr_score(&cand.0, &cand.1);
+                if sc < best_score {
+                    best_score = sc;
+                    best = cand;
+                    sr_elected = Some(denom);
+                }
+            }
+        }
+        superres_inter_elections.push(sr_elected);
+        let (tu, rc, saved_mf, carry, aux) = best;
         temporal_units.push(tu);
         recon.push(rc);
         // r436 — a §6.8.14 donor win: patch the PRIMARY frame's
@@ -1928,6 +2029,7 @@ fn encode_gop_yuv_core_fg(
         lr_elections,
         ctx_donor_elections,
         film_grain_elected: false,
+        superres_inter_elections,
     })
 }
 
@@ -2192,6 +2294,21 @@ pub(crate) struct InterFrameConfig<'a> {
     /// frames code `tile_start_and_end_present_flag = 1` under the
     /// split (`OBU_FRAME_HEADER` + `OBU_TILE_GROUP`) framing.
     pub tile_spans: bool,
+    /// r456 — §5.9.8 SUPERRES on an INTER frame: `Some((UpscaledWidth,
+    /// SuperresDenom))` codes `input` (the DOWNSCALED frame, exactly
+    /// `superres_coded_width(UpscaledWidth, SuperresDenom)` wide)
+    /// against references held at the UPSCALED extent — every
+    /// reference is `is_scaled()` per §5.11.27 (the §7.11.3.3 scaled
+    /// sampling path on both sides), LOCALWARP / global warps fall
+    /// silent, the reconstruction is §7.16-upscaled between the CDEF
+    /// and LR stages, and the returned reconstruction (the §7.20
+    /// payload) lives at the upscaled extent. `None` keeps the flat
+    /// shape.
+    pub superres: Option<(u32, u32)>,
+    /// r456 — the ORIGINAL (upscaled-extent) source frame on a
+    /// [`Self::superres`] arm: the §7.17 election fits and scores
+    /// against it. `None` unless `superres` is set.
+    pub superres_source: Option<&'a YuvFrame>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2583,6 +2700,8 @@ fn p_frame_config_primary<'a>(
         s_frame,
         error_resilient: s_frame,
         tile_spans: false,
+        superres: None,
+        superres_source: None,
     }
 }
 
@@ -2714,6 +2833,8 @@ fn encode_p_frame_yuv(
     s_frame: bool,
     error_resilient: bool,
     short_ref_signaling: bool,
+    superres: Option<(u32, u32)>,
+    superres_source: Option<&YuvFrame>,
 ) -> Result<
     (
         Vec<u8>,
@@ -2790,6 +2911,8 @@ fn encode_p_frame_yuv(
     // elect over (it still collects: the frames chaining off its
     // slots elect on ITS donor set).
     cfg.elect_donor = donor_armed && !error_resilient;
+    cfg.superres = superres;
+    cfg.superres_source = superres_source;
     let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -2899,14 +3022,54 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let height = input.height as usize;
     let chroma_w = input.chroma_width() as usize;
     let chroma_h = input.chroma_height() as usize;
+    // r456 — the §5.9.8 inter arm: `input` is the DOWNSCALED frame,
+    // every reference sits at the UPSCALED extent (`ref_w`), and the
+    // pair must satisfy the §5.9.8 width derivation, the sequence
+    // gate, the sequence budget and the §6.8.2 reference-size bounds
+    // (`2 * FrameWidth >= RefUpscaledWidth` — the ladder's strongest
+    // ratio lands exactly on it).
+    let ref_w: usize = match cfg.superres {
+        Some((up_w, denom)) => {
+            if !(crate::frame_header::SUPERRES_DENOM_MIN..=16).contains(&denom)
+                || crate::encoder::superres_elect::superres_coded_width(up_w, denom) != input.width
+                || up_w <= input.width
+                || !seq.enable_superres
+                || up_w > seq.max_frame_width_minus_1 + 1
+                || 2 * input.width < up_w
+                || cfg.exact_mask.is_some()
+                || cfg.auto_lossless
+            {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            match cfg.superres_source {
+                Some(src)
+                    if src.width == up_w
+                        && src.height == input.height
+                        && src.bit_depth == bit_depth
+                        && src.format == input.format => {}
+                _ => return Err(Error::PartitionWalkOutOfRange),
+            }
+            up_w as usize
+        }
+        None => width,
+    };
+    let ref_chroma_w = (ref_w + usize::from(ssx)) >> ssx;
     for reference in &cfg.refs {
-        if reference.y.len() != width * height
-            || reference.u.len() != chroma_w * chroma_h
-            || reference.v.len() != chroma_w * chroma_h
+        if reference.y.len() != ref_w * height
+            || reference.u.len() != ref_chroma_w * chroma_h
+            || reference.v.len() != ref_chroma_w * chroma_h
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
     }
+    // §5.11.27 `is_scaled( refFrame )` — one answer for all seven
+    // references (they share the upscaled extent).
+    let ref_scaled = crate::encoder::superres_elect::is_scaled(
+        ref_w as u32,
+        height as u32,
+        width as u32,
+        height as u32,
+    );
 
     let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
     // r427 — the §5.11.46 palette election inside inter frames stays
@@ -2914,6 +3077,28 @@ pub(crate) fn encode_inter_frame_generic_gm(
     fh.allow_screen_content_tools = fh.allow_screen_content_tools
         && bit_depth == 8
         && input.format == crate::encoder::yuv_frame::ChromaFormat::Yuv420;
+    // r456 — patch the §5.9.8 fields: the wire codes the UPSCALED
+    // width (through the sequence maximum on the implicit arm, or the
+    // §5.9.5 override fields) plus `use_superres = 1` / `coded_denom`;
+    // `FrameWidth` and the mi grid stay at the coded (downscaled)
+    // extent the builder derived from `input`. The §5.9.5 override
+    // decision compares the DISPLAY width (a SWITCH frame keeps its
+    // forced explicit shape).
+    if let Some((up_w, denom)) = cfg.superres {
+        let fs = fh
+            .frame_size
+            .as_mut()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        fs.upscaled_width = up_w;
+        fs.render_width = up_w;
+        fs.use_superres = true;
+        fs.superres_denom = denom;
+        fs.coded_denom = (denom - crate::frame_header::SUPERRES_DENOM_MIN) as u8;
+        if !cfg.s_frame {
+            fh.frame_size_override_flag = up_w != seq.max_frame_width_minus_1 + 1
+                || input.height != seq.max_frame_height_minus_1 + 1;
+        }
+    }
     let fs = fh
         .frame_size
         .as_ref()
@@ -2923,7 +3108,23 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // config asked for columns/rows). The whole driver — search arms,
     // every post-tile replay election, the §5.11.1 assembly — walks
     // the same tile plan.
-    let mut ti = match cfg.explicit_tiles {
+    // r456 — on the superres inter arm an explicit column layout is
+    // remapped onto the downscaled superblock grid (column count
+    // preserved — the primary frame's per-tile donor CDFs keep
+    // lining up; Annex A superres tile-width rule enforced).
+    let remapped_widths: Option<Vec<u32>> = match (cfg.superres, cfg.explicit_tiles) {
+        (Some((up_w, denom)), Some((ws, hs))) => Some(
+            crate::encoder::superres_elect::denom_explicit_ok(up_w, input.height, denom, ws, hs)
+                .ok_or(Error::PartitionWalkOutOfRange)?,
+        ),
+        _ => None,
+    };
+    let explicit_tiles: Option<(&[u32], &[u32])> =
+        match (remapped_widths.as_deref(), cfg.explicit_tiles) {
+            (Some(r), Some((_, hs))) => Some((r, hs)),
+            _ => cfg.explicit_tiles,
+        };
+    let mut ti = match explicit_tiles {
         // r433 — §5.9.15 non-uniform (explicit) layout.
         Some((widths_sb, heights_sb)) => crate::tile_info::TileInfo::explicit_layout(
             mi_cols,
@@ -3005,6 +3206,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // §7.10.2 stack derivations (`lower_mv_precision` becomes a
     // no-op) and the §5.11.32 `mv_hp` write cascade all key off this.
     ip.allow_high_precision_mv = cfg.high_precision_mv;
+    // r456 — §5.11.27 `is_scaled( refFrame )` per reference: on the
+    // §5.9.8 inter arm the scale test fires for all seven (the
+    // `motion_mode` read collapses to the `use_obmc` arm; the syntax
+    // twin prices exactly that cascade).
+    ip.is_scaled_per_ref = [ref_scaled; 7];
     // r412: SWITCHABLE frame filter — each inter leaf RD-selects its
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
@@ -3161,7 +3367,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // write pass) and into the frame header (feeding the §5.9.24
     // write arm) — one source of truth on every side, so the stream
     // and the search can never disagree about the model.
-    if global_motion {
+    // r456 — §7.11.3.1 step 7 never selects a global warp against a
+    // scaled reference (`is_scaled( refFrame ) == 0` is required) and
+    // the estimator's sample collection assumes equal extents: the
+    // superres inter arm keeps identity models.
+    if global_motion && !ref_scaled {
         let hp = fh
             .inter_refs
             .as_ref()
@@ -3373,6 +3583,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 mi_cols,
                 width,
                 height,
+                (ref_w as u32, height as u32),
                 ip.clone(),
                 base_q_idx,
                 alt_q,
@@ -4356,21 +4567,61 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // applied through the §7.17 frame driver — the §7.20 reference
     // store the following frames predict from is the RESTORED frame,
     // exactly like the decoder's.
+    // r456 — §7.4 steps 3-4 / §7.16 on the superres inter arm: upscale
+    // the post-CDEF reconstruction (and the pre-CDEF snapshot §7.17
+    // reads across stripe boundaries) to the upscaled extent through
+    // the decoder's OWN driver, BETWEEN the CDEF and LR elections —
+    // exactly the KEY arm's order. From here on the recon planes (the
+    // §7.20 reference payload) live at the upscaled extent.
+    let mut pre_cdef = pre_cdef;
+    let (lr_w, lr_chroma_w, lr_src): (usize, usize, &YuvFrame) =
+        if let Some((up_w, _)) = cfg.superres {
+            let np = usize::from(num_planes);
+            let upscale = |y: &[u16], u: &[u16], v: &[u16]| {
+                crate::encoder::superres_elect::upscale_recon(
+                    [y, u, v],
+                    width as u32,
+                    height as u32,
+                    up_w,
+                    mi_cols,
+                    bit_depth,
+                    ssx,
+                    ssy,
+                    np,
+                )
+            };
+            let (uy, uu, uv) = upscale(&recon.y, &recon.u, &recon.v)?;
+            recon.y = uy;
+            recon.u = uu;
+            recon.v = uv;
+            if let Some(pc) = pre_cdef.as_mut() {
+                let (py, pu, pv) = upscale(&pc.0, &pc.1, &pc.2)?;
+                *pc = (py, pu, pv);
+            }
+            let src = cfg.superres_source.ok_or(Error::PartitionWalkOutOfRange)?;
+            (
+                up_w as usize,
+                ((up_w + u32::from(ssx)) >> ssx) as usize,
+                src,
+            )
+        } else {
+            (width, chroma_w, input)
+        };
     let mut lr_elected = false;
     if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
         let price_cdfs = start_cdfs_for(fh.primary_ref_frame);
         if let Some(plan) =
             crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
-                input,
+                input: lr_src,
                 curr_y: pcy,
                 curr_u: pcu,
                 curr_v: pcv,
                 cdef_y: &recon.y,
                 cdef_u: &recon.u,
                 cdef_v: &recon.v,
-                width,
+                width: lr_w,
                 height,
-                chroma_w,
+                chroma_w: lr_chroma_w,
                 chroma_h,
                 bit_depth,
                 subsampling_x: ssx,
@@ -4381,9 +4632,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
                 price_cdfs: &price_cdfs,
                 disable_cdf_update: fh.disable_cdf_update,
-                // Inter frames never code §5.9.8 superres.
-                use_superres: false,
-                superres_denom: crate::frame_header::SUPERRES_NUM,
+                // r456 — the §7.17 election at the UPSCALED extent on
+                // the superres inter arm (§5.11.57 window through the
+                // denominator ratio).
+                use_superres: cfg.superres.is_some(),
+                superres_denom: cfg
+                    .superres
+                    .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
             })
         {
             let mut re_params = params.clone();
@@ -4430,16 +4685,16 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     state = re_state;
                     let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                         &plan,
-                        input,
+                        lr_src,
                         pcy,
                         pcu,
                         pcv,
                         &mut recon.y,
                         &mut recon.u,
                         &mut recon.v,
-                        width,
+                        lr_w,
                         height,
-                        chroma_w,
+                        lr_chroma_w,
                         chroma_h,
                         bit_depth,
                         ssx,
@@ -4709,6 +4964,19 @@ struct PSearchCtx {
     mi_cols: u32,
     luma_w: u32,
     luma_h: u32,
+    /// r456 — the references' LUMA extent (`RefUpscaledWidth` /
+    /// `RefFrameHeight` per §7.11.3.3); equals `(luma_w, luma_h)` off
+    /// the superres inter arm.
+    ref_w: u32,
+    ref_h: u32,
+    /// r456 — integer-pel SEARCH planes at the CODED extent for
+    /// scaled references (each reference luma resampled to `luma_w`
+    /// columns through the same low-pass the arm downscales the
+    /// source with): the coarse SSD walk reads them where it reads
+    /// `ref_planes[..][0]` on flat frames. Empty off the arm. A
+    /// selection aid only — every candidate that matters is scored
+    /// through the decoder's own §7.11.3.3 / §7.11.3.4 kernels.
+    search_planes: Vec<Vec<u16>>,
     /// r427 — stream §5.5.2 `BitDepth` (threads the §7.11.2 /
     /// §7.11.3 clip + rounding parameters of the decoder kernels the
     /// search predicts through).
@@ -4878,6 +5146,7 @@ impl PSearchCtx {
             mi_cols,
             width,
             height,
+            (width as u32, height as u32),
             ip,
             base_q_idx,
             seg_alt_q,
@@ -4904,6 +5173,7 @@ impl PSearchCtx {
         mi_cols: u32,
         width: usize,
         height: usize,
+        ref_extent: (u32, u32),
         ip: SyntaxInterFrameParams,
         base_q_idx: u8,
         seg_alt_q: &[i16],
@@ -4948,11 +5218,31 @@ impl PSearchCtx {
             },
         )
         .ok_or(Error::PartitionWalkOutOfRange)?;
+        let (ref_w, ref_h) = ref_extent;
+        let scaled =
+            crate::encoder::superres_elect::is_scaled(ref_w, ref_h, width as u32, height as u32);
+        let search_planes: Vec<Vec<u16>> = if scaled {
+            refs.iter()
+                .map(|r| {
+                    crate::encoder::superres_elect::downscale_plane_width(
+                        &r.y,
+                        ref_w as usize,
+                        ref_h as usize,
+                        width,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(PSearchCtx {
             mi_rows,
             mi_cols,
             luma_w: width as u32,
             luma_h: height as u32,
+            ref_w,
+            ref_h,
+            search_planes,
             bit_depth,
             subsampling_x,
             subsampling_y,
@@ -5024,7 +5314,7 @@ impl PSearchCtx {
                 let ll = seg_lossless_array(base_q_idx, seg_alt_q);
                 (0..seg_alt_q.len()).find(|&s| ll[s]).map(|s| s as u8)
             },
-            no_scaled: [false; 8],
+            no_scaled: [scaled; 8],
             mirror,
             ip,
             delta_q_units: 0,
@@ -5274,6 +5564,17 @@ impl PSearchCtx {
 
     /// r415 — resolve a raw `RefFrame` ordinal to its
     /// [`Self::ref_planes`] index through the header slot map.
+    /// r456 — the luma plane the integer-pel SSD walk reads for
+    /// reference plane `plane`: the reference itself on flat frames,
+    /// its coded-extent resample on the superres inter arm.
+    fn search_luma(&self, plane: usize) -> &[u16] {
+        if self.search_planes.is_empty() {
+            &self.ref_planes[plane][0]
+        } else {
+            &self.search_planes[plane]
+        }
+    }
+
     fn plane_of_ref(&self, rf: i8) -> usize {
         self.slot_to_plane[self.ref_frame_idx[(rf - 1) as usize] as usize]
     }
@@ -5821,6 +6122,7 @@ impl PSearchCtx {
         // vectors immutably while the plane contexts borrow the
         // scratch planes mutably.
         let (luma_w, luma_h) = (self.luma_w, self.luma_h);
+        let (ref_w, ref_h) = (self.ref_w, self.ref_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
@@ -5863,29 +6165,26 @@ impl PSearchCtx {
         // (slots outside the mapped roles point at plane 0, never
         // resolved through `ref_frame_idx`). Dimensions are LUMA
         // extents per the r405 contract; strides are plane samples.
-        let store_y = make_store(
-            ref_planes,
-            &slot_to_plane,
-            0,
-            luma_w as usize,
-            luma_w,
-            luma_h,
-        );
+        // r456 — the store carries the REFERENCE extents (§7.11.3.3
+        // `RefUpscaledWidth` / `RefFrameHeight`); strides are the
+        // reference's own plane widths. Off the superres inter arm
+        // they coincide with the frame's.
+        let store_y = make_store(ref_planes, &slot_to_plane, 0, ref_w as usize, ref_w, ref_h);
         let store_u = make_store(
             ref_planes,
             &slot_to_plane,
             1,
-            (luma_w as usize) >> ssx,
-            luma_w,
-            luma_h,
+            ((ref_w + u32::from(ssx)) >> ssx) as usize,
+            ref_w,
+            ref_h,
         );
         let store_v = make_store(
             ref_planes,
             &slot_to_plane,
             2,
-            (luma_w as usize) >> ssx,
-            luma_w,
-            luma_h,
+            ((ref_w + u32::from(ssx)) >> ssx) as usize,
+            ref_w,
+            ref_h,
         );
 
         let grid = InterModeInfoGrid {
@@ -6792,7 +7091,7 @@ fn encode_inter_leaf_modes(
         let ref_plane = ictx.plane_of_ref(rf);
         let mv_int = motion_search_luma(
             input,
-            &ictx.ref_planes[ref_plane][0],
+            ictx.search_luma(ref_plane),
             width,
             recon.height,
             row0,
@@ -10009,6 +10308,8 @@ mod tests {
             false,
             false,
             false,
+            None,
+            None,
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);
@@ -10321,6 +10622,7 @@ mod tests {
             mi_cols,
             (mi_cols * 4) as usize,
             (mi_rows * 4) as usize,
+            (mi_cols * 4, mi_rows * 4),
             ip,
             base_q_idx,
             &[],

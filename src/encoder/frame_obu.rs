@@ -1098,10 +1098,15 @@ pub(crate) fn encode_tile_info(bw: &mut BitWriter, ti: &TileInfo) {
         let mut start_sb: u32 = 0;
         for window in ti.mi_col_starts.windows(2) {
             let next_mi = window[1];
-            let size_sb = (next_mi >> sb_shift) - start_sb;
-            // last tile clamps to (sb_cols - start_sb); we want the same.
+            // §5.9.15: `width_in_sbs_minus_1 + 1` superblocks from the
+            // running start; the parser sets `MiColStarts[ TileCols ]
+            // = MiCols`, so the LAST column's coded size is the
+            // superblock CEILING of its mi extent (r456 — a frame
+            // whose width is not a superblock multiple, e.g. the
+            // 160-wide §5.9.8 coded extent, previously underflowed
+            // here: the floor `next_mi >> sb_shift` came up short).
             let actual = ((next_mi - (start_sb << sb_shift)) + (1 << sb_shift) - 1) >> sb_shift;
-            let final_size_sb = if actual == 0 { 1 } else { size_sb };
+            let final_size_sb = actual.max(1);
             let max_width = (sb_cols - start_sb).min(max_tile_width_sb);
             bw.write_ns(max_width.max(1), final_size_sb - 1);
             start_sb += final_size_sb;
@@ -1119,9 +1124,9 @@ pub(crate) fn encode_tile_info(bw: &mut BitWriter, ti: &TileInfo) {
         let mut start_sb_r: u32 = 0;
         for window in ti.mi_row_starts.windows(2) {
             let next_mi = window[1];
-            let size_sb = (next_mi >> sb_shift) - start_sb_r;
+            // Same superblock-ceiling rule for the last row.
             let actual = ((next_mi - (start_sb_r << sb_shift)) + (1 << sb_shift) - 1) >> sb_shift;
-            let final_size_sb = if actual == 0 { 1 } else { size_sb };
+            let final_size_sb = actual.max(1);
             let max_height = (sb_rows - start_sb_r).min(max_tile_height_sb);
             bw.write_ns(max_height.max(1), final_size_sb - 1);
             start_sb_r += final_size_sb;
