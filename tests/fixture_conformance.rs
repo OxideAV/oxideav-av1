@@ -14325,6 +14325,97 @@ fn self_encoded_superres_inter_gop_decodes_byte_exact() {
 }
 
 // ---------------------------------------------------------------------
+// r456: film grain × FEATURE-EXTRA segmentation — a SEG_LVL_SKIP table
+// ([0, 16], segment 1 skip-forced) with an apply_grain = 1 block on
+// every header; the first stream pairing a §5.9.14 feature table with
+// §5.9.30 grain.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q60_SEG_SKIP_FILM_GRAIN_IVF: &str = concat!(
+    "444b4946000020004156303180006000190000000100000004000000000000009d0100000000",
+    "00000000000012000a0a0000000337fbe5dfcc06328c03160021e03800033f020551ed8101a3",
+    "01a5019701a9019b01ed01af01a000b8b6b9b584fd64c2afaa2eb226336808e6e7d0ac760aa7",
+    "ee245ee4118dcfbd8658b46aca5313f17ccef3d76d5b4692d0023704dd684d25c5b029766472",
+    "fb4832ccff9dd182ee048297995a3c0c8e0ca20b04a2b1583ebabad8e2c4d58334fa0c6925e8",
+    "9943d477c43d845a2c83dd0e5d9ff58440e9be49478bd2ff2038e138703a85f44f023a269eb9",
+    "071fad8012c8389faa49a53ab67da023020517c84c0fb69f32c9ccbddc4fcd7a591d0d69f381",
+    "39e8c0717e1809cc0743d4ef6585dd9b68e4902a603e846ffd5b870a68f7494a9b959ce74ec6",
+    "86e1ad59d6e012e5234e50b1658cc323c6ed5962a123a59995191c8b3b813ccca5836168f5df",
+    "07c729d5414d1bd65ace25dd315d641d00e5fbf8ce453d6b1f84eacc449ff6c83ed82b5882ba",
+    "d6281e1a4e4f8dbbbf34fb45b8d849f4ff0d4a0170e1c1169831d2650432b76a612177fc7578",
+    "417d94abc32324d3a26fe4ba2564e76bf4372b3210480dc1b4a096c7fbf230235f7cabdef6f7",
+    "183b0000000100000000000000120032373201002248249d0f03600010802000000000000e00",
+    "00000003807c093020346034a032e0352033603da035e034001716d736b0801b35d167000000",
+    "0200000000000000120032633202004001003d0f03600010802000000000000e00008400f0f0",
+    "0c72de04068c0694065c06a4066c07b406bc068002e2dae6d610d089d397c19f3ef04dc1764e",
+    "8dc143a2ed2594115a3c68e2073cb67e87773c5a31ef275ad169f4ecaca791ebb6856e390000",
+    "000300000000000000120032353203002248249d0f036000108020000000000000000000001e",
+    "012c92c080d180d280cb80d480cd80f680d780d0005c5b5cdac23fc9",
+);
+
+/// r456: film grain × SEG_LVL_SKIP feature table (4-frame 128×96 at q60;
+/// every P header carries BOTH the feature table and the full grain
+/// block — the corpus's first feature-extra segmentation × grain
+/// stream) — the digest is the byte-identical output of THREE independent
+/// black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q60-seg-skip-film-grain/`.
+#[test]
+fn self_encoded_seg_skip_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q60-seg-skip-film-grain",
+        SELF_GOP_128X96_Q60_SEG_SKIP_FILM_GRAIN_IVF,
+        "e5a659302543ab126c9d33569475552811608b7d645c2309130554eca6815e2d",
+        4,
+    );
+}
+
+// ---------------------------------------------------------------------
+// r456: film grain × a LOSSLESS segment — a SEG_LVL_ALT_Q table [0, -60]
+// at q60 clamps segment 1 to qindex 0 (WHT leaves, no tx symbols)
+// inside lossy frames that carry a full §5.9.30 grain block.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_128X96_Q60_LOSSLESS_SEG_FILM_GRAIN_IVF: &str = concat!(
+    "444b4946000020004156303180006000190000000100000004000000000000009d0100000000",
+    "00000000000012000a0a0000000337fbe5dfcc06328c03160021e03800033f020551ed8101a3",
+    "01a5019701a9019b01ed01af01a000b8b6b9b584fd64c2afaa2eb226336808e6e7d0ac760aa7",
+    "ee245ee4118dcfbd8658b46aca5313f17ccef3d76d5b4692d0023704dd684d25c5b029766472",
+    "fb4832ccff9dd182ee048297995a3c0c8e0ca20b04a2b1583ebabad8e2c4d58334fa0c6925e8",
+    "9943d477c43d845a2c83dd0e5d9ff58440e9be49478bd2ff2038e138703a85f44f023a269eb9",
+    "071fad8012c8389faa49a53ab67da023020517c84c0fb69f32c9ccbddc4fcd7a591d0d69f381",
+    "39e8c0717e1809cc0743d4ef6585dd9b68e4902a603e846ffd5b870a68f7494a9b959ce74ec6",
+    "86e1ad59d6e012e5234e50b1658cc323c6ed5962a123a59995191c8b3b813ccca5836168f5df",
+    "07c729d5414d1bd65ace25dd315d641d00e5fbf8ce453d6b1f84eacc449ff6c83ed82b5882ba",
+    "d6281e1a4e4f8dbbbf34fb45b8d849f4ff0d4a0170e1c1169831d2650432b76a612177fc7578",
+    "417d94abc32324d3a26fe4ba2564e76bf4372b3210480dc1b4a096c7fbf230235f7cabdef6f7",
+    "18ab0000000100000000000000120032a601320100224824bd0f0360001e2000000000000000",
+    "00060e001c03e0498101a301a5019701a9019b01ed01af01a000b8b6b9b584d225c8ce3bc922",
+    "ae9a462e41240536c3c7f80773450128381655188902da48706f5806526d7ad2fff24c256fce",
+    "07228ff1d34015baee375fcf411f72e993d464e5b5fef25c49e7aa4d02074491a0954fdd488a",
+    "ad5375885efc971200888af6ddcfa1e619f052cce0c74227d46d52d478256a1b440000000200",
+    "000000000000120032403202004001003d0f0360001e200000000000000000000a081e018e5b",
+    "c080d180d280cb80d480cd80f680d780d0005c5b5cdac2d7cc5b464ef7688aab4cdc69804900",
+    "0000030000000000000012003245320300224824bd0f0360001e200000000000000000066c41",
+    "87804b24b020346034a032e0352033603da035e034001716d736b080d089d37f673b56babb9a",
+    "c84ff2b470b573",
+);
+
+/// r456: film grain × lossless-segment table (4-frame 128×96 at q60; the
+/// `[0, -60]` table's segment 1 is lossless — the corpus's first
+/// stream pairing a lossless segment with §5.9.30 grain) — the digest is the byte-identical output of THREE independent
+/// black-box reference decoders; notes under
+/// `docs/video/av1/fixtures/self-gop-128x96-q60-lossless-seg-film-grain/`.
+#[test]
+fn self_encoded_lossless_segment_film_grain_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-128x96-q60-lossless-seg-film-grain",
+        SELF_GOP_128X96_Q60_LOSSLESS_SEG_FILM_GRAIN_IVF,
+        "4a7ba430f800c4c9528a8e3cfc8da04f3ea55156b2cbcb557f74cb533624070e",
+        4,
+    );
+}
+
+// ---------------------------------------------------------------------
 // r456: superres × EXPLICIT (non-uniform) tile layout — the 320-wide
 // `[3, 2]` column layout remapped per frame onto the downscaled
 // superblock grid (`[2, 1]` at 160, `[2, 2]` at 256), inter frames on

@@ -1281,24 +1281,24 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     // gate for the plain SEG_LVL_ALT_Q ladder: the grain arm codes
     // the DENOISED frames under the same §5.9.14 table (the KEY of a
     // segmented GOP is itself unsegmented, so the grain block and
-    // the feature table ride together only on the P headers).
-    // Feature-extra segmentation (SEG_LVL_REF_FRAME / SKIP /
-    // GLOBALMV), lossless regions and exactness demands stay out —
-    // grain synthesis on an exactness-contracted region would break
-    // the pixel contract.
+    // the feature table ride together only on the P headers). r456
+    // lifts the two remaining table gates: FEATURE-EXTRA
+    // segmentation (SEG_LVL_REF_FRAME / SKIP / GLOBALMV — the arm
+    // re-runs the r426 twin-priced feature trials over the denoised
+    // frames under the same table) and tables carrying a LOSSLESS
+    // segment (a `-base_q_idx`-clamped SEG_LVL_ALT_Q entry is a
+    // quantiser choice, not a pixel contract — the pre-grain §7.20
+    // reference stays WHT-exact for the blocks the ladder puts
+    // there, and §7.18.3 synthesis is output-only). Exactness-demand
+    // regions and the auto-lossless election stay out: grain
+    // synthesis on a demanded region would break the pixel contract.
     if !(tuning.film_grain
         && base_q_idx > 0
         && regions.is_empty()
         && !auto_detect
-        && extras.is_none()
         && tuning.model == RateModel::Twin
         && frames.len() >= 2)
     {
-        return Ok(plain);
-    }
-    // A segmented ladder with any lossless segment keeps the plain
-    // shape (same exactness-contract reasoning as `regions`).
-    if !alt_q.is_empty() && seg_lossless_array(base_q_idx, alt_q).iter().any(|&b| b) {
         return Ok(plain);
     }
     let elected = elect_film_grain(

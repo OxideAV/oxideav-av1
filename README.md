@@ -1360,7 +1360,7 @@ MiCols`, so the coded size is the CEILING) — fixed, regression in
 `self-gop-320x96-q180-superres-explicit-tiles` — the corpus's first
 non-uniform-layout stream carrying `use_superres = 1` frames,
 byte-identical through three black-box reference decoders (corpus
-157).
+159 with the two film-grain pairings).
 
 ### Film-grain election (r441; AR taps + chroma points r444)
 
@@ -1440,6 +1440,26 @@ desync: the ref-less header parse mis-derived §5.9.22
 so the wire audit now tracks §7.20 reference state across frames.
 Pinned: `self-gop-128x96-q60-seg-film-grain` — the corpus's first
 segmentation × grain stream (corpus 151).
+
+### Film grain × feature-extra / lossless-segment tables (r456)
+
+The two segmentation gates the r450 election kept are lifted:
+FEATURE-EXTRA tables (SEG_LVL_SKIP / SEG_LVL_GLOBALMV /
+SEG_LVL_REF_FRAME — the grain arm re-runs the r426 twin-priced
+feature trials over the denoised frames under the same table) and
+SEG_LVL_ALT_Q tables carrying a LOSSLESS segment (a
+`-base_q_idx`-clamped entry is a quantiser choice, not a pixel
+contract: the pre-grain §7.20 reference stays WHT-exact for the
+blocks the ladder puts there and §7.18.3 synthesis is output-only).
+Exactness-demand regions and the auto-lossless election stay out.
+Witnesses in `tests/film_grain_seg_extras.rs` (SKIP, GLOBALMV +
+REF_FRAME and `[0, -60]` tables elect on noisy split content, every
+P header carries BOTH the table and an `apply_grain = 1` block,
+bit-exact decode; clean content bit-identical). Pinned:
+`self-gop-128x96-q60-seg-skip-film-grain` and
+`self-gop-128x96-q60-lossless-seg-film-grain` — the corpus's first
+feature-table × grain and lossless-segment × grain streams,
+byte-identical through three black-box reference decoders.
 
 ### Film grain on the pyramid drivers (r452)
 
@@ -1666,9 +1686,9 @@ corpus stands at 150.
   keep the opener-only election), and the §7.3 camera mode is
   SPEC-BARRED from the pairing (§7.3.1 requires
   `enable_superres = 0`).
-- The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames; r450
-  admits plain SEG_LVL_ALT_Q ladders — feature-extra segmentation,
-  lossless regions/segments and the pyramid drivers stay out); the
+- The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames;
+  exactness-demand regions and the auto-lossless election stay out
+  — grain on a demanded region would break the pixel contract); the
   AR ladder stops at `ar_coeff_lag = 2` (the lag-3 ring's 24 + 2×25
   coefficient bytes per header never paid on the measured extents).
 - Intra-block-copy × superres is SPEC-BARRED (§5.9.2 reads
