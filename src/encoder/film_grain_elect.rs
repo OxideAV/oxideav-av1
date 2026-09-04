@@ -501,7 +501,16 @@ pub(crate) fn chroma_noise_gate(
 /// correlation-match term scores (and the probe gates on).
 #[must_use]
 pub(crate) fn lag1_h_rho(a: &[u16], b: &[u16], w: usize, h: usize) -> f64 {
-    if w < 2 || h == 0 {
+    lag_h_rho(a, b, w, h, 1)
+}
+
+/// r456 — the lag-`lag` HORIZONTAL autocorrelation of the residual
+/// between two equal-shape planes (`lag1_h_rho` at `lag = 1`): the
+/// correlation-match term scores lags 1..=3, so a §5.9.30
+/// `ar_coeff_lag = 3` ring has structure it is scored on.
+#[must_use]
+pub(crate) fn lag_h_rho(a: &[u16], b: &[u16], w: usize, h: usize, lag: usize) -> f64 {
+    if lag == 0 || w <= lag || h == 0 {
         return 0.0;
     }
     let n: Vec<f64> = a
@@ -514,8 +523,8 @@ pub(crate) fn lag1_h_rho(a: &[u16], b: &[u16], w: usize, h: usize) -> f64 {
     for r in 0..h {
         for c in 0..w {
             e += n[r * w + c] * n[r * w + c];
-            if c + 1 < w {
-                lagsum += n[r * w + c] * n[r * w + c + 1];
+            if c + lag < w {
+                lagsum += n[r * w + c] * n[r * w + c + lag];
             }
         }
     }

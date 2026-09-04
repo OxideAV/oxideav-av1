@@ -1407,6 +1407,19 @@ where
     }
     let fit1 = fge::fit_ar_lag(&frames[0], &denoised[0], 1);
     let fit2 = fge::fit_ar_lag(&frames[0], &denoised[0], 2);
+    // r456 — the `ar_coeff_lag = 3` ring joins the ladder, GATED on
+    // the residual actually carrying distance-3 horizontal structure
+    // (|ρ(3)| >= 0.2 on the first frame — the r452 measurement showed
+    // the 24-tap header never pays where the deeper lags are flat,
+    // and each candidate is a full re-encode). The correlation-match
+    // term below scores lags 1..=3, so the ring is scored on exactly
+    // the structure it models.
+    let fit3 = {
+        let (w, h) = (width as usize, height as usize);
+        (fge::lag_h_rho(&frames[0].y, &denoised[0].y, w, h, 3).abs() >= 0.2)
+            .then(|| fge::fit_ar_lag(&frames[0], &denoised[0], 3))
+            .flatten()
+    };
     let mut cand_params: Vec<FilmGrainParams> = vec![fge::build_grain_params(
         &est, bit_depth, ssx, ssy, mc, None, false, false, false,
     )];
@@ -1416,9 +1429,14 @@ where
     let csfl_ok = chroma_cb && chroma_cr;
     let chroma_only: Option<fge::ArFit> = ((chroma_cb || chroma_cr) && fit1.is_none())
         .then(|| fge::fit_chroma_corr(&frames[0], &denoised[0]));
-    for fit in [fit1.as_ref(), fit2.as_ref(), chroma_only.as_ref()]
-        .into_iter()
-        .flatten()
+    for fit in [
+        fit1.as_ref(),
+        fit2.as_ref(),
+        fit3.as_ref(),
+        chroma_only.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         cand_params.push(fge::build_grain_params(
             &est,
@@ -1547,15 +1565,21 @@ where
             }
             // Correlation-match term (luma): unmodelled spatial
             // structure counts as noise energy times the squared
-            // correlation gap.
+            // correlation gap — r456: summed over lags 1..=3 (white
+            // and lag-1 content leave the deeper gaps at ~0, so the
+            // r444 settlement is unchanged there; distance-3
+            // structure now reaches the score).
             let w = width as usize;
             let h = height as usize;
-            let rho_src = fge::lag1_h_rho(&frames[k].y, &denoised[k].y, w, h);
-            let rho_syn = fge::lag1_h_rho(&grained[k].y, &cand_recon[k].y, w, h);
             let sig_src = fge::plane_sigma16(&frames[k].y, &denoised[k].y, bit_depth);
-            let gap = (rho_src - rho_syn).abs();
-            let term = (frames[k].y.len() as f64) * gap * gap * ((sig_src * sig_src) as f64)
-                / 256.0
+            let mut gap2 = 0.0f64;
+            for lag in 1..=3usize {
+                let rho_src = fge::lag_h_rho(&frames[k].y, &denoised[k].y, w, h, lag);
+                let rho_syn = fge::lag_h_rho(&grained[k].y, &cand_recon[k].y, w, h, lag);
+                let gap = rho_src - rho_syn;
+                gap2 += gap * gap;
+            }
+            let term = (frames[k].y.len() as f64) * gap2 * ((sig_src * sig_src) as f64) / 256.0
                 * f64::from(1u32 << (2 * shift));
             d_grain += term.round() as u64;
         }

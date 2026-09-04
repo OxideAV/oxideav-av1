@@ -1441,6 +1441,25 @@ so the wire audit now tracks §7.20 reference state across frames.
 Pinned: `self-gop-128x96-q60-seg-film-grain` — the corpus's first
 segmentation × grain stream (corpus 151).
 
+### Film grain: the `ar_coeff_lag = 3` ring (r456)
+
+The r452 measurement stood because the objective's correlation-match
+term reached lag 1 only. r456 scores horizontal lags 1..=3 (`samples ·
+Σ_lag (ρ_src − ρ_syn)² · σ_src²` — white and lag-1 content leave the
+deeper gaps at ~0, so the r444 settlement is unchanged there) and
+offers the 24-tap ring as a candidate where the first frame's
+residual carries distance-3 structure (`|ρ(3)| >= 0.2` — each
+candidate is a full re-encode). On grain correlated ONLY three
+columns apart (ρ(1) = ρ(2) = 0, ρ(3) = ½) the ring now wins:
+192×160 q60, 1 415 → 1 228 bytes (−13.2 %) at the best neutrality
+score of the ladder; on a 4-frame 128×96 GOP it still outscores
+every shallower ring but forfeits the strictly-fewer-bytes RATE
+mandate (four lag-3 headers outrun the denoising saving), so a
+shallower ring is elected — the mandate governs. Witnesses in `tests/film_grain_lag3.rs`.
+Pinned: `self-gop-192x160-q60-film-grain-lag3` — the corpus's first
+self-encoded `ar_coeff_lag = 3` stream, byte-identical through three
+black-box reference decoders (corpus 162).
+
 ### Film grain × feature-extra / lossless-segment tables (r456)
 
 The two segmentation gates the r450 election kept are lifted:
@@ -1716,8 +1735,9 @@ corpus stands at 150.
 - The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames;
   exactness-demand regions and the auto-lossless election stay out
   — grain on a demanded region would break the pixel contract); the
-  AR ladder stops at `ar_coeff_lag = 2` (the lag-3 ring's 24 + 2×25
-  coefficient bytes per header never paid on the measured extents).
+  correlation-match term scores HORIZONTAL lags only (vertical /
+  diagonal structure reaches the ladder through the least-squares
+  fit, not the score).
 - Intra-block-copy × superres is SPEC-BARRED (§5.9.2 reads
   `allow_intrabc` only when `UpscaledWidth == FrameWidth`), so the
   composition never appears on either side of the crate.

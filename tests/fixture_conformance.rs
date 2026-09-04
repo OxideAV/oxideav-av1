@@ -15069,3 +15069,61 @@ fn self_encoded_spatial_temporal_2x3_stream_decodes_byte_exact_at_all_six_operat
         2,
     );
 }
+
+// ---------------------------------------------------------------------
+// r456: §5.9.30 `ar_coeff_lag = 3` — the 24-tap luma ring elected on
+// grain correlated only three columns apart (ρ(1) = ρ(2) = 0, ρ(3) =
+// ½); the §7.18.3.3 lag-3 auto-regression on the decode side.
+// ---------------------------------------------------------------------
+
+const SELF_GOP_192X160_Q60_FILM_GRAIN_LAG3_IVF: &str = concat!(
+    "444b49460000200041563031c000a00019000000010000000200000000000000920300000000",
+    "00000000000012000a0b00000003bdfcf977f30180328007160021e03800033b02a2a8f6c080",
+    "c180c280c380c480c580ce80c780c000dfdf1e5e1e9f1fdf5ddb9adc5e5fa05d18d75b1e9fa5",
+    "5cd982fd62331bc557e47ec8fdac38e2483033af029b27d669ec027f8e67aa3baef24e5b2b67",
+    "6e9425c8a579887277bc1dd8d83456a7b67d7ebe9a567fcee53232a4fc4a07ba084011547049",
+    "ccb9aa78d466759d7e3d00df90f90e477fa49a3cc961a97d017116f727c6661d0057ec594eef",
+    "ecb09620a8a7e6eccf4d88bcc4a7c6cd9dad782abaa2880e36c0727bf27ff380ac1a24f86691",
+    "364b80dfa045b6d4b9ced66ea482d4298954426aab879ea5d42b942e1a4800c920d06bebc7bc",
+    "83801c8555d45d5c9fd33d3eb58f88157fa1de3195738f7382567e5c2efbbc735129a8ae87ac",
+    "f37e63172963ed08e9510dd4bd9c1b4fc3c00f3e412c2afcd15329895218617ea4906481cfae",
+    "4ca0e995b9606a4d2c733dfef9e28108dddb260f2eb38b1feb65b0d281d19cf171b662298a82",
+    "15529b534a6888adbbf2e20805987062b400725c1b2267cb2b4a784bbf018d735a6815053f91",
+    "9535ed23c5a47ee2dd2e3a9923b2ae4dec233c1e1b939e7703425d260efa66a8b0948c280bdb",
+    "ef621b5f4caa9ff5c47d96b3f4b57c21380778b34bb3ff566e5d1abdf83ab1b203c3da00b5cb",
+    "07571676df9ee6c5367bd8d07a36ae729ea7380823d32c1e3fe63e4a26700d5174d88b9baabd",
+    "f1c4ace63ae6d146e3d07d045047a8910fb10851c68e8d0f543cc4523a497fd80d072fc76e9b",
+    "cc438d5dd750b02386f38599ce1990bbd7eabebd07b911f8b426223817c70f19f6a5306624c0",
+    "8ec8194d68846b8af348be8749d2ef6c3420b75f7edb896a0d5f05a87b30a535c368ca3bcf18",
+    "1c4531c220c6979fccee1455f2ab6270a719b5e2e9c8bc1b173ba54c7bac70b67c6e5f38dbf5",
+    "1220111815f04f201cc0205247203e5ec5e2aabf44489dc24b399d4a54d4f46ac86dc3725088",
+    "62ce498f03da5896cb1d7e3814d83acfc14f208ed30ba28035411f2ec1db022eea3bf7830b28",
+    "c0a793df0c72abece827db2905838b09c90b094192de9630f12f5aadfec3fcaad54e4851d2b6",
+    "4547df0e433bb99df0116580be1b63aa5aaee66484bdd1dc205052809334c5a7905b7e7d6e05",
+    "812baf615aaf3d2795e1c6d03882000dde0d47703b8f7ad148feee1a0481587f33207827d601",
+    "48688214bf86b15870335c92b5f0ae7e2128b9c145e519d9098cfaeb23572dc77df8afe7d015",
+    "78dc27a87f7529d0020100000100000000000000120032fd01320100224824bd0f000000c3c0",
+    "0ce01f024c080c180c280c380c480c580ce80c780c000dfdf1e5e1e9f1fdf5ddb9adc5e5fa05",
+    "d18d75b1e9fa55cd9820f7660ef3fd9de596a0569adc4a83d3d146117db41f5e6249d5263744",
+    "10e39132e83520767c8d074e511e91436352727f516ee177d18a109bc479cd16bcfb24f9b4e3",
+    "30bec7d98d486dee03d765bf633b9bb088129b975faf705ba77ede43c4de6e50d7def7809de1",
+    "7f594cc0b53fb8b07064a8b5a1d38f288d311caa51849a8ec7650fefb038fc5d56b1ef0b1316",
+    "1a056148bb856e92661e5342fc93d624ecc9aead02eba5c66898152fc9600c514275d5e84cae",
+    "6843d3d7afa1d61da02051fe",
+);
+
+/// r456: film grain with `ar_coeff_lag = 3` (2-frame 192×160 at q60;
+/// the ladder's lag-3 ring elected under the multi-lag
+/// correlation-match term — the corpus's first self-encoded
+/// `ar_coeff_lag = 3` stream) — the digest is the byte-identical
+/// output of THREE independent black-box reference decoders; notes
+/// under `docs/video/av1/fixtures/self-gop-192x160-q60-film-grain-lag3/`.
+#[test]
+fn self_encoded_film_grain_lag3_gop_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "self-gop-192x160-q60-film-grain-lag3",
+        SELF_GOP_192X160_Q60_FILM_GRAIN_LAG3_IVF,
+        "3341c8778b29ec32397d7c8ee60c05b44dde04127816a60cc630ce60f8987d41",
+        2,
+    );
+}
