@@ -83,6 +83,54 @@ pub(crate) fn denom_tile_ok(width: u32, height: u32, denom: u32, tiles: (u32, u3
         .all(|w| (w[1] - w[0]) * 4 >= 128)
 }
 
+/// r456 — bilinear resample of a luma plane to an arbitrary extent
+/// (centre-aligned, edge-clamped): the integer-pel SEARCH aid for a
+/// reference whose extent differs from the coded frame's in either
+/// direction (a spatial-SVC lower layer is SMALLER than the frame;
+/// a superres reference is wider). A selection aid only — every
+/// candidate that matters is scored through the decoder's own
+/// §7.11.3.3 / §7.11.3.4 kernels.
+#[must_use]
+pub(crate) fn resample_plane_bilinear(
+    src: &[u16],
+    w_src: usize,
+    h_src: usize,
+    w_dst: usize,
+    h_dst: usize,
+) -> Vec<u16> {
+    debug_assert_eq!(src.len(), w_src * h_src);
+    if w_src == w_dst && h_src == h_dst {
+        return src.to_vec();
+    }
+    // Source coordinate (in 1/64 samples) of destination sample `x`:
+    // (x + 1/2) · src / dst − 1/2, clamped at the plane edges.
+    let axis = |dst: usize, srcn: usize| -> Vec<(usize, usize, u32)> {
+        (0..dst)
+            .map(|x| {
+                let s64 = ((2 * x as i64 + 1) * srcn as i64 * 32) / (dst as i64) - 32;
+                let s64 = s64.max(0) as usize;
+                let i0 = (s64 >> 6).min(srcn - 1);
+                let i1 = (i0 + 1).min(srcn - 1);
+                (i0, i1, (s64 & 63) as u32)
+            })
+            .collect()
+    };
+    let xs = axis(w_dst, w_src);
+    let ys = axis(h_dst, h_src);
+    let mut out = vec![0u16; w_dst * h_dst];
+    for (y, &(r0, r1, fy)) in ys.iter().enumerate() {
+        let row0 = &src[r0 * w_src..(r0 + 1) * w_src];
+        let row1 = &src[r1 * w_src..(r1 + 1) * w_src];
+        for (x, &(c0, c1, fx)) in xs.iter().enumerate() {
+            let top = (64 - fx) * u32::from(row0[c0]) + fx * u32::from(row0[c1]);
+            let bot = (64 - fx) * u32::from(row1[c0]) + fx * u32::from(row1[c1]);
+            let v = ((64 - fy) * top + fy * bot + 2048) >> 12;
+            out[y * w_dst + x] = v as u16;
+        }
+    }
+    out
+}
+
 /// r456 — remap an explicit (§5.9.15 non-uniform) column layout onto
 /// the DOWNSCALED superblock grid: the widths (superblock units,
 /// summing to `sb_cols_full`) scale proportionally onto

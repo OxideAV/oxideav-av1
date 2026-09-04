@@ -2333,6 +2333,14 @@ pub(crate) struct InterFrameConfig<'a> {
     /// [`Self::superres`] arm: the §7.17 election fits and scores
     /// against it. `None` unless `superres` is set.
     pub superres_source: Option<&'a YuvFrame>,
+    /// r456 — per-[`Self::refs`] LUMA extents `(RefUpscaledWidth,
+    /// RefFrameHeight)` for references whose size differs from the
+    /// coded frame's (spatial-SVC INTER-LAYER prediction: a lower
+    /// layer's reconstruction predicting an enhancement frame through
+    /// the §7.11.3.3 scaled path in BOTH axes). Empty = every
+    /// reference at the frame's extent (or the superres upscaled
+    /// extent). Each reference must satisfy the §6.8.2 bounds.
+    pub ref_dims: Vec<(u32, u32)>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2726,6 +2734,7 @@ fn p_frame_config_primary<'a>(
         tile_spans: false,
         superres: None,
         superres_source: None,
+        ref_dims: Vec::new(),
     }
 }
 
@@ -3077,23 +3086,45 @@ pub(crate) fn encode_inter_frame_generic_gm(
         }
         None => width,
     };
-    let ref_chroma_w = (ref_w + usize::from(ssx)) >> ssx;
-    for reference in &cfg.refs {
-        if reference.y.len() != ref_w * height
-            || reference.u.len() != ref_chroma_w * chroma_h
-            || reference.v.len() != ref_chroma_w * chroma_h
+    // r456 — per-reference LUMA extents: the caller's `ref_dims`
+    // (inter-layer prediction) or the shared extent; every reference
+    // plane must match its extent and satisfy the §6.8.2 bounds
+    // (`2 * FrameWidth >= RefUpscaledWidth`, `2 * FrameHeight >=
+    // RefFrameHeight`, `FrameWidth <= 16 * RefUpscaledWidth`,
+    // `FrameHeight <= 16 * RefFrameHeight`).
+    let ref_dims: Vec<(u32, u32)> = if cfg.ref_dims.is_empty() {
+        vec![(ref_w as u32, height as u32); cfg.refs.len()]
+    } else {
+        cfg.ref_dims.clone()
+    };
+    if ref_dims.len() != cfg.refs.len() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    for (reference, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
+        let (rw, rh) = (rw as usize, rh as usize);
+        let rcw = (rw + usize::from(ssx)) >> ssx;
+        let rch = (rh + usize::from(ssy)) >> ssy;
+        if rw == 0
+            || rh == 0
+            || reference.y.len() != rw * rh
+            || reference.u.len() != rcw * rch
+            || reference.v.len() != rcw * rch
+            || 2 * width < rw
+            || 2 * height < rh
+            || width > 16 * rw
+            || height > 16 * rh
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
     }
-    // §5.11.27 `is_scaled( refFrame )` — one answer for all seven
-    // references (they share the upscaled extent).
-    let ref_scaled = crate::encoder::superres_elect::is_scaled(
-        ref_w as u32,
-        height as u32,
-        width as u32,
-        height as u32,
-    );
+    // §5.11.27 `is_scaled( refFrame )` per reference ordinal (through
+    // the slot map to the reference's extent).
+    let mut scaled_per_ref = [false; 7];
+    for (r, flag) in scaled_per_ref.iter_mut().enumerate() {
+        let (rw, rh) = ref_dims[cfg.slot_to_plane[cfg.ref_frame_idx[r] as usize]];
+        *flag = crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32);
+    }
+    let any_scaled = scaled_per_ref.iter().any(|&f| f);
 
     let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
     // r427 — the §5.11.46 palette election inside inter frames stays
@@ -3234,7 +3265,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // §5.9.8 inter arm the scale test fires for all seven (the
     // `motion_mode` read collapses to the `use_obmc` arm; the syntax
     // twin prices exactly that cascade).
-    ip.is_scaled_per_ref = [ref_scaled; 7];
+    ip.is_scaled_per_ref = scaled_per_ref;
     // r412: SWITCHABLE frame filter — each inter leaf RD-selects its
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
@@ -3395,7 +3426,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     // scaled reference (`is_scaled( refFrame ) == 0` is required) and
     // the estimator's sample collection assumes equal extents: the
     // superres inter arm keeps identity models.
-    if global_motion && !ref_scaled {
+    if global_motion && !any_scaled {
         let hp = fh
             .inter_refs
             .as_ref()
@@ -3607,7 +3638,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 mi_cols,
                 width,
                 height,
-                (ref_w as u32, height as u32),
+                &ref_dims,
                 ip.clone(),
                 base_q_idx,
                 alt_q,
@@ -4988,19 +5019,19 @@ struct PSearchCtx {
     mi_cols: u32,
     luma_w: u32,
     luma_h: u32,
-    /// r456 — the references' LUMA extent (`RefUpscaledWidth` /
-    /// `RefFrameHeight` per §7.11.3.3); equals `(luma_w, luma_h)` off
-    /// the superres inter arm.
-    ref_w: u32,
-    ref_h: u32,
+    /// r456 — per-[`Self::ref_planes`] LUMA extents
+    /// (`RefUpscaledWidth` / `RefFrameHeight` per §7.11.3.3); equal to
+    /// `(luma_w, luma_h)` off the scaled arms (superres inter frames,
+    /// spatial-SVC inter-layer prediction).
+    ref_dims: Vec<(u32, u32)>,
     /// r456 — integer-pel SEARCH planes at the CODED extent for
-    /// scaled references (each reference luma resampled to `luma_w`
-    /// columns through the same low-pass the arm downscales the
-    /// source with): the coarse SSD walk reads them where it reads
-    /// `ref_planes[..][0]` on flat frames. Empty off the arm. A
-    /// selection aid only — every candidate that matters is scored
-    /// through the decoder's own §7.11.3.3 / §7.11.3.4 kernels.
-    search_planes: Vec<Vec<u16>>,
+    /// scaled references (`Some` per reference whose extent differs
+    /// from the frame's: its luma resampled to the frame's extent):
+    /// the coarse SSD walk reads them where it reads
+    /// `ref_planes[..][0]` on flat references. A selection aid only —
+    /// every candidate that matters is scored through the decoder's
+    /// own §7.11.3.3 / §7.11.3.4 kernels.
+    search_planes: Vec<Option<Vec<u16>>>,
     /// r427 — stream §5.5.2 `BitDepth` (threads the §7.11.2 /
     /// §7.11.3 clip + rounding parameters of the decoder kernels the
     /// search predicts through).
@@ -5170,7 +5201,7 @@ impl PSearchCtx {
             mi_cols,
             width,
             height,
-            (width as u32, height as u32),
+            &[(width as u32, height as u32); 2],
             ip,
             base_q_idx,
             seg_alt_q,
@@ -5197,7 +5228,7 @@ impl PSearchCtx {
         mi_cols: u32,
         width: usize,
         height: usize,
-        ref_extent: (u32, u32),
+        ref_dims: &[(u32, u32)],
         ip: SyntaxInterFrameParams,
         base_q_idx: u8,
         seg_alt_q: &[i16],
@@ -5242,30 +5273,39 @@ impl PSearchCtx {
             },
         )
         .ok_or(Error::PartitionWalkOutOfRange)?;
-        let (ref_w, ref_h) = ref_extent;
-        let scaled =
-            crate::encoder::superres_elect::is_scaled(ref_w, ref_h, width as u32, height as u32);
-        let search_planes: Vec<Vec<u16>> = if scaled {
-            refs.iter()
-                .map(|r| {
-                    crate::encoder::superres_elect::downscale_plane_width(
+        if ref_dims.len() != refs.len() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let scaled_of = |plane: usize| -> bool {
+            let (rw, rh) = ref_dims[plane];
+            crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32)
+        };
+        let search_planes: Vec<Option<Vec<u16>>> = refs
+            .iter()
+            .enumerate()
+            .map(|(plane, r)| {
+                scaled_of(plane).then(|| {
+                    let (rw, rh) = ref_dims[plane];
+                    crate::encoder::superres_elect::resample_plane_bilinear(
                         &r.y,
-                        ref_w as usize,
-                        ref_h as usize,
+                        rw as usize,
+                        rh as usize,
                         width,
+                        height,
                     )
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            })
+            .collect();
+        let mut no_scaled = [false; 8];
+        for (slot, flag) in no_scaled.iter_mut().enumerate() {
+            *flag = scaled_of(slot_to_plane[slot]);
+        }
         Ok(PSearchCtx {
             mi_rows,
             mi_cols,
             luma_w: width as u32,
             luma_h: height as u32,
-            ref_w,
-            ref_h,
+            ref_dims: ref_dims.to_vec(),
             search_planes,
             bit_depth,
             subsampling_x,
@@ -5338,7 +5378,7 @@ impl PSearchCtx {
                 let ll = seg_lossless_array(base_q_idx, seg_alt_q);
                 (0..seg_alt_q.len()).find(|&s| ll[s]).map(|s| s as u8)
             },
-            no_scaled: [scaled; 8],
+            no_scaled,
             mirror,
             ip,
             delta_q_units: 0,
@@ -5592,11 +5632,9 @@ impl PSearchCtx {
     /// reference plane `plane`: the reference itself on flat frames,
     /// its coded-extent resample on the superres inter arm.
     fn search_luma(&self, plane: usize) -> &[u16] {
-        if self.search_planes.is_empty() {
-            &self.ref_planes[plane][0]
-        } else {
-            &self.search_planes[plane]
-        }
+        self.search_planes[plane]
+            .as_deref()
+            .unwrap_or(&self.ref_planes[plane][0])
     }
 
     fn plane_of_ref(&self, rf: i8) -> usize {
@@ -6146,7 +6184,6 @@ impl PSearchCtx {
         // vectors immutably while the plane contexts borrow the
         // scratch planes mutably.
         let (luma_w, luma_h) = (self.luma_w, self.luma_h);
-        let (ref_w, ref_h) = (self.ref_w, self.ref_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
@@ -6181,6 +6218,7 @@ impl PSearchCtx {
             hint_bits,
             current_hint,
             no_scaled,
+            ref_dims,
             ..
         } = &mut *self;
 
@@ -6193,23 +6231,9 @@ impl PSearchCtx {
         // `RefUpscaledWidth` / `RefFrameHeight`); strides are the
         // reference's own plane widths. Off the superres inter arm
         // they coincide with the frame's.
-        let store_y = make_store(ref_planes, &slot_to_plane, 0, ref_w as usize, ref_w, ref_h);
-        let store_u = make_store(
-            ref_planes,
-            &slot_to_plane,
-            1,
-            ((ref_w + u32::from(ssx)) >> ssx) as usize,
-            ref_w,
-            ref_h,
-        );
-        let store_v = make_store(
-            ref_planes,
-            &slot_to_plane,
-            2,
-            ((ref_w + u32::from(ssx)) >> ssx) as usize,
-            ref_w,
-            ref_h,
-        );
+        let store_y = make_store(ref_planes, ref_dims, &slot_to_plane, 0, 0);
+        let store_u = make_store(ref_planes, ref_dims, &slot_to_plane, 1, ssx);
+        let store_v = make_store(ref_planes, ref_dims, &slot_to_plane, 2, ssx);
 
         let grid = InterModeInfoGrid {
             mi_sizes,
@@ -6304,18 +6328,23 @@ impl PSearchCtx {
 /// through `ref_frame_idx`, so their content is immaterial.
 fn make_store<'a>(
     ref_planes: &'a [[Vec<u16>; 3]],
+    ref_dims: &[(u32, u32)],
     slot_to_plane: &[usize; 8],
     plane: usize,
-    stride: usize,
-    luma_w: u32,
-    luma_h: u32,
+    ssx: u8,
 ) -> [RefFrameStoreEntry<'a>; 8] {
-    core::array::from_fn(|slot| RefFrameStoreEntry {
-        plane: &ref_planes[slot_to_plane[slot]][plane],
-        stride,
-        upscaled_width: luma_w,
-        width: luma_w,
-        height: luma_h,
+    core::array::from_fn(|slot| {
+        let idx = slot_to_plane[slot];
+        let (rw, rh) = ref_dims[idx];
+        RefFrameStoreEntry {
+            plane: &ref_planes[idx][plane],
+            // r456 — the reference's OWN plane stride and extents
+            // (§7.11.3.3 `RefUpscaledWidth` / `RefFrameHeight`).
+            stride: ((rw + u32::from(ssx)) >> ssx) as usize,
+            upscaled_width: rw,
+            width: rw,
+            height: rh,
+        }
     })
 }
 
@@ -10646,7 +10675,7 @@ mod tests {
             mi_cols,
             (mi_cols * 4) as usize,
             (mi_rows * 4) as usize,
-            (mi_cols * 4, mi_rows * 4),
+            &[(mi_cols * 4, mi_rows * 4); 2],
             ip,
             base_q_idx,
             &[],

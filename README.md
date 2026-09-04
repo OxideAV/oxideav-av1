@@ -1698,6 +1698,42 @@ operating-point lists, every point byte-identical through two
 independent black-box reference decoders at that point (corpus
 161).
 
+### Spatial scalability with inter-layer prediction (r456)
+
+`encoder::encode_spatial_layered_gop_yuv{420,}_with_q_inter_layer(layers,
+q, temporal_layers)` (`temporal_layers = 1..=4`; 1 is the plain
+spatial shape plus the inter-layer reference) makes every
+enhancement-layer inter frame carry the NEXT-LOWER layer's
+reconstruction of the SAME instant as its GOLDEN reference
+(`ref_frame_idx[ 3 ]` names the lower layer's §7.20 slot — refreshed
+moments earlier in the same temporal unit, lower layers code first)
+alongside its own layer's LAST, and the RD ladder picks per block.
+The reference sits at the lower layer's OWN extent, so the search
+context's `FrameStore` views now carry PER-REFERENCE
+`RefUpscaledWidth` / `RefFrameHeight` (`InterFrameConfig::ref_dims`),
+`is_scaled( GOLDEN_FRAME )` fires while `is_scaled( LAST_FRAME )`
+does not, every candidate prediction runs the decoder's own
+§7.11.3.3 scaled path in BOTH axes (a 2× upscale — the §6.8.2
+`FrameWidth <= 16 · RefUpscaledWidth` side of the bound), the
+integer-pel walk reads a bilinear resample of the lower frame as its
+selection aid, and the §5.9.24 election keeps identity models on
+scaled frames. Openers stay `INTRA_ONLY`; lower layers never
+reference upper ones, so every spatial-suffix drop leaves the
+surviving frames bit-identical; top-temporal-layer instants (lower
+frame non-reference) predict within their own layer. Witnesses in
+`tests/spatial_inter_layer.rs` (wire audit of the GOLDEN slot against
+the tracked per-slot extents, every operating point bit-exact on
+2-layer / 3-layer chains and the 2×2 ladder). Measured honestly: on
+a fresh texture at every instant (own-layer LAST useless) the
+inter-layer stream is **2 433 B against 4 682 B independent
+(−48 %)**; on a smooth pan the own-layer LAST already predicts
+near-perfectly and the extra reference costs its signalling (1 736 B
+vs 1 713 B). Pinned: `self-svc-il-64-128-q84-cuts` (2 points) and
+`self-svc-il-64-128-q84-t2` (4 points) — the corpus's first streams
+whose enhancement layers predict from a scaled lower layer, every
+point byte-identical through two independent black-box reference
+decoders (corpus 164).
+
 ### External tool-combination battery (r450)
 
 The r450 decode-tail sweep (`tests/external_sweep.rs`, an env-gated
@@ -1732,6 +1768,11 @@ corpus stands at 150.
   keep the opener-only election), and the §7.3 camera mode is
   SPEC-BARRED from the pairing (§7.3.1 requires
   `enable_superres = 0`).
+- Spatial-SVC inter-layer prediction references the NEXT-LOWER layer
+  only (single-reference GOLDEN, no compound with the own-layer LAST)
+  and the enhancement openers stay `INTRA_ONLY`; the inter-layer
+  driver takes no per-layer tile layouts / tile groups and runs no
+  superres pre-pass (those ride the independent-layer driver).
 - The §5.9.30 film-grain election is GOP-scoped (≥ 2 frames;
   exactness-demand regions and the auto-lossless election stay out
   — grain on a demanded region would break the pixel contract); the

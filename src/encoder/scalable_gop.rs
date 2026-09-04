@@ -364,6 +364,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             tile_spans: false,
             superres: None,
             superres_source: None,
+            ref_dims: Vec::new(),
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -595,7 +596,53 @@ pub fn encode_spatial_layered_gop_yuv_with_q_tiles(
     layer_tiles: Option<&[(u32, u32)]>,
     tile_groups: u32,
 ) -> Result<SpatialLayeredGopYuv, Error> {
-    encode_spatial_layered_core(layers, base_q_idx, layer_tiles, tile_groups, 1)
+    encode_spatial_layered_core(layers, base_q_idx, layer_tiles, tile_groups, 1, false)
+}
+
+/// r456 — spatial scalability with INTER-LAYER PREDICTION: every
+/// enhancement-layer inter frame adds the NEXT-LOWER layer's
+/// reconstruction of the SAME instant as its GOLDEN reference (the
+/// lower layer's §7.20 slot for that instant; `ref_frame_idx[ 3 ]`),
+/// predicted through the §7.11.3.3 scaled path in BOTH axes
+/// (`is_scaled( GOLDEN_FRAME ) = 1`, every §6.8.2 bound holds for
+/// dyadic and gentler ratios), alongside its own layer's LAST — the
+/// RD ladder picks per block. Openers stay `INTRA_ONLY`; lower layers
+/// never reference upper ones, so every spatial-suffix drop still
+/// leaves the surviving frames bit-identical. `temporal_layers = 1`
+/// is the plain spatial shape plus the inter-layer reference;
+/// `2..=4` composes the dyadic ladder of
+/// [`encode_spatial_temporal_layered_gop_yuv_with_q`] (top-temporal-
+/// layer instants, whose lower-layer frame is non-reference, predict
+/// within their own layer).
+///
+/// ## Errors
+///
+/// Every [`encode_spatial_temporal_layered_gop_yuv_with_q`] reject
+/// (with `temporal_layers = 1` admitted).
+pub fn encode_spatial_layered_gop_yuv_with_q_inter_layer(
+    layers: &[Vec<YuvFrame>],
+    base_q_idx: u8,
+    temporal_layers: u8,
+) -> Result<SpatialLayeredGopYuv, Error> {
+    if !(1..=4).contains(&temporal_layers) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    encode_spatial_layered_core(layers, base_q_idx, None, 1, temporal_layers, true)
+}
+
+/// 8-bit 4:2:0 entry point of
+/// [`encode_spatial_layered_gop_yuv_with_q_inter_layer`].
+pub fn encode_spatial_layered_gop_yuv420_with_q_inter_layer(
+    layers: &[Vec<Yuv420Frame>],
+    base_q_idx: u8,
+    temporal_layers: u8,
+) -> Result<SpatialLayeredGop, Error> {
+    let wide: Vec<Vec<YuvFrame>> = layers
+        .iter()
+        .map(|l| l.iter().map(YuvFrame::from_yuv420_8bit).collect())
+        .collect();
+    encode_spatial_layered_gop_yuv_with_q_inter_layer(&wide, base_q_idx, temporal_layers)
+        .map(narrow_spatial_gop)
 }
 
 /// r456 — SPATIAL × TEMPORAL scalability: the independently coded
@@ -631,7 +678,7 @@ pub fn encode_spatial_temporal_layered_gop_yuv_with_q(
     if !(2..=4).contains(&temporal_layers) {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    encode_spatial_layered_core(layers, base_q_idx, None, 1, temporal_layers)
+    encode_spatial_layered_core(layers, base_q_idx, None, 1, temporal_layers, false)
 }
 
 /// 8-bit 4:2:0 entry point of
@@ -657,6 +704,7 @@ fn encode_spatial_layered_core(
     layer_tiles: Option<&[(u32, u32)]>,
     tile_groups: u32,
     temporal_layers: u8,
+    inter_layer: bool,
 ) -> Result<SpatialLayeredGopYuv, Error> {
     let s_count = layers.len();
     // r456 — the per-spatial-layer §7.20 slot budget: the pure spatial
@@ -959,6 +1007,41 @@ fn encode_spatial_layered_core(
                     (ls, rs, want)
                 };
             let prev = layer_recons[s][last_display].clone();
+            // r456 — inter-layer prediction: the next-lower layer's
+            // reconstruction of THIS instant rides as GOLDEN (its
+            // slot was refreshed moments ago in this very unit —
+            // lower layers code first), at the lower layer's own
+            // extent (§7.11.3.3 scaled prediction). Absent when the
+            // lower frame is non-reference (top temporal layer).
+            let lower: Option<(usize, GopFrameReconYuv, (u32, u32))> = if inter_layer && s > 0 {
+                let l = s - 1;
+                let lower_slot = if temporal_layers <= 1 {
+                    Some(2 * l + (i & 1))
+                } else {
+                    (tid + 1 < temporal_layers).then_some(budget * l + usize::from(tid))
+                };
+                lower_slot.map(|ls| {
+                    (
+                        ls,
+                        layer_recons[l][i].clone(),
+                        (layers[l][0].width, layers[l][0].height),
+                    )
+                })
+            } else {
+                None
+            };
+            let mut il_ref_frame_idx = [last_slot as u8; 7];
+            let mut il_slot_to_plane = [0usize; 8];
+            let mut il_single_refs: Vec<i8> = vec![1];
+            let mut il_refs: Vec<&GopFrameReconYuv> = vec![&prev];
+            let mut il_ref_dims: Vec<(u32, u32)> = vec![(layer[0].width, layer[0].height)];
+            if let Some((ls, lower_recon, dims)) = lower.as_ref() {
+                il_ref_frame_idx[3] = *ls as u8;
+                il_slot_to_plane[*ls] = 1;
+                il_single_refs.push(4);
+                il_refs.push(lower_recon);
+                il_ref_dims.push(*dims);
+            }
             let last_carry = carry_store[last_slot]
                 .clone()
                 .expect("layer slots seeded at instant 0");
@@ -967,13 +1050,13 @@ fn encode_spatial_layered_core(
                 order_hint: i as u32,
                 show_frame: true,
                 refresh_frame_flags: refresh_slot.map_or(0, |rs| 1u8 << rs),
-                ref_frame_idx: [last_slot as u8; 7],
+                ref_frame_idx: il_ref_frame_idx,
                 short_ref_signaling: false,
                 slot_hints,
-                single_refs: vec![1],
+                single_refs: il_single_refs,
                 compound_pairs: Vec::new(),
-                refs: vec![&prev],
-                slot_to_plane: [0usize; 8],
+                refs: il_refs,
+                slot_to_plane: il_slot_to_plane,
                 primary_ref_frame: 0,
                 primary_carry: Some(&last_carry),
                 allow_temporal_seg: false,
@@ -1004,6 +1087,7 @@ fn encode_spatial_layered_core(
                 tile_spans: false,
                 superres: None,
                 superres_source: None,
+                ref_dims: il_ref_dims,
             };
             // r456 — per-temporal-layer quantiser offset (anchors
             // finest, leaves coarsest; inert on the pure spatial

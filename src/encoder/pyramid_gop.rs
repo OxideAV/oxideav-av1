@@ -838,6 +838,7 @@ impl PyramidSession {
                         tile_spans: false,
                         superres: None,
                         superres_source: None,
+                        ref_dims: Vec::new(),
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
