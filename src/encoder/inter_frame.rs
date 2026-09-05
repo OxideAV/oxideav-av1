@@ -3102,8 +3102,16 @@ pub(crate) fn encode_inter_frame_generic_gm(
     }
     for (reference, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
         let (rw, rh) = (rw as usize, rh as usize);
-        let rcw = (rw + usize::from(ssx)) >> ssx;
-        let rch = (rh + usize::from(ssy)) >> ssy;
+        // Monochrome references carry EMPTY chroma planes (the frame's
+        // own `chroma_width()` / `chroma_height()` are 0 there).
+        let (rcw, rch) = if mono {
+            (0, 0)
+        } else {
+            (
+                (rw + usize::from(ssx)) >> ssx,
+                (rh + usize::from(ssy)) >> ssy,
+            )
+        };
         if rw == 0
             || rh == 0
             || reference.y.len() != rw * rh
