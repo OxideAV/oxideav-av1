@@ -4,6 +4,12 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/OxideAV/oxideav-av1/compare/v0.1.18...v0.1.19) - 2026-09-05
+
+### Other
+
+- r456 fix — monochrome references carry empty chroma planes (per-reference extent validation rejected every mono GOP)
+
 ## [0.1.18](https://github.com/OxideAV/oxideav-av1/compare/v0.1.17...v0.1.18) - 2026-09-04
 
 ### Other
