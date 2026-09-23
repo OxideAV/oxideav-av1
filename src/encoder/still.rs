@@ -84,6 +84,14 @@ pub struct StillOptions {
     /// the ordinary KEY-frame fields (`show_existing_frame`,
     /// `frame_type`, `show_frame`, ...).
     pub reduced_header: bool,
+    /// §5.5.2 colour description `(color_primaries,
+    /// transfer_characteristics, matrix_coefficients)` — H.273 code
+    /// points, e.g. `(1, 13, 6)` for BT.709 primaries / sRGB transfer /
+    /// BT.601 matrix, or `(1, 13, 0)` for identity-matrix RGB carried
+    /// as 4:4:4. `None` codes the unspecified triple
+    /// (`color_description_present_flag = 0`). Signalling only; a
+    /// container's `colr` box should carry the same values.
+    pub color_description: Option<(u8, u8, u8)>,
 }
 
 impl StillOptions {
@@ -98,6 +106,7 @@ impl StillOptions {
             speed: StillSpeed::Balanced,
             full_range: false,
             reduced_header: true,
+            color_description: None,
         }
     }
 
@@ -278,6 +287,7 @@ pub fn encode_still_yuv(input: &YuvFrame, opts: &StillOptions) -> Result<Encoded
         still: opts.reduced_header,
         full_range: opts.full_range,
         still_full_header: !opts.reduced_header,
+        color_description: opts.color_description,
         ..KeyExtras::default()
     };
     let (k, _carry) = encode_key_frame_yuv_full(
@@ -415,9 +425,29 @@ mod tests {
         opts.reduced_header = false;
         opts.full_range = true;
         opts.speed = StillSpeed::Fast;
+        opts.color_description = Some((1, 13, 6));
         let still = encode_still_yuv(&input, &opts).expect("full-header still encodes");
         assert!(still.seq.still_picture && !still.seq.reduced_still_picture_header);
         assert!(still.seq.color_config.color_range);
+        let cc = &still.seq.color_config;
+        assert!(cc.color_description_present_flag);
+        assert_eq!(
+            (
+                cc.color_primaries,
+                cc.transfer_characteristics,
+                cc.matrix_coefficients
+            ),
+            (1, 13, 6)
+        );
+        let reparsed = crate::sequence_header::parse_sequence_header(
+            crate::obu::ObuIter::new(&still.temporal_unit_bytes)
+                .filter_map(Result::ok)
+                .find(|d| d.obu_type == crate::obu::ObuType::SequenceHeader)
+                .expect("sequence header")
+                .payload,
+        )
+        .expect("parses");
+        assert_eq!(reparsed.color_config, still.seq.color_config);
         assert_eq!(still.seq.operating_points[0].seq_level_idx, 0);
         assert_decodes_to_recon(&still, 8);
 
@@ -425,6 +455,50 @@ mod tests {
         let s2 = encode_still_yuv420(&yuv420, &StillOptions::default()).expect("encodes");
         assert_eq!(s2.recon_y.len(), 256);
         assert_decodes_to_recon(&s2, 8);
+    }
+
+    /// r460 — any extent: non-multiple-of-8 / tiny pictures code
+    /// their true `frame_size` (padded to the mi grid internally),
+    /// decode to the cropped reconstruction, and reproduce the input
+    /// losslessly.
+    #[test]
+    fn arbitrary_extent_stills_round_trip() {
+        for &(w, h, bd, fmt, q) in &[
+            (37u32, 19u32, 8u8, ChromaFormat::Yuv420, 0u8),
+            (37, 19, 8, ChromaFormat::Yuv420, 110),
+            (1, 1, 8, ChromaFormat::Yuv420, 90),
+            (3, 5, 8, ChromaFormat::Monochrome, 0),
+            (7, 3, 10, ChromaFormat::Yuv444, 60),
+            (65, 9, 12, ChromaFormat::Yuv422, 140),
+            (16, 13, 8, ChromaFormat::Yuv420, 200),
+        ] {
+            let input = textured(w, h, bd, fmt);
+            assert_eq!(
+                input.chroma_width(),
+                if fmt == ChromaFormat::Monochrome {
+                    0
+                } else {
+                    (w + u32::from(fmt.subsampling().0)) >> fmt.subsampling().0
+                }
+            );
+            let mut opts = StillOptions::new(q);
+            opts.speed = StillSpeed::Fast;
+            let still = encode_still_yuv(&input, &opts)
+                .unwrap_or_else(|e| panic!("{w}x{h} {bd}-bit {fmt:?} q{q}: {e:?}"));
+            let fs = still.fh.frame_size.as_ref().expect("frame size");
+            assert_eq!((fs.frame_width, fs.frame_height), (w, h));
+            assert_eq!(still.seq.max_frame_width_minus_1 + 1, w);
+            assert_eq!(still.recon_y.len(), (w * h) as usize);
+            assert_eq!(
+                still.recon_u.len(),
+                (input.chroma_width() * input.chroma_height()) as usize
+            );
+            if q == 0 {
+                assert_eq!(still.recon_y, input.y, "{w}x{h}: lossless luma");
+                assert_eq!(still.recon_u, input.u, "{w}x{h}: lossless u");
+            }
+            assert_decodes_to_recon(&still, bd);
+        }
     }
 
     #[test]

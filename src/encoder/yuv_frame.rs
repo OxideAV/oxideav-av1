@@ -102,7 +102,10 @@ impl YuvFrame {
         let (cw, ch) = if format == ChromaFormat::Monochrome {
             (0, 0)
         } else {
-            (width >> ssx, height >> ssy)
+            (
+                (width + u32::from(ssx)) >> ssx,
+                (height + u32::from(ssy)) >> ssy,
+            )
         };
         Self {
             width,
@@ -138,7 +141,8 @@ impl YuvFrame {
         if self.format == ChromaFormat::Monochrome {
             0
         } else {
-            self.width >> self.format.subsampling().0
+            let ssx = u32::from(self.format.subsampling().0);
+            (self.width + ssx) >> ssx
         }
     }
 
@@ -149,29 +153,75 @@ impl YuvFrame {
         if self.format == ChromaFormat::Monochrome {
             0
         } else {
-            self.height >> self.format.subsampling().1
+            let ssy = u32::from(self.format.subsampling().1);
+            (self.height + ssy) >> ssy
         }
     }
 
-    /// Validate shape + sample range: dimensions multiples of 8 in
-    /// `[8, 4096]` per axis, `bit_depth ∈ {8, 10, 12}`, plane lengths
-    /// consistent with the format (empty chroma on monochrome), every
-    /// sample `< (1 << bit_depth)`.
+    /// r460 — [`Self::validate`] without the multiple-of-8 extent
+    /// rule: any `1..=KEY_FRAME_MAX_DIM` extent per axis (the
+    /// still-picture / KEY-frame entries pad the picture to the
+    /// §5.9.5 mi grid internally and code the true extent).
     ///
     /// ## Errors
     ///
     /// [`Error::PartitionWalkOutOfRange`] on any violation.
-    pub fn validate(&self) -> Result<(), Error> {
-        if !matches!(self.bit_depth, 8 | 10 | 12) {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        if self.width < 8
-            || self.height < 8
+    pub fn validate_any_extent(&self) -> Result<(), Error> {
+        if self.width < 1
+            || self.height < 1
             || self.width > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
             || self.height > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
-            || self.width % 8 != 0
-            || self.height % 8 != 0
         {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        self.validate_planes()
+    }
+
+    /// r460 — the picture replicated out to the §5.9.5 mi grid
+    /// (`MiCols * MI_SIZE` = the extent rounded up to a multiple of
+    /// 8; the last column / row repeated), chroma at the padded
+    /// extent's subsampled size. An already-aligned picture comes
+    /// back as a plain clone.
+    #[must_use]
+    pub fn padded_to_mi_grid(&self) -> Self {
+        let pw = (self.width + 7) & !7;
+        let ph = (self.height + 7) & !7;
+        if pw == self.width && ph == self.height {
+            return self.clone();
+        }
+        let pad = |src: &[u16], sw: u32, sh: u32, dw: u32, dh: u32| -> Vec<u16> {
+            if sw == 0 || sh == 0 {
+                return Vec::new();
+            }
+            let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+            let mut out = vec![0u16; dw * dh];
+            for y in 0..dh {
+                let sy = y.min(sh - 1);
+                let row = &src[sy * sw..sy * sw + sw];
+                let dst = &mut out[y * dw..y * dw + dw];
+                dst[..sw].copy_from_slice(row);
+                let last = row[sw - 1];
+                for s in &mut dst[sw..] {
+                    *s = last;
+                }
+            }
+            out
+        };
+        let padded_geom = Self::filled(pw, ph, self.bit_depth, self.format, 0);
+        let (pcw, pch) = (padded_geom.chroma_width(), padded_geom.chroma_height());
+        Self {
+            width: pw,
+            height: ph,
+            bit_depth: self.bit_depth,
+            format: self.format,
+            y: pad(&self.y, self.width, self.height, pw, ph),
+            u: pad(&self.u, self.chroma_width(), self.chroma_height(), pcw, pch),
+            v: pad(&self.v, self.chroma_width(), self.chroma_height(), pcw, pch),
+        }
+    }
+
+    fn validate_planes(&self) -> Result<(), Error> {
+        if !matches!(self.bit_depth, 8 | 10 | 12) {
             return Err(Error::PartitionWalkOutOfRange);
         }
         let expected_y = (self.width * self.height) as usize;
@@ -186,6 +236,27 @@ impl YuvFrame {
             return Err(Error::PartitionWalkOutOfRange);
         }
         Ok(())
+    }
+
+    /// Validate shape + sample range: dimensions multiples of 8 in
+    /// `[8, 16384]` per axis, `bit_depth ∈ {8, 10, 12}`, plane lengths
+    /// consistent with the format (empty chroma on monochrome), every
+    /// sample `< (1 << bit_depth)`.
+    ///
+    /// ## Errors
+    ///
+    /// [`Error::PartitionWalkOutOfRange`] on any violation.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.width < 8
+            || self.height < 8
+            || self.width > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
+            || self.height > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
+            || self.width % 8 != 0
+            || self.height % 8 != 0
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        self.validate_planes()
     }
 }
 
@@ -317,14 +388,14 @@ impl Yuv420Frame {
     /// Chroma plane width — `width / 2` per the 4:2:0 sampling pattern.
     #[must_use]
     pub fn chroma_width(&self) -> u32 {
-        self.width / 2
+        self.width.div_ceil(2)
     }
 
     /// Chroma plane height — `height / 2` per the 4:2:0 sampling
     /// pattern.
     #[must_use]
     pub fn chroma_height(&self) -> u32 {
-        self.height / 2
+        self.height.div_ceil(2)
     }
 
     /// Validate the input's dimensions + plane lengths against the

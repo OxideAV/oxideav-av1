@@ -123,6 +123,13 @@ pub(crate) struct LrElectInput<'a> {
     /// grid), and the §5.11.57 write-side window rides the
     /// superres column mapping through
     /// [`crate::cdf::LrParams::use_superres`].
+    /// r460 — the CODED frame extent (`UpscaledWidth` / `FrameHeight`,
+    /// the §7.17 unit-grid and stripe geometry) when it differs from
+    /// the plane buffers' extent (`width` / `height` — the §5.9.5 mi
+    /// grid a non-multiple-of-8 picture is padded to).
+    pub frame_width: usize,
+    /// See [`Self::frame_width`].
+    pub frame_height: usize,
     pub use_superres: bool,
     /// The §5.9.8 `SuperresDenom` (`SUPERRES_NUM` when
     /// `use_superres` is `false`).
@@ -438,8 +445,8 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         subsampling_y: inp.subsampling_y,
         mi_rows: inp.mi_rows,
         mi_cols: inp.mi_cols,
-        frame_height: inp.height as u32,
-        upscaled_width: inp.width as u32,
+        frame_height: inp.frame_height as u32,
+        upscaled_width: inp.frame_width as u32,
         // Eval-side header: every plane SWITCHABLE so the per-unit
         // closure decides (the real header collapses below).
         eval_lrp: header_shape([FrameRestorationType::Switchable; 3]),
@@ -845,6 +852,8 @@ pub(crate) fn apply_lr_plan(
     num_planes: u8,
     mi_rows: u32,
     mi_cols: u32,
+    frame_width: usize,
+    frame_height: usize,
 ) -> u64 {
     let num_planes = num_planes.min(3) as usize;
     let dims: Vec<(usize, usize)> = (0..num_planes)
@@ -881,8 +890,8 @@ pub(crate) fn apply_lr_plan(
             bit_depth,
             subsampling_x,
             subsampling_y,
-            frame_height: height as u32,
-            upscaled_width: width as u32,
+            frame_height: frame_height as u32,
+            upscaled_width: frame_width as u32,
             lr_params: &plan.header,
             lr_type: &|p, r, c| match find(p, r, c).restoration_type {
                 RESTORE_WIENER => FrameRestorationType::Wiener,
@@ -898,14 +907,32 @@ pub(crate) fn apply_lr_plan(
         let mut lr_bufs = make_bufs(&mut lr_owned, &dims);
         loop_restoration_frame(&ctx, &curr_bufs, &cdef_bufs, &mut lr_bufs);
     }
+    // r460 — the SSD is measured over the CODED extent only (the
+    // election's per-unit rects never reach into the mi-grid padding
+    // of a non-multiple-of-8 picture; §7.17 leaves it untouched).
     let mut ssd = 0u64;
     let srcs: [&[u16]; 3] = [&input.y, &input.u, &input.v];
     let recons: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
     for (p, recon) in recons.into_iter().enumerate().take(num_planes) {
-        for (dst, (&out, &s)) in recon.iter_mut().zip(lr_owned[p].iter().zip(srcs[p].iter())) {
+        let (plane_w, _) = dims[p];
+        let (fw, fh) = if p == 0 {
+            (frame_width, frame_height)
+        } else {
+            (
+                (frame_width + usize::from(subsampling_x)) >> subsampling_x,
+                (frame_height + usize::from(subsampling_y)) >> subsampling_y,
+            )
+        };
+        for (i, (dst, (&out, &s))) in recon
+            .iter_mut()
+            .zip(lr_owned[p].iter().zip(srcs[p].iter()))
+            .enumerate()
+        {
             *dst = out.max(0) as u16;
-            let d = i64::from(out) - i64::from(s);
-            ssd += (d * d) as u64;
+            if i % plane_w < fw && i / plane_w < fh {
+                let d = i64::from(out) - i64::from(s);
+                ssd += (d * d) as u64;
+            }
         }
     }
     ssd

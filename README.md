@@ -1825,6 +1825,25 @@ without touching the bitstream (this crate writes no ISOBMFF boxes).
 Decoded output equals the reconstruction planes sample for sample on
 every pairing; lossless stills reproduce the input.
 
+**Any extent** (r460): a picture whose width / height is not a
+multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5
+mi grid internally (the decoder reconstructs every mi block in full,
+so the encoder's reconstruction and neighbour mirror span the padded
+extent), coded under its TRUE `frame_size` / sequence maximum / §7.17
+restoration geometry, and the returned reconstruction is cropped back
+(chroma at the rounded-up `(w + ss_x) >> ss_x` extent). The per-axis
+ceiling is `KEY_FRAME_MAX_DIM = 16384` (Annex A level 6.x
+`MaxHSize`). Odd-extent stills decode byte-identical through two
+independent black-box reference decoders, and wrapped into AVIF by a
+black-box muxer they are read by four independent readers (a
+`libdav1d`-backed converter byte-exact, an image-processing suite, a
+HEIF converter and the OS image framework at the right extent / depth).
+`StillOptions::color_description` / the `color_primaries` /
+`transfer_characteristics` / `matrix_coefficients` encoder options
+signal the §5.5.2 H.273 triple in the sequence header (readers apply
+range / matrix conversion from the bitstream, so a container's `colr`
+should agree).
+
 The framework `Encoder` (`registry::make_encoder`, registered with
 `CodecCapabilities::with_encode`) takes planar YUV / gray frames at
 every pairing (`Yuv420P` / `Yuv422P` / `Yuv444P`, the `YuvJ*`
@@ -1837,7 +1856,8 @@ frames under a full sequence header, an all-intra video), `q` /
 `base_q_idx` (0..=255, default 120), `quality` (0..=100, overrides
 `q`), `lossless`, `speed` (`fast` / `balanced` / `thorough`),
 `tile_cols_log2` / `tile_rows_log2`, `full_range` (default from the
-pixel format). `output_params().extradata` carries the `av1C` record
+pixel format), `color_primaries` / `transfer_characteristics` /
+`matrix_coefficients`. `output_params().extradata` carries the `av1C` record
 bytes (no `configOBUs`), so a container writer fills its
 codec-configuration property directly.
 

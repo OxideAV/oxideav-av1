@@ -4698,6 +4698,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 // r456 — the §7.17 election at the UPSCALED extent on
                 // the superres inter arm (§5.11.57 window through the
                 // denominator ratio).
+                frame_width: lr_w,
+                frame_height: height,
                 use_superres: cfg.superres.is_some(),
                 superres_denom: cfg
                     .superres
@@ -4765,6 +4767,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                         num_planes,
                         mi_rows,
                         mi_cols,
+                        lr_w,
+                        height,
                     );
                     debug_assert_eq!(
                         applied_d, plan.d,

@@ -183,7 +183,7 @@ pub struct EncodedKeyFrame {
 /// — r410 raises the r409 `512` cap to `4096` (the RD search works
 /// superblock-by-superblock, so state stays flat; HD/UHD extents were
 /// validated against independent black-box decoders during the round).
-pub const KEY_FRAME_MAX_DIM: u32 = 4096;
+pub const KEY_FRAME_MAX_DIM: u32 = 16384;
 
 /// §5.11.45 (αU, αV) candidate grid for the chroma `UV_CFL_PRED` arm —
 /// the same compact set the dyn mirror driver enumerates.
@@ -906,6 +906,20 @@ pub(crate) struct KeyExtras<'a> {
     /// r460 — signal §5.5.2 `color_range = 1` (full-range samples).
     /// Inert under `seq_override`.
     pub full_range: bool,
+    /// r460 — the CODED picture extent when `input` is the §5.9.5
+    /// mi-grid-padded copy of a picture whose extent is not a
+    /// multiple of 8 (see [`YuvFrame::padded_to_mi_grid`]): the
+    /// sequence maximum, the §5.9.5 `frame_size`, the §7.17
+    /// restoration geometry and the IVF header carry THIS extent
+    /// while every plane buffer / RD walk runs at the padded one.
+    /// Set by [`encode_key_frame_yuv_full`]; callers leave it `None`.
+    pub coded_size: Option<(u32, u32)>,
+    /// r460 — signal a §5.5.2 colour description
+    /// (`color_primaries`, `transfer_characteristics`,
+    /// `matrix_coefficients` — H.273 code points) instead of the
+    /// unspecified triple. Signalling only. Inert under
+    /// `seq_override`.
+    pub color_description: Option<(u8, u8, u8)>,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -913,6 +927,74 @@ pub(crate) struct KeyExtras<'a> {
 /// [`KeyExtras::intra_only_refresh`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_key_frame_yuv_full(
+    input: &YuvFrame,
+    base_q_idx: u8,
+    model: RateModel,
+    alt_q: &[i16],
+    exact_mask: Option<&[bool]>,
+    cdef: bool,
+    cdef_units: bool,
+    lr: bool,
+    extras: &KeyExtras<'_>,
+) -> Result<
+    (
+        EncodedKeyFrameYuv,
+        crate::encoder::inter_frame::RefSlotCarry,
+    ),
+    Error,
+> {
+    input.validate_any_extent()?;
+    if input.width % 8 == 0 && input.height % 8 == 0 {
+        return encode_key_frame_yuv_full_aligned(
+            input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
+        );
+    }
+    // r460 — ANY extent: the picture is replicated out to the §5.9.5
+    // mi grid (the decoder reconstructs every mi block in full, so the
+    // encoder's reconstruction / neighbour mirror must span the
+    // padded extent too), coded under the TRUE extent
+    // (`KeyExtras::coded_size` — sequence maximum, §5.9.5
+    // `frame_size`, §7.17 restoration geometry, IVF header), and the
+    // returned reconstruction is cropped back. The layered-stream /
+    // §5.9.8 superres / per-segment-demand arms keep the aligned
+    // contract (they carry their own extent bookkeeping).
+    if extras.seq_override.is_some()
+        || extras.superres.is_some()
+        || extras.superres_source.is_some()
+        || extras.superres_gate
+        || exact_mask.is_some()
+        || !alt_q.is_empty()
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let padded = input.padded_to_mi_grid();
+    let mut ex = *extras;
+    ex.coded_size = Some((input.width, input.height));
+    ex.superres_elect = false;
+    let (mut k, carry) = encode_key_frame_yuv_full_aligned(
+        &padded, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &ex,
+    )?;
+    let crop = |src: &[u16], sw: u32, w: u32, h: u32| -> Vec<u16> {
+        let (sw, w, h) = (sw as usize, w as usize, h as usize);
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            out.extend_from_slice(&src[y * sw..y * sw + w]);
+        }
+        out
+    };
+    k.recon_y = crop(&k.recon_y, padded.width, input.width, input.height);
+    if input.format != ChromaFormat::Monochrome {
+        let (cw, ch) = (input.chroma_width(), input.chroma_height());
+        k.recon_u = crop(&k.recon_u, padded.chroma_width(), cw, ch);
+        k.recon_v = crop(&k.recon_v, padded.chroma_width(), cw, ch);
+    }
+    Ok((k, carry))
+}
+
+/// The aligned-extent core behind [`encode_key_frame_yuv_full`]
+/// (`input` a multiple of 8 per axis — the pre-r460 contract).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_key_frame_yuv_full_aligned(
     input: &YuvFrame,
     base_q_idx: u8,
     model: RateModel,
@@ -956,6 +1038,7 @@ pub(crate) fn encode_key_frame_yuv_full(
             && extras.seq_override.is_none()
             && extras.intra_only_refresh.is_none()
             && extras.explicit_tiles.is_none()
+            && extras.coded_size.is_none()
             && crate::encoder::superres_elect::superres_arm_allowed(
                 base_q_idx,
                 input.width as usize,
@@ -989,7 +1072,7 @@ pub(crate) fn encode_key_frame_yuv_full(
         let mut plain_extras = *extras;
         plain_extras.superres_elect = false;
         if candidates.is_empty() {
-            return encode_key_frame_yuv_full(
+            return encode_key_frame_yuv_full_aligned(
                 input,
                 base_q_idx,
                 model,
@@ -1016,7 +1099,7 @@ pub(crate) fn encode_key_frame_yuv_full(
             }
             score256(d, lambda, (k.temporal_unit_bytes.len() as u64) * 8 * 256)
         };
-        let mut best = encode_key_frame_yuv_full(
+        let mut best = encode_key_frame_yuv_full_aligned(
             input,
             base_q_idx,
             model,
@@ -1125,6 +1208,8 @@ pub(crate) fn encode_key_frame_yuv_full(
         still: extras.still,
         still_full_header: extras.still_full_header,
         full_range: extras.full_range,
+        coded_size: extras.coded_size,
+        color_description: extras.color_description,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -1269,7 +1354,7 @@ pub(crate) fn encode_key_frame_superres_arm(
     ex.superres_elect = false;
     ex.superres = Some((input.width, denom));
     ex.superres_source = Some(input);
-    encode_key_frame_yuv_full(
+    encode_key_frame_yuv_full_aligned(
         &down, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, &ex,
     )
 }
@@ -1330,6 +1415,8 @@ fn encode_key_frame_yuv_core(
     let height = input.height as usize;
     let chroma_w = input.chroma_width() as usize;
     let chroma_h = input.chroma_height() as usize;
+    // r460 — the coded (true) extent vs the padded plane extent.
+    let (coded_w, coded_h) = extras.coded_size.unwrap_or((input.width, input.height));
     // §5.11.46 palette + §5.9.20 intra-block-copy scope (r427): the
     // screen-content searches stay 8-bit 4:2:0 (their content scans
     // and the even-DV chroma alignment are built for that pairing);
@@ -1390,8 +1477,8 @@ fn encode_key_frame_yuv_core(
             // UPSCALED width: §5.9.5 `frame_size_override_flag = 0`
             // seeds `FrameWidth` from it and §5.9.8 then derives the
             // coded width.
-            let seq_w = superres.map_or(input.width, |(up_w, _)| up_w);
-            let mut s = build_intra_only_seq_yuv(seq_w, input.height, bit_depth, input.format)?;
+            let seq_w = superres.map_or(coded_w, |(up_w, _)| up_w);
+            let mut s = build_intra_only_seq_yuv(seq_w, coded_h, bit_depth, input.format)?;
             // r410: open the §5.11.24 filter-intra gate — the mode
             // picker now evaluates the five §7.11.2.3 recursive modes
             // on eligible luma blocks (the historical mirror drivers
@@ -1413,11 +1500,16 @@ fn encode_key_frame_yuv_core(
                 }
             }
             s.color_config.color_range = extras.full_range;
+            if let Some((cp, tc, mc)) = extras.color_description {
+                s.color_config.color_description_present_flag = true;
+                s.color_config.color_primaries = cp;
+                s.color_config.transfer_characteristics = tc;
+                s.color_config.matrix_coefficients = mc;
+            }
             s
         }
     };
-    let mut fh =
-        build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    let mut fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, coded_w, coded_h, base_q_idx);
     if seq.reduced_still_picture_header {
         // §5.9.2: `disable_frame_end_update_cdf` is derived to 1 on
         // the reduced arm (no bit on the wire).
@@ -1451,10 +1543,10 @@ fn encode_key_frame_yuv_core(
     // codes its dimensions explicitly. r444 — the coded fields carry
     // the DISPLAY (upscaled) width on a §5.9.8 arm, so the override
     // decision compares that, not the downscaled coding extent.
-    let display_w = superres.map_or(input.width, |(up_w, _)| up_w);
+    let display_w = superres.map_or(coded_w, |(up_w, _)| up_w);
     fh.frame_size_override_flag = extras.seq_override.is_some()
         && (display_w != seq.max_frame_width_minus_1 + 1
-            || input.height != seq.max_frame_height_minus_1 + 1);
+            || coded_h != seq.max_frame_height_minus_1 + 1);
     // r431 — §5.9.2 INTRA_ONLY arm: explicit refresh mask (never
     // `allFrames` — §5.9.2 bars it), no error resilience (the
     // ref_order_hint block stays silent; primary_ref is intra-skipped
@@ -2156,6 +2248,12 @@ fn encode_key_frame_yuv_core(
                 num_planes,
                 mi_rows,
                 mi_cols,
+                frame_width: if superres.is_some() {
+                    lr_w
+                } else {
+                    coded_w as usize
+                },
+                frame_height: coded_h as usize,
                 lambda: lambda_for(&recon.qp),
                 price_cdfs: &price_cdfs,
                 disable_cdf_update: fh.disable_cdf_update,
@@ -2209,6 +2307,12 @@ fn encode_key_frame_yuv_core(
                     num_planes,
                     mi_rows,
                     mi_cols,
+                    if superres.is_some() {
+                        lr_w
+                    } else {
+                        coded_w as usize
+                    },
+                    coded_h as usize,
                 );
                 debug_assert_eq!(
                     applied_d, plan.d,
@@ -2322,19 +2426,12 @@ fn encode_key_frame_yuv_core(
 
     // IVF v0 wrap. r441 — the container carries DISPLAY dimensions:
     // the §5.9.8 upscaled width on a superres frame.
-    let ivf_w = superres.map_or(input.width, |(up_w, _)| up_w);
+    let ivf_w = superres.map_or(coded_w, |(up_w, _)| up_w);
     let mut ivf_bytes: Vec<u8> = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut ivf_bytes);
-        let mut iw = IvfWriter::new(
-            cursor,
-            FOURCC_AV01,
-            ivf_w as u16,
-            input.height as u16,
-            25,
-            1,
-        )
-        .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        let mut iw = IvfWriter::new(cursor, FOURCC_AV01, ivf_w as u16, coded_h as u16, 25, 1)
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
         iw.write_frame(&temporal_unit_bytes, 0)
             .map_err(|_| Error::PartitionWalkOutOfRange)?;
         iw.patch_frame_count()

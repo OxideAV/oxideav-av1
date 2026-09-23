@@ -2709,7 +2709,9 @@ pub fn decode_av1_at_operating_point(
 ///
 /// ## Accepted scope (round 409)
 ///
-/// * `width`, `height` ∈ `[8, 4096]` per axis, both multiples of 8
+/// * `width`, `height` ∈ `[8, 16384]` per axis, both multiples of 8 (any
+///   extent via [`crate::encoder::encode_still_yuv`] /
+///   [`crate::encoder::encode_key_frame_yuv_with_q`])
 ///   ([`crate::encoder::KEY_FRAME_MAX_DIM`]).
 /// * 8-bit 4:2:0 YUV. Single KEY frame per stream (one IVF frame).
 /// * `base_q_idx = 0` — the §5.9.2 `CodedLossless` arm. The matching
@@ -2728,7 +2730,7 @@ pub fn decode_av1_at_operating_point(
 ///
 /// * `pixels.len() != width * height + 2 * (width / 2) * (height / 2)`
 ///   ⇒ [`Error::PartitionWalkOutOfRange`].
-/// * Dimensions out of `[8, 4096]` per axis or not multiples of 8 ⇒
+/// * Dimensions out of `[8, 16384]` per axis or not multiples of 8 ⇒
 ///   [`Error::PartitionWalkOutOfRange`].
 /// * Internal partition-tree / coefficient writer overflow — same
 ///   `Error` variants the driver surfaces.

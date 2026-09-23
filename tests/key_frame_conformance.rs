@@ -274,16 +274,14 @@ fn key_frame_encode_is_deterministic() {
     assert_eq!(a.recon_y, b.recon_y);
 }
 
+/// r460 — any extent in `1..=KEY_FRAME_MAX_DIM` is accepted (the
+/// picture is padded to the mi grid internally and coded under its
+/// true `frame_size`); zero / over-ceiling extents and plane-length
+/// mismatches are still rejected.
 #[test]
 fn key_frame_rejects_bad_dimensions() {
-    for (w, h) in [
-        (0u32, 64u32),
-        (12, 64),
-        (64, 4),
-        (KEY_FRAME_MAX_DIM + 8, 64),
-    ] {
-        let f = Yuv420Frame::filled(w.max(8), h.max(8), 0);
-        let mut f = f;
+    for (w, h) in [(0u32, 64u32), (64, 0), (KEY_FRAME_MAX_DIM + 8, 64)] {
+        let mut f = Yuv420Frame::filled(w.max(8), h.max(8), 0);
         f.width = w;
         f.height = h;
         assert!(
@@ -295,4 +293,19 @@ fn key_frame_rejects_bad_dimensions() {
     let mut f = Yuv420Frame::filled(64, 64, 0);
     f.y.pop();
     assert!(encode_key_frame_yuv420_with_q(&f, 0).is_err());
+    // Non-multiple-of-8 extents code their true frame size and
+    // reproduce the input losslessly.
+    for (w, h) in [(12u32, 64u32), (64, 4), (9, 7)] {
+        let f = gradient(w, h, 3);
+        let k = encode_key_frame_yuv420_with_q(&f, 0)
+            .unwrap_or_else(|e| panic!("{w}x{h} must be accepted: {e:?}"));
+        let fs = k.fh.frame_size.as_ref().expect("frame size");
+        assert_eq!((fs.frame_width, fs.frame_height), (w, h));
+        assert_eq!(k.recon_y, f.y, "{w}x{h}: lossless luma");
+        let frames = oxideav_av1::decode_av1(&k.ivf_bytes).expect("decodes");
+        let oxideav_av1::decoder::Frame::Spec(sf) = &frames[0] else {
+            panic!("spec frame expected");
+        };
+        assert_eq!(sf.planes[0], f.y, "{w}x{h}: decoded luma");
+    }
 }

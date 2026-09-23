@@ -274,6 +274,7 @@ fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame 
 /// | `tile_cols_log2` | §5.9.15 `TileColsLog2`            | `0`                          |
 /// | `tile_rows_log2` | §5.9.15 `TileRowsLog2`            | `0`                          |
 /// | `full_range`     | `true` / `false` (§5.5.2 `color_range`) | from the pixel format (`YuvJ*` full) |
+/// | `color_primaries` / `transfer_characteristics` / `matrix_coefficients` | H.273 code points (§5.5.2 colour description; all three or none) | unspecified |
 ///
 /// `still = true` codes every frame as an independent still picture
 /// (`still_picture = 1` + `reduced_still_picture_header = 1`, one
@@ -295,6 +296,9 @@ pub struct Av1EncoderOptions {
     pub tile_rows_log2: u32,
     /// §5.5.2 `color_range`.
     pub full_range: bool,
+    /// §5.5.2 colour description `(cp, tc, mc)` when all three keys
+    /// are given.
+    pub color_description: Option<(u8, u8, u8)>,
 }
 
 impl Av1EncoderOptions {
@@ -315,7 +319,9 @@ impl Av1EncoderOptions {
                 params.pixel_format,
                 Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
             ),
+            color_description: None,
         };
+        let mut cicp: [Option<u8>; 3] = [None; 3];
         let bad = |k: &str, v: &str| CoreError::invalid(format!("oxideav-av1: option {k}={v:?}"));
         let parse_bool = |k: &str, v: &str| -> CoreResult<bool> {
             match v {
@@ -349,11 +355,24 @@ impl Av1EncoderOptions {
                 "tile_cols_log2" => o.tile_cols_log2 = v.parse().map_err(|_| bad(k, v))?,
                 "tile_rows_log2" => o.tile_rows_log2 = v.parse().map_err(|_| bad(k, v))?,
                 "full_range" => o.full_range = parse_bool(k, v)?,
+                "color_primaries" => cicp[0] = Some(v.parse().map_err(|_| bad(k, v))?),
+                "transfer_characteristics" => cicp[1] = Some(v.parse().map_err(|_| bad(k, v))?),
+                "matrix_coefficients" => cicp[2] = Some(v.parse().map_err(|_| bad(k, v))?),
                 _ => {
                     return Err(CoreError::invalid(format!(
                         "oxideav-av1: unknown option {k:?}"
                     )))
                 }
+            }
+        }
+        match cicp {
+            [None, None, None] => {}
+            [Some(cp), Some(tc), Some(mc)] => o.color_description = Some((cp, tc, mc)),
+            _ => {
+                return Err(CoreError::invalid(
+                    "oxideav-av1: color_primaries / transfer_characteristics / \
+                     matrix_coefficients must be given together",
+                ))
             }
         }
         if let Some(q) = quality {
@@ -373,6 +392,7 @@ impl Av1EncoderOptions {
             speed: self.speed,
             full_range: self.full_range,
             reduced_header: true,
+            color_description: self.color_description,
         }
     }
 }
@@ -439,6 +459,12 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         crate::encoder::still::apply_still_picture_shape(&mut seq);
     }
     seq.color_config.color_range = opts.full_range;
+    if let Some((cp, tc, mc)) = opts.color_description {
+        seq.color_config.color_description_present_flag = true;
+        seq.color_config.color_primaries = cp;
+        seq.color_config.transfer_characteristics = tc;
+        seq.color_config.matrix_coefficients = mc;
+    }
     let mut out = params.clone();
     out.codec_id = CodecId::new(CODEC_ID_STR);
     out.extradata = Av1CodecConfig::from_sequence_header(&seq).to_bytes();
@@ -782,6 +808,12 @@ mod tests {
         params.options.insert("tile_cols_log2", "1");
         let o = Av1EncoderOptions::from_params(&params).unwrap();
         assert!(o.full_range && o.tile_cols_log2 == 1);
+        params.options.insert("color_primaries", "1");
+        assert!(Av1EncoderOptions::from_params(&params).is_err());
+        params.options.insert("transfer_characteristics", "13");
+        params.options.insert("matrix_coefficients", "6");
+        let o = Av1EncoderOptions::from_params(&params).unwrap();
+        assert_eq!(o.color_description, Some((1, 13, 6)));
     }
 
     #[test]
