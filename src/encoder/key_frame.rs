@@ -116,7 +116,7 @@ use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
     write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxNode,
 };
-use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
+use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork, TwinScope};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
@@ -5564,17 +5564,17 @@ fn build_search_tree(
             None
         };
         let before = save_region_wh(recon, r, c, n4 as usize, n4 as usize);
-        let mut rect_best: Option<(SyntaxNode, RegionSnapshot, u64, RateTwin, u64)> = None;
+        let origin = twin.scope(r, c, b_size, params);
+        let mut rect_best: Option<(SyntaxNode, RegionSnapshot, u64, TwinScope, u64)> = None;
         if let Some(part) = rect_part {
             if let Some(psub) = crate::cdf::partition_subsize(part, b_size)
                 .filter(|&p| chroma_partition_ok(recon, p))
             {
-                let mut twin_s = twin.clone();
-                let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
-                let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
+                let mut cost_s = twin.commit_partition_symbol(part, r, c, b_size)?;
+                let pricing_s = (model == RateModel::Twin).then_some((&*twin, params));
                 let blk = encode_key_leaf(r, c, psub, input, recon, pricing_s, seg, dq_units)?;
                 let h_rate = 4 + leaf_rate(&blk);
-                cost_s += twin_s.commit_block(&blk, r, c, psub, params)?;
+                cost_s += twin.commit_block(&blk, r, c, psub, params)?;
                 let d = region_distortion_wh(recon, input, r, c, n4 as usize, n4 as usize);
                 // §5.11.4: the second block of the pair is never
                 // coded on the edge arm — the writer ignores the
@@ -5593,34 +5593,24 @@ fn build_search_tree(
                     node,
                     save_region_wh(recon, r, c, n4 as usize, n4 as usize),
                     score,
-                    twin_s,
+                    twin.scope(r, c, b_size, params),
                     cost_s,
                 ));
                 restore_region(recon, r, c, &before);
+                twin.restore(&origin);
             }
         }
         // SPLIT arm (forced on the corner case; elected otherwise).
-        let mut twin_b = twin.clone();
-        let mut cost = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-        let (nw, c0) = build_search_tree(
-            r,
-            c,
-            sub,
-            input,
-            recon,
-            &mut twin_b,
-            params,
-            model,
-            seg,
-            dq_units,
-        )?;
+        let mut cost = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let (nw, c0) =
+            build_search_tree(r, c, sub, input, recon, twin, params, model, seg, dq_units)?;
         let (ne, c1) = build_search_tree(
             r,
             c + half,
             sub,
             input,
             recon,
-            &mut twin_b,
+            twin,
             params,
             model,
             seg,
@@ -5632,7 +5622,7 @@ fn build_search_tree(
             sub,
             input,
             recon,
-            &mut twin_b,
+            twin,
             params,
             model,
             seg,
@@ -5644,7 +5634,7 @@ fn build_search_tree(
             sub,
             input,
             recon,
-            &mut twin_b,
+            twin,
             params,
             model,
             seg,
@@ -5662,11 +5652,10 @@ fn build_search_tree(
             };
             if rect_score <= score256(d_b, lambda, r_b) {
                 restore_region(recon, r, c, &after);
-                *twin = twin_s;
+                twin.restore(&twin_s);
                 return Ok((node, rect_cost));
             }
         }
-        *twin = twin_b;
         return Ok((SyntaxNode::Split(children), cost));
     }
 
@@ -5679,8 +5668,10 @@ fn build_search_tree(
     let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg, dq_units)?;
     let node_a = SyntaxNode::Leaf(Box::new(leaf));
     let d_a = region_distortion(recon, input, r, c, n4 as usize);
-    let mut twin_a = twin.clone();
-    let cost_a = twin_a.commit_subtree(&node_a, r, c, b_size, params)?;
+    let origin = twin.scope(r, c, b_size, params);
+    let cost_a = twin.commit_subtree(&node_a, r, c, b_size, params)?;
+    let twin_a = twin.scope(r, c, b_size, params);
+    twin.restore(&origin);
     let after_a = save_region(recon, r, c, n4 as usize);
     restore_region(recon, r, c, &before);
     let score_a = {
@@ -5698,7 +5689,7 @@ fn build_search_tree(
     };
     // Running best over the non-split candidates (ties prefer the
     // earlier candidate — fewer coded blocks).
-    let mut best: (SyntaxNode, RegionSnapshot, u64, RateTwin, u64) =
+    let mut best: (SyntaxNode, RegionSnapshot, u64, TwinScope, u64) =
         (node_a, after_a, score_a, twin_a, cost_a);
 
     // Candidates A2/A3 (r425): §5.11.4 PARTITION_HORZ / PARTITION_VERT
@@ -5725,15 +5716,14 @@ fn build_search_tree(
             } else {
                 [(r, c), (r, c + half)]
             };
-            let mut twin_s = twin.clone();
-            let mut cost_s = twin_s.commit_partition_symbol(part, r, c, b_size)?;
+            let mut cost_s = twin.commit_partition_symbol(part, r, c, b_size)?;
             let mut h_rate = 4u64;
             let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(2);
             for &(rr, cc) in &cells {
-                let pricing_s = (model == RateModel::Twin).then_some((&twin_s, params));
+                let pricing_s = (model == RateModel::Twin).then_some((&*twin, params));
                 let blk = encode_key_leaf(rr, cc, psub, input, recon, pricing_s, seg, dq_units)?;
                 h_rate += leaf_rate(&blk);
-                cost_s += twin_s.commit_block(&blk, rr, cc, psub, params)?;
+                cost_s += twin.commit_block(&blk, rr, cc, psub, params)?;
                 blocks.push(blk);
             }
             let d = region_distortion(recon, input, r, c, n4 as usize);
@@ -5756,10 +5746,11 @@ fn build_search_tree(
                     node,
                     save_region(recon, r, c, n4 as usize),
                     score,
-                    twin_s,
+                    twin.scope(r, c, b_size, params),
                     cost_s,
                 );
             }
+            twin.restore(&origin);
             restore_region(recon, r, c, &before);
         }
     }
@@ -5768,27 +5759,15 @@ fn build_search_tree(
     // quadrants (NW/NE/SW/SE dispatch order — the writer's order),
     // each child searched against the twin state its symbols will
     // actually be written under (SPLIT arm + earlier siblings).
-    let mut twin_b = twin.clone();
-    let mut cost_b = twin_b.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-    let (nw, c0) = build_search_tree(
-        r,
-        c,
-        sub,
-        input,
-        recon,
-        &mut twin_b,
-        params,
-        model,
-        seg,
-        dq_units,
-    )?;
+    let mut cost_b = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+    let (nw, c0) = build_search_tree(r, c, sub, input, recon, twin, params, model, seg, dq_units)?;
     let (ne, c1) = build_search_tree(
         r,
         c + half,
         sub,
         input,
         recon,
-        &mut twin_b,
+        twin,
         params,
         model,
         seg,
@@ -5800,7 +5779,7 @@ fn build_search_tree(
         sub,
         input,
         recon,
-        &mut twin_b,
+        twin,
         params,
         model,
         seg,
@@ -5812,7 +5791,7 @@ fn build_search_tree(
         sub,
         input,
         recon,
-        &mut twin_b,
+        twin,
         params,
         model,
         seg,
@@ -5833,10 +5812,9 @@ fn build_search_tree(
     if best.2 <= score_b {
         let (node, after, _, twin_best, cost) = best;
         restore_region(recon, r, c, &after);
-        *twin = twin_best;
+        twin.restore(&twin_best);
         Ok((node, cost))
     } else {
-        *twin = twin_b;
         Ok((SyntaxNode::Split(children), cost_b))
     }
 }

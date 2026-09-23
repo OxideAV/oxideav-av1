@@ -16155,6 +16155,7 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
 /// clipped `rows × cols` rect; the multi-slot grids (`ref_frames` ×2,
 /// `interp_filters` ×2, `mvs` ×4, `delta_lfs` ×FRAME_LF_COUNT,
 /// palette grids ×3 planes) pack their per-cell slots contiguously.
+#[derive(Debug, Clone)]
 pub(crate) struct EncoderStampSnapshot {
     mi_row: u32,
     mi_col: u32,
@@ -16184,6 +16185,26 @@ pub(crate) struct EncoderStampSnapshot {
     interintra_modes: Vec<u8>,
     wedge_interintras: Vec<u8>,
     interintra_wedge_indices: Vec<u8>,
+}
+
+/// r460 — the [`PartitionWalker::snapshot_price_scope`] capture: one
+/// block's worth of encoder-write-path state, restorable in O(block).
+#[derive(Debug, Clone)]
+pub(crate) struct PriceScopeSnapshot {
+    stamp: EncoderStampSnapshot,
+    tx_types: Vec<u8>,
+    cdef: Vec<(usize, i8)>,
+    /// Per plane `(above_c0, above_c1, left_r0, left_r1)`.
+    spans: [(usize, usize, usize, usize); 3],
+    above_ctx: Vec<(u8, u8)>,
+    left_ctx: Vec<(u8, u8)>,
+    seg_cols: (usize, usize),
+    seg_rows: (usize, usize),
+    above_seg: Vec<u8>,
+    left_seg: Vec<u8>,
+    current_q_index: i32,
+    current_delta_lf: [i32; FRAME_LF_COUNT],
+    read_deltas_pending: bool,
 }
 
 /// Per-tile frame-constant parameters threaded into the §5.11.2
@@ -21234,8 +21255,20 @@ impl PartitionWalker {
         mi_col: u32,
         n4: u32,
     ) -> EncoderStampSnapshot {
-        let r1 = (mi_row + n4).min(self.mi_rows);
-        let c1 = (mi_col + n4).min(self.mi_cols);
+        self.snapshot_encoder_stamp_rect_wh(mi_row, mi_col, n4, n4)
+    }
+
+    /// r460 — [`Self::snapshot_encoder_stamp_rect`] over a `w4 × h4`
+    /// (columns × rows, mi units) rectangle.
+    pub(crate) fn snapshot_encoder_stamp_rect_wh(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+    ) -> EncoderStampSnapshot {
+        let r1 = (mi_row + h4).min(self.mi_rows);
+        let c1 = (mi_col + w4).min(self.mi_cols);
         let rows = r1.saturating_sub(mi_row);
         let cols = c1.saturating_sub(mi_col);
         let cells = (rows as usize) * (cols as usize);
@@ -21375,6 +21408,155 @@ impl PartitionWalker {
                 i += 1;
             }
         }
+    }
+
+    /// r460 — capture every walker cell the ENCODER write path
+    /// (`write_block_syntax` / `write_single_transform_block` and the
+    /// partition-symbol stamps) can touch while coding one block at
+    /// `(mi_row, mi_col)` of `w4 × h4` mi units, so a search driver
+    /// can price a candidate on the LIVE state and roll it back
+    /// without cloning the whole-frame mirror (the pre-r460 rate twin
+    /// deep-cloned the walker per priced transform unit — O(frame)
+    /// per candidate, quadratic over a picture).
+    ///
+    /// Covered: the [`Self::snapshot_encoder_stamp_rect_wh`] grids,
+    /// `TxTypes[]` over the rect, the §5.11.56 `cdef_idx` anchor cells
+    /// (the stamp lands on the 64×64-aligned origins covering the
+    /// rect, which can lie OUTSIDE it), the §5.11.39 above / left
+    /// level + DC context spans of every plane (widened by one mi on
+    /// each side so the sub-8×8 chroma stitch's neighbouring column /
+    /// row is inside the scope), the §5.11.9 segment-prediction
+    /// context spans, and the §5.11.2 `CurrentQIndex` /
+    /// `DeltaLF[]` / `ReadDeltas` scalars.
+    pub(crate) fn snapshot_price_scope(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) -> PriceScopeSnapshot {
+        let stamp = self.snapshot_encoder_stamp_rect_wh(mi_row, mi_col, w4, h4);
+        let r1 = (mi_row + h4).min(self.mi_rows);
+        let c1 = (mi_col + w4).min(self.mi_cols);
+        let mut tx_types =
+            Vec::with_capacity(((r1 - mi_row.min(r1)) * (c1 - mi_col.min(c1))) as usize);
+        for rr in mi_row..r1 {
+            for cc in mi_col..c1 {
+                tx_types.push(self.tx_types[(rr * self.mi_cols + cc) as usize]);
+            }
+        }
+        let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+        let mask: u32 = !(cdef_size4 - 1);
+        let mut cdef = Vec::new();
+        let mut i = mi_row & mask;
+        while i < mi_row + h4 && i < self.mi_rows {
+            let mut j = mi_col & mask;
+            while j < mi_col + w4 && j < self.mi_cols {
+                let idx = (i * self.mi_cols + j) as usize;
+                cdef.push((idx, self.cdef_idx[idx]));
+                j += cdef_size4;
+            }
+            i += cdef_size4;
+        }
+        let mut above_ctx = Vec::new();
+        let mut left_ctx = Vec::new();
+        let mut spans = [(0usize, 0usize, 0usize, 0usize); 3];
+        for (plane, span) in spans.iter_mut().enumerate() {
+            let (ssx, ssy) = if plane == 0 {
+                (0u32, 0u32)
+            } else {
+                (u32::from(subsampling_x), u32::from(subsampling_y))
+            };
+            let above_base = plane * self.mi_cols as usize;
+            let left_base = plane * self.mi_rows as usize;
+            let c0 = (mi_col.saturating_sub(1) >> ssx) as usize;
+            let c1p = (((mi_col + w4 + 1) >> ssx) as usize + 1).min(self.mi_cols as usize);
+            let r0 = (mi_row.saturating_sub(1) >> ssy) as usize;
+            let r1p = (((mi_row + h4 + 1) >> ssy) as usize + 1).min(self.mi_rows as usize);
+            let (c0, r0) = (c0.min(c1p), r0.min(r1p));
+            *span = (c0, c1p, r0, r1p);
+            for i in c0..c1p {
+                above_ctx.push((
+                    self.above_level_context[above_base + i],
+                    self.above_dc_context[above_base + i],
+                ));
+            }
+            for i in r0..r1p {
+                left_ctx.push((
+                    self.left_level_context[left_base + i],
+                    self.left_dc_context[left_base + i],
+                ));
+            }
+        }
+        let seg_c0 = mi_col.min(self.mi_cols) as usize;
+        let seg_c1 = c1 as usize;
+        let seg_r0 = mi_row.min(self.mi_rows) as usize;
+        let seg_r1 = r1 as usize;
+        PriceScopeSnapshot {
+            stamp,
+            tx_types,
+            cdef,
+            spans,
+            above_ctx,
+            left_ctx,
+            seg_cols: (seg_c0, seg_c1),
+            seg_rows: (seg_r0, seg_r1),
+            above_seg: self.above_seg_pred_context[seg_c0..seg_c1.max(seg_c0)].to_vec(),
+            left_seg: self.left_seg_pred_context[seg_r0..seg_r1.max(seg_r0)].to_vec(),
+            current_q_index: self.current_q_index,
+            current_delta_lf: self.current_delta_lf,
+            read_deltas_pending: self.read_deltas_pending,
+        }
+    }
+
+    /// r460 — roll the walker back to (or forward onto) a
+    /// [`Self::snapshot_price_scope`] capture. Value-restoring, so a
+    /// capture taken AFTER a trial commit re-applies that commit.
+    pub(crate) fn restore_price_scope(&mut self, snap: &PriceScopeSnapshot) {
+        self.restore_encoder_stamp_rect(&snap.stamp);
+        let (mi_row, mi_col) = (snap.stamp.mi_row, snap.stamp.mi_col);
+        let mut i = 0usize;
+        for dr in 0..snap.stamp.rows {
+            for dc in 0..snap.stamp.cols {
+                let cell = ((mi_row + dr) * self.mi_cols + mi_col + dc) as usize;
+                self.tx_types[cell] = snap.tx_types[i];
+                i += 1;
+            }
+        }
+        for &(idx, v) in &snap.cdef {
+            self.cdef_idx[idx] = v;
+        }
+        let mut ai = 0usize;
+        let mut li = 0usize;
+        for (plane, &(c0, c1, r0, r1)) in snap.spans.iter().enumerate() {
+            let above_base = plane * self.mi_cols as usize;
+            let left_base = plane * self.mi_rows as usize;
+            for i in c0..c1 {
+                let (lvl, dc) = snap.above_ctx[ai];
+                ai += 1;
+                self.above_level_context[above_base + i] = lvl;
+                self.above_dc_context[above_base + i] = dc;
+            }
+            for i in r0..r1 {
+                let (lvl, dc) = snap.left_ctx[li];
+                li += 1;
+                self.left_level_context[left_base + i] = lvl;
+                self.left_dc_context[left_base + i] = dc;
+            }
+        }
+        let (c0, c1) = snap.seg_cols;
+        if c1 > c0 {
+            self.above_seg_pred_context[c0..c1].copy_from_slice(&snap.above_seg);
+        }
+        let (r0, r1) = snap.seg_rows;
+        if r1 > r0 {
+            self.left_seg_pred_context[r0..r1].copy_from_slice(&snap.left_seg);
+        }
+        self.current_q_index = snap.current_q_index;
+        self.current_delta_lf = snap.current_delta_lf;
+        self.read_deltas_pending = snap.read_deltas_pending;
     }
 
     /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the

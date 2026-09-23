@@ -1257,6 +1257,14 @@ impl SyntaxFrameParams {
     }
 }
 
+/// r460 — one block's worth of [`PartitionSyntaxWriter`] write state
+/// (see [`PartitionSyntaxWriter::snapshot_price_scope`]).
+#[derive(Debug, Clone)]
+pub(crate) struct WriterScopeSnapshot {
+    mirror: crate::cdf::PriceScopeSnapshot,
+    write_deltas_pending: bool,
+}
+
 /// Full-syntax driver state — frame geometry plus the
 /// [`PartitionWalker`] neighbour-grid mirror every §8.3.2 context is
 /// derived from. One driver per tile, mirroring the decode side's
@@ -1335,6 +1343,36 @@ impl PartitionSyntaxWriter {
     /// block's delta pair is coded).
     pub fn arm_read_deltas(&mut self) {
         self.write_deltas_pending = true;
+    }
+
+    /// r460 — capture the block-scoped write state (see
+    /// [`crate::cdf::PartitionWalker::snapshot_price_scope`]) plus
+    /// the §5.11.2 `ReadDeltas` write-side twin.
+    pub(crate) fn snapshot_price_scope(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+        params: &SyntaxFrameParams,
+    ) -> WriterScopeSnapshot {
+        WriterScopeSnapshot {
+            mirror: self.mirror.snapshot_price_scope(
+                mi_row,
+                mi_col,
+                w4,
+                h4,
+                params.subsampling_x,
+                params.subsampling_y,
+            ),
+            write_deltas_pending: self.write_deltas_pending,
+        }
+    }
+
+    /// r460 — roll back onto a [`Self::snapshot_price_scope`] capture.
+    pub(crate) fn restore_price_scope(&mut self, snap: &WriterScopeSnapshot) {
+        self.mirror.restore_price_scope(&snap.mirror);
+        self.write_deltas_pending = snap.write_deltas_pending;
     }
 
     /// The encoder-side neighbour-grid mirror (read-only view, e.g.

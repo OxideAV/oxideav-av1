@@ -37,10 +37,12 @@
 //! stream position. `D + λ·R` comparisons scale distortion by 256 to
 //! match (see [`score256`]).
 
-use crate::cdf::TileCdfContext;
+use core::cell::RefCell;
+
+use crate::cdf::{TileCdfContext, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE};
 use crate::encoder::partition_tree::{
     write_block_syntax, write_partition_symbol, write_partition_tree_syntax, PartitionSyntaxWriter,
-    SyntaxBlock, SyntaxFrameParams, SyntaxNode,
+    SyntaxBlock, SyntaxFrameParams, SyntaxNode, WriterScopeSnapshot,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -67,51 +69,100 @@ pub(crate) fn score256(distortion: u64, lambda: u64, rate_bits256: u64) -> u64 {
     distortion * 256 + lambda * rate_bits256
 }
 
-/// The search-side shadow of one tile's live write state. See the
-/// module docs for the desync argument.
+/// The search-side shadow of one tile's live write state (see the
+/// module docs for the desync argument): the rate twin: a private copy of the tile's live
+/// entropy state (`cdfs` + writer mirror + arithmetic range) that
+/// candidate symbol sequences are priced against.
+///
+/// r460 — the live state sits behind a `RefCell` so `&self` pricing
+/// entries can trial-write a candidate onto it and roll the block's
+/// scope back through
+/// [`PartitionSyntaxWriter::snapshot_price_scope`] — O(block) per
+/// candidate instead of the pre-r460 whole-frame clone (O(frame) per
+/// priced transform unit, quadratic over a picture: a 640×480 KEY
+/// frame spent two thirds of its wall clock in that clone).
+/// Deep [`Clone`] is still available for callers that branch the
+/// whole twin.
 #[derive(Debug, Clone)]
 pub(crate) struct RateTwin {
-    cdfs: TileCdfContext,
-    state: PartitionSyntaxWriter,
-    range: u32,
+    inner: RefCell<TwinInner>,
     disable_cdf_update: bool,
 }
 
+#[derive(Debug, Clone)]
+struct TwinInner {
+    cdfs: TileCdfContext,
+    state: PartitionSyntaxWriter,
+    range: u32,
+}
+
+/// r460 — a frozen block-scoped branch of a [`RateTwin`]: the writer
+/// scope, the adapted CDF tables and the arithmetic range after (or
+/// before) a trial commit. [`RateTwin::restore`] moves the live twin
+/// onto it in O(block) + one CDF-table copy.
+#[derive(Debug, Clone)]
+pub(crate) struct TwinScope {
+    writer: WriterScopeSnapshot,
+    cdfs: TileCdfContext,
+    range: u32,
+}
+
 impl RateTwin {
-    /// Snapshot the live writer state (call at superblock entry,
-    /// BEFORE the superblock's search).
+    /// Fork the live tile state into a twin.
     pub fn snapshot(
         cdfs: &TileCdfContext,
         state: &PartitionSyntaxWriter,
         writer: &SymbolWriter,
     ) -> Self {
         Self {
-            cdfs: cdfs.clone(),
-            state: state.clone(),
-            range: writer.range(),
+            inner: RefCell::new(TwinInner {
+                cdfs: cdfs.clone(),
+                state: state.clone(),
+                range: writer.range(),
+            }),
             disable_cdf_update: writer.disable_cdf_update(),
         }
     }
 
-    /// Mirror of [`PartitionSyntaxWriter::arm_read_deltas`] — call
-    /// where the driver arms the real state (superblock entry) so the
-    /// twin's §5.11.2 delta lifecycle stays in step.
+    /// Re-arm the §5.11.2 `ReadDeltas` write-side twin (superblock
+    /// entry).
     pub fn arm_read_deltas(&mut self) {
-        self.state.arm_read_deltas();
+        self.inner.get_mut().state.arm_read_deltas();
     }
 
-    /// r428 — the fork's §5.11.2 delta lifecycle bit: `true` while
-    /// the next block committed into THIS fork is the one that codes
-    /// the §5.11.13 deltas. The search's leaf builders consult it so
-    /// exactly that block carries the superblock's delta value.
+    /// Whether the next block coded on this twin carries the §5.11.12
+    /// / §5.11.13 delta syntax.
     pub fn deltas_pending(&self) -> bool {
-        self.state.deltas_pending()
+        self.inner.borrow().state.deltas_pending()
     }
 
-    /// Commit the subtree rooted at `(r, c, b_size)` into the twin —
-    /// advancing CDFs, neighbour mirror and `range` exactly as the
-    /// emitting pass will — and return its exact cost in 1/256-bit
-    /// units.
+    /// r460 — capture the block scope `(r, c, b_size)` of the live
+    /// twin (see [`TwinScope`]).
+    pub fn scope(&self, r: u32, c: u32, b_size: usize, params: &SyntaxFrameParams) -> TwinScope {
+        let g = self.inner.borrow();
+        TwinScope {
+            writer: g.state.snapshot_price_scope(
+                r,
+                c,
+                NUM_4X4_BLOCKS_WIDE[b_size] as u32,
+                NUM_4X4_BLOCKS_HIGH[b_size] as u32,
+                params,
+            ),
+            cdfs: g.cdfs.clone(),
+            range: g.range,
+        }
+    }
+
+    /// r460 — move the live twin onto a captured [`TwinScope`].
+    pub fn restore(&mut self, scope: &TwinScope) {
+        let g = self.inner.get_mut();
+        g.state.restore_price_scope(&scope.writer);
+        g.cdfs.clone_from(&scope.cdfs);
+        g.range = scope.range;
+    }
+
+    /// Commit a whole subtree's symbols (partition symbols + every
+    /// leaf) and return the exact bits it costs.
     pub fn commit_subtree(
         &mut self,
         node: &SyntaxNode,
@@ -120,25 +171,23 @@ impl RateTwin {
         b_size: usize,
         params: &SyntaxFrameParams,
     ) -> Result<u64, Error> {
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        let g = self.inner.get_mut();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
         write_partition_tree_syntax(
             &mut w,
-            &mut self.cdfs,
-            &mut self.state,
+            &mut g.cdfs,
+            &mut g.state,
             node,
             r,
             c,
             b_size,
             params,
         )?;
-        self.range = w.range();
+        g.range = w.range();
         Ok(w.cost_bits256())
     }
 
-    /// Commit ONLY the §5.11.4 partition symbol for `(r, c, b_size)`
-    /// (possibly a zero-bit forced arm) — used by the split search
-    /// path so child searches see the post-arm state — and return its
-    /// exact cost.
+    /// Commit one §5.11.4 `partition` symbol.
     pub fn commit_partition_symbol(
         &mut self,
         partition: usize,
@@ -146,19 +195,14 @@ impl RateTwin {
         c: u32,
         b_size: usize,
     ) -> Result<u64, Error> {
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
-        write_partition_symbol(&mut w, &mut self.cdfs, &self.state, partition, r, c, b_size)?;
-        self.range = w.range();
+        let g = self.inner.get_mut();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
+        write_partition_symbol(&mut w, &mut g.cdfs, &g.state, partition, r, c, b_size)?;
+        g.range = w.range();
         Ok(w.cost_bits256())
     }
 
-    /// Commit one leaf block's §5.11.5 syntax at `(r, c, b_size)` —
-    /// block only, NO partition symbol. The multi-block partition
-    /// shapes (HORZ / VERT / T-shapes / 4-strips) thread a running
-    /// fork through this: each later block's search AND validation
-    /// then see the earlier siblings' §5.11.5 mirror stamps, exactly
-    /// like the writer (the §5.11.27 cascade in particular reads the
-    /// committed neighbour grid).
+    /// Commit one leaf block's symbols.
     pub fn commit_block(
         &mut self,
         block: &SyntaxBlock,
@@ -167,25 +211,24 @@ impl RateTwin {
         b_size: usize,
         params: &SyntaxFrameParams,
     ) -> Result<u64, Error> {
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        let g = self.inner.get_mut();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
         write_block_syntax(
             &mut w,
-            &mut self.cdfs,
-            &mut self.state,
+            &mut g.cdfs,
+            &mut g.state,
             block,
             r,
             c,
             b_size,
             params,
         )?;
-        self.range = w.range();
+        g.range = w.range();
         Ok(w.cost_bits256())
     }
 
-    /// Price one leaf block's §5.11.5 syntax at `(r, c, b_size)`
-    /// without touching the twin. Excludes the partition symbol
-    /// (constant across the candidates of one leaf-level election, so
-    /// it cancels in every comparison this price feeds).
+    /// Price one leaf block WITHOUT committing it: the exact bits the
+    /// emitting writer would append for it at the current state.
     pub fn price_block(
         &self,
         block: &SyntaxBlock,
@@ -194,29 +237,34 @@ impl RateTwin {
         b_size: usize,
         params: &SyntaxFrameParams,
     ) -> Result<u64, Error> {
-        let mut twin = self.clone();
-        let mut w = SymbolWriter::new_counting(twin.disable_cdf_update, twin.range);
-        write_block_syntax(
+        let mut g = self.inner.borrow_mut();
+        let g = &mut *g;
+        let scope = g.state.snapshot_price_scope(
+            r,
+            c,
+            NUM_4X4_BLOCKS_WIDE[b_size] as u32,
+            NUM_4X4_BLOCKS_HIGH[b_size] as u32,
+            params,
+        );
+        let cdfs = g.cdfs.clone();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
+        let res = write_block_syntax(
             &mut w,
-            &mut twin.cdfs,
-            &mut twin.state,
+            &mut g.cdfs,
+            &mut g.state,
             block,
             r,
             c,
             b_size,
             params,
-        )?;
+        );
+        g.state.restore_price_scope(&scope);
+        g.cdfs = cdfs;
+        res?;
         Ok(w.cost_bits256())
     }
 
-    /// r421 — exact price (1/256-bit units) of the §5.11.27
-    /// `motion_mode` arm for one candidate ordinal, through the
-    /// writer's own arm derivation
-    /// ([`crate::encoder::block_mode_info::write_motion_mode`] — the
-    /// single source of truth for the short-circuit cascade and the
-    /// arm-A/arm-B dispatch), against this twin's CURRENT adaptive
-    /// CDFs. Zero for every forced-SIMPLE configuration, the exact
-    /// `use_obmc` / `motion_mode` S() cost otherwise.
+    /// Price a §5.11.27 `motion_mode` symbol at the current CDF state.
     #[allow(clippy::too_many_arguments)]
     pub fn price_motion_mode(
         &self,
@@ -233,8 +281,9 @@ impl RateTwin {
         is_scaled_per_ref: [bool; 7],
         has_overlappable: bool,
     ) -> Result<u64, Error> {
-        let mut cdfs = self.cdfs.clone();
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        let g = self.inner.borrow();
+        let mut cdfs = g.cdfs.clone();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
         crate::encoder::block_mode_info::write_motion_mode(
             &mut w,
             &mut cdfs,
@@ -255,15 +304,8 @@ impl RateTwin {
         Ok(w.cost_bits256())
     }
 
-    /// r422 — exact price (1/256-bit units) of the §5.11.23 mode + MV
-    /// prefix (the §5.11.25 reference cascade, the four-arm `YMode`
-    /// dispatch, the `drl_mode` loop and the NEWMV `read_mv`
-    /// differences) for one `(RefFrame, YMode, Mv, RefMvIdx)`
-    /// candidate — through the writer's own emission path
-    /// ([`crate::encoder::block_mode_info::write_inter_mode_mv_prefix`],
-    /// the single body the committing pass also runs), against this
-    /// twin's CURRENT adaptive CDFs. Replaces the pre-r422 constant
-    /// per-mode bit proxies in the leaf's candidate election.
+    /// Price the §5.11.23 inter-mode + MV prefix at the current CDF
+    /// state.
     #[allow(clippy::too_many_arguments)]
     pub fn price_inter_mode(
         &self,
@@ -281,8 +323,9 @@ impl RateTwin {
         force_integer_mv: bool,
         allow_high_precision_mv: bool,
     ) -> Result<u64, Error> {
-        let mut cdfs = self.cdfs.clone();
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        let g = self.inner.borrow();
+        let mut cdfs = g.cdfs.clone();
+        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
         crate::encoder::block_mode_info::write_inter_mode_mv_prefix(
             &mut w,
             &mut cdfs,
@@ -313,91 +356,56 @@ impl RateTwin {
         Ok(w.cost_bits256())
     }
 
-    /// r423 — the §5.11.9 spatial segment-id `pred` cascade at
-    /// `(mi_row, mi_col)` over THIS twin's write-state mirror — the
-    /// exact value the write path's own derivation will produce for
-    /// this block given the symbols committed so far. A `skip == 1`
-    /// leaf on a segmented inter frame MUST carry it as its
-    /// `segment_id` (§5.11.19 arm 4 / §5.11.9 skip short-circuit), so
-    /// candidate builders consult the twin BEFORE pricing.
+    /// §5.11.9 spatial segment-id prediction at `(mi_row, mi_col)`.
     pub fn spatial_segment_pred(&self, mi_row: u32, mi_col: u32) -> u8 {
-        self.state.segment_pred_ctx(mi_row, mi_col).0
+        self.inner.borrow().state.segment_pred_ctx(mi_row, mi_col).0
     }
 
-    /// Anti-desync check: after the driver's REAL emission of the
-    /// superblock the search committed, the twin must hold the
-    /// identical CDF state and coder `range`. A mismatch means the
-    /// search committed a different symbol sequence than the writer
-    /// emitted — a bug, never a tolerable approximation.
+    /// Parity check against the emitting writer's live state.
     pub fn matches(&self, cdfs: &TileCdfContext, writer: &SymbolWriter) -> bool {
-        self.range == writer.range() && self.cdfs == *cdfs
+        let g = self.inner.borrow();
+        g.range == writer.range() && g.cdfs == *cdfs
     }
 
-    /// r424 — fork the twin's state into a running per-TU pricing
-    /// fork for one leaf's residual chain (see [`TuFork`]).
-    pub fn tu_fork(&self) -> TuFork {
+    /// r424 — open a per-transform-unit fork: TU decisions commit onto
+    /// the fork progressively (so later TUs are priced with earlier
+    /// ones' §5.11.39 contexts in place) and the whole fork is rolled
+    /// back when it drops. r460 — the fork lives on this twin's state
+    /// under a block scope instead of a whole-frame clone.
+    pub fn tu_fork(&self) -> TuFork<'_> {
         TuFork {
-            cdfs: self.cdfs.clone(),
-            state: self.state.clone(),
-            range: self.range,
-            disable_cdf_update: self.disable_cdf_update,
+            twin: self,
+            origin: RefCell::new(None),
         }
     }
 }
 
-/// r424 — the running per-TU twin fork for one leaf's residual chain:
-/// snapshot the leaf-entry twin ([`RateTwin::tu_fork`]), then price
-/// each §5.11.47 tx-type candidate's ACTUAL §5.11.39 coefficient
-/// chain (the `all_zero` symbol at its true neighbour context, the
-/// `inter_tx_type` / `intra_tx_type` S() against the CURRENT adaptive
-/// CDFs, `eob_pt` / `coeff_base` / `coeff_br` / `dc_sign` / golomb
-/// tails) through the writer's own one-TU body
-/// ([`write_single_transform_block`] — the same
-/// `write_transform_block` the emitting pass runs), and COMMIT the
-/// winner so the next TU's candidates see its CDF adaptation and
-/// §6.10.2 level-context stamps exactly as the emitting pass will.
-///
-/// Exactness note: the fork prices luma TUs from the leaf-entry state
-/// — the block's mode-info prefix (coded between the snapshot and the
-/// first TU in the real stream) touches no coefficient CDF row and no
-/// level-context cell, and chroma TUs (coded after every luma TU of a
-/// ≤ 64-sample-wide block) touch only the chroma context rows
-/// (disjoint `txb_skip` context indices, `ptype = 1` tables), so the
-/// per-candidate prices differ from the true in-stream costs only by
-/// the shared §8.2.6 range fraction — identical across the candidates
-/// of one election, which is all an argmin consumes.
-pub(crate) struct TuFork {
-    cdfs: TileCdfContext,
-    state: PartitionSyntaxWriter,
-    range: u32,
-    disable_cdf_update: bool,
+/// r424 — the running per-TU fork of a [`RateTwin`] (see
+/// [`RateTwin::tu_fork`]).
+pub(crate) struct TuFork<'a> {
+    twin: &'a RateTwin,
+    /// The block scope captured before the fork's first write; restored
+    /// when the fork drops. `None` until the first price / commit.
+    origin: RefCell<Option<TwinScope>>,
 }
 
-/// The leaf-constant inputs of one [`TuFork`] pricing/commit call —
-/// everything the §5.11.47 / §5.11.39 one-TU write reads besides the
-/// candidate itself.
+/// The per-leaf inputs a TU price needs (the §5.11.39 residual
+/// facade's block-level fields).
 pub(crate) struct TuCtx<'a> {
     pub params: &'a SyntaxFrameParams,
-    /// Leaf position / size (mi units + §3 block-size ordinal).
     pub mi_row: u32,
     pub mi_col: u32,
     pub mi_size: usize,
-    /// Leaf luma origin in pixels (`MiCol * MI_SIZE`, `MiRow * MI_SIZE`).
     pub base_x: u32,
     pub base_y: u32,
-    /// §5.11.47 arm selector (`inter_tx_type` vs `intra_tx_type`).
     pub is_inter: bool,
-    /// §5.11.47 quantiser-guard segment (`get_qindex( 1, segment_id )`).
     pub segment_id: u8,
-    /// §8.3.2 `intra_dir` axis inputs (intra arm only).
     pub y_mode: u8,
     pub use_filter_intra: bool,
     pub filter_intra_mode: Option<u8>,
 }
 
 impl TuCtx<'_> {
-    /// The facade [`SyntaxBlock`] carrying one TU's commitment at
-    /// vector index 0.
     fn facade(&self, quant: &[i32], tx_type: u8) -> SyntaxBlock {
         let mut b = SyntaxBlock::skip_leaf(self.y_mode, None);
         b.segment_id = self.segment_id;
@@ -409,11 +417,19 @@ impl TuCtx<'_> {
     }
 }
 
-impl TuFork {
-    /// Exact price (1/256-bit units) of one LUMA TU candidate —
-    /// `Quant[]` array + committed §5.11.47 `TxType` at the TU whose
-    /// origin is `(x, y)` in 4-sample units from the leaf's luma
-    /// origin — against this fork's CURRENT state. No commit.
+impl TuFork<'_> {
+    fn ensure_origin(&self, ctx: &TuCtx<'_>) {
+        let mut o = self.origin.borrow_mut();
+        if o.is_none() {
+            *o = Some(
+                self.twin
+                    .scope(ctx.mi_row, ctx.mi_col, ctx.mi_size, ctx.params),
+            );
+        }
+    }
+
+    /// Price one luma TU at the fork's current state (earlier
+    /// committed TUs' contexts in place) without committing it.
     pub fn price_luma_tu(
         &self,
         ctx: &TuCtx<'_>,
@@ -423,13 +439,22 @@ impl TuFork {
         quant: &[i32],
         tx_type: u8,
     ) -> Result<u64, Error> {
-        let mut cdfs = self.cdfs.clone();
-        let mut state = self.state.clone();
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
-        crate::encoder::partition_tree::write_single_transform_block(
+        self.ensure_origin(ctx);
+        let mut g = self.twin.inner.borrow_mut();
+        let g = &mut *g;
+        let scope = g.state.snapshot_price_scope(
+            ctx.mi_row,
+            ctx.mi_col,
+            NUM_4X4_BLOCKS_WIDE[ctx.mi_size] as u32,
+            NUM_4X4_BLOCKS_HIGH[ctx.mi_size] as u32,
+            ctx.params,
+        );
+        let cdfs = g.cdfs.clone();
+        let mut w = SymbolWriter::new_counting(self.twin.disable_cdf_update, g.range);
+        let res = crate::encoder::partition_tree::write_single_transform_block(
             &mut w,
-            &mut cdfs,
-            &mut state,
+            &mut g.cdfs,
+            &mut g.state,
             &ctx.facade(quant, tx_type),
             ctx.params,
             /* plane = */ 0,
@@ -442,13 +467,14 @@ impl TuFork {
             ctx.mi_col,
             ctx.mi_size,
             ctx.is_inter,
-        )?;
+        );
+        g.state.restore_price_scope(&scope);
+        g.cdfs = cdfs;
+        res?;
         Ok(w.cost_bits256())
     }
 
-    /// Commit the elected LUMA TU into the fork — advancing the CDFs,
-    /// the §6.10.2 level-context mirror and the coder range exactly
-    /// as the emitting pass will for the same TU.
+    /// Commit one luma TU onto the fork.
     pub fn commit_luma_tu(
         &mut self,
         ctx: &TuCtx<'_>,
@@ -458,11 +484,14 @@ impl TuFork {
         quant: &[i32],
         tx_type: u8,
     ) -> Result<(), Error> {
-        let mut w = SymbolWriter::new_counting(self.disable_cdf_update, self.range);
+        self.ensure_origin(ctx);
+        let mut g = self.twin.inner.borrow_mut();
+        let g = &mut *g;
+        let mut w = SymbolWriter::new_counting(self.twin.disable_cdf_update, g.range);
         crate::encoder::partition_tree::write_single_transform_block(
             &mut w,
-            &mut self.cdfs,
-            &mut self.state,
+            &mut g.cdfs,
+            &mut g.state,
             &ctx.facade(quant, tx_type),
             ctx.params,
             /* plane = */ 0,
@@ -476,7 +505,18 @@ impl TuFork {
             ctx.mi_size,
             ctx.is_inter,
         )?;
-        self.range = w.range();
+        g.range = w.range();
         Ok(())
+    }
+}
+
+impl Drop for TuFork<'_> {
+    fn drop(&mut self) {
+        if let Some(origin) = self.origin.get_mut().take() {
+            let mut g = self.twin.inner.borrow_mut();
+            g.state.restore_price_scope(&origin.writer);
+            g.cdfs = origin.cdfs;
+            g.range = origin.range;
+        }
     }
 }
