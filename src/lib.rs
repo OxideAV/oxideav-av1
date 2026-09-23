@@ -2705,13 +2705,13 @@ pub fn decode_av1_at_operating_point(
 /// * `pixels[width * height + chroma_size .. width * height +
 ///   2 * chroma_size]` — V (Cr) chroma plane.
 ///
-/// where `chroma_size = (width / 2) * (height / 2)`.
+/// where `chroma_size = ceil(width / 2) * ceil(height / 2)`.
 ///
 /// ## Accepted scope (round 409)
 ///
-/// * `width`, `height` ∈ `[8, 16384]` per axis, both multiples of 8 (any
-///   extent via [`crate::encoder::encode_still_yuv`] /
-///   [`crate::encoder::encode_key_frame_yuv_with_q`])
+/// * `width`, `height` ∈ `[1, 16384]` per axis (r460: any extent — a
+///   non-multiple-of-8 picture is padded to the mi grid internally and
+///   coded under its true `frame_size`)
 ///   ([`crate::encoder::KEY_FRAME_MAX_DIM`]).
 /// * 8-bit 4:2:0 YUV. Single KEY frame per stream (one IVF frame).
 /// * `base_q_idx = 0` — the §5.9.2 `CodedLossless` arm. The matching
@@ -2728,16 +2728,16 @@ pub fn decode_av1_at_operating_point(
 ///
 /// ## Errors
 ///
-/// * `pixels.len() != width * height + 2 * (width / 2) * (height / 2)`
+/// * `pixels.len() != width * height + 2 * ceil(width / 2) * ceil(height / 2)`
 ///   ⇒ [`Error::PartitionWalkOutOfRange`].
-/// * Dimensions out of `[8, 16384]` per axis or not multiples of 8 ⇒
+/// * Dimensions out of `[1, 16384]` per axis ⇒
 ///   [`Error::PartitionWalkOutOfRange`].
 /// * Internal partition-tree / coefficient writer overflow — same
 ///   `Error` variants the driver surfaces.
 pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
     use crate::encoder::{encode_key_frame_yuv420, Yuv420Frame};
-    let chroma_w = (width / 2) as usize;
-    let chroma_h = (height / 2) as usize;
+    let chroma_w = width.div_ceil(2) as usize;
+    let chroma_h = height.div_ceil(2) as usize;
     let y_size = (width as usize) * (height as usize);
     let uv_size = chroma_w * chroma_h;
     let expected = y_size + 2 * uv_size;

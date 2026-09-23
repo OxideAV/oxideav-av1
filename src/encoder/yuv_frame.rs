@@ -374,8 +374,8 @@ impl Yuv420Frame {
     /// constructor; every plane is set to the same value.
     #[must_use]
     pub fn filled(width: u32, height: u32, fill: u8) -> Self {
-        let cw = width / 2;
-        let ch = height / 2;
+        let cw = width.div_ceil(2);
+        let ch = height.div_ceil(2);
         Self {
             width,
             height,

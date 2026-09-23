@@ -471,6 +471,8 @@ mod tests {
             (7, 3, 10, ChromaFormat::Yuv444, 60),
             (65, 9, 12, ChromaFormat::Yuv422, 140),
             (16, 13, 8, ChromaFormat::Yuv420, 200),
+            (9, 7, 8, ChromaFormat::Yuv420, 0),
+            (9, 7, 8, ChromaFormat::Yuv420, 120),
         ] {
             let input = textured(w, h, bd, fmt);
             assert_eq!(
