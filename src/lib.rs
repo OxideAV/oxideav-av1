@@ -1520,6 +1520,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod annexb;
 mod bitreader;
+pub mod codec_config;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod cdef;
@@ -1783,6 +1784,7 @@ pub use cdf::{
 // `inverse_identity`) and the §7.13.2.1 butterfly building blocks
 // (`butterfly_b` / `butterfly_h` / `cos128` / `sin128` / `brev`)
 // are exposed standalone for bit-exact testing.
+pub use codec_config::Av1CodecConfig;
 #[doc(hidden)]
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

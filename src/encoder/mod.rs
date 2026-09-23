@@ -292,6 +292,8 @@ pub(crate) mod rate_twin;
 pub mod scalable_gop;
 #[doc(hidden)]
 pub mod sequence_obu;
+/// r460 — the still-picture entry point (AVIF / HEIF `av01` items).
+pub mod still;
 
 pub(crate) mod film_grain_elect;
 
@@ -474,6 +476,10 @@ pub use scalable_gop::{
 };
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
+pub use still::{
+    elect_seq_level_idx, encode_still_yuv, encode_still_yuv420, quality_to_base_q_idx,
+    EncodedStill, StillOptions, StillSpeed, DEFAULT_STILL_BASE_Q_IDX, SEQ_LEVEL_IDX_MAX_PARAMETERS,
+};
 #[doc(hidden)]
 pub use symbol_writer::SymbolWriter;
 #[doc(hidden)]

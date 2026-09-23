@@ -891,6 +891,21 @@ pub(crate) struct KeyExtras<'a> {
     /// coded under the open gate (its own election / plain shape
     /// unchanged otherwise). Inert under `seq_override`.
     pub superres_gate: bool,
+    /// r460 — code the frame as a §6.4.1 STILL PICTURE: the sequence
+    /// header carries `still_picture = 1` +
+    /// `reduced_still_picture_header = 1` (operating point 0 only,
+    /// `seq_level_idx` elected from the picture size per Annex A,
+    /// the inter tool gates closed the way §5.5.1 infers them), and
+    /// the frame header rides the §5.9.2 reduced arm
+    /// (`disable_frame_end_update_cdf = 1` derived). Inert under
+    /// `seq_override`.
+    pub still: bool,
+    /// r460 — `still_picture = 1` under a FULL (non-reduced) sequence
+    /// header. Inert under `seq_override` or when `still` is set.
+    pub still_full_header: bool,
+    /// r460 — signal §5.5.2 `color_range = 1` (full-range samples).
+    /// Inert under `seq_override`.
+    pub full_range: bool,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -1107,6 +1122,9 @@ pub(crate) fn encode_key_frame_yuv_full(
         film_grain: extras.film_grain,
         superres_source: extras.superres_source,
         superres_gate: extras.superres_gate,
+        still: extras.still,
+        still_full_header: extras.still_full_header,
+        full_range: extras.full_range,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -1383,11 +1401,28 @@ fn encode_key_frame_yuv_core(
             // r441 — the §5.9.30 sequence gate (see
             // [`KeyExtras::film_grain`]).
             s.film_grain_params_present = extras.film_grain.is_some();
+            if extras.still {
+                crate::encoder::still::apply_still_picture_shape(&mut s);
+            } else if extras.still_full_header {
+                s.still_picture = true;
+                if let Some(op) = s.operating_points.first_mut() {
+                    op.seq_level_idx = crate::encoder::still::elect_seq_level_idx(
+                        s.max_frame_width_minus_1 + 1,
+                        s.max_frame_height_minus_1 + 1,
+                    );
+                }
+            }
+            s.color_config.color_range = extras.full_range;
             s
         }
     };
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    if seq.reduced_still_picture_header {
+        // §5.9.2: `disable_frame_end_update_cdf` is derived to 1 on
+        // the reduced arm (no bit on the wire).
+        fh.disable_frame_end_update_cdf = true;
+    }
     // r441 — patch the §5.9.8 fields: the wire codes the UPSCALED
     // width (via the sequence maximum) + `coded_denom`; `FrameWidth`
     // / the mi grid stay at the coded (downscaled) extent the builder

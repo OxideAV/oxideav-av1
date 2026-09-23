@@ -82,21 +82,55 @@ pub fn register(ctx: &mut RuntimeContext) {
 /// Decoder factory — the [`CodecInfo::decoder`] callback.
 ///
 /// The AV1 elementary-stream framing is self-describing (the sequence
-/// header OBU arrives in-band), so no per-stream setup is parsed from
-/// [`CodecParameters`] here. `params.codec_id` is threaded through so
-/// [`Decoder::codec_id`] reports the resolved id.
+/// header OBU normally arrives in-band), so a stream needs no setup
+/// from [`CodecParameters`]. r460 — when `params.extradata` carries
+/// the container's codec configuration it is honoured too: either an
+/// `av1C` record ([`crate::codec_config::Av1CodecConfig`] — the AVIF /
+/// HEIF `av01` item property or the ISOBMFF `av01` sample-entry box
+/// payload, whose `configOBUs` tail may hold a Sequence Header OBU) or
+/// a bare OBU sequence (a Sequence Header OBU, optionally preceded by
+/// a temporal delimiter). Those OBUs are fed to the session before the
+/// first packet, so an item / sample whose payload omits the sequence
+/// header still decodes; a payload that repeats it (the av1-avif §2.1
+/// "exactly one Sequence Header OBU" shape) simply re-caches it.
+/// `params.codec_id` is threaded through so [`Decoder::codec_id`]
+/// reports the resolved id.
 ///
 /// ## Errors
 ///
-/// Never fails at construction time — an unconfigured / empty stream is
+/// Construction fails only when the extradata's configuration OBUs
+/// are malformed (`Error::invalid`); an empty / unconfigured stream is
 /// represented by an idle decoder that returns `NeedMore` until fed.
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
+    let mut session = SpecDecodeSession::new();
+    let config_obus = codec_config_obus(&params.extradata);
+    if !config_obus.is_empty() {
+        session
+            .decode_temporal_unit(config_obus)
+            .map_err(|e| CoreError::invalid(format!("oxideav-av1: extradata: {e}")))?;
+    }
     Ok(Box::new(Av1Decoder {
         codec_id: params.codec_id.clone(),
-        session: SpecDecodeSession::new(),
+        session,
         queue: std::collections::VecDeque::new(),
         eof: false,
     }))
+}
+
+/// The configuration OBUs an extradata blob carries: the `configOBUs`
+/// tail of an `av1C` record, or the blob itself when it is a bare OBU
+/// sequence starting with a Sequence Header / temporal delimiter OBU
+/// (§5.3.1: forbidden bit clear, `obu_type` 1 or 2). Anything else
+/// yields an empty slice (ignored).
+fn codec_config_obus(extradata: &[u8]) -> &[u8] {
+    if let Some(cfg) = crate::codec_config::Av1CodecConfig::parse(extradata) {
+        let n = cfg.config_obus.len();
+        return &extradata[extradata.len() - n..];
+    }
+    match extradata.first() {
+        Some(&b) if b & 0x80 == 0 && matches!((b >> 3) & 0xF, 1 | 2) => extradata,
+        _ => &[],
+    }
 }
 
 /// Packet-to-frame wrapper driving [`SpecDecodeSession`].
@@ -231,6 +265,70 @@ mod tests {
             ctx.codecs.has_decoder(&codec_id),
             "codec registration should install a decoder factory"
         );
+    }
+
+    /// r460 — an `av1C` extradata whose `configOBUs` carry the
+    /// sequence header lets an item payload that omits it decode; the
+    /// same payload without the extradata is refused (no sequence
+    /// header), and a payload that repeats the header decodes to the
+    /// same pixels.
+    #[test]
+    fn av1c_extradata_config_obus_seed_the_sequence_header() {
+        use crate::encoder::{encode_still_yuv420, StillOptions, Yuv420Frame};
+        use crate::obu::{ObuIter, ObuType};
+        let mut frame = Yuv420Frame::filled(32, 16, 60);
+        for (i, s) in frame.y.iter_mut().enumerate() {
+            *s = (i * 7 % 200) as u8 + 20;
+        }
+        let still = encode_still_yuv420(&frame, &StillOptions::new(90)).expect("encodes");
+        // Split the temporal unit into its sequence header OBU and a
+        // header-less payload (temporal delimiter + frame OBU).
+        let mut seq_obu = Vec::new();
+        let mut frame_obus = Vec::new();
+        for desc in ObuIter::new(&still.temporal_unit_bytes) {
+            let desc = desc.expect("well-formed OBU");
+            let obu = crate::encoder::obu::ObuFrame::new(desc.obu_type, desc.payload.to_vec());
+            if desc.obu_type == ObuType::SequenceHeader {
+                seq_obu.push(obu);
+            } else {
+                frame_obus.push(obu);
+            }
+        }
+        let config_obus = crate::encoder::obu::write_temporal_unit(&seq_obu);
+        let payload = crate::encoder::obu::write_temporal_unit(&frame_obus);
+        let mut av1c = still.codec_config.clone();
+        av1c.config_obus = config_obus.clone();
+
+        let decode_with = |extradata: Vec<u8>, packet: &[u8]| -> CoreResult<Vec<Vec<u8>>> {
+            let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            params.extradata = extradata;
+            let mut dec = make_decoder(&params)?;
+            dec.send_packet(&Packet::new(
+                0,
+                oxideav_core::TimeBase::new(1, 1),
+                packet.to_vec(),
+            ))?;
+            match dec.receive_frame()? {
+                CoreFrame::Video(v) => Ok(v.planes.into_iter().map(|p| p.data).collect()),
+                other => panic!("expected a video frame, got {other:?}"),
+            }
+        };
+        let expected = decode_with(Vec::new(), &still.temporal_unit_bytes).expect("in-band");
+        assert!(
+            decode_with(Vec::new(), &payload).is_err(),
+            "a header-less payload must be refused without extradata"
+        );
+        let via_av1c = decode_with(av1c.to_bytes(), &payload).expect("av1C configOBUs");
+        assert_eq!(via_av1c, expected);
+        let via_raw = decode_with(config_obus, &payload).expect("bare OBU extradata");
+        assert_eq!(via_raw, expected);
+        let repeated = decode_with(av1c.to_bytes(), &still.temporal_unit_bytes)
+            .expect("repeated sequence header");
+        assert_eq!(repeated, expected);
+        // A record without configOBUs is accepted and ignored.
+        let bare = decode_with(still.codec_config.to_bytes(), &still.temporal_unit_bytes)
+            .expect("bare av1C");
+        assert_eq!(bare, expected);
     }
 
     #[test]

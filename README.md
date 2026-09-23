@@ -1783,11 +1783,55 @@ corpus stands at 150.
   `allow_intrabc` only when `UpscaledWidth == FrameWidth`), so the
   composition never appears on either side of the crate.
 - Conformance-grade encoding lives on
+  `encoder::encode_still_yuv{420,}` /
   `encoder::encode_key_frame_yuv{420,}{,_with_q}` /
   `encoder::encode_gop_yuv{420,}{,_with_q,...}` /
   `encoder::encode_pyramid_gop_yuv{420,}_with_q` /
   `encoder::encode_adaptive_gop_yuv{420,}_with_q` — every §6.4.1
   (bit depth, chroma format) pairing.
+
+### Still pictures — AVIF / HEIF `av01` items (r460)
+
+`encoder::encode_still_yuv(&YuvFrame, &StillOptions)` (8-bit 4:2:0
+sibling `encode_still_yuv420`) codes one intra frame under a §6.4.1
+`still_picture = 1` + `reduced_still_picture_header = 1` sequence
+header — the shape every AVIF / HEIF image item carries (av1-avif
+§2.1) and the one every third-party AVIF producer measured this round
+emits — at every §6.4.1 (bit depth, chroma format) pairing including
+monochrome (an alpha auxiliary item). `StillOptions`: `base_q_idx`
+(0 = lossless; `StillOptions::from_quality(0..=100)` maps a quality
+dial onto it, `DEFAULT_STILL_BASE_Q_IDX = 120`), `tile_cols_log2` /
+`tile_rows_log2`, `speed` (`Fast` skips the frame-level QM / delta-q
+elections, `Balanced` runs them, `Thorough` adds the §5.9.8 superres
+election), `full_range` (§5.5.2 `color_range`) and `reduced_header`
+(`false` codes `still_picture = 1` under a full header). Every field
+§5.5.1 / §5.9.2 infers on the reduced arm is set to its inferred
+value (`OrderHintBits = 0`, the inter tool gates closed,
+`disable_frame_end_update_cdf = 1`, `refresh_frame_flags =
+allFrames`), and operating point 0 carries the Annex A level elected
+from the picture size (`elect_seq_level_idx`: the smallest level
+whose `MaxPicSize` / `MaxHSize` / `MaxVSize` admit the frame — 3.0
+for 640×480, 4.0 for 1080p, 5.0 for 4K, 6.0 for a 12 MP still; `31`
+beyond 6.3). `EncodedStill` carries the bare temporal unit (the AV1
+Image Item Data), the IVF wrapper, the reconstruction planes, the
+header descriptors and `codec_config: Av1CodecConfig` — the `av1C`
+record fields (`seq_profile`, `seq_level_idx`, `seq_tier`,
+`high_bitdepth`, `twelve_bit`, `monochrome`,
+`chroma_subsampling_x/y`, `chroma_sample_position`,
+`initial_presentation_delay`, `config_obus`) with
+`from_sequence_header` / `to_bytes` / `parse` /
+`matches_sequence_header`, so a container writer fills its property
+without touching the bitstream (this crate writes no ISOBMFF boxes).
+Decoded output equals the reconstruction planes sample for sample on
+every pairing; lossless stills reproduce the input.
+
+The framework decoder honours codec configuration in
+`CodecParameters::extradata`: an `av1C` record whose `configOBUs`
+carry a Sequence Header OBU, or a bare OBU sequence, is fed to the
+session before the first packet, so an `av01` item / sample whose
+payload omits the sequence header still decodes (a payload that
+repeats it simply re-caches it). Item payloads with or without a
+leading temporal delimiter decode alike.
 
 ## Module layout
 

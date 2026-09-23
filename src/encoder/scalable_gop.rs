@@ -911,6 +911,9 @@ fn encode_spatial_layered_core(
             film_grain: None,
             superres_source: sr_pair.is_some().then(|| &layer[0]),
             superres_gate: false,
+            still: false,
+            still_full_header: false,
+            full_range: false,
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             opener_input,
