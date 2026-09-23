@@ -48,11 +48,16 @@
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Error as CoreError, Frame as CoreFrame, Packet, Result as CoreResult, RuntimeContext,
-    VideoFrame, VideoPlane,
+    Encoder, Error as CoreError, Frame as CoreFrame, Packet, PixelFormat, Result as CoreResult,
+    RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
+use crate::codec_config::Av1CodecConfig;
 use crate::decoder::{SpecDecodeSession, SpecFrame};
+use crate::encoder::{
+    encode_key_frame_yuv_with_q, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
+    StillOptions, StillSpeed, YuvFrame, DEFAULT_STILL_BASE_Q_IDX,
+};
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates to [`register`].
@@ -64,11 +69,14 @@ pub const CODEC_ID_STR: &str = "av1";
 /// claims the three container identifiers (ISOBMFF `av01` / IVF `AV01`
 /// FourCC, Matroska `V_AV1`).
 pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("av1_sw").with_decode();
+    let caps = CodecCapabilities::video("av1_sw")
+        .with_decode()
+        .with_encode();
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(make_encoder)
             .tags([CodecTag::fourcc(b"AV01"), CodecTag::matroska("V_AV1")]),
     );
 }
@@ -251,10 +259,530 @@ fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame 
     VideoFrame { pts, planes }
 }
 
+// ───────────────────────── Encoder ─────────────────────────
+
+/// The `CodecOptions` schema of the framework encoder (r460) — the
+/// string-bag twin of [`StillOptions`].
+///
+/// | key              | kind                              | default                      |
+/// |------------------|-----------------------------------|------------------------------|
+/// | `still`          | `true` / `false`                  | `false`                      |
+/// | `q`              | `base_q_idx` 0..=255 (0 lossless) | `DEFAULT_STILL_BASE_Q_IDX`   |
+/// | `quality`        | 0..=100 (100 lossless); overrides `q` | —                        |
+/// | `lossless`       | `true` forces `base_q_idx = 0`    | `false`                      |
+/// | `speed`          | `fast` / `balanced` / `thorough`  | `balanced`                   |
+/// | `tile_cols_log2` | §5.9.15 `TileColsLog2`            | `0`                          |
+/// | `tile_rows_log2` | §5.9.15 `TileRowsLog2`            | `0`                          |
+/// | `full_range`     | `true` / `false` (§5.5.2 `color_range`) | from the pixel format (`YuvJ*` full) |
+///
+/// `still = true` codes every frame as an independent still picture
+/// (`still_picture = 1` + `reduced_still_picture_header = 1`, one
+/// temporal unit per packet — the AVIF / HEIF `av01` item payload);
+/// `still = false` codes every frame as a KEY frame under a full
+/// sequence header repeated per temporal unit (an all-intra AV1
+/// video every packet of which is a sync sample).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Av1EncoderOptions {
+    /// See the schema table.
+    pub still: bool,
+    /// The resolved `base_q_idx`.
+    pub base_q_idx: u8,
+    /// Search effort.
+    pub speed: StillSpeed,
+    /// §5.9.15 `TileColsLog2`.
+    pub tile_cols_log2: u32,
+    /// §5.9.15 `TileRowsLog2`.
+    pub tile_rows_log2: u32,
+    /// §5.5.2 `color_range`.
+    pub full_range: bool,
+}
+
+impl Av1EncoderOptions {
+    /// Parse the option bag (see the schema table). `full_range`
+    /// defaults from `pixel_format` (`YuvJ*` = full range).
+    ///
+    /// ## Errors
+    ///
+    /// `Error::invalid` on an unparsable value or unknown key.
+    pub fn from_params(params: &CodecParameters) -> CoreResult<Self> {
+        let mut o = Self {
+            still: false,
+            base_q_idx: DEFAULT_STILL_BASE_Q_IDX,
+            speed: StillSpeed::Balanced,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+            full_range: matches!(
+                params.pixel_format,
+                Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
+            ),
+        };
+        let bad = |k: &str, v: &str| CoreError::invalid(format!("oxideav-av1: option {k}={v:?}"));
+        let parse_bool = |k: &str, v: &str| -> CoreResult<bool> {
+            match v {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" => Ok(false),
+                _ => Err(bad(k, v)),
+            }
+        };
+        let mut quality: Option<u8> = None;
+        let mut lossless = false;
+        for (k, v) in params.options.iter() {
+            match k {
+                "still" => o.still = parse_bool(k, v)?,
+                "q" | "base_q_idx" => o.base_q_idx = v.parse().map_err(|_| bad(k, v))?,
+                "quality" => {
+                    let q: u8 = v.parse().map_err(|_| bad(k, v))?;
+                    if q > 100 {
+                        return Err(bad(k, v));
+                    }
+                    quality = Some(q);
+                }
+                "lossless" => lossless = parse_bool(k, v)?,
+                "speed" => {
+                    o.speed = match v {
+                        "fast" => StillSpeed::Fast,
+                        "balanced" => StillSpeed::Balanced,
+                        "thorough" => StillSpeed::Thorough,
+                        _ => return Err(bad(k, v)),
+                    }
+                }
+                "tile_cols_log2" => o.tile_cols_log2 = v.parse().map_err(|_| bad(k, v))?,
+                "tile_rows_log2" => o.tile_rows_log2 = v.parse().map_err(|_| bad(k, v))?,
+                "full_range" => o.full_range = parse_bool(k, v)?,
+                _ => {
+                    return Err(CoreError::invalid(format!(
+                        "oxideav-av1: unknown option {k:?}"
+                    )))
+                }
+            }
+        }
+        if let Some(q) = quality {
+            o.base_q_idx = quality_to_base_q_idx(q);
+        }
+        if lossless {
+            o.base_q_idx = 0;
+        }
+        Ok(o)
+    }
+
+    fn still_options(&self) -> StillOptions {
+        StillOptions {
+            base_q_idx: self.base_q_idx,
+            tile_cols_log2: self.tile_cols_log2,
+            tile_rows_log2: self.tile_rows_log2,
+            speed: self.speed,
+            full_range: self.full_range,
+            reduced_header: true,
+        }
+    }
+}
+
+/// Map a framework pixel format onto the encoder's `(bit depth,
+/// chroma format)` pairing.
+fn pixel_format_layout(pf: PixelFormat) -> Option<(u8, ChromaFormat)> {
+    Some(match pf {
+        PixelFormat::Yuv420P | PixelFormat::YuvJ420P => (8, ChromaFormat::Yuv420),
+        PixelFormat::Yuv422P | PixelFormat::YuvJ422P => (8, ChromaFormat::Yuv422),
+        PixelFormat::Yuv444P | PixelFormat::YuvJ444P => (8, ChromaFormat::Yuv444),
+        PixelFormat::Gray8 => (8, ChromaFormat::Monochrome),
+        PixelFormat::Yuv420P10Le => (10, ChromaFormat::Yuv420),
+        PixelFormat::Yuv422P10Le => (10, ChromaFormat::Yuv422),
+        PixelFormat::Yuv444P10Le => (10, ChromaFormat::Yuv444),
+        PixelFormat::Gray10Le => (10, ChromaFormat::Monochrome),
+        PixelFormat::Yuv420P12Le => (12, ChromaFormat::Yuv420),
+        PixelFormat::Yuv422P12Le => (12, ChromaFormat::Yuv422),
+        PixelFormat::Yuv444P12Le => (12, ChromaFormat::Yuv444),
+        PixelFormat::Gray12Le => (12, ChromaFormat::Monochrome),
+        _ => return None,
+    })
+}
+
+/// Encoder factory — the [`CodecInfo::encoder`] callback (r460).
+///
+/// Needs `width`, `height` and a planar YUV / gray `pixel_format`
+/// (8-bit 4:2:0 / 4:2:2 / 4:4:4 / gray, the `YuvJ*` full-range
+/// variants, and the 10 / 12-bit little-endian siblings incl.
+/// `Gray10Le` / `Gray12Le`). Options per [`Av1EncoderOptions`].
+/// [`Encoder::output_params`] carries the `av1C` record bytes in
+/// `extradata` (no `configOBUs` — av1-avif §2.2.1), so a container
+/// writer fills its codec-configuration property directly.
+///
+/// ## Errors
+///
+/// `Error::invalid` on missing / unsupported geometry or format and on
+/// bad options.
+pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+    let width = params
+        .width
+        .ok_or_else(|| CoreError::invalid("oxideav-av1: encoder needs width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| CoreError::invalid("oxideav-av1: encoder needs height"))?;
+    let pf = params
+        .pixel_format
+        .ok_or_else(|| CoreError::invalid("oxideav-av1: encoder needs pixel_format"))?;
+    let (bit_depth, format) = pixel_format_layout(pf).ok_or_else(|| {
+        CoreError::invalid(format!("oxideav-av1: unsupported pixel format {pf:?}"))
+    })?;
+    let opts = Av1EncoderOptions::from_params(params)?;
+    // Probe the geometry the same way the encoder will (the r410 shape
+    // rules) so a bad size fails at construction, not at the first
+    // frame.
+    YuvFrame::filled(width, height, bit_depth, format, 0)
+        .validate()
+        .map_err(|e| CoreError::invalid(format!("oxideav-av1: unsupported geometry: {e}")))?;
+    // The av1C fields follow from the pairing + size alone (the tool
+    // gates the encoder opens do not appear in the record).
+    let mut seq = crate::encoder::build_intra_only_seq_yuv(width, height, bit_depth, format)
+        .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+    if opts.still {
+        crate::encoder::still::apply_still_picture_shape(&mut seq);
+    }
+    seq.color_config.color_range = opts.full_range;
+    let mut out = params.clone();
+    out.codec_id = CodecId::new(CODEC_ID_STR);
+    out.extradata = Av1CodecConfig::from_sequence_header(&seq).to_bytes();
+    let time_base = match params.frame_rate {
+        Some(r) if r.num > 0 && r.den > 0 => TimeBase::new(r.den, r.num),
+        _ => TimeBase::new(1, 25),
+    };
+    Ok(Box::new(Av1Encoder {
+        codec_id: CodecId::new(CODEC_ID_STR),
+        params: out,
+        opts,
+        width,
+        height,
+        bit_depth,
+        format,
+        time_base,
+        next_pts: 0,
+        queue: std::collections::VecDeque::new(),
+        eof: false,
+    }))
+}
+
+/// Frame-to-packet wrapper around [`encode_still_yuv`] /
+/// [`encode_key_frame_yuv_with_q`].
+struct Av1Encoder {
+    codec_id: CodecId,
+    params: CodecParameters,
+    opts: Av1EncoderOptions,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    format: ChromaFormat,
+    time_base: TimeBase,
+    next_pts: i64,
+    queue: std::collections::VecDeque<Packet>,
+    eof: bool,
+}
+
+impl std::fmt::Debug for Av1Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Av1Encoder")
+            .field("opts", &self.opts)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bit_depth", &self.bit_depth)
+            .field("format", &self.format)
+            .field("queued", &self.queue.len())
+            .finish()
+    }
+}
+
+impl Av1Encoder {
+    /// Lift a framework frame's planes into the encoder's `u16`
+    /// representation (little-endian pairs at 10 / 12 bit).
+    fn to_yuv(&self, frame: &VideoFrame) -> CoreResult<YuvFrame> {
+        let planes = frame.image_planes();
+        let need = usize::from(self.format.num_planes());
+        if planes.len() < need {
+            return Err(CoreError::invalid(format!(
+                "oxideav-av1: frame carries {} planes, format needs {need}",
+                planes.len()
+            )));
+        }
+        let bps: usize = if self.bit_depth > 8 { 2 } else { 1 };
+        let lift = |p: &VideoPlane, w: usize, h: usize| -> CoreResult<Vec<u16>> {
+            let row_bytes = w * bps;
+            if p.stride < row_bytes || p.data.len() < p.stride * (h - 1) + row_bytes {
+                return Err(CoreError::invalid(
+                    "oxideav-av1: frame plane shorter than the declared geometry",
+                ));
+            }
+            let mut out = Vec::with_capacity(w * h);
+            for y in 0..h {
+                let row = &p.data[y * p.stride..y * p.stride + row_bytes];
+                if bps == 1 {
+                    out.extend(row.iter().map(|&b| u16::from(b)));
+                } else {
+                    out.extend(
+                        row.chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]])),
+                    );
+                }
+            }
+            Ok(out)
+        };
+        let (w, h) = (self.width as usize, self.height as usize);
+        let probe = YuvFrame::filled(self.width, self.height, self.bit_depth, self.format, 0);
+        let (cw, ch) = (
+            probe.chroma_width() as usize,
+            probe.chroma_height() as usize,
+        );
+        let y = lift(&planes[0], w, h)?;
+        let (u, v) = if need > 1 {
+            (lift(&planes[1], cw, ch)?, lift(&planes[2], cw, ch)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(YuvFrame {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            format: self.format,
+            y,
+            u,
+            v,
+        })
+    }
+}
+
+impl Encoder for Av1Encoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_frame(&mut self, frame: &CoreFrame) -> CoreResult<()> {
+        let CoreFrame::Video(vf) = frame else {
+            return Err(CoreError::invalid(
+                "oxideav-av1: encoder takes video frames",
+            ));
+        };
+        let input = self.to_yuv(vf)?;
+        let tu = if self.opts.still {
+            encode_still_yuv(&input, &self.opts.still_options())
+                .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?
+                .temporal_unit_bytes
+        } else {
+            // TODO(r460 followup): the all-intra arm ignores tiles /
+            // speed / full_range — it rides the historical KEY entry.
+            encode_key_frame_yuv_with_q(&input, self.opts.base_q_idx)
+                .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?
+                .temporal_unit_bytes
+        };
+        let pts = vf.pts.unwrap_or(self.next_pts);
+        self.next_pts = pts + 1;
+        self.queue.push_back(
+            Packet::new(0, self.time_base, tu)
+                .with_pts(pts)
+                .with_dts(pts)
+                .with_duration(1)
+                .with_keyframe(true),
+        );
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> CoreResult<Packet> {
+        match self.queue.pop_front() {
+            Some(p) => Ok(p),
+            None if self.eof => Err(CoreError::Eof),
+            None => Err(CoreError::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxideav_core::ProbeContext;
+
+    fn textured_frame(width: u32, height: u32, pf: PixelFormat) -> (VideoFrame, YuvFrame) {
+        let (bd, fmt) = pixel_format_layout(pf).expect("supported");
+        let mut yuv = YuvFrame::filled(width, height, bd, fmt, 0);
+        let max = (1u32 << bd) - 1;
+        for (i, s) in yuv.y.iter_mut().enumerate() {
+            *s = ((i as u32 * 37 + (i as u32 / width) * 91) % max) as u16;
+        }
+        for (i, s) in yuv.u.iter_mut().enumerate() {
+            *s = ((i as u32 * 13) % max) as u16;
+        }
+        for (i, s) in yuv.v.iter_mut().enumerate() {
+            *s = ((i as u32 * 29 + 5) % max) as u16;
+        }
+        let pack = |p: &[u16], w: usize| -> VideoPlane {
+            let mut data = Vec::new();
+            for &s in p {
+                if bd > 8 {
+                    data.extend_from_slice(&s.to_le_bytes());
+                } else {
+                    data.push(s as u8);
+                }
+            }
+            VideoPlane {
+                stride: w * if bd > 8 { 2 } else { 1 },
+                data,
+            }
+        };
+        let mut planes = vec![pack(&yuv.y, width as usize)];
+        if fmt != ChromaFormat::Monochrome {
+            planes.push(pack(&yuv.u, yuv.chroma_width() as usize));
+            planes.push(pack(&yuv.v, yuv.chroma_width() as usize));
+        }
+        (
+            VideoFrame {
+                pts: Some(7),
+                planes,
+            },
+            yuv,
+        )
+    }
+
+    fn video_params(width: u32, height: u32, pf: PixelFormat) -> CodecParameters {
+        let mut p = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        p.width = Some(width);
+        p.height = Some(height);
+        p.pixel_format = Some(pf);
+        p
+    }
+
+    /// r460 — the framework encoder's still arm produces a
+    /// reduced-header still per frame whose `av1C` extradata matches
+    /// the in-band sequence header, and the framework decoder (fed
+    /// that extradata + the packet) reproduces the direct-API
+    /// reconstruction.
+    #[test]
+    fn framework_still_encode_round_trips_through_the_framework_decoder() {
+        for (pf, opts) in [
+            (PixelFormat::Yuv420P, [("still", "true"), ("quality", "60")]),
+            (PixelFormat::Gray10Le, [("still", "true"), ("q", "80")]),
+            (
+                PixelFormat::YuvJ444P,
+                [("still", "true"), ("lossless", "true")],
+            ),
+        ] {
+            let mut params = video_params(32, 24, pf);
+            for (k, v) in opts {
+                params.options.insert(k, v);
+            }
+            let mut enc = make_encoder(&params).expect("encoder constructs");
+            let (frame, yuv) = textured_frame(32, 24, pf);
+            enc.send_frame(&CoreFrame::Video(frame))
+                .expect("frame accepted");
+            let pkt = enc.receive_packet().expect("one packet");
+            assert!(pkt.flags.keyframe && pkt.pts == Some(7));
+            assert!(matches!(enc.receive_packet(), Err(CoreError::NeedMore)));
+            enc.flush().unwrap();
+            assert!(matches!(enc.receive_packet(), Err(CoreError::Eof)));
+
+            let extradata = enc.output_params().extradata.clone();
+            let cfg = Av1CodecConfig::parse(&extradata).expect("av1C extradata");
+            let seq = crate::sequence_header::parse_sequence_header(
+                crate::obu::ObuIter::new(&pkt.data)
+                    .filter_map(Result::ok)
+                    .find(|d| d.obu_type == crate::obu::ObuType::SequenceHeader)
+                    .expect("in-band sequence header")
+                    .payload,
+            )
+            .expect("parses");
+            assert!(seq.still_picture && seq.reduced_still_picture_header);
+            assert!(cfg.matches_sequence_header(&seq), "{pf:?}: av1C mismatch");
+            assert_eq!(seq.color_config.color_range, pf == PixelFormat::YuvJ444P);
+
+            let opts = Av1EncoderOptions::from_params(&params).unwrap();
+            let direct = encode_still_yuv(&yuv, &opts.still_options()).expect("direct still");
+            assert_eq!(
+                direct.temporal_unit_bytes, pkt.data,
+                "{pf:?}: framework != direct"
+            );
+
+            let mut dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            dparams.extradata = extradata;
+            let mut dec = make_decoder(&dparams).expect("decoder");
+            dec.send_packet(&pkt).expect("decodes");
+            let CoreFrame::Video(out) = dec.receive_frame().expect("frame") else {
+                panic!("video frame expected");
+            };
+            let widen = |p: &[u8]| -> Vec<u16> {
+                if cfg.bit_depth() > 8 {
+                    p.chunks(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect()
+                } else {
+                    p.iter().map(|&b| u16::from(b)).collect()
+                }
+            };
+            assert_eq!(widen(&out.planes[0].data), direct.recon_y);
+            if opts.base_q_idx == 0 {
+                assert_eq!(direct.recon_y, yuv.y, "{pf:?}: lossless luma");
+            }
+        }
+    }
+
+    /// r460 — the all-intra (video) arm emits KEY frames under a full
+    /// sequence header, one packet per frame with running timestamps.
+    #[test]
+    fn framework_all_intra_encode_emits_one_key_packet_per_frame() {
+        let mut params = video_params(16, 16, PixelFormat::Yuv420P);
+        params.options.insert("q", "200");
+        params.options.insert("speed", "fast");
+        let mut enc = make_encoder(&params).expect("encoder constructs");
+        assert_eq!(enc.output_params().extradata, vec![0x81, 0x00, 0x0c, 0x00]);
+        for i in 0..2 {
+            let (mut frame, _) = textured_frame(16, 16, PixelFormat::Yuv420P);
+            frame.pts = None;
+            enc.send_frame(&CoreFrame::Video(frame)).expect("frame");
+            let pkt = enc.receive_packet().expect("packet");
+            assert_eq!(pkt.pts, Some(i));
+            let frames = crate::decoder::decode_av1_spec(&{
+                let mut buf = Vec::new();
+                let cur = std::io::Cursor::new(&mut buf);
+                let mut w = crate::encoder::IvfWriter::new(
+                    cur,
+                    crate::encoder::ivf::FOURCC_AV01,
+                    16,
+                    16,
+                    25,
+                    1,
+                )
+                .unwrap();
+                w.write_frame(&pkt.data, 0).unwrap();
+                w.patch_frame_count().unwrap();
+                buf
+            })
+            .expect("decodes");
+            assert_eq!(frames.len(), 1);
+        }
+    }
+
+    #[test]
+    fn encoder_options_and_geometry_are_validated() {
+        let mut params = video_params(16, 16, PixelFormat::Yuv420P);
+        params.options.insert("speed", "warp");
+        assert!(make_encoder(&params).is_err());
+        let mut params = video_params(16, 16, PixelFormat::Yuv420P);
+        params.options.insert("bogus", "1");
+        assert!(make_encoder(&params).is_err());
+        let params = video_params(16, 16, PixelFormat::Rgb24);
+        assert!(make_encoder(&params).is_err());
+        let mut params = video_params(16, 16, PixelFormat::Yuv420P);
+        params.options.insert("quality", "100");
+        let o = Av1EncoderOptions::from_params(&params).unwrap();
+        assert_eq!(o.base_q_idx, 0);
+        params.options.insert("full_range", "true");
+        params.options.insert("tile_cols_log2", "1");
+        let o = Av1EncoderOptions::from_params(&params).unwrap();
+        assert!(o.full_range && o.tile_cols_log2 == 1);
+    }
 
     #[test]
     fn register_via_runtime_context_installs_decoder() {

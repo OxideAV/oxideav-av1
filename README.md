@@ -1825,6 +1825,22 @@ without touching the bitstream (this crate writes no ISOBMFF boxes).
 Decoded output equals the reconstruction planes sample for sample on
 every pairing; lossless stills reproduce the input.
 
+The framework `Encoder` (`registry::make_encoder`, registered with
+`CodecCapabilities::with_encode`) takes planar YUV / gray frames at
+every pairing (`Yuv420P` / `Yuv422P` / `Yuv444P`, the `YuvJ*`
+full-range variants, `Gray8`, and the `*P10Le` / `*P12Le` /
+`Gray10Le` / `Gray12Le` siblings) and emits one temporal unit per
+packet (`keyframe` set, running pts). `CodecOptions` keys
+(`registry::Av1EncoderOptions`): `still` (`true` = reduced-header
+still per frame — the `av01` item payload; default `false` = KEY
+frames under a full sequence header, an all-intra video), `q` /
+`base_q_idx` (0..=255, default 120), `quality` (0..=100, overrides
+`q`), `lossless`, `speed` (`fast` / `balanced` / `thorough`),
+`tile_cols_log2` / `tile_rows_log2`, `full_range` (default from the
+pixel format). `output_params().extradata` carries the `av1C` record
+bytes (no `configOBUs`), so a container writer fills its
+codec-configuration property directly.
+
 The framework decoder honours codec configuration in
 `CodecParameters::extradata`: an `av1C` record whose `configOBUs`
 carry a Sequence Header OBU, or a bare OBU sequence, is fed to the
