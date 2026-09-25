@@ -1861,6 +1861,18 @@ pixel format), `color_primaries` / `transfer_characteristics` /
 bytes (no `configOBUs`), so a container writer fills its
 codec-configuration property directly.
 
+**Decode interop** (r460): 114 stills from four real-world producers
+(a libheif-driven encoder via `heif-enc` and ImageMagick, an SVT-AV1
+encoder through a black-box AVIF muxer, `aomenc --allintra`) across
+1×1 .. 12 MP extents, 8/10/12-bit, 4:2:0 / 4:2:2 / 4:4:4 / monochrome,
+alpha auxiliaries, lossless, several qualities, superres / film-grain
+/ palette / intra-bc / QM / delta-q / tile / 128-superblock toggles
+and both `reduced_still_picture_header` shapes decode byte-identical
+to an independent reference decoder with no decoder change; 25 of
+them are pinned in `tests/still_interop_conformance.rs` (with the
+producers' `av1C` records checked against the in-band sequence
+header and fed to the framework decoder as extradata).
+
 The framework decoder honours codec configuration in
 `CodecParameters::extradata`: an `av1C` record whose `configOBUs`
 carry a Sequence Header OBU, or a bare OBU sequence, is fed to the

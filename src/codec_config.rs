@@ -139,12 +139,23 @@ impl Av1CodecConfig {
     /// Whether the record's fields match `seq` (the av1-avif §2.2.1
     /// "shall match the Sequence Header OBU in the AV1 Image Item
     /// Data" check).
+    ///
+    /// `chroma_sample_position` is compared only when the header codes
+    /// it (4:2:0 — §5.5.2 reads the field under `subsampling_x &&
+    /// subsampling_y`); for 4:2:2 / 4:4:4 items third-party producers
+    /// write `2` (`CSP_COLOCATED`) into the record while the header
+    /// carries no position at all, so the field is ignored there.
     #[must_use]
     pub fn matches_sequence_header(&self, seq: &SequenceHeader) -> bool {
         let mut mine = self.clone();
         mine.config_obus.clear();
         mine.initial_presentation_delay_minus_one = None;
-        mine == Self::from_sequence_header(seq)
+        let mut theirs = Self::from_sequence_header(seq);
+        if !(theirs.chroma_subsampling_x && theirs.chroma_subsampling_y) {
+            mine.chroma_sample_position = 0;
+            theirs.chroma_sample_position = 0;
+        }
+        mine == theirs
     }
 }
 
@@ -186,6 +197,29 @@ mod tests {
         assert!(cfg.config_obus.is_empty());
         assert_eq!(cfg.bit_depth(), 8);
         assert_eq!(cfg.to_bytes(), vec![0x81, 0x00, 0x0c, 0x00]);
+    }
+
+    #[test]
+    fn non_420_records_ignore_the_uncoded_sample_position() {
+        // A 4:4:4 High-profile lossless item from a third-party
+        // producer: `81 20 02 00` — the record says CSP_COLOCATED
+        // although §5.5.2 codes no position for 4:4:4.
+        let cfg = Av1CodecConfig::parse(&[0x81, 0x20, 0x02, 0x00]).expect("valid record");
+        let mut seq =
+            crate::encoder::build_intra_only_seq_yuv(8, 8, 8, crate::encoder::ChromaFormat::Yuv444)
+                .expect("seq");
+        seq.operating_points[0].seq_level_idx = 0;
+        assert!(cfg.matches_sequence_header(&seq));
+        let mut cfg420 = Av1CodecConfig::parse(&[0x81, 0x00, 0x0e, 0x00]).expect("valid record");
+        let seq420 =
+            crate::encoder::build_intra_only_seq_yuv(8, 8, 8, crate::encoder::ChromaFormat::Yuv420)
+                .expect("seq");
+        assert!(
+            !cfg420.matches_sequence_header(&seq420),
+            "4:2:0 compares the position"
+        );
+        cfg420.chroma_sample_position = 0;
+        assert!(cfg420.matches_sequence_header(&seq420));
     }
 
     #[test]
