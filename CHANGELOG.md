@@ -4,6 +4,19 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/OxideAV/oxideav-av1/compare/v0.1.18...v0.1.19) - 2026-09-25
+
+### Other
+
+- r460 still quality + speed — forward-transform gain corrected at every TX size (+70.7% -> +19.8% BD-rate vs the third-party encoder), FLIPADST search remap, speed presets (SearchLimits), §7.14 deblock election, §7.17 unit-size ladder, dead-zone quantiser, CfL least-squares alpha, tile-parallel search, spec-floor tile layouts
+- r460 third-party still-picture interop corpus — 25 AVIF/HEIF/IVF image items from four real-world producers pinned by an independent decoder's SHA-256 with their av1C records; tests + fuzz excluded from the package
+- r460 Yuv420Frame chroma extents round up (odd-extent 8-bit 4:2:0 entries) — the any-extent witness passes on 9x7
+- r460 any picture extent on the KEY / still path — mi-grid padding coded under the true frame_size, rounded-up chroma extents, KEY_FRAME_MAX_DIM 16384, §5.5.2 colour-description signalling
+- r460 framework Encoder — still (reduced-header) or all-intra KEY packets at every §6.4.1 pairing, CodecOptions quality dial, av1C record in output extradata
+- r460 still-picture entry point + av1C codec-configuration fields + extradata-seeded framework decoder — reduced_still_picture_header stills at every §6.4.1 pairing with the KEY encoder's quality dial and Annex A level election
+- r460 block-scoped rate-twin pricing — the search twin trial-writes on one live state and rolls the block scope back instead of deep-cloning the whole-frame syntax mirror per candidate; bit-identical, 640x480 KEY 85 s -> 26 s
+- r456 fix — monochrome references carry empty chroma planes (per-reference extent validation rejected every mono GOP)
+
 - THIRD-PARTY STILL-PICTURE INTEROP CORPUS (r460, `tests/still_interop_conformance.rs`): 25 AV1 image items real-world AVIF / HEIF producers emit — a libheif-driven encoder via `heif-enc` (8/10/12-bit, 4:2:0 / 4:2:2 / 4:4:4, monochrome, an ALPHA auxiliary item, lossless identity-matrix RGB, tiny 2×2 / 16×8, a non-multiple-of-8 256×130, a 1080p multi-tile still), ImageMagick, an SVT-AV1-driven encoder through a black-box AVIF muxer (`still_picture = 0`, no temporal delimiter; screen-content tools) and `aomenc --allintra` (12-bit 4:4:4, superres, film grain, palette / intra-bc, `--full-still-picture-hdr`, 128×128 superblocks, QM, delta-q, 2×4 / 7×3 / 1×1) — each pinned by the SHA-256 of an independent black-box decoder's output (cross-checked against a second decoder), the container-extracted items additionally carrying the producer's `av1C` record, which must match the in-band sequence header (av1-avif §2.2.1) and equal `Av1CodecConfig::from_sequence_header(..).to_bytes()`, and is fed to the framework decoder as extradata for the bare item payload. The full r460 matrix behind the pins — 114 stills across four producers × sizes (1×1 .. 12 MP) × depths × chroma layouts × alpha / lossless / quality / tool toggles × reduced and full still headers — decoded byte-identical with NO decoder change
 
 - `Cargo.toml` `exclude = ["/tests", "/fuzz"]` (r460): the hex-embedded corpora and the fuzz harness stay out of the published crate (the crates.io 10 MiB cap)
