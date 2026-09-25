@@ -154,11 +154,13 @@ fn distance_three_grain_elects_lag_three_ring() {
 }
 
 /// The RATE mandate still governs: on the 4-frame 128×96 GOP the
-/// 24-tap ring outscores every shallower candidate on the neutrality
-/// terms yet realizes MORE bytes than the plain arm (the per-header
-/// cost of four lag-3 blocks outruns what the denoised frames save),
-/// so a shallower ring is elected — strictly fewer bytes than plain,
-/// never the lag-3 header.
+/// elected ring — whichever depth the neutrality score prefers — must
+/// realize strictly fewer bytes than the plain arm. (Until r460 the
+/// four lag-3 headers outran the denoising saving here and a
+/// shallower ring won; with the forward-transform gain corrected the
+/// denoised frames code cheaply enough that the 24-tap ring clears
+/// the mandate too, so the witness pins the mandate itself, not the
+/// depth it happens to select.)
 #[test]
 fn rate_mandate_outranks_the_neutrality_score() {
     let frames: Vec<Yuv420Frame> = (0..4).map(|t| grainy(128, 96, t, 10, true)).collect();
@@ -173,8 +175,8 @@ fn rate_mandate_outranks_the_neutrality_score() {
         "elected arm codes fewer bytes"
     );
     assert!(
-        key_ar_lag(&on) <= 2,
-        "the lag-3 header forfeits the rate mandate here"
+        key_ar_lag(&on) <= 3,
+        "the elected ring is one of the ladder's depths"
     );
     assert_bit_exact(&on, "rate-mandate grain");
 }

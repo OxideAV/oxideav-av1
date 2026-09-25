@@ -3633,6 +3633,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 // §5.9.20: intra-block-copy is intra-frame-only.
                 allow_intrabc: false,
                 qp: arm_params.quant,
+                search: crate::encoder::key_frame::SearchLimits::default(),
                 bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
                 dv_hash: Default::default(),
             });
@@ -4673,39 +4674,75 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let mut lr_elected = false;
     if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
         let price_cdfs = start_cdfs_for(fh.primary_ref_frame);
-        if let Some(plan) =
-            crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
-                input: lr_src,
-                curr_y: pcy,
-                curr_u: pcu,
-                curr_v: pcv,
-                cdef_y: &recon.y,
-                cdef_u: &recon.u,
-                cdef_v: &recon.v,
-                width: lr_w,
-                height,
-                chroma_w: lr_chroma_w,
-                chroma_h,
-                bit_depth,
-                subsampling_x: ssx,
-                subsampling_y: ssy,
-                num_planes,
-                mi_rows,
-                mi_cols,
-                lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
-                price_cdfs: &price_cdfs,
-                disable_cdf_update: fh.disable_cdf_update,
-                // r456 — the §7.17 election at the UPSCALED extent on
-                // the superres inter arm (§5.11.57 window through the
-                // denominator ratio).
-                frame_width: lr_w,
-                frame_height: height,
-                use_superres: cfg.superres.is_some(),
-                superres_denom: cfg
-                    .superres
-                    .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
-            })
-        {
+        let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
+        let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
+            let mut fh_c = fh.clone();
+            fh_c.lr_params = Some(*lrp);
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                &fh_c,
+                seq,
+                prev_gm_for_header.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let off_hdr = lr_header_len(
+            fh.lr_params
+                .as_ref()
+                .expect("lossy inter header carries lr_params"),
+        );
+        // r460 — the §5.9.20 unit-size ladder (64 / 128 / 256-sample
+        // units; see the KEY driver): every rung a complete election
+        // + re-emission, the frame keeping the best exact score
+        // against the unfiltered arm.
+        type LrCand = (
+            crate::encoder::lr_elect::LrPlan,
+            Vec<Vec<u8>>,
+            Vec<u8>,
+            Vec<Box<TileCdfContext>>,
+            PartitionSyntaxWriter,
+            u64,
+        );
+        let mut best_lr: Option<LrCand> = None;
+        let mut off_score: Option<u64> = None;
+        let min_shift: u8 = if seq.use_128x128_superblock { 1 } else { 0 };
+        for unit_shift in min_shift..=2u8 {
+            let Some(plan) =
+                crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
+                    input: lr_src,
+                    curr_y: pcy,
+                    curr_u: pcu,
+                    curr_v: pcv,
+                    cdef_y: &recon.y,
+                    cdef_u: &recon.u,
+                    cdef_v: &recon.v,
+                    width: lr_w,
+                    height,
+                    chroma_w: lr_chroma_w,
+                    chroma_h,
+                    bit_depth,
+                    subsampling_x: ssx,
+                    subsampling_y: ssy,
+                    num_planes,
+                    mi_rows,
+                    mi_cols,
+                    lambda,
+                    price_cdfs: &price_cdfs,
+                    disable_cdf_update: fh.disable_cdf_update,
+                    frame_width: lr_w,
+                    frame_height: height,
+                    sgr_step: 1,
+                    unit_shift,
+                    use_superres: cfg.superres.is_some(),
+                    superres_denom: cfg
+                        .superres
+                        .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
+                })
+            else {
+                continue;
+            };
             let mut re_params = params.clone();
             if let Some(ip) = re_params.inter.as_mut() {
                 ip.segmentation_temporal_update = seg_temporal_elected;
@@ -4718,66 +4755,52 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 &|| start_cdfs_for(elected_ord),
                 Some(&plan),
             );
-            if let Ok((re_payloads, re_cdfs, re_state)) = re_out {
-                let re_body = assemble(&re_payloads)?;
-                let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
-                let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
-                    let mut fh_c = fh.clone();
-                    fh_c.lr_params = Some(*lrp);
-                    let mut bw = crate::encoder::bitwriter::BitWriter::new();
-                    crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
-                        &mut bw,
-                        &fh_c,
-                        seq,
-                        prev_gm_for_header.as_ref(),
-                    );
-                    bw.byte_align();
-                    bw.finish().len()
-                };
-                let off_hdr = lr_header_len(
-                    fh.lr_params
-                        .as_ref()
-                        .expect("lossy inter header carries lr_params"),
-                );
-                let on_score = plan.d * 256
-                    + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
-                let off_score =
-                    plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64);
-                if on_score < off_score {
-                    tile_payloads = re_payloads;
-                    tile_bytes = re_body;
-                    all_cdfs = re_cdfs;
-                    state = re_state;
-                    let applied_d = crate::encoder::lr_elect::apply_lr_plan(
-                        &plan,
-                        lr_src,
-                        pcy,
-                        pcu,
-                        pcv,
-                        &mut recon.y,
-                        &mut recon.u,
-                        &mut recon.v,
-                        lr_w,
-                        height,
-                        lr_chroma_w,
-                        chroma_h,
-                        bit_depth,
-                        ssx,
-                        ssy,
-                        num_planes,
-                        mi_rows,
-                        mi_cols,
-                        lr_w,
-                        height,
-                    );
-                    debug_assert_eq!(
-                        applied_d, plan.d,
-                        "applied §7.17 SSD diverged from the elected plan"
-                    );
-                    fh.lr_params = Some(plan.header);
-                    lr_elected = true;
-                }
+            let Ok((re_payloads, re_cdfs, re_state)) = re_out else {
+                continue;
+            };
+            let re_body = assemble(&re_payloads)?;
+            let on_score = plan.d * 256
+                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
+            let off = *off_score.get_or_insert(
+                plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64),
+            );
+            if on_score < off && best_lr.as_ref().map_or(true, |b| on_score < b.5) {
+                best_lr = Some((plan, re_payloads, re_body, re_cdfs, re_state, on_score));
             }
+        }
+        if let Some((plan, re_payloads, re_body, re_cdfs, re_state, _)) = best_lr {
+            tile_payloads = re_payloads;
+            tile_bytes = re_body;
+            all_cdfs = re_cdfs;
+            state = re_state;
+            let applied_d = crate::encoder::lr_elect::apply_lr_plan(
+                &plan,
+                lr_src,
+                pcy,
+                pcu,
+                pcv,
+                &mut recon.y,
+                &mut recon.u,
+                &mut recon.v,
+                lr_w,
+                height,
+                lr_chroma_w,
+                chroma_h,
+                bit_depth,
+                ssx,
+                ssy,
+                num_planes,
+                mi_rows,
+                mi_cols,
+                lr_w,
+                height,
+            );
+            debug_assert_eq!(
+                applied_d, plan.d,
+                "applied §7.17 SSD diverged from the elected plan"
+            );
+            fh.lr_params = Some(plan.header);
+            lr_elected = true;
         }
     }
 
@@ -9411,6 +9434,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -9533,6 +9557,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -9662,6 +9687,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -9770,6 +9796,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -9885,6 +9912,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -9987,6 +10015,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -10124,6 +10153,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -10248,6 +10278,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -10718,6 +10749,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         }
@@ -12081,6 +12113,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -12204,6 +12237,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -12354,6 +12388,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: crate::encoder::key_frame::SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };

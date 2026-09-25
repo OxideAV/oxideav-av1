@@ -139,6 +139,41 @@ impl TileInfo {
     /// `tile_size_bytes_minus_1` is a fixed-width `f(2)`, so the
     /// header LENGTH is independent of the final value).
     /// `context_update_tile_id` is seeded to `0`.
+    ///
+    /// r460 — the smallest §5.9.15 uniform layout `(TileColsLog2,
+    /// TileRowsLog2)` a `mi_cols × mi_rows` frame admits (the
+    /// `MAX_TILE_WIDTH` / `MAX_TILE_AREA` floors: a 12 MP picture
+    /// cannot be one tile), `None` for an empty frame.
+    #[must_use]
+    pub fn min_uniform_layout(
+        mi_cols: u32,
+        mi_rows: u32,
+        use_128x128_superblock: bool,
+    ) -> Option<(u32, u32)> {
+        if mi_cols == 0 || mi_rows == 0 {
+            return None;
+        }
+        let (sb_cols, sb_rows, sb_shift) = if use_128x128_superblock {
+            ((mi_cols + 31) >> 5, (mi_rows + 31) >> 5, 5u32)
+        } else {
+            ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4, 4u32)
+        };
+        let sb_size = sb_shift + 2;
+        let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
+        let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
+        let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
+        let min_log2_tiles = min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
+        Some((
+            min_log2_tile_cols,
+            min_log2_tiles.saturating_sub(min_log2_tile_cols),
+        ))
+    }
+
+    /// §5.9.15 uniform tile layout for a `(TileColsLog2, TileRowsLog2)`
+    /// pair inside the legal window (see the doc block above);
+    /// `tile_size_bytes` is seeded to `1` and patched once the
+    /// per-tile payload sizes are known, `context_update_tile_id` to
+    /// `0`.
     #[must_use]
     pub fn uniform_layout(
         mi_cols: u32,

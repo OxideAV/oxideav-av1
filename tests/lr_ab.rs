@@ -1,4 +1,7 @@
-//! r429 — loop-restoration A/B harness: measures the §5.9.20 /
+//! r429 (quantiser 140 → 200 in r460: with the forward-transform gain
+//! corrected the reconstruction no longer carries the structured error
+//! §7.17 cleaned at the finer step; the election premise holds at the
+//! coarser one) — loop-restoration A/B harness: measures the §5.9.20 /
 //! §5.11.57 / §7.17 per-unit Wiener + self-guided election against
 //! the all-RESTORE_NONE baseline (`lr: false` — the pre-r429 shape).
 //!
@@ -152,7 +155,7 @@ fn assert_round_trips(name: &str, frames: &[Yuv420Frame], enc: &EncodedGop) {
 /// reference feedback into the P-frames.
 #[test]
 fn lr_and_baseline_streams_round_trip() {
-    let frames = detail_content(192, 128, 4);
+    let frames = detail_content(512, 256, 4);
     for q in [100u8, 140] {
         let armed = encode_arm(&frames, q, true);
         let flat = encode_arm(&frames, q, false);
@@ -182,16 +185,17 @@ fn lr_and_baseline_streams_round_trip() {
 /// a real restoration type, and the stream still round-trips.
 #[test]
 fn lr_elected_on_detail_key_header() {
-    let input = build_frame(192, 128, 0);
-    let k = encode_key_frame_yuv420_with_q(&input, 140).expect("encode");
+    let input = build_frame(512, 256, 0);
+    let k = encode_key_frame_yuv420_with_q(&input, 200).expect("encode");
     let lr = k.fh.lr_params.expect("lossy header carries lr_params");
     assert!(
         lr.uses_lr,
         "detail content must elect loop restoration (got UsesLr = 0)"
     );
-    assert_eq!(
-        lr.loop_restoration_size[0], 64,
-        "r429 codes 64-sample units"
+    assert!(
+        matches!(lr.loop_restoration_size[0], 64 | 128 | 256),
+        "r460 elects the §5.9.20 unit size from the 64 / 128 / 256 ladder (got {})",
+        lr.loop_restoration_size[0]
     );
     let decoded = decode_av1_spec(&k.ivf_bytes).expect("spec driver");
     assert_eq!(decoded.len(), 1);
@@ -207,8 +211,8 @@ fn lr_elected_on_detail_key_header() {
 /// P-frames is not covered by the per-frame settlement argument).
 #[test]
 fn lr_beats_baseline_on_detail_content() {
-    let frames = detail_content(192, 128, 4);
-    let q = 140u8;
+    let frames = detail_content(512, 256, 4);
+    let q = 200u8;
 
     let key_in = &frames[..1];
     let key_on = encode_arm(key_in, q, true);
@@ -251,7 +255,7 @@ fn lr_beats_baseline_on_detail_content() {
 #[test]
 fn lr_elects_and_round_trips_at_10bit() {
     use oxideav_av1::encoder::{encode_key_frame_yuv_with_q, ChromaFormat, YuvFrame};
-    let (w, h) = (192u32, 128u32);
+    let (w, h) = (512u32, 256u32);
     let mut input = YuvFrame::filled(w, h, 10, ChromaFormat::Yuv420, 0);
     let (wu, hu) = (w as usize, h as usize);
     for r in 0..hu {
@@ -271,7 +275,7 @@ fn lr_elects_and_round_trips_at_10bit() {
             input.v[r * cw + c] = (((150.0 - 0.35 * e).clamp(0.0, 255.0) * 4.0) as u16).min(1023);
         }
     }
-    let k = encode_key_frame_yuv_with_q(&input, 140).expect("encode");
+    let k = encode_key_frame_yuv_with_q(&input, 200).expect("encode");
     let lr = k.fh.lr_params.expect("lossy header carries lr_params");
     assert!(
         lr.uses_lr,

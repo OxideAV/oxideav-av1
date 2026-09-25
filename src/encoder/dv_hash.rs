@@ -143,7 +143,7 @@ pub(crate) fn dv_hash_size_idx(size: usize) -> Option<usize> {
 /// The per-frame index. `Default` is the inert empty state (never
 /// matches) — the KEY driver arms it with [`DvHashIndex::build`]
 /// only when the frame-level §5.9.20 gate opens.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct DvHashIndex {
     /// Per-tier `hash → source top-left (y, x)` buckets, insertion in
     /// raster order (earliest first).

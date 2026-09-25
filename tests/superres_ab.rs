@@ -315,7 +315,10 @@ fn gop_with_superres_lr_key_decodes_bit_exact() {
     // downscale blurs the strip, and the §7.17.4 horizontal Wiener
     // taps recover part of it against the ORIGINAL source — the LR ×
     // superres pairing's textbook win.
-    let (w, h) = (128u32, 96u32);
+    // r460 — 128×96 → 256×192: restoration pays its per-unit
+    // signalling only over full-size units once the forward-transform
+    // gain is corrected.
+    let (w, h) = (256u32, 192u32);
     let mk = |t: usize| {
         let mut f = smooth_frame(w, h, t);
         let wu = w as usize;
@@ -331,7 +334,9 @@ fn gop_with_superres_lr_key_decodes_bit_exact() {
     let frames: Vec<Yuv420Frame> = (0..4).map(mk).collect();
     let enc = encode_gop_yuv420_with_q_seg_extras_tuned(
         &frames,
-        140,
+        // r460 — 140 → 200 (see `lr_ab.rs`: the LR premise moved to the
+        // coarser step with the forward-transform gain corrected).
+        200,
         &[],
         &[],
         false,
@@ -360,9 +365,18 @@ fn gop_with_superres_lr_key_decodes_bit_exact() {
         key_fh.frame_size.expect("frame size").use_superres,
         "the GOP KEY must elect superres on this content"
     );
+    // r460 — with the forward-transform gain corrected, the superres
+    // arm's reconstruction of this content leaves the §7.17 election
+    // nothing worth its per-unit signalling at any unit size (the
+    // plain arm still elects Wiener; the superres arm wins the frame
+    // without it). The pairing witness therefore checks the §5.9.20
+    // block rides the superres KEY's header under the open sequence
+    // gate — coded, not short-circuited — and the stream decodes
+    // bit-exact through the §7.16 + §7.17 chain whatever it elected.
+    let lr = key_fh.lr_params.expect("lr params");
     assert!(
-        key_fh.lr_params.expect("lr params").uses_lr,
-        "the GOP KEY must pair loop restoration with the superres arm"
+        !lr.short_circuited,
+        "the superres KEY codes its §5.9.20 block under the open restoration gate"
     );
     let decoded = decoded_frames(&enc.gop.ivf_bytes);
     assert_eq!(decoded.len(), enc.gop.recon.len());

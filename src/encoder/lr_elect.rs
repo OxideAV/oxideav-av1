@@ -49,7 +49,7 @@
 //! plan through the decoder's own §7.17 frame driver so the stored
 //! reference planes equal the decoder's byte-for-byte.
 //!
-//! Unit-size scope (r429): `lr_unit_shift = 0`, `lr_uv_shift = 0` —
+//! Unit-size scope (r429; r460 elects `lr_unit_shift` 0 / 1 / 2 from the caller): `lr_uv_shift = 0` —
 //! 64×64-sample units on every plane (the finest §5.9.20 grid; the
 //! size election is left open).
 
@@ -130,6 +130,14 @@ pub(crate) struct LrElectInput<'a> {
     pub frame_width: usize,
     /// See [`Self::frame_width`].
     pub frame_height: usize,
+    /// r460 — every `sgr_step`-th §7.17 self-guided set is trialled
+    /// (`1` = all).
+    pub sgr_step: usize,
+    /// r460 — §5.9.20 `lr_unit_shift` (0 / 1 / 2 → 64 / 128 / 256 px
+    /// units; under 128×128 superblocks the header codes 1 or 2
+    /// only). Larger units amortise the per-unit Wiener / SGR
+    /// signalling over more samples.
+    pub unit_shift: u8,
     pub use_superres: bool,
     /// The §5.9.8 `SuperresDenom` (`SUPERRES_NUM` when
     /// `use_superres` is `false`).
@@ -198,18 +206,20 @@ fn make_bufs<'a>(owned: &'a mut [Vec<i32>], dims: &[(usize, usize)]) -> Vec<Plan
         .collect()
 }
 
-/// The §5.9.20 header block this election codes: 64×64 units on
-/// every plane, restoration types as given.
-fn header_shape(frt: [FrameRestorationType; 3]) -> HeaderLrParams {
+/// The §5.9.20 header block this election codes: `64 << unit_shift`
+/// units on every plane (`lr_uv_shift = 0`), restoration types as
+/// given.
+fn header_shape(frt: [FrameRestorationType; 3], unit_shift: u8) -> HeaderLrParams {
     let uses_lr = frt.iter().any(|&t| t != FrameRestorationType::None);
     let uses_chroma_lr = frt[1..].iter().any(|&t| t != FrameRestorationType::None);
+    let size = 64u32 << unit_shift.min(2);
     HeaderLrParams {
         frame_restoration_type: frt,
         uses_lr,
         uses_chroma_lr,
-        lr_unit_shift: 0,
+        lr_unit_shift: unit_shift.min(2),
         lr_uv_shift: 0,
-        loop_restoration_size: if uses_lr { [64, 64, 64] } else { [0, 0, 0] },
+        loop_restoration_size: if uses_lr { [size; 3] } else { [0, 0, 0] },
         short_circuited: false,
     }
 }
@@ -449,7 +459,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         upscaled_width: inp.frame_width as u32,
         // Eval-side header: every plane SWITCHABLE so the per-unit
         // closure decides (the real header collapses below).
-        eval_lrp: header_shape([FrameRestorationType::Switchable; 3]),
+        eval_lrp: header_shape([FrameRestorationType::Switchable; 3], inp.unit_shift),
     };
 
     let to_i32 = |p: &[u16]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
@@ -490,8 +500,9 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
             } else {
                 (u32::from(inp.subsampling_x), u32::from(inp.subsampling_y))
             };
-            let unit_rows = count_units_in_frame(64, (ec.frame_height + sub_y) >> sub_y);
-            let unit_cols = count_units_in_frame(64, (ec.upscaled_width + sub_x) >> sub_x);
+            let unit_size = 64u32 << inp.unit_shift.min(2);
+            let unit_rows = count_units_in_frame(unit_size, (ec.frame_height + sub_y) >> sub_y);
+            let unit_cols = count_units_in_frame(unit_size, (ec.upscaled_width + sub_x) >> sub_x);
             let mut units: Vec<UnitBlocks> = (0..unit_rows * unit_cols)
                 .map(|_| UnitBlocks {
                     blocks: Vec::new(),
@@ -591,7 +602,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
                 // Self-guided candidate: probe-fit each set, keep the
                 // best by exact SSD.
                 let mut best_sgr: Option<(LrUnit, u64)> = None;
-                for (set, params) in SGR_PARAMS.iter().enumerate() {
+                for (set, params) in SGR_PARAMS.iter().enumerate().step_by(inp.sgr_step.max(1)) {
                     let (r0, r1) = (params[0], params[2]);
                     let read_delta = |lr: &[Vec<i32>], cdef: &[Vec<i32>]| -> Vec<i32> {
                         let mut out = Vec::new();
@@ -791,7 +802,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         return None;
     }
 
-    let header = header_shape(frt);
+    let header = header_shape(frt, inp.unit_shift);
     let write_params = crate::cdf::LrParams {
         num_planes,
         frame_restoration_type: [

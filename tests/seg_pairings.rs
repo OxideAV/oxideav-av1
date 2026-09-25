@@ -439,7 +439,9 @@ fn segmented_lr_pairs_and_decodes_bit_exact() {
     let frames: Vec<Yuv420Frame> = (0..5).map(|t| mixed_frame(128, 96, t)).collect();
     let enc = encode_gop_yuv420_with_q_seg_tuned(
         &frames,
-        140,
+        // r460 — 140 → 200: the corrected forward-transform gain leaves
+        // no structured error for §7.17 to clean at the finer step.
+        200,
         &SEG_TABLE,
         GopTuning {
             // Isolate the LR axis.

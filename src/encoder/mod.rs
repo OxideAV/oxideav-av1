@@ -276,6 +276,7 @@ pub mod inter_predict;
 pub mod ivf;
 #[doc(hidden)]
 pub mod key_frame;
+pub(crate) mod lf_elect;
 #[doc(hidden)]
 pub mod loop_restoration_write;
 pub(crate) mod lr_elect;

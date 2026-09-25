@@ -92,6 +92,17 @@ pub struct StillOptions {
     /// (`color_description_present_flag = 0`). Signalling only; a
     /// container's `colr` box should carry the same values.
     pub color_description: Option<(u8, u8, u8)>,
+    /// Tile-search threads (r460). Tiles are independent by
+    /// construction, so a multi-tile still is searched
+    /// `threads`-wide and stitched in tile order — the stream is
+    /// identical to the single-threaded encode of the same layout.
+    /// `1` = sequential.
+    pub threads: usize,
+    /// Derive the §5.9.15 tile layout from `threads` and the picture
+    /// size (tiles at least 256 px wide / 128 px tall, at most
+    /// `threads.next_power_of_two()` of them) instead of
+    /// `tile_cols_log2` / `tile_rows_log2`. Off by default (one tile).
+    pub auto_tiles: bool,
 }
 
 impl StillOptions {
@@ -107,7 +118,18 @@ impl StillOptions {
             full_range: false,
             reduced_header: true,
             color_description: None,
+            threads: 1,
+            auto_tiles: false,
         }
+    }
+
+    /// Search on `threads` threads over an automatically derived tile
+    /// layout (see [`StillOptions::auto_tiles`]).
+    #[must_use]
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self.auto_tiles = self.threads > 1;
+        self
     }
 
     /// The lossless shape (`base_q_idx = 0`).
@@ -279,15 +301,29 @@ pub fn apply_still_picture_shape(seq: &mut SequenceHeader) {
 /// * Internal writer overflow surfaces the underlying [`Error`].
 pub fn encode_still_yuv(input: &YuvFrame, opts: &StillOptions) -> Result<EncodedStill, Error> {
     let elections = opts.speed != StillSpeed::Fast && opts.base_q_idx > 0;
+    let tiles = if opts.auto_tiles {
+        auto_tile_layout(input.width, input.height, opts.threads)
+    } else {
+        (opts.tile_cols_log2, opts.tile_rows_log2)
+    };
+    let mut search = match opts.speed {
+        StillSpeed::Fast => crate::encoder::key_frame::SearchLimits::fast(),
+        StillSpeed::Balanced => crate::encoder::key_frame::SearchLimits::balanced(),
+        StillSpeed::Thorough => crate::encoder::key_frame::SearchLimits::default(),
+    };
+    search.threads = opts.threads.max(1);
     let extras = KeyExtras {
-        tiles: (opts.tile_cols_log2, opts.tile_rows_log2),
+        tiles,
         delta_q: elections,
-        qm: elections,
+        // The §5.9.12 quantizer-matrix election trades PSNR for bytes
+        // (a perceptual shaping); it stays a `Thorough`-only arm.
+        qm: opts.speed == StillSpeed::Thorough && opts.base_q_idx > 0,
         superres_elect: opts.speed == StillSpeed::Thorough && opts.base_q_idx > 0,
         still: opts.reduced_header,
         full_range: opts.full_range,
         still_full_header: !opts.reduced_header,
         color_description: opts.color_description,
+        search,
         ..KeyExtras::default()
     };
     let (k, _carry) = encode_key_frame_yuv_full(
@@ -302,6 +338,26 @@ pub fn encode_still_yuv(input: &YuvFrame, opts: &StillOptions) -> Result<Encoded
         &extras,
     )?;
     Ok(EncodedStill::from_key(k))
+}
+
+/// The [`StillOptions::auto_tiles`] layout: `(TileColsLog2,
+/// TileRowsLog2)` for a `width × height` picture searched on
+/// `threads` threads — columns first (tiles ≥ 256 px wide), then rows
+/// (tiles ≥ 128 px tall), never more tiles than
+/// `threads.next_power_of_two()`.
+#[must_use]
+pub fn auto_tile_layout(width: u32, height: u32, threads: usize) -> (u32, u32) {
+    let target = threads.max(1).next_power_of_two();
+    let sb_cols = width.div_ceil(64);
+    let sb_rows = height.div_ceil(64);
+    let (mut cols_log2, mut rows_log2) = (0u32, 0u32);
+    while (1usize << (cols_log2 + 1)) <= target && (sb_cols >> (cols_log2 + 1)) >= 4 {
+        cols_log2 += 1;
+    }
+    while (1usize << (cols_log2 + rows_log2 + 1)) <= target && (sb_rows >> (rows_log2 + 1)) >= 2 {
+        rows_log2 += 1;
+    }
+    (cols_log2, rows_log2)
 }
 
 /// 8-bit 4:2:0 sibling of [`encode_still_yuv`].
@@ -501,6 +557,59 @@ mod tests {
             }
             assert_decodes_to_recon(&still, bd);
         }
+    }
+
+    /// r460 — the threaded tile search is bit-identical to the
+    /// sequential walk of the same layout.
+    #[test]
+    fn threaded_tile_search_is_bit_identical() {
+        let input = textured(320, 192, 8, ChromaFormat::Yuv420);
+        let mut seq_opts = StillOptions::new(120);
+        seq_opts.speed = StillSpeed::Fast;
+        seq_opts.tile_cols_log2 = 1;
+        seq_opts.tile_rows_log2 = 1;
+        let mut par_opts = seq_opts;
+        par_opts.threads = 4;
+        let a = encode_still_yuv(&input, &seq_opts).expect("sequential");
+        let b = encode_still_yuv(&input, &par_opts).expect("threaded");
+        assert_eq!(a.temporal_unit_bytes, b.temporal_unit_bytes);
+        assert_eq!(a.recon_y, b.recon_y);
+        assert_eq!(a.recon_u, b.recon_u);
+        assert_decodes_to_recon(&b, 8);
+        assert_eq!(auto_tile_layout(4032, 3024, 8), (3, 0));
+        assert_eq!(auto_tile_layout(4032, 3024, 4), (2, 0));
+        assert_eq!(auto_tile_layout(640, 480, 8), (1, 2));
+        assert_eq!(auto_tile_layout(64, 64, 8), (0, 0));
+        let auto = StillOptions::new(120).threads(4);
+        assert!(auto.auto_tiles && auto.threads == 4);
+    }
+
+    /// r460 — a picture above `MAX_TILE_AREA` (12 MP) cannot be one
+    /// tile: the requested `(0, 0)` layout is raised to the §5.9.15
+    /// legal minimum instead of being refused. (Flat content keeps
+    /// the witness fast; the geometry is what is pinned.)
+    #[test]
+    fn oversize_pictures_take_the_minimum_legal_tile_layout() {
+        assert_eq!(
+            crate::tile_info::TileInfo::min_uniform_layout(2 * 4032 / 8, 2 * 3024 / 8, false),
+            Some((0, 1))
+        );
+        assert_eq!(
+            crate::tile_info::TileInfo::min_uniform_layout(2 * 640 / 8, 2 * 480 / 8, false),
+            Some((0, 0))
+        );
+        let input = YuvFrame::filled(4096, 2432, 8, ChromaFormat::Monochrome, 90);
+        let mut opts = StillOptions::new(200);
+        opts.speed = StillSpeed::Fast;
+        let still = encode_still_yuv(&input, &opts).expect("12 MP still encodes");
+        let ti = still.fh.tile_info.as_ref().expect("tile info");
+        assert!(
+            ti.tile_cols * ti.tile_rows >= 2,
+            "{}x{}",
+            ti.tile_cols,
+            ti.tile_rows
+        );
+        assert_eq!(still.seq.operating_points[0].seq_level_idx, 16);
     }
 
     #[test]

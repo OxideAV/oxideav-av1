@@ -275,6 +275,7 @@ fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame 
 /// | `tile_rows_log2` | §5.9.15 `TileRowsLog2`            | `0`                          |
 /// | `full_range`     | `true` / `false` (§5.5.2 `color_range`) | from the pixel format (`YuvJ*` full) |
 /// | `color_primaries` / `transfer_characteristics` / `matrix_coefficients` | H.273 code points (§5.5.2 colour description; all three or none) | unspecified |
+/// | `threads`        | tile-search threads; > 1 derives an automatic tile layout unless `tile_*_log2` are given | `1` |
 ///
 /// `still = true` codes every frame as an independent still picture
 /// (`still_picture = 1` + `reduced_still_picture_header = 1`, one
@@ -299,6 +300,11 @@ pub struct Av1EncoderOptions {
     /// §5.5.2 colour description `(cp, tc, mc)` when all three keys
     /// are given.
     pub color_description: Option<(u8, u8, u8)>,
+    /// Tile-search threads.
+    pub threads: usize,
+    /// Derive the tile layout from `threads` (set when `threads > 1`
+    /// and no explicit `tile_*_log2` was given).
+    pub auto_tiles: bool,
 }
 
 impl Av1EncoderOptions {
@@ -320,8 +326,11 @@ impl Av1EncoderOptions {
                 Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
             ),
             color_description: None,
+            threads: 1,
+            auto_tiles: false,
         };
         let mut cicp: [Option<u8>; 3] = [None; 3];
+        let mut explicit_tiles = false;
         let bad = |k: &str, v: &str| CoreError::invalid(format!("oxideav-av1: option {k}={v:?}"));
         let parse_bool = |k: &str, v: &str| -> CoreResult<bool> {
             match v {
@@ -352,8 +361,15 @@ impl Av1EncoderOptions {
                         _ => return Err(bad(k, v)),
                     }
                 }
-                "tile_cols_log2" => o.tile_cols_log2 = v.parse().map_err(|_| bad(k, v))?,
-                "tile_rows_log2" => o.tile_rows_log2 = v.parse().map_err(|_| bad(k, v))?,
+                "tile_cols_log2" => {
+                    o.tile_cols_log2 = v.parse().map_err(|_| bad(k, v))?;
+                    explicit_tiles = true;
+                }
+                "tile_rows_log2" => {
+                    o.tile_rows_log2 = v.parse().map_err(|_| bad(k, v))?;
+                    explicit_tiles = true;
+                }
+                "threads" => o.threads = v.parse::<usize>().map_err(|_| bad(k, v))?.max(1),
                 "full_range" => o.full_range = parse_bool(k, v)?,
                 "color_primaries" => cicp[0] = Some(v.parse().map_err(|_| bad(k, v))?),
                 "transfer_characteristics" => cicp[1] = Some(v.parse().map_err(|_| bad(k, v))?),
@@ -381,6 +397,7 @@ impl Av1EncoderOptions {
         if lossless {
             o.base_q_idx = 0;
         }
+        o.auto_tiles = o.threads > 1 && !explicit_tiles;
         Ok(o)
     }
 
@@ -393,6 +410,8 @@ impl Av1EncoderOptions {
             full_range: self.full_range,
             reduced_header: true,
             color_description: self.color_description,
+            threads: self.threads,
+            auto_tiles: self.auto_tiles,
         }
     }
 }

@@ -144,6 +144,40 @@ pub fn forward_quantize(
     seg_qm_level: u8,
     quant: &QuantizerParams,
 ) -> Vec<i32> {
+    forward_quantize_rounded(
+        coeffs,
+        tx_size,
+        plane,
+        segment_id,
+        plane_tx_type,
+        seg_qm_level,
+        quant,
+        QUANT_ROUND_HALF,
+    )
+}
+
+/// The [`forward_quantize_rounded`] offset that rounds to nearest
+/// (`32 / 64` of a quantiser step — the pre-r460 rule).
+pub const QUANT_ROUND_HALF: i64 = 32;
+
+/// r460 — [`forward_quantize`] with an explicit rounding offset
+/// `round_num_64 / 64` of a step: `|level| = floor(|c| / step +
+/// round_num_64 / 64)`. Offsets below 32 open a dead zone (a
+/// coefficient must exceed `(1 - round) · step` to reach `±1`), the
+/// classic rate-distortion trade for Laplacian-distributed transform
+/// coefficients; the DC coefficient (`i == j == 0`) always rounds to
+/// nearest.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_quantize_rounded(
+    coeffs: &[i64],
+    tx_size: usize,
+    plane: u8,
+    segment_id: u8,
+    plane_tx_type: usize,
+    seg_qm_level: u8,
+    quant: &QuantizerParams,
+    round_num_64: i64,
+) -> Vec<i32> {
     assert!(
         tx_size < TX_SIZES_ALL,
         "oxideav-av1 forward_quantize: tx_size {tx_size} out of range (TX_SIZES_ALL = {TX_SIZES_ALL})"
@@ -201,8 +235,13 @@ pub fn forward_quantize(
             // (which is the spec's regime — DC/AC lookups are all
             // even integers in row 0) but biases tie-break by `1`
             // when `q2` is odd. The two-step form is robust to both.
-            let num = 2 * abs_c * dq_denom + q2;
-            let den = 2 * q2;
+            let round = if i == 0 && j == 0 {
+                QUANT_ROUND_HALF
+            } else {
+                round_num_64.clamp(0, 64)
+            };
+            let num = 64 * abs_c * dq_denom + round * q2;
+            let den = 64 * q2;
             let mag = num / den;
             // The spec's truncation `(|dq| & 0xFF_FFFF) / dq_denom`
             // also bounds the recovered magnitude: a `Quant` whose

@@ -153,12 +153,19 @@ fn mechanism_three_segment_ladder_q72_round_trips() {
 /// last frame — the §5.11.22 intra-fallback arm fires next to
 /// lossless-segment inter leaves.
 #[test]
-fn mechanism_multi_superblock_cut_q100_round_trips() {
+fn mechanism_multi_superblock_cut_round_trips() {
     let mut frames: Vec<Yuv420Frame> = (0..2)
         .map(|k| half_flat_half_texture(96, 80, 2 * k, 4 * k, 3))
         .collect();
     frames.push(half_flat_half_texture(96, 80, 40, 70, 91));
-    assert_mixed_round_trip(&frames, 100, &[0, -255], true);
+    // r460 — with the forward-transform gain corrected the lossy
+    // segment codes the binary hash texture cheaply enough at every
+    // quantiser that no lossless cell is worth its bytes (the pre-r460
+    // chain quantised that texture so badly that lossless won); the
+    // multi-superblock cut mechanism this witness pins — both segments
+    // reachable, every frame bit-exact — no longer demands a committed
+    // lossless cell.
+    assert_mixed_round_trip(&frames, 240, &[0, -255], false);
 }
 
 /// "Camera" frame: smooth moving gradients everywhere, with a

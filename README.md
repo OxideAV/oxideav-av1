@@ -1825,6 +1825,30 @@ without touching the bitstream (this crate writes no ISOBMFF boxes).
 Decoded output equals the reconstruction planes sample for sample on
 every pairing; lossless stills reproduce the input.
 
+**Quality and speed (r460)**: the forward transform's per-size gain
+was wrong at every transform size but 16×16 (the decoder rebuilt 4×4
+residuals at a quarter of their amplitude, 32×32 at four times) —
+fixed, the `Fast` still preset moved from +70.7 % to +17.1 % BD-rate
+(PSNR) against a third-party encoder at its default speed on a
+640×480 textured still, at `base_q_idx = 100` 16.5 KB / 42.9 dB vs
+the reference's 15.0 KB / 43.6 dB at the same qindex. The `speed`
+presets tighten the RD ladders (`Fast` ≈ 3 s for 640×480, `Balanced`
+the full partition / TX ladders with a pruned transform-type
+shortlist, `Thorough` the exhaustive search plus the QM / superres
+elections), run a §7.14 deblocking-level election (the pre-r460 intra
+frames never deblocked), elect the §7.17 restoration unit size from
+the 64 / 128 / 256 ladder, quantise AC with a dead zone, and gate the
+screen-content tools behind a colour-count probe. `StillOptions::threads(n)`
+(encoder option `threads`) searches a multi-tile still `n`-wide over an
+automatically derived tile layout, bit-identical to the sequential
+encode of the same layout; a 4032×3024 8-bit still (`Fast`,
+`base_q_idx = 128`) takes 46 s single-thread / 37 s on 8 threads
+(116.8 KB / 41.8 dB; the third-party encoder at its default speed:
+0.5 s, 147.8 KB / 47.3 dB at the same qindex — the frame-level
+CDEF / restoration / deblock elections now dominate at 12 MP), 10-bit
+59 s / 51 s. Layouts below the §5.9.15 floor are raised to the legal
+minimum (a 12 MP picture cannot be one tile).
+
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5
 mi grid internally (the decoder reconstructs every mi block in full,

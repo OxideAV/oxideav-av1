@@ -107,7 +107,7 @@ use crate::cdf::{
     predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
     predict_intra_smooth_v_pred, predict_intra_v_pred,
 };
-use crate::encoder::forward_quantize::forward_quantize;
+use crate::encoder::forward_quantize::forward_quantize_rounded;
 use crate::encoder::forward_transform_2d::forward_transform_2d;
 use crate::encoder::forward_wht::forward_wht_4x4;
 use crate::encoder::frame_obu::encode_uncompressed_header;
@@ -184,31 +184,6 @@ pub struct EncodedKeyFrame {
 /// superblock-by-superblock, so state stays flat; HD/UHD extents were
 /// validated against independent black-box decoders during the round).
 pub const KEY_FRAME_MAX_DIM: u32 = 16384;
-
-/// §5.11.45 (αU, αV) candidate grid for the chroma `UV_CFL_PRED` arm —
-/// the same compact set the dyn mirror driver enumerates.
-const CFL_ALPHA_CANDIDATES: &[(i8, i8)] = &[
-    (1, 0),
-    (-1, 0),
-    (0, 1),
-    (0, -1),
-    (1, 1),
-    (-1, -1),
-    (1, -1),
-    (-1, 1),
-    (2, 0),
-    (-2, 0),
-    (0, 2),
-    (0, -2),
-    (2, 2),
-    (-2, -2),
-    (2, -2),
-    (-2, 2),
-    (4, 0),
-    (-4, 0),
-    (0, 4),
-    (0, -4),
-];
 
 /// Lossless (`base_q_idx = 0`) conformance-grade KEY-frame encode —
 /// see [`encode_key_frame_yuv420_with_q`].
@@ -778,6 +753,155 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
     )
 }
 
+/// r460 — one tile's search output (see the tile loop in
+/// `encode_key_frame_yuv_core`).
+pub(crate) struct TileSearchOut {
+    pub payload: Vec<u8>,
+    pub cdfs: Box<TileCdfContext>,
+    pub trees: Vec<crate::encoder::partition_tree::SyntaxNode>,
+    pub sbs: Vec<(u32, u32)>,
+}
+
+/// r460 — search-effort limits on the intra RD ladders. The default
+/// is the exhaustive pre-r460 search (every entry point that does not
+/// set them stays bit-identical); the still-picture speed presets
+/// tighten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchLimits {
+    /// §5.11.15 `Split_Tx_Size` ladder depth tried per leaf
+    /// (`MAX_TX_DEPTH` = the full ladder; `1` = the largest rect size
+    /// plus one split; `0` = the largest only).
+    pub tx_depth_steps: usize,
+    /// Prune the §5.11.47 per-TU transform-type search to `DCT_DCT` +
+    /// the mode's `Mode_To_Txfm` default (+ `IDTX` under screen-content
+    /// tools) instead of the full §5.11.48 intra set.
+    pub prune_tx_types: bool,
+    /// Try the §5.11.4 `PARTITION_HORZ` / `PARTITION_VERT` arms at
+    /// >= 16×16 nodes.
+    pub rect_partitions: bool,
+    /// Smallest leaf the fully-inside search descends to (`BLOCK_4X4`
+    /// = full; `BLOCK_8X8` skips the 4×4 level).
+    pub min_leaf: usize,
+    /// Do not try the split (or rect) arms below a node whose
+    /// square leaf coded `skip = 1` (no residual at all).
+    pub skip_leaf_early_exit: bool,
+    /// Every `sgr_step`-th §7.17 self-guided parameter set is tried
+    /// by the loop-restoration election (`1` = all 16).
+    pub sgr_step: usize,
+    /// Gate `allow_screen_content_tools` behind a luma colour-count
+    /// probe (photographic content keeps the palette / intra-bc
+    /// searches and the per-block palette syntax off).
+    pub screen_content_probe: bool,
+    /// AC quantiser rounding offset in 1/64 steps
+    /// ([`crate::encoder::forward_quantize::forward_quantize_rounded`];
+    /// `32` = round to nearest, the pre-r460 rule).
+    pub quant_round_64: i64,
+    /// §7.14 deblocking-level election effort
+    /// ([`crate::encoder::lf_elect`]): `0` = off (the pre-r460
+    /// `loop_filter_level = 0` shape), `1` = coarse ladder, `2` =
+    /// coarse + refinement.
+    pub lf_effort: u8,
+    /// Tile-search threads (`1` = sequential; more only matters on
+    /// multi-tile layouts — tiles are stitched in order, so the output
+    /// is identical either way).
+    pub threads: usize,
+    /// Smallest §5.9.20 `lr_unit_shift` the restoration election
+    /// tries (`0` = the full 64 / 128 / 256 ladder; `2` = 256-sample
+    /// units only). Each rung is a complete per-unit election, and at
+    /// 12 MP the ladder dominates the still's wall clock.
+    pub lr_min_unit_shift: u8,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            tx_depth_steps: MAX_TX_DEPTH,
+            prune_tx_types: false,
+            rect_partitions: true,
+            min_leaf: BLOCK_4X4,
+            skip_leaf_early_exit: false,
+            sgr_step: 1,
+            screen_content_probe: false,
+            quant_round_64: crate::encoder::forward_quantize::QUANT_ROUND_HALF,
+            lf_effort: 0,
+            threads: 1,
+            lr_min_unit_shift: 0,
+        }
+    }
+}
+
+impl SearchLimits {
+    /// The `StillSpeed::Fast` shape.
+    pub(crate) fn fast() -> Self {
+        Self {
+            tx_depth_steps: 1,
+            prune_tx_types: true,
+            rect_partitions: false,
+            min_leaf: crate::cdf::BLOCK_8X8,
+            skip_leaf_early_exit: true,
+            sgr_step: 4,
+            screen_content_probe: true,
+            quant_round_64: 22,
+            lf_effort: 1,
+            threads: 1,
+            lr_min_unit_shift: 2,
+        }
+    }
+
+    /// The `StillSpeed::Balanced` shape.
+    pub(crate) fn balanced() -> Self {
+        Self {
+            tx_depth_steps: MAX_TX_DEPTH,
+            prune_tx_types: true,
+            rect_partitions: true,
+            min_leaf: BLOCK_4X4,
+            skip_leaf_early_exit: true,
+            sgr_step: 2,
+            screen_content_probe: true,
+            quant_round_64: 22,
+            lf_effort: 2,
+            threads: 1,
+            lr_min_unit_shift: 1,
+        }
+    }
+}
+
+/// r460 — the luma colour-count probe behind
+/// [`SearchLimits::screen_content_probe`]: the fraction of 16×16
+/// luma blocks with at most 8 distinct sample values. Screen-like
+/// content (text, UI, flat fills) scores high; photographic content
+/// near zero.
+pub(crate) fn screen_content_probe(input: &YuvFrame) -> bool {
+    let (w, h) = (input.width as usize, input.height as usize);
+    let mut blocks = 0usize;
+    let mut flat = 0usize;
+    let mut y = 0;
+    while y + 16 <= h {
+        let mut x = 0;
+        while x + 16 <= w {
+            let mut seen: Vec<u16> = Vec::with_capacity(9);
+            let mut few = true;
+            'scan: for i in 0..16 {
+                for j in 0..16 {
+                    let v = input.y[(y + i) * w + x + j];
+                    if !seen.contains(&v) {
+                        if seen.len() == 8 {
+                            few = false;
+                            break 'scan;
+                        }
+                        seen.push(v);
+                    }
+                }
+            }
+            blocks += 1;
+            flat += usize::from(few);
+            x += 16;
+        }
+        y += 16;
+    }
+    blocks == 0 || flat * 4 >= blocks
+}
+
 /// r431 — the spatial-scalability shape knobs on the intra driver
 /// (see [`encode_key_frame_yuv_full`]). Every field's default keeps
 /// the pre-r431 KEY shape bit-for-bit.
@@ -920,6 +1044,8 @@ pub(crate) struct KeyExtras<'a> {
     /// unspecified triple. Signalling only. Inert under
     /// `seq_override`.
     pub color_description: Option<(u8, u8, u8)>,
+    /// r460 — search-effort limits (see [`SearchLimits`]).
+    pub search: SearchLimits,
 }
 
 /// r427/r431 — the general-format intra-frame core: every entry
@@ -944,6 +1070,24 @@ pub(crate) fn encode_key_frame_yuv_full(
     Error,
 > {
     input.validate_any_extent()?;
+    // r460 — raise a requested uniform layout to the §5.9.15 legal
+    // minimum (`MAX_TILE_WIDTH` / `MAX_TILE_AREA`): a 12 MP picture
+    // cannot be one tile, so `(0, 0)` means "as few tiles as the
+    // spec allows" rather than a reject.
+    let mut extras = *extras;
+    if extras.explicit_tiles.is_none() {
+        let mi_cols = 2 * input.width.div_ceil(8);
+        let mi_rows = 2 * input.height.div_ceil(8);
+        if let Some((min_cols, min_rows_at_min_cols)) =
+            crate::tile_info::TileInfo::min_uniform_layout(mi_cols, mi_rows, false)
+        {
+            let min_tiles = min_cols + min_rows_at_min_cols;
+            let cols = extras.tiles.0.max(min_cols);
+            let rows = extras.tiles.1.max(min_tiles.saturating_sub(cols));
+            extras.tiles = (cols, rows);
+        }
+    }
+    let extras = &extras;
     if input.width % 8 == 0 && input.height % 8 == 0 {
         return encode_key_frame_yuv_full_aligned(
             input, base_q_idx, model, alt_q, exact_mask, cdef, cdef_units, lr, extras,
@@ -1210,6 +1354,7 @@ pub(crate) fn encode_key_frame_yuv_full_aligned(
         full_range: extras.full_range,
         coded_size: extras.coded_size,
         color_description: extras.color_description,
+        search: extras.search,
     };
     let lambda = lambda_for(&QuantizerParams::neutral(base_q_idx, input.bit_depth));
     type KeyOut = (
@@ -1564,7 +1709,9 @@ fn encode_key_frame_yuv_core(
     // r427 — screen-content election is 8-bit-4:2:0-scoped (see
     // `sc_eligible` above); the §5.9.5 SELECT arm codes the header
     // bit either way.
-    fh.allow_screen_content_tools = fh.allow_screen_content_tools && sc_eligible;
+    fh.allow_screen_content_tools = fh.allow_screen_content_tools
+        && sc_eligible
+        && (!extras.search.screen_content_probe || screen_content_probe(input));
     // r431 — the §5.9.15 uniform tile layout (single-tile unless the
     // caller configured columns/rows). Derived before the intra-bc
     // gate below: the DV hash index is frame-scoped, so the §5.9.20
@@ -1758,6 +1905,7 @@ fn encode_key_frame_yuv_core(
         allow_screen_content_tools: fh.allow_screen_content_tools,
         allow_intrabc: fh.allow_intrabc,
         qp,
+        search: extras.search,
         bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
         // r425 — arm the exact-match DV index whenever the §5.9.20
         // gate opened (input-space hash seeds for the §5.11.7
@@ -1828,20 +1976,34 @@ fn encode_key_frame_yuv_core(
     // kept (boxed — far too large for by-value moves) so the carry
     // can offer the §6.8.14 donor-candidate set.
     let mut all_cdfs: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
-    for (geo, origins) in tile_plan.iter() {
-        if !state.begin_tile(*geo) {
+    // r460 — the per-tile search body (one closure, run sequentially
+    // or on `SearchLimits::threads` scoped threads: tiles are
+    // independent by construction — no intra neighbour, context or
+    // symbol state crosses a tile boundary — so each thread walks its
+    // tiles on a private copy of the reconstruction / syntax mirror
+    // and the results are stitched back in tile order, bit-identical
+    // to the sequential walk).
+    let disable_cdf_update_search = fh.disable_cdf_update;
+    let run_tile = |geo: TileGeometry,
+                    origins: &[(u32, u32)],
+                    rc: &mut ReconState,
+                    st: &mut PartitionSyntaxWriter|
+     -> Result<TileSearchOut, Error> {
+        let mut out_trees: Vec<crate::encoder::partition_tree::SyntaxNode> = Vec::new();
+        let mut out_sbs: Vec<(u32, u32)> = Vec::new();
+        if !st.begin_tile(geo) {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        recon.bd.set_tile(*geo);
-        let mut writer = SymbolWriter::new(fh.disable_cdf_update);
+        rc.bd.set_tile(geo);
+        let mut writer = SymbolWriter::new(disable_cdf_update_search);
         let mut tile_cdfs = TileCdfContext::new_from_defaults();
         tile_cdfs.init_coeff_cdfs(base_q_idx);
         // §5.11.1 per-tile prologue: `CurrentQIndex = base_q_idx` at
         // every tile entry.
-        recon.qp.current_q_index = base_q_idx;
+        rc.qp.current_q_index = base_q_idx;
         let sb_cols_frame = mi_cols.div_ceil(16);
         for &(sb_r, sb_c) in origins {
-            recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            rc.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
             // r431 — §5.11.13 `CurrentQIndex` walk (the KEY twin of
             // the inter r428 arm): apply the plan step BEFORE the
             // superblock's search so every trial quantises (and the
@@ -1851,13 +2013,13 @@ fn encode_key_frame_yuv_core(
             // symbol codes the RELATIVE step from the running index,
             // computed so the §7.12.2 `Clip3( 1, 255, _ )` never
             // truncates.
-            let prev_q = recon.qp.current_q_index;
+            let prev_q = rc.qp.current_q_index;
             let dq_units = if let Some(p) = delta_plan {
                 let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
                 let step = 1i32 << params.delta_q_res;
                 let want = (i32::from(base_q_idx) + p[k] * step).clamp(1, 255);
                 let units = (want - i32::from(prev_q)) / step;
-                recon.qp.current_q_index = (i32::from(prev_q) + units * step) as u8;
+                rc.qp.current_q_index = (i32::from(prev_q) + units * step) as u8;
                 units
             } else {
                 0
@@ -1865,8 +2027,8 @@ fn encode_key_frame_yuv_core(
             // r421 — arm the §5.11.2 delta lifecycle on the live state
             // AND the rate twin's fork, so both enter the superblock
             // identically.
-            state.arm_read_deltas();
-            let mut twin = RateTwin::snapshot(&tile_cdfs, &state, &writer);
+            st.arm_read_deltas();
+            let mut twin = RateTwin::snapshot(&tile_cdfs, st, &writer);
             twin.arm_read_deltas();
             let seg_demand = exact_mask.map(|mask| KeySegDemand {
                 mask,
@@ -1877,7 +2039,7 @@ fn encode_key_frame_yuv_core(
                 sb_c,
                 BLOCK_64X64,
                 input,
-                &mut recon,
+                rc,
                 &mut twin,
                 &params,
                 model,
@@ -1887,7 +2049,7 @@ fn encode_key_frame_yuv_core(
             write_partition_tree_syntax(
                 &mut writer,
                 &mut tile_cdfs,
-                &mut state,
+                st,
                 &tree,
                 sb_r,
                 sb_c,
@@ -1909,15 +2071,104 @@ fn encode_key_frame_yuv_core(
             if delta_plan.is_some() {
                 if let SyntaxNode::Leaf(b) = &tree {
                     if b.skip == 1 {
-                        recon.qp.current_q_index = prev_q;
+                        rc.qp.current_q_index = prev_q;
                     }
                 }
             }
-            trees.push(tree);
-            tree_sb.push((sb_r, sb_c));
+            out_trees.push(tree);
+            out_sbs.push((sb_r, sb_c));
         }
-        tile_payloads.push(writer.finish());
-        all_cdfs.push(Box::new(tile_cdfs));
+        Ok(TileSearchOut {
+            payload: writer.finish(),
+            cdfs: Box::new(tile_cdfs),
+            trees: out_trees,
+            sbs: out_sbs,
+        })
+    };
+    let threads = extras.search.threads.max(1).min(num_tiles as usize);
+    if threads <= 1 {
+        for (geo, origins) in tile_plan.iter() {
+            let out = run_tile(*geo, origins, &mut recon, &mut state)?;
+            tile_payloads.push(out.payload);
+            all_cdfs.push(out.cdfs);
+            trees.extend(out.trees);
+            tree_sb.extend(out.sbs);
+        }
+    } else {
+        let next = core::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<Result<(usize, TileSearchOut, ReconState, PartitionSyntaxWriter), Error>> =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for _ in 0..threads {
+                    let recon_ref = &recon;
+                    let state_ref = &state;
+                    let plan_ref = &tile_plan;
+                    let next_ref = &next;
+                    let run = &run_tile;
+                    handles.push(scope.spawn(move || {
+                        let mut outs = Vec::new();
+                        loop {
+                            let t = next_ref.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                            if t >= plan_ref.len() {
+                                break;
+                            }
+                            let (geo, origins) = &plan_ref[t];
+                            let mut rc = recon_ref.clone();
+                            let mut st = state_ref.clone();
+                            outs.push(run(*geo, origins, &mut rc, &mut st).map(|o| (t, o, rc, st)));
+                        }
+                        outs
+                    }));
+                }
+                let mut all = Vec::with_capacity(tile_plan.len());
+                for h in handles {
+                    all.extend(h.join().expect("tile search thread panicked"));
+                }
+                all
+            });
+        let mut per_tile: Vec<Option<(TileSearchOut, ReconState, PartitionSyntaxWriter)>> =
+            (0..tile_plan.len()).map(|_| None).collect();
+        for r in results {
+            let (t, o, rc, st) = r?;
+            per_tile[t] = Some((o, rc, st));
+        }
+        for (t, slot) in per_tile.into_iter().enumerate() {
+            let (o, rc, st) = slot.expect("every tile searched");
+            let geo = tile_plan[t].0;
+            // Stitch the tile's reconstruction rect and mirror rect.
+            let (r0, r1, c0, c1) = (
+                geo.mi_row_start as usize * 4,
+                (geo.mi_row_end as usize * 4).min(height),
+                geo.mi_col_start as usize * 4,
+                (geo.mi_col_end as usize * 4).min(width),
+            );
+            for y in r0..r1 {
+                recon.y[y * width + c0..y * width + c1]
+                    .copy_from_slice(&rc.y[y * width + c0..y * width + c1]);
+            }
+            if num_planes > 1 {
+                let (cr0, cr1) = (r0 >> ssy, ((r1 + usize::from(ssy)) >> ssy).min(chroma_h));
+                let (cc0, cc1) = (c0 >> ssx, ((c1 + usize::from(ssx)) >> ssx).min(chroma_w));
+                for y in cr0..cr1 {
+                    recon.u[y * chroma_w + cc0..y * chroma_w + cc1]
+                        .copy_from_slice(&rc.u[y * chroma_w + cc0..y * chroma_w + cc1]);
+                    recon.v[y * chroma_w + cc0..y * chroma_w + cc1]
+                        .copy_from_slice(&rc.v[y * chroma_w + cc0..y * chroma_w + cc1]);
+                }
+            }
+            let snap = st.snapshot_price_scope(
+                geo.mi_row_start,
+                geo.mi_col_start,
+                geo.mi_col_end - geo.mi_col_start,
+                geo.mi_row_end - geo.mi_row_start,
+                &params,
+            );
+            state.restore_price_scope(&snap);
+            tile_payloads.push(o.payload);
+            all_cdfs.push(o.cdfs);
+            trees.extend(o.trees);
+            tree_sb.extend(o.sbs);
+        }
     }
 
     // §5.11.1 assembled tile-group body length — what the exact-bytes
@@ -2041,6 +2292,40 @@ fn encode_key_frame_yuv_core(
     // the CDEF election and the LR election below, so §7.17 fits,
     // prices and applies at the UPSCALED extent — exactly the §7.4
     // order the decoder runs.
+    // r460 — §7.14 deblocking-level election (runs first in the §7.4
+    // in-loop order: deblock, then CDEF, then loop restoration).
+    if extras.search.lf_effort > 0
+        && base_q_idx > 0
+        && !fh.allow_intrabc
+        && exact_mask.is_none()
+        && alt_q.is_empty()
+    {
+        if let Some(e) =
+            crate::encoder::lf_elect::elect_loop_filter(&crate::encoder::lf_elect::LfElectInput {
+                mirror: state.mirror(),
+                input,
+                recon_y: &recon.y,
+                recon_u: &recon.u,
+                recon_v: &recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
+                bit_depth,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                num_planes,
+                effort: extras.search.lf_effort,
+            })
+        {
+            recon.y = e.y;
+            recon.u = e.u;
+            recon.v = e.v;
+            fh.loop_filter_params = Some(e.params);
+        }
+    }
     let lr_armed =
         lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
     let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
@@ -2229,97 +2514,160 @@ fn encode_key_frame_yuv_core(
             c.init_coeff_cdfs(base_q_idx);
             c
         };
-        if let Some(plan) =
-            crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
-                input: lr_src,
-                curr_y: pcy,
-                curr_u: pcu,
-                curr_v: pcv,
-                cdef_y: &recon.y,
-                cdef_u: &recon.u,
-                cdef_v: &recon.v,
-                width: lr_w,
-                height,
-                chroma_w: lr_chroma_w,
-                chroma_h,
-                bit_depth,
-                subsampling_x: ssx,
-                subsampling_y: ssy,
-                num_planes,
-                mi_rows,
-                mi_cols,
-                frame_width: if superres.is_some() {
-                    lr_w
-                } else {
-                    coded_w as usize
-                },
-                frame_height: coded_h as usize,
-                lambda: lambda_for(&recon.qp),
-                price_cdfs: &price_cdfs,
-                disable_cdf_update: fh.disable_cdf_update,
-                use_superres: superres.is_some(),
-                superres_denom: superres.map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
-            })
-        {
-            let mut lr_params_w = params.clone();
-            lr_params_w.cdef_bits = committed_cdef_bits;
-            let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &lr_params_w, Some(&plan))?;
-            let re_body = assemble(&re_payloads)?;
-            let lambda = lambda_for(&recon.qp);
-            let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
-                let mut fh_c = fh.clone();
-                fh_c.lr_params = Some(*lrp);
-                let mut bw = crate::encoder::bitwriter::BitWriter::new();
-                encode_uncompressed_header(&mut bw, &fh_c, &seq);
-                bw.byte_align();
-                bw.finish().len()
+        let lambda = lambda_for(&recon.qp);
+        let lr_header_len = |lrp: &crate::uncompressed_header_tail::LrParams| {
+            let mut fh_c = fh.clone();
+            fh_c.lr_params = Some(*lrp);
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            encode_uncompressed_header(&mut bw, &fh_c, &seq);
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let off_hdr = lr_header_len(
+            fh.lr_params
+                .as_ref()
+                .expect("lossy KEY header carries lr_params"),
+        );
+        let off_score = {
+            let mut d = 0u64;
+            let (fw, fhh) = if superres.is_some() {
+                (lr_w, height)
+            } else {
+                (coded_w as usize, coded_h as usize)
             };
-            let off_hdr = lr_header_len(
-                fh.lr_params
-                    .as_ref()
-                    .expect("lossy KEY header carries lr_params"),
+            let (cfw, cfh) = (
+                (fw + usize::from(ssx)) >> ssx,
+                (fhh + usize::from(ssy)) >> ssy,
             );
-            let on_score = plan.d * 256
-                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
-            let off_score =
-                plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_group_body.len()) as u64);
-            if on_score < off_score {
-                tile_payloads = re_payloads;
-                tile_group_body = re_body;
-                all_cdfs = re_cdfs;
-                state = re_state;
-                let applied_d = crate::encoder::lr_elect::apply_lr_plan(
-                    &plan,
-                    lr_src,
-                    pcy,
-                    pcu,
-                    pcv,
-                    &mut recon.y,
-                    &mut recon.u,
-                    &mut recon.v,
-                    lr_w,
+            for y in 0..fhh {
+                for x in 0..fw {
+                    let e = i64::from(recon.y[y * lr_w + x]) - i64::from(lr_src.y[y * lr_w + x]);
+                    d += (e * e) as u64;
+                }
+            }
+            if num_planes > 1 {
+                for y in 0..cfh {
+                    for x in 0..cfw {
+                        let eu = i64::from(recon.u[y * lr_chroma_w + x])
+                            - i64::from(lr_src.u[y * lr_chroma_w + x]);
+                        let ev = i64::from(recon.v[y * lr_chroma_w + x])
+                            - i64::from(lr_src.v[y * lr_chroma_w + x]);
+                        d += (eu * eu + ev * ev) as u64;
+                    }
+                }
+            }
+            d * 256 + lambda * 8 * 256 * ((off_hdr + tile_group_body.len()) as u64)
+        };
+        // r460 — the §5.9.20 unit-size ladder: 64 / 128 / 256 px units
+        // (128 / 256 under 128×128 superblocks), each a complete
+        // per-unit election + tile re-emission, the frame keeping the
+        // best `D·256 + λ·bits` — larger units amortise the per-unit
+        // Wiener / SGR signalling, which is what lets restoration pay
+        // on small pictures.
+        type LrCand = (
+            crate::encoder::lr_elect::LrPlan,
+            Vec<Vec<u8>>,
+            Vec<u8>,
+            Vec<Box<TileCdfContext>>,
+            PartitionSyntaxWriter,
+            u64,
+        );
+        let mut best_lr: Option<LrCand> = None;
+        let min_shift: u8 = if seq.use_128x128_superblock { 1 } else { 0 };
+        for unit_shift in min_shift.max(extras.search.lr_min_unit_shift.min(2))..=2u8 {
+            let Some(plan) =
+                crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
+                    input: lr_src,
+                    curr_y: pcy,
+                    curr_u: pcu,
+                    curr_v: pcv,
+                    cdef_y: &recon.y,
+                    cdef_u: &recon.u,
+                    cdef_v: &recon.v,
+                    width: lr_w,
                     height,
-                    lr_chroma_w,
+                    chroma_w: lr_chroma_w,
                     chroma_h,
                     bit_depth,
-                    ssx,
-                    ssy,
+                    subsampling_x: ssx,
+                    subsampling_y: ssy,
                     num_planes,
                     mi_rows,
                     mi_cols,
-                    if superres.is_some() {
+                    frame_width: if superres.is_some() {
                         lr_w
                     } else {
                         coded_w as usize
                     },
-                    coded_h as usize,
+                    frame_height: coded_h as usize,
+                    sgr_step: extras.search.sgr_step,
+                    unit_shift,
+                    lambda,
+                    price_cdfs: &price_cdfs,
+                    disable_cdf_update: fh.disable_cdf_update,
+                    use_superres: superres.is_some(),
+                    superres_denom: superres.map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
+                })
+            else {
+                continue;
+            };
+            let mut lr_params_w = params.clone();
+            lr_params_w.cdef_bits = committed_cdef_bits;
+            let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &lr_params_w, Some(&plan))?;
+            let re_body = assemble(&re_payloads)?;
+            let on_score = plan.d * 256
+                + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
+            if std::env::var_os("OXIDEAV_AV1_LR_DEBUG").is_some() {
+                eprintln!(
+                    "lr-elect q={base_q_idx} units {}: d_pre {} d {} | bytes off {} on {} | score off {off_score} on {on_score} | frt {:?}",
+                    64u32 << unit_shift,
+                    plan.d_pre,
+                    plan.d,
+                    off_hdr + tile_group_body.len(),
+                    lr_header_len(&plan.header) + re_body.len(),
+                    plan.header.frame_restoration_type
                 );
-                debug_assert_eq!(
-                    applied_d, plan.d,
-                    "applied §7.17 SSD diverged from the elected plan"
-                );
-                fh.lr_params = Some(plan.header);
             }
+            if on_score < off_score && best_lr.as_ref().map_or(true, |b| on_score < b.5) {
+                best_lr = Some((plan, re_payloads, re_body, re_cdfs, re_state, on_score));
+            }
+        }
+        if let Some((plan, re_payloads, re_body, re_cdfs, re_state, _)) = best_lr {
+            tile_payloads = re_payloads;
+            tile_group_body = re_body;
+            all_cdfs = re_cdfs;
+            state = re_state;
+            let applied_d = crate::encoder::lr_elect::apply_lr_plan(
+                &plan,
+                lr_src,
+                pcy,
+                pcu,
+                pcv,
+                &mut recon.y,
+                &mut recon.u,
+                &mut recon.v,
+                lr_w,
+                height,
+                lr_chroma_w,
+                chroma_h,
+                bit_depth,
+                ssx,
+                ssy,
+                num_planes,
+                mi_rows,
+                mi_cols,
+                if superres.is_some() {
+                    lr_w
+                } else {
+                    coded_w as usize
+                },
+                coded_h as usize,
+            );
+            debug_assert_eq!(
+                applied_d, plan.d,
+                "applied §7.17 SSD diverged from the elected plan"
+            );
+            fh.lr_params = Some(plan.header);
         }
     }
 
@@ -2775,6 +3123,7 @@ pub(crate) fn tu_bd_stamp(
 /// planes are `u16` at [`Self::bit_depth`], chroma at the
 /// [`Self::subsampling_x`] / [`Self::subsampling_y`] extents (empty
 /// when [`Self::num_planes`] is 1).
+#[derive(Clone)]
 pub(crate) struct ReconState {
     pub(crate) y: Vec<u16>,
     pub(crate) u: Vec<u16>,
@@ -2812,6 +3161,8 @@ pub(crate) struct ReconState {
     /// driver armed it alongside `allow_intrabc`; maintained once per
     /// superblock via [`Self::advance_dv_hash`].
     pub(crate) dv_hash: crate::encoder::dv_hash::DvHashIndex,
+    /// r460 — see [`SearchLimits`].
+    pub(crate) search: SearchLimits,
 }
 
 impl ReconState {
@@ -3148,6 +3499,48 @@ fn cfl_layer(
     out
 }
 
+/// r460 — the §7.11.5 luma AC term `L - luma_avg` a CfL prediction
+/// scales by α (see [`cfl_layer`]), for the least-squares α seed.
+#[allow(clippy::too_many_arguments)]
+fn cfl_luma_ac(
+    recon_y: &[u16],
+    luma_w: usize,
+    start_x: usize,
+    start_y: usize,
+    w: usize,
+    h: usize,
+    max_luma_w: usize,
+    max_luma_h: usize,
+    sub_x: u8,
+    sub_y: u8,
+) -> Vec<i64> {
+    let (sub_x, sub_y) = (u32::from(sub_x), u32::from(sub_y));
+    let clamp_x = max_luma_w.saturating_sub(1 << sub_x);
+    let clamp_y = max_luma_h.saturating_sub(1 << sub_y);
+    let mut l = vec![0i64; w * h];
+    let mut luma_sum: i64 = 0;
+    for i in 0..h {
+        let luma_y = ((start_y + i) << sub_y).min(clamp_y);
+        for j in 0..w {
+            let luma_x = ((start_x + j) << sub_x).min(clamp_x);
+            let mut t = 0i64;
+            for dy in 0..=sub_y as usize {
+                for dx in 0..=sub_x as usize {
+                    t += i64::from(recon_y[(luma_y + dy) * luma_w + luma_x + dx]);
+                }
+            }
+            let v = t << (3 - sub_x - sub_y);
+            l[i * w + j] = v;
+            luma_sum += v;
+        }
+    }
+    let luma_avg = round2_signed(luma_sum, w.trailing_zeros() + h.trailing_zeros());
+    for v in l.iter_mut() {
+        *v -= luma_avg;
+    }
+    l
+}
+
 // ---------------------------------------------------------------------
 // Residual pipeline (any square TX size).
 // ---------------------------------------------------------------------
@@ -3231,6 +3624,7 @@ pub(crate) fn residual_tx(
         qp,
         w,
         h,
+        crate::encoder::forward_quantize::QUANT_ROUND_HALF,
     )
 }
 
@@ -3256,6 +3650,7 @@ pub(crate) fn residual_tx_avail(
     qp: &QuantizerParams,
     avail_w: usize,
     avail_h: usize,
+    round_num_64: i64,
 ) -> Vec<i32> {
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
@@ -3280,7 +3675,7 @@ pub(crate) fn residual_tx_avail(
     // QM election sets it on unsegmented lossy frames, so segment 0
     // is the only coded segment whenever it is < 15).
     let qm = qp.seg_qm_level[plane as usize][0];
-    let dense = forward_quantize(&coeffs, tx_sz, plane, 0, tx_type, qm, qp);
+    let dense = forward_quantize_rounded(&coeffs, tx_sz, plane, 0, tx_type, qm, qp, round_num_64);
     let quant = repack_compact(dense, w, h);
     let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, qm, qp);
     let res_back =
@@ -3335,6 +3730,10 @@ fn residual_tx_search_luma_avail(
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
     avail_w: usize,
     avail_h: usize,
+    // r460 — `Some(set)`: only these §5.11.47 types are trialled (the
+    // pruned search); `None` = the full admissible set.
+    tx_type_shortlist: Option<&[usize]>,
+    round_num_64: i64,
 ) -> Result<(Vec<i32>, u8), Error> {
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
@@ -3362,20 +3761,36 @@ fn residual_tx_search_luma_avail(
     let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
     for t in 0..crate::cdf::TX_TYPES {
         let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(false, set, t));
-        if !admissible {
+        if !admissible || tx_type_shortlist.is_some_and(|l| !l.contains(&t)) {
             continue;
         }
         let coeffs = forward_transform_2d(&residual, tx_sz, t, false);
         // r439 — luma §5.9.12 QM row (15 = no-QM; see `residual_tx_avail`).
         let qm = qp.seg_qm_level[0][0];
-        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, qm, qp), w, h);
+        let quant = repack_compact(
+            forward_quantize_rounded(&coeffs, tx_sz, 0, 0, t, qm, qp, round_num_64),
+            w,
+            h,
+        );
         let all_zero = quant.iter().all(|&q| q == 0);
         let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, qm, qp);
         let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
+        // r460 — the §7.12.3 step-3 `flipUD` / `flipLR` destination
+        // remap: the decoder places the inverse-transformed residual
+        // flipped for the FLIPADST family, so the candidate's
+        // distortion (and the committed reconstruction below) must
+        // read it the same way — the pre-r460 search scored those
+        // types against the unflipped residual and never elected one.
+        let (flip_ud, flip_lr) = step3_flips(t);
+        let src_idx = |i: usize, j: usize| -> usize {
+            let yy = if flip_ud { h - 1 - i } else { i };
+            let xx = if flip_lr { w - 1 - j } else { j };
+            yy * w + xx
+        };
         let mut d = 0u64;
         for i in 0..ah {
             for j in 0..aw {
-                let rec = (i64::from(pred[i * w + j]) + res_back[i * w + j]).clamp(0, max_val);
+                let rec = (i64::from(pred[i * w + j]) + res_back[src_idx(i, j)]).clamp(0, max_val);
                 let diff = i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - rec;
                 d += (diff * diff) as u64;
             }
@@ -3419,9 +3834,12 @@ fn residual_tx_search_luma_avail(
     if let (Some((tu_fork, ctx)), Some((fx, fy))) = (fork, fork_xy) {
         tu_fork.commit_luma_tu(ctx, tx_sz, fx, fy, &quant, label)?;
     }
+    let (flip_ud, flip_lr) = step3_flips(label as usize);
     for i in 0..ah {
         for j in 0..aw {
-            let p = i64::from(pred[i * w + j]) + res_back[i * w + j];
+            let yy = if flip_ud { h - 1 - i } else { i };
+            let xx = if flip_lr { w - 1 - j } else { j };
+            let p = i64::from(pred[i * w + j]) + res_back[yy * w + xx];
             recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, max_val) as u16;
         }
     }
@@ -3656,7 +4074,53 @@ fn pick_uv_mode(
         }
     }
     if cfl_allowed {
-        for &(au, av) in CFL_ALPHA_CANDIDATES {
+        // r460 — least-squares (αU, αV) seeds: with `pred = dc +
+        // Round2Signed(α · ac, 6)` (§7.11.5), the SSD-optimal α per
+        // plane is `64 · Σ(res · ac) / Σ(ac²)` over the block; the
+        // candidates are each plane's seed ±1 (the neighbouring
+        // §5.11.45 alphabet entries), replacing the fixed 20-pair grid
+        // that reached no further than |α| = 4.
+        let ac = cfl_luma_ac(
+            &recon.y,
+            recon.width,
+            ccol0,
+            crow0,
+            cbw,
+            cbh,
+            max_luma_w,
+            max_luma_h,
+            recon.subsampling_x,
+            recon.subsampling_y,
+        );
+        let seed = |plane_in: &[u16], dc: &[u16]| -> i8 {
+            let mut num = 0i128;
+            let mut den = 0i128;
+            for i in 0..cah {
+                for j in 0..caw {
+                    let k = i * cbw + j;
+                    let r = i64::from(plane_in[(crow0 + i) * pw + (ccol0 + j)]) - i64::from(dc[k]);
+                    num += i128::from(r) * i128::from(ac[k]);
+                    den += i128::from(ac[k]) * i128::from(ac[k]);
+                }
+            }
+            if den == 0 {
+                return 0;
+            }
+            let a = (64 * num + den.signum() * den / 2) / den;
+            a.clamp(-16, 16) as i8
+        };
+        let (su, sv) = (seed(&input.u, &dc_pred_u), seed(&input.v, &dc_pred_v));
+        let around =
+            |a: i8| -> [i8; 3] { [a.saturating_sub(1).max(-16), a, a.saturating_add(1).min(16)] };
+        let mut cands: Vec<(i8, i8)> = Vec::with_capacity(9);
+        for &au in &around(su) {
+            for &av in &around(sv) {
+                if (au != 0 || av != 0) && !cands.contains(&(au, av)) {
+                    cands.push((au, av));
+                }
+            }
+        }
+        for &(au, av) in &cands {
             let pred_u = cfl_layer(
                 &dc_pred_u,
                 &recon.y,
@@ -3801,7 +4265,11 @@ pub(crate) fn encode_leaf_sq_seg(
             MAX_TX_SIZE_RECT[b_size]
         }]
     } else {
-        let max_steps = if b_size == BLOCK_8X8 { 1 } else { MAX_TX_DEPTH };
+        let max_steps = if b_size == BLOCK_8X8 {
+            1.min(recon.search.tx_depth_steps)
+        } else {
+            MAX_TX_DEPTH.min(recon.search.tx_depth_steps)
+        };
         let mut v = vec![MAX_TX_SIZE_RECT[b_size]];
         for _ in 0..max_steps {
             let next = SPLIT_TX_SIZE[*v.last().expect("non-empty")];
@@ -4971,6 +5439,26 @@ pub(crate) fn encode_leaf_with_tx(
         use_filter_intra: filter_intra_mode.is_some(),
         filter_intra_mode,
     });
+    // r460 — the pruned §5.11.47 shortlist: DCT_DCT + the mode's
+    // `Mode_To_Txfm` default (+ IDTX under screen-content tools).
+    let tx_shortlist: Option<Vec<usize>> = recon.search.prune_tx_types.then(|| {
+        let mut l = vec![DCT_DCT];
+        let default = if palette_y.is_some() || filter_intra_mode.is_some() {
+            DCT_DCT
+        } else {
+            MODE_TO_TXFM
+                .get(y_mode as usize)
+                .copied()
+                .unwrap_or(DCT_DCT)
+        };
+        if !l.contains(&default) {
+            l.push(default);
+        }
+        if recon.allow_screen_content_tools {
+            l.push(crate::cdf::IDTX);
+        }
+        l
+    });
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
     // r425 — on-screen extent for frame-edge-straddling leaves: the
     // §5.11.35 walk skips TUs whose origin is off-screen and the
@@ -5031,6 +5519,7 @@ pub(crate) fn encode_leaf_with_tx(
                         &qp,
                         os_w - tx,
                         os_h - ty,
+                        crate::encoder::forward_quantize::QUANT_ROUND_HALF,
                     ),
                     DCT_DCT as u8,
                 )
@@ -5053,6 +5542,8 @@ pub(crate) fn encode_leaf_with_tx(
                     },
                     os_w - tx,
                     os_h - ty,
+                    tx_shortlist.as_deref(),
+                    recon.search.quant_round_64,
                 )?
             };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
@@ -5225,6 +5716,7 @@ pub(crate) fn encode_leaf_with_tx(
                         &qp,
                         os_cw - tx,
                         os_ch - ty,
+                        recon.search.quant_round_64,
                     );
                     tu_bd_stamp(&mut recon.bd, plane, tc, tr, ctw, cth);
                     residual_quant.push(q);
@@ -5658,18 +6150,20 @@ fn build_search_tree(
         // costed: the write pass short-circuits before any symbol).
         return Ok((SyntaxNode::dummy_oob(), 0));
     }
-    if b_size == BLOCK_4X4 {
+    let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let fully_inside = r + n4 <= recon.mi_rows && c + n4 <= recon.mi_cols;
+    // r460 — `min_leaf` stops the fully-inside descent early (edge
+    // nodes keep the §5.11.4 forced-split arms).
+    if b_size == BLOCK_4X4 || (fully_inside && b_size <= recon.search.min_leaf) {
         let pricing = (model == RateModel::Twin).then_some((&*twin, params));
         let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg, dq_units)?;
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let cost = twin.commit_subtree(&node, r, c, b_size, params)?;
         return Ok((node, cost));
     }
-    let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
     let half = n4 >> 1;
     let sub = crate::cdf::partition_subsize(crate::cdf::PARTITION_SPLIT, b_size)
         .expect("PARTITION_SPLIT subsize exists for every b_size >= BLOCK_8X8");
-    let fully_inside = r + n4 <= recon.mi_rows && c + n4 <= recon.mi_cols;
 
     if !fully_inside {
         // §5.11.4 edge arms: a node straddling the frame edge cannot
@@ -5798,10 +6292,16 @@ fn build_search_tree(
     // syntax committed to a twin fork).
     let pricing = (model == RateModel::Twin).then_some((&*twin, params));
     let leaf = encode_key_leaf(r, c, b_size, input, recon, pricing, seg, dq_units)?;
+    let leaf_is_skip = leaf.skip == 1;
     let node_a = SyntaxNode::Leaf(Box::new(leaf));
     let d_a = region_distortion(recon, input, r, c, n4 as usize);
     let origin = twin.scope(r, c, b_size, params);
     let cost_a = twin.commit_subtree(&node_a, r, c, b_size, params)?;
+    if recon.search.skip_leaf_early_exit && leaf_is_skip {
+        // r460 — a residual-free square leaf is kept as is: no split /
+        // rect arm is trialled below it.
+        return Ok((node_a, cost_a));
+    }
     let twin_a = twin.scope(r, c, b_size, params);
     twin.restore(&origin);
     let after_a = save_region(recon, r, c, n4 as usize);
@@ -5833,7 +6333,8 @@ fn build_search_tree(
     // measure against). Each shape's second leaf searches against the
     // first leaf's committed twin state, exactly like the emitting
     // pass.
-    if model == RateModel::Twin && b_size >= crate::cdf::BLOCK_16X16 {
+    if model == RateModel::Twin && b_size >= crate::cdf::BLOCK_16X16 && recon.search.rect_partitions
+    {
         for part in [crate::cdf::PARTITION_HORZ, crate::cdf::PARTITION_VERT] {
             let Some(psub) = crate::cdf::partition_subsize(part, b_size) else {
                 continue;
@@ -6082,6 +6583,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -6216,6 +6718,7 @@ mod tests {
                 subsampling_x: 1,
                 subsampling_y: 1,
                 num_planes: 3,
+                search: SearchLimits::default(),
                 bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
@@ -6332,6 +6835,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -6441,6 +6945,7 @@ mod tests {
                 subsampling_x: 1,
                 subsampling_y: 1,
                 num_planes: 3,
+                search: SearchLimits::default(),
                 bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
@@ -6585,6 +7090,7 @@ mod tests {
                 subsampling_x: 1,
                 subsampling_y: 1,
                 num_planes: 3,
+                search: SearchLimits::default(),
                 bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
             };
@@ -6652,12 +7158,20 @@ mod tests {
     /// colours are not, and the VERT pair costs two palette lists /
     /// token walks against the SPLIT arm's four — and the stream must
     /// round-trip byte-exact through the spec driver on the lossy AND
-    /// lossless arms.
+    /// lossless arms. r460 — with the forward-transform gain
+    /// corrected, one 64×64 palette of the 16 colours' midpoints plus a
+    /// small residual can legitimately undercut two exact palettes, so
+    /// the strips sit 16 levels apart (a ±8 residual) and the lossy arm
+    /// runs at a fine quantiser (`q = 20`) — the regime where the
+    /// residual is not free.
     #[test]
     fn r425_rect_palette_leaf_elected_on_split_content() {
         let (w, h) = (64usize, 64usize);
         const LEFT: [u16; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
-        const RIGHT: [u16; 8] = [20, 52, 84, 116, 148, 180, 212, 244];
+        // r460 — the strips sit 16 levels apart (a ±8 residual on any
+        // shared 8-colour palette), so the lossy arm cannot fold both
+        // into one list plus a free residual.
+        const RIGHT: [u16; 8] = [32, 64, 96, 128, 160, 192, 224, 255];
         let mut input = YuvFrame::filled(w as u32, h as u32, 8, ChromaFormat::Yuv420, 128);
         let mut state = 0x5EED_0425u32;
         let mut next = move || {
@@ -6673,7 +7187,7 @@ mod tests {
             }
         }
 
-        for q in [60u8, 0] {
+        for q in [20u8, 0] {
             let mut recon = ReconState {
                 y: vec![0u16; w * h],
                 u: vec![0u16; (w / 2) * (h / 2)],
@@ -6692,6 +7206,7 @@ mod tests {
                 subsampling_x: 1,
                 subsampling_y: 1,
                 num_planes: 3,
+                search: SearchLimits::default(),
                 bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
@@ -6786,6 +7301,7 @@ mod tests {
                 subsampling_x: 1,
                 subsampling_y: 1,
                 num_planes: 3,
+                search: SearchLimits::default(),
                 bd: BlockDecodedMirror::new(1, 1, 3),
                 dv_hash: Default::default(),
             };
@@ -6870,6 +7386,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: if hash && allow_intrabc {
                 crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h)
@@ -7219,6 +7736,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: crate::encoder::dv_hash::DvHashIndex::build(&input.y, w, h),
         };
@@ -7398,6 +7916,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };
@@ -7568,6 +8087,7 @@ mod tests {
             subsampling_x: 1,
             subsampling_y: 1,
             num_planes: 3,
+            search: SearchLimits::default(),
             bd: BlockDecodedMirror::new(1, 1, 3),
             dv_hash: Default::default(),
         };

@@ -916,6 +916,7 @@ fn encode_spatial_layered_core(
             full_range: false,
             coded_size: None,
             color_description: None,
+            search: Default::default(),
         };
         let (k, carry) = crate::encoder::key_frame::encode_key_frame_yuv_full(
             opener_input,

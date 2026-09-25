@@ -717,6 +717,38 @@ pub fn forward_transform_2d(
         work[i * w..(i + 1) * w].copy_from_slice(&row_buf);
     }
 
+    // r460 — the per-size GAIN correction. Measured against the
+    // decoder's own §7.13.3 chain (forward → quantise at a fine step →
+    // §7.12.3 dequantise → inverse), the column-then-row composition
+    // above reproduced the residual at 1/4 amplitude for the 4×4
+    // family, 1/2 for 8×8 / 8×16 / 4×16, exactly 1 only at 16×16 /
+    // 8×32, 2 at 16×32 and 4 at 32×32 — every TU size but 16×16 was
+    // coding a residual the decoder rebuilds at the wrong amplitude,
+    // and the RD search had been compensating around it (pre-r460
+    // KEY frames ran ~2× the bytes of a third-party encoder at equal
+    // PSNR). The kernels' own gain is 2^(floor((log2W + log2H) / 2) - 4)
+    // up to a 16×16-sized product and 2^(log2W + log2H - 8) beyond it
+    // relative to what the §7.13.3 shift envelope (`Transform_Row_Shift`
+    // + `colShift = 4`) undoes; scale the coefficients by the inverse
+    // so `inverse(quantise(forward(r))) ≈ r` at every size.
+    let sum = log2_w + log2_h;
+    let shift: i32 = if sum <= 8 {
+        4 - (sum / 2) as i32
+    } else {
+        8 - sum as i32
+    };
+    if shift > 0 {
+        for v in work.iter_mut() {
+            *v <<= shift;
+        }
+    } else if shift < 0 {
+        let s = (-shift) as u32;
+        let half = 1i64 << (s - 1);
+        for v in work.iter_mut() {
+            *v = (*v + half) >> s;
+        }
+    }
+
     work
 }
 
@@ -892,22 +924,23 @@ mod tests {
         }
     }
 
-    // DCT_DCT across square sizes. Empirical per-cell scale (from
-    // the round-trip probe): {1/4, 1/2, 1, 4, 4} for
-    // {TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64}.
+    // DCT_DCT across square sizes. r460 — unit per-cell gain at every
+    // size: `inverse(forward(x)) ≈ x` through the decoder's own
+    // §7.13.3 chain (the pre-r460 kernels reproduced {1/4, 1/2, 1, 4,
+    // 4} of the input at {4×4, 8×8, 16×16, 32×32, 64×64}; the
+    // per-size correction at the end of `forward_transform_2d`
+    // restores unity).
 
     #[test]
     fn dct_dct_tx_4x4_roundtrip() {
         let input = lcg_residual(0x1111_2222_3333_4444, 16);
-        // Per-cell ≈ 1/4 of input.
-        check_roundtrip_frac(&input, TX_4X4, DCT_DCT, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X4, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn dct_dct_tx_8x8_roundtrip() {
         let input = lcg_residual(0x5555_6666_7777_8888, 64);
-        // Per-cell ≈ 1/2 of input.
-        check_roundtrip_frac(&input, TX_8X8, DCT_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X8, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
@@ -915,25 +948,22 @@ mod tests {
         // Scale down inputs so the post-quantization range fits in
         // the inverse's 16-bit between-stage clamp.
         let input = lcg_residual_bound(0x9999_AAAA_BBBB_CCCC, 256, 32);
-        // Per-cell ≈ 1 × input.
         check_roundtrip_frac(&input, TX_16X16, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn dct_dct_tx_32x32_roundtrip() {
         let input = lcg_residual_bound(0xDEAD_BEEF_F00D_CAFE, 1024, 8);
-        // Per-cell ≈ 4 × input.
-        check_roundtrip_frac(&input, TX_32X32, DCT_DCT, 4, 1, 16);
+        check_roundtrip_frac(&input, TX_32X32, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn dct_dct_tx_64x64_roundtrip() {
         let input = lcg_residual_bound(0x0123_4567_89AB_CDEF, 4096, 2);
-        // Per-cell ≈ 4 × input (per the empirical probe). The
         // larger error bound here reflects the deeper DCT-64
         // butterfly schedule's accumulated `Round2(_, 12)` floor
         // (31-step butterfly graph vs ~5 steps for DCT-4).
-        check_roundtrip_frac(&input, TX_64X64, DCT_DCT, 4, 1, 64);
+        check_roundtrip_frac(&input, TX_64X64, DCT_DCT, 1, 1, 64);
     }
 
     // ADST × ADST and ADST × DCT combinations. Same per-cell scale
@@ -943,19 +973,19 @@ mod tests {
     #[test]
     fn adst_adst_tx_4x4_roundtrip() {
         let input = lcg_residual(0xABCD_EF01_2345_6789, 16);
-        check_roundtrip_frac(&input, TX_4X4, ADST_ADST, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X4, ADST_ADST, 1, 1, 16);
     }
 
     #[test]
     fn adst_dct_tx_8x8_roundtrip() {
         let input = lcg_residual(0xFACE_BEEF_CAFE_BABE, 64);
-        check_roundtrip_frac(&input, TX_8X8, ADST_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X8, ADST_DCT, 1, 1, 16);
     }
 
     #[test]
     fn dct_adst_tx_8x8_roundtrip() {
         let input = lcg_residual(0xBADD_CAFE_F00D_0BAD, 64);
-        check_roundtrip_frac(&input, TX_8X8, DCT_ADST, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X8, DCT_ADST, 1, 1, 16);
     }
 
     #[test]
@@ -972,19 +1002,19 @@ mod tests {
     #[test]
     fn flipadst_flipadst_tx_4x4_roundtrip() {
         let input = lcg_residual(0x2233_4455_6677_8899, 16);
-        check_roundtrip_flip(&input, TX_4X4, FLIPADST_FLIPADST, 1, 4, 16);
+        check_roundtrip_flip(&input, TX_4X4, FLIPADST_FLIPADST, 1, 1, 16);
     }
 
     #[test]
     fn flipadst_dct_tx_8x8_roundtrip() {
         let input = lcg_residual(0xAA55_AA55_AA55_AA55, 64);
-        check_roundtrip_flip(&input, TX_8X8, FLIPADST_DCT, 1, 2, 16);
+        check_roundtrip_flip(&input, TX_8X8, FLIPADST_DCT, 1, 1, 16);
     }
 
     #[test]
     fn dct_flipadst_tx_8x8_roundtrip() {
         let input = lcg_residual(0x55AA_55AA_55AA_55AA, 64);
-        check_roundtrip_flip(&input, TX_8X8, DCT_FLIPADST, 1, 2, 16);
+        check_roundtrip_flip(&input, TX_8X8, DCT_FLIPADST, 1, 1, 16);
     }
 
     #[test]
@@ -1010,14 +1040,14 @@ mod tests {
     fn idtx_tx_4x4_roundtrip() {
         let input = lcg_residual(0x1234_5678_9ABC_DEF0, 16);
         // Empirical: per-cell ≈ 1/4 × input.
-        check_roundtrip_frac(&input, TX_4X4, IDTX, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X4, IDTX, 1, 1, 16);
     }
 
     #[test]
     fn idtx_tx_8x8_roundtrip() {
         let input = lcg_residual(0xDEAD_FACE_BEEF_CAFE, 64);
         // Empirical: per-cell ≈ 1/2 × input.
-        check_roundtrip_frac(&input, TX_8X8, IDTX, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X8, IDTX, 1, 1, 16);
     }
 
     #[test]
@@ -1032,7 +1062,7 @@ mod tests {
         let input = lcg_residual_bound(0xC001_D00D_FACE_FEED, 1024, 8);
         // Empirical: per-cell ≈ 4 × input (and exact since c = 16384
         // is a power of two).
-        check_roundtrip_frac(&input, TX_32X32, IDTX, 4, 1, 16);
+        check_roundtrip_frac(&input, TX_32X32, IDTX, 1, 1, 16);
     }
 
     // V_/H_ mixed (DCT × identity) combinations. Same per-cell
@@ -1043,14 +1073,14 @@ mod tests {
     fn v_dct_tx_4x4_roundtrip() {
         // V_DCT: column kernel = DCT, row kernel = identity.
         let input = lcg_residual(0x1010_2020_3030_4040, 16);
-        check_roundtrip_frac(&input, TX_4X4, V_DCT, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X4, V_DCT, 1, 1, 16);
     }
 
     #[test]
     fn h_dct_tx_8x8_roundtrip() {
         // H_DCT: row kernel = DCT, column kernel = identity.
         let input = lcg_residual(0x5050_6060_7070_8080, 64);
-        check_roundtrip_frac(&input, TX_8X8, H_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X8, H_DCT, 1, 1, 16);
     }
 
     // -------------------------------------------------------------
@@ -1089,13 +1119,13 @@ mod tests {
         // TX_4X8 round-trip per-cell scale ≈ 1/4 of input (empirical
         // on a constant-DC probe: input = 64 ⇒ recovered = 16).
         let input = lcg_residual(0x1357_2468_ACE0_BDF1, 32);
-        check_roundtrip_frac(&input, TX_4X8, DCT_DCT, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X8, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn rect_tx_8x4_dct_dct_roundtrip() {
         let input = lcg_residual(0x2468_ACE0_BDF1_1357, 32);
-        check_roundtrip_frac(&input, TX_8X4, DCT_DCT, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_8X4, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
@@ -1113,13 +1143,12 @@ mod tests {
             dc.abs() > 10 * max_off.max(1),
             "TX_4X8 DC = {dc}, max off-DC = {max_off} — DC should dominate"
         );
-        // Round-trip per-cell scale of 1/4 on input = 64 ⇒ each
-        // recovered cell ≈ 16.
+        // r460 — unit per-cell gain: each recovered cell ≈ the input.
         let recovered = inverse_transform_2d(&coeffs, TX_4X8, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_4X8 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 64).abs() <= 2,
+                "TX_4X8 constant-DC round-trip cell {i}: got {v}, expected ≈ 64"
             );
         }
     }
@@ -1138,8 +1167,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_8X4, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_8X4 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 64).abs() <= 2,
+                "TX_8X4 constant-DC round-trip cell {i}: got {v}, expected ≈ 64"
             );
         }
     }
@@ -1150,13 +1179,13 @@ mod tests {
         // log2_w = 2 (n=2) and log2_h = 3 (n=3) are in range, so
         // ADST × DCT and DCT × ADST are reachable for TX_4X8.
         let input = lcg_residual(0xFACE_BABE_F00D_CAFE, 32);
-        check_roundtrip_frac(&input, TX_4X8, ADST_DCT, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X8, ADST_DCT, 1, 1, 16);
     }
 
     #[test]
     fn rect_tx_8x4_dct_adst_roundtrip() {
         let input = lcg_residual(0xCAFE_F00D_BABE_FACE, 32);
-        check_roundtrip_frac(&input, TX_8X4, DCT_ADST, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_8X4, DCT_ADST, 1, 1, 16);
     }
 
     #[test]
@@ -1164,7 +1193,7 @@ mod tests {
         // IDTX is defined for n in 2..=5 (sizes 4 / 8 / 16 / 32);
         // both axes are in range for TX_4X8.
         let input = lcg_residual(0x1010_2020_3030_4040, 32);
-        check_roundtrip_frac(&input, TX_4X8, IDTX, 1, 4, 16);
+        check_roundtrip_frac(&input, TX_4X8, IDTX, 1, 1, 16);
     }
 
     #[test]
@@ -1173,7 +1202,7 @@ mod tests {
         // axes is in effect (flipped input compared against the
         // recovered).
         let input = lcg_residual(0xDEAD_BEEF_CAFE_BABE, 32);
-        check_roundtrip_flip(&input, TX_8X4, FLIPADST_FLIPADST, 1, 4, 16);
+        check_roundtrip_flip(&input, TX_8X4, FLIPADST_FLIPADST, 1, 1, 16);
     }
 
     // -------------------------------------------------------------
@@ -1223,25 +1252,23 @@ mod tests {
 
     #[test]
     fn rect_tx_8x16_dct_dct_roundtrip() {
-        // Per-cell ≈ 1/2 × input. Reduced input bound keeps the
         // inverse pipeline's 16-bit between-stage clamp from
         // saturating on the 16-tall column kernel.
         let input = lcg_residual_bound(0xCAFE_8B16_DEAD_BEEF, 8 * 16, 32);
-        check_roundtrip_frac(&input, TX_8X16, DCT_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X16, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn rect_tx_16x8_dct_dct_roundtrip() {
         let input = lcg_residual_bound(0xBEEF_16B8_F00D_CAFE, 16 * 8, 32);
-        check_roundtrip_frac(&input, TX_16X8, DCT_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_16X8, DCT_DCT, 1, 1, 16);
     }
 
     #[test]
     fn rect_tx_8x16_dc_input_dc_only_coefficient() {
         // A constant-DC input should produce a single dominant DC
         // coefficient (at index 0 of the row-major coefficient
-        // buffer). Per-cell round-trip scale of 1/2 on input = 32 ⇒
-        // each recovered cell ≈ 16.
+        // buffer); r460 unit gain: each recovered cell ≈ the input.
         let input = vec![32i64; 8 * 16];
         let coeffs = forward_transform_2d(&input, TX_8X16, DCT_DCT, false);
         assert_eq!(coeffs.len(), 8 * 16);
@@ -1254,8 +1281,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_8X16, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_8X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 32).abs() <= 2,
+                "TX_8X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 32"
             );
         }
     }
@@ -1274,8 +1301,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_16X8, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_16X8 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 32).abs() <= 2,
+                "TX_16X8 constant-DC round-trip cell {i}: got {v}, expected ≈ 32"
             );
         }
     }
@@ -1283,13 +1310,13 @@ mod tests {
     #[test]
     fn rect_tx_8x16_adst_dct_roundtrip() {
         let input = lcg_residual_bound(0x8B16_AD0C_DEAD_BEEF, 8 * 16, 32);
-        check_roundtrip_frac(&input, TX_8X16, ADST_DCT, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X16, ADST_DCT, 1, 1, 16);
     }
 
     #[test]
     fn rect_tx_16x8_dct_adst_roundtrip() {
         let input = lcg_residual_bound(0x16B8_DCAD_F00D_CAFE, 16 * 8, 32);
-        check_roundtrip_frac(&input, TX_16X8, DCT_ADST, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_16X8, DCT_ADST, 1, 1, 16);
     }
 
     #[test]
@@ -1297,7 +1324,7 @@ mod tests {
         // IDTX is defined for n in 2..=5 (sizes 4 / 8 / 16 / 32);
         // both log2_w = 3 (n=3) and log2_h = 4 (n=4) are in range.
         let input = lcg_residual_bound(0x8B16_1D70_BEEF_CAFE, 8 * 16, 32);
-        check_roundtrip_frac(&input, TX_8X16, IDTX, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X16, IDTX, 1, 1, 16);
     }
 
     #[test]
@@ -1306,7 +1333,7 @@ mod tests {
         // axes is in effect (flipped input compared against the
         // recovered).
         let input = lcg_residual_bound(0x16B8_F1F1_DEAD_BEEF, 16 * 8, 32);
-        check_roundtrip_flip(&input, TX_16X8, FLIPADST_FLIPADST, 1, 2, 16);
+        check_roundtrip_flip(&input, TX_16X8, FLIPADST_FLIPADST, 1, 1, 16);
     }
 
     #[test]
@@ -1314,7 +1341,7 @@ mod tests {
         // Both axes ADST — log2_w = 3, log2_h = 4, both in
         // forward_adst_dispatch range (n in 2..=4).
         let input = lcg_residual_bound(0x8B16_AAAA_BABE_FACE, 8 * 16, 32);
-        check_roundtrip_frac(&input, TX_8X16, ADST_ADST, 1, 2, 16);
+        check_roundtrip_frac(&input, TX_8X16, ADST_ADST, 1, 1, 16);
     }
 
     // -------------------------------------------------------------
@@ -1364,25 +1391,23 @@ mod tests {
 
     #[test]
     fn rect_tx_16x32_dct_dct_roundtrip() {
-        // Per-cell ≈ 2 × input. Reduced input bound (`±8`) keeps the
         // inverse pipeline's 16-bit between-stage clamp from
         // saturating on the length-32 column kernel.
         let input = lcg_residual_bound(0xCAFE_1632_DEAD_BEEF, 16 * 32, 8);
-        check_roundtrip_frac(&input, TX_16X32, DCT_DCT, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_16X32, DCT_DCT, 1, 1, 4);
     }
 
     #[test]
     fn rect_tx_32x16_dct_dct_roundtrip() {
         let input = lcg_residual_bound(0xBEEF_3216_F00D_CAFE, 32 * 16, 8);
-        check_roundtrip_frac(&input, TX_32X16, DCT_DCT, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_32X16, DCT_DCT, 1, 1, 4);
     }
 
     #[test]
     fn rect_tx_16x32_dc_input_dc_only_coefficient() {
         // A constant-DC input should produce a single dominant DC
         // coefficient (at index 0 of the row-major coefficient
-        // buffer). Per-cell round-trip scale of 2 on input = 8 ⇒
-        // each recovered cell ≈ 16.
+        // buffer); r460 unit gain: each recovered cell ≈ the input.
         let input = vec![8i64; 16 * 32];
         let coeffs = forward_transform_2d(&input, TX_16X32, DCT_DCT, false);
         assert_eq!(coeffs.len(), 16 * 32);
@@ -1395,8 +1420,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_16X32, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_16X32 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 8).abs() <= 2,
+                "TX_16X32 constant-DC round-trip cell {i}: got {v}, expected ≈ 8"
             );
         }
     }
@@ -1415,8 +1440,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_32X16, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_32X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 8).abs() <= 2,
+                "TX_32X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 8"
             );
         }
     }
@@ -1432,7 +1457,7 @@ mod tests {
         // col selector for DCT_ADST is DCT (length 32, in DCT 2..=6
         // range). Both kernels reachable.
         let input = lcg_residual_bound(0x1632_AD0C_DEAD_BEEF, 16 * 32, 8);
-        check_roundtrip_frac(&input, TX_16X32, DCT_ADST, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_16X32, DCT_ADST, 1, 1, 4);
     }
 
     #[test]
@@ -1444,7 +1469,7 @@ mod tests {
         // [`forward_col_kernel`] the col selector for ADST_DCT is
         // ADST (length 16, in §7.13.2.9 range).
         let input = lcg_residual_bound(0x3216_DCAD_F00D_CAFE, 32 * 16, 8);
-        check_roundtrip_frac(&input, TX_32X16, ADST_DCT, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_32X16, ADST_DCT, 1, 1, 4);
     }
 
     #[test]
@@ -1480,7 +1505,7 @@ mod tests {
         // V_DCT: column kernel = DCT (length 32, in range), row
         // kernel = identity (length 16, in IDTX 2..=5 range).
         let input = lcg_residual_bound(0x1632_5DC7_BABE_F00D, 16 * 32, 8);
-        check_roundtrip_frac(&input, TX_16X32, V_DCT, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_16X32, V_DCT, 1, 1, 4);
     }
 
     #[test]
@@ -1488,7 +1513,7 @@ mod tests {
         // H_DCT: row kernel = DCT (length 32, in range), column
         // kernel = identity (length 16, in IDTX 2..=5 range).
         let input = lcg_residual_bound(0x3216_4DC7_FACE_BABE, 32 * 16, 8);
-        check_roundtrip_frac(&input, TX_32X16, H_DCT, 2, 1, 4);
+        check_roundtrip_frac(&input, TX_32X16, H_DCT, 1, 1, 4);
     }
 
     // -------------------------------------------------------------
@@ -1547,7 +1572,6 @@ mod tests {
 
     #[test]
     fn rect_tx_32x64_dct_dct_roundtrip() {
-        // Per-cell ≈ 8 × input on the round-trip. Tight input bound
         // (`±2`) keeps the inverse pipeline's 16-bit between-stage
         // clamp from saturating on the length-64 column kernel; the
         // generous `max_err = 64` mirrors the TX_64X64 square test —
@@ -1557,21 +1581,20 @@ mod tests {
         // stage clamp closer to saturation than the constant-DC
         // probe does.
         let input = lcg_residual_bound(0xCAFE_3264_DEAD_BEEF, 32 * 64, 2);
-        check_roundtrip_frac(&input, TX_32X64, DCT_DCT, 8, 1, 64);
+        check_roundtrip_frac(&input, TX_32X64, DCT_DCT, 1, 1, 64);
     }
 
     #[test]
     fn rect_tx_64x32_dct_dct_roundtrip() {
         let input = lcg_residual_bound(0xBEEF_6432_F00D_CAFE, 64 * 32, 2);
-        check_roundtrip_frac(&input, TX_64X32, DCT_DCT, 8, 1, 64);
+        check_roundtrip_frac(&input, TX_64X32, DCT_DCT, 1, 1, 64);
     }
 
     #[test]
     fn rect_tx_32x64_dc_input_dc_only_coefficient() {
         // A constant-DC input should produce a single dominant DC
         // coefficient (at index 0 of the row-major coefficient
-        // buffer). Per-cell round-trip scale of 8 on input = 2 ⇒
-        // each recovered cell ≈ 16.
+        // buffer); r460 unit gain: each recovered cell ≈ the input.
         let input = vec![2i64; 32 * 64];
         let coeffs = forward_transform_2d(&input, TX_32X64, DCT_DCT, false);
         assert_eq!(coeffs.len(), 32 * 64);
@@ -1584,8 +1607,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_32X64, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_32X64 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 2).abs() <= 2,
+                "TX_32X64 constant-DC round-trip cell {i}: got {v}, expected ≈ 2"
             );
         }
     }
@@ -1604,8 +1627,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_64X32, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_64X32 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 2).abs() <= 2,
+                "TX_64X32 constant-DC round-trip cell {i}: got {v}, expected ≈ 2"
             );
         }
     }
@@ -1620,7 +1643,7 @@ mod tests {
         // case — the length-64 column kernel still dominates the
         // round-trip error envelope.
         let input = lcg_residual_bound(0x3264_5DC7_BABE_F00D, 32 * 64, 2);
-        check_roundtrip_frac(&input, TX_32X64, V_DCT, 8, 1, 64);
+        check_roundtrip_frac(&input, TX_32X64, V_DCT, 1, 1, 64);
     }
 
     #[test]
@@ -1630,7 +1653,7 @@ mod tests {
         // identity (length 32, in forward_idtx_dispatch 2..=5
         // range). The IDTX kernel sits on the length-32 axis.
         let input = lcg_residual_bound(0x6432_4DC7_FACE_BABE, 64 * 32, 2);
-        check_roundtrip_frac(&input, TX_64X32, H_DCT, 8, 1, 64);
+        check_roundtrip_frac(&input, TX_64X32, H_DCT, 1, 1, 64);
     }
 
     // -------------------------------------------------------------
@@ -1694,7 +1717,6 @@ mod tests {
 
     #[test]
     fn rect_tx_16x64_dct_dct_roundtrip() {
-        // Per-cell ≈ 4 × input on the round-trip. Tight input bound
         // (`±2`) keeps the inverse pipeline's 16-bit between-stage
         // clamp from saturating on the length-64 column kernel; the
         // generous `max_err = 64` mirrors the TX_64X64 / TX_32X64 /
@@ -1704,21 +1726,20 @@ mod tests {
         // 16-bit between-stage clamp closer to saturation than the
         // constant-DC probe does.
         let input = lcg_residual_bound(0xCAFE_1664_DEAD_BEEF, 16 * 64, 2);
-        check_roundtrip_frac(&input, TX_16X64, DCT_DCT, 4, 1, 64);
+        check_roundtrip_frac(&input, TX_16X64, DCT_DCT, 1, 1, 64);
     }
 
     #[test]
     fn rect_tx_64x16_dct_dct_roundtrip() {
         let input = lcg_residual_bound(0xBEEF_6416_F00D_CAFE, 64 * 16, 2);
-        check_roundtrip_frac(&input, TX_64X16, DCT_DCT, 4, 1, 64);
+        check_roundtrip_frac(&input, TX_64X16, DCT_DCT, 1, 1, 64);
     }
 
     #[test]
     fn rect_tx_16x64_dc_input_dc_only_coefficient() {
         // A constant-DC input should produce a single dominant DC
         // coefficient (at index 0 of the row-major coefficient
-        // buffer). Per-cell round-trip scale of 4 on input = 4 ⇒
-        // each recovered cell ≈ 16.
+        // buffer); r460 unit gain: each recovered cell ≈ the input.
         let input = vec![4i64; 16 * 64];
         let coeffs = forward_transform_2d(&input, TX_16X64, DCT_DCT, false);
         assert_eq!(coeffs.len(), 16 * 64);
@@ -1731,8 +1752,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_16X64, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_16X64 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 4).abs() <= 2,
+                "TX_16X64 constant-DC round-trip cell {i}: got {v}, expected ≈ 4"
             );
         }
     }
@@ -1751,8 +1772,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_64X16, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 16).abs() <= 2,
-                "TX_64X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+                (v - 4).abs() <= 2,
+                "TX_64X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 4"
             );
         }
     }
@@ -1828,13 +1849,13 @@ mod tests {
         // boundary, so the full per-cell residual range is safe.
         // Empirical per-cell round-trip scale = 1/2.
         let input = lcg_residual_bound(0x416B_EEF1_DEAD_F00D, 4 * 16, 128);
-        check_roundtrip_frac(&input, TX_4X16, DCT_DCT, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_4X16, DCT_DCT, 1, 1, 6);
     }
 
     #[test]
     fn rect_tx_16x4_dct_dct_roundtrip() {
         let input = lcg_residual_bound(0x164B_EEF2_F00D_CAFE, 16 * 4, 128);
-        check_roundtrip_frac(&input, TX_16X4, DCT_DCT, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_16X4, DCT_DCT, 1, 1, 6);
     }
 
     #[test]
@@ -1842,13 +1863,13 @@ mod tests {
         // ADST × ADST is reachable on this pair — n=2 (length 4) and
         // n=4 (length 16) are both in forward_adst_dispatch range.
         let input = lcg_residual_bound(0x4A6B_EEF3_C0DE_BABE, 4 * 16, 128);
-        check_roundtrip_frac(&input, TX_4X16, ADST_ADST, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_4X16, ADST_ADST, 1, 1, 6);
     }
 
     #[test]
     fn rect_tx_16x4_adst_adst_roundtrip() {
         let input = lcg_residual_bound(0x16AB_EEF4_DECA_F00D, 16 * 4, 128);
-        check_roundtrip_frac(&input, TX_16X4, ADST_ADST, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_16X4, ADST_ADST, 1, 1, 6);
     }
 
     #[test]
@@ -1860,13 +1881,13 @@ mod tests {
         // the empirical round-trip per-cell scale matches the DCT
         // arm at 1/2.
         let input = lcg_residual_bound(0x40C0_FFEE_BEEF_1664, 4 * 16, 128);
-        check_roundtrip_frac(&input, TX_4X16, IDTX, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_4X16, IDTX, 1, 1, 6);
     }
 
     #[test]
     fn rect_tx_16x4_idtx_roundtrip() {
         let input = lcg_residual_bound(0x16C0_FFEE_BEEF_BABE, 16 * 4, 128);
-        check_roundtrip_frac(&input, TX_16X4, IDTX, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_16X4, IDTX, 1, 1, 6);
     }
 
     #[test]
@@ -1880,7 +1901,7 @@ mod tests {
         // directly, so we compare against the doubly-flipped input
         // via `check_roundtrip_flip`.
         let input = lcg_residual_bound(0x4F1A_DEAD_C0DE_4F00, 4 * 16, 128);
-        check_roundtrip_flip(&input, TX_4X16, FLIPADST_FLIPADST, 1, 2, 6);
+        check_roundtrip_flip(&input, TX_4X16, FLIPADST_FLIPADST, 1, 1, 6);
     }
 
     #[test]
@@ -1890,7 +1911,7 @@ mod tests {
         // IDTX dispatcher range 2..=5). Reachable because §5.11.40
         // does not short-circuit on this shape.
         let input = lcg_residual_bound(0x164D_C742_BABE_C0DE, 16 * 4, 128);
-        check_roundtrip_frac(&input, TX_16X4, V_DCT, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_16X4, V_DCT, 1, 1, 6);
     }
 
     #[test]
@@ -1899,7 +1920,7 @@ mod tests {
         // dispatcher range 2..=4), column kernel = IDTX (length 16 —
         // in IDTX dispatcher range 2..=5). Reachable.
         let input = lcg_residual_bound(0x4A57_DEAD_BEEF_416B, 4 * 16, 128);
-        check_roundtrip_frac(&input, TX_4X16, H_ADST, 1, 2, 6);
+        check_roundtrip_frac(&input, TX_4X16, H_ADST, 1, 1, 6);
     }
 
     #[test]
@@ -1919,8 +1940,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_4X16, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 2).abs() <= 1,
-                "TX_4X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 2"
+                (v - 4).abs() <= 1,
+                "TX_4X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 4"
             );
         }
     }
@@ -1939,8 +1960,8 @@ mod tests {
         let recovered = inverse_transform_2d(&coeffs, TX_16X4, DCT_DCT, 8, false);
         for (i, &v) in recovered.iter().enumerate() {
             assert!(
-                (v - 2).abs() <= 1,
-                "TX_16X4 constant-DC round-trip cell {i}: got {v}, expected ≈ 2"
+                (v - 4).abs() <= 1,
+                "TX_16X4 constant-DC round-trip cell {i}: got {v}, expected ≈ 4"
             );
         }
     }
