@@ -4509,6 +4509,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 num_planes,
                 lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
                 max_bits: if cfg.cdef_units { 3 } else { 0 },
+                fast: false,
+                threads: 1,
             })
         {
             let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
@@ -4602,6 +4604,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 crate::encoder::cdef_elect::apply_cdef_plan(
                     state.mirror(),
                     &plan,
+                    input,
                     &mut recon.y,
                     &mut recon.u,
                     &mut recon.v,
@@ -4613,6 +4616,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     ssx,
                     ssy,
                     num_planes,
+                    1,
                 );
                 fh.cdef_params = Some(plan.params);
                 cdef_elected = true;
@@ -4739,6 +4743,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     superres_denom: cfg
                         .superres
                         .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
+                    threads: 1,
                 })
             else {
                 continue;

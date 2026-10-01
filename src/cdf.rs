@@ -19438,6 +19438,15 @@ impl PartitionWalker {
     /// coordinates (the §8.3.2 skip-ctx walk already gates on
     /// `AvailU` / `AvailL`, so an unavailable neighbour's
     /// contribution is zero either way).
+    /// r464 — `Skips[ r ][ c ] != 0` for in-grid mi coordinates
+    /// (`false` outside the grid), the §7.15.1 per-cell predicate the
+    /// encoder's CDEF election evaluates on local unit windows.
+    #[doc(hidden)]
+    #[inline]
+    pub fn skip_at_mi(&self, r: u32, c: u32) -> bool {
+        self.skip_at(r as i32, c as i32) != 0
+    }
+
     #[inline]
     fn skip_at(&self, r: i32, c: i32) -> u8 {
         if r < 0 || c < 0 {

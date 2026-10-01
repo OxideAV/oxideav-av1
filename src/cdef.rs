@@ -254,7 +254,6 @@ pub fn cdef_block(
         return;
     }
     // av1-spec p.319 lines 17666-17668.
-    let coeff_shift = ctx.bit_depth as i32 - 8;
     let skip = (ctx.skip)(r, c)
         && (r + 1 >= ctx.mi_rows || (ctx.skip)(r + 1, c))
         && (c + 1 >= ctx.mi_cols || (ctx.skip)(r, c + 1))
@@ -263,7 +262,33 @@ pub fn cdef_block(
         return;
     }
     // av1-spec p.319 line 17670: §7.15.2 direction search.
-    let (y_dir, var) = cdef_direction(ctx, src_planes, r, c);
+    let dir = cdef_direction(ctx, src_planes, r, c);
+    cdef_block_dir(ctx, src_planes, dst_planes, num_planes, r, c, idx, dir);
+}
+
+/// r464 — the §7.15.1 per-plane filter stage of [`cdef_block`] with
+/// the §7.15.2 direction search already done (`dir = (yDir, var)`):
+/// the encoder's strength election evaluates many candidate
+/// schedules over the same pre-CDEF samples, whose directions never
+/// change, so it searches them once per block and feeds them here.
+/// Runs no copy and no skip test — the caller has already established
+/// the block is filtered (`idx >= 0`, not all-skip).
+#[allow(clippy::too_many_arguments)]
+pub fn cdef_block_dir(
+    ctx: &CdefFrameContext<'_>,
+    src_planes: &[PlaneBuffer<'_>],
+    dst_planes: &mut [PlaneBuffer<'_>],
+    num_planes: u8,
+    r: u32,
+    c: u32,
+    idx: i8,
+    dir: (i32, i32),
+) {
+    if idx < 0 {
+        return;
+    }
+    let coeff_shift = ctx.bit_depth as i32 - 8;
+    let (y_dir, var) = dir;
     // av1-spec p.319 lines 17675-17688: luma filter.
     let idx = idx as usize;
     let pri_str_y = (ctx.cdef_params.cdef_y_pri_strength[idx] as i32) << coeff_shift;
@@ -490,26 +515,57 @@ pub fn cdef_filter_block(
     let y0 = ((r as i32) * MI_SIZE as i32) >> sub_y;
     let w = 8i32 >> sub_x;
     let h = 8i32 >> sub_y;
+    let plane_w = src.cols as i32;
+    let plane_h = src.rows as i32;
+    // r464 — both strengths zero: every `constrain` term is 0, so
+    // `sum = 0`, `delta = 0` and `Clip3(min, max, x) = x` (the centre
+    // sample is inside its own neighbour range). The block already
+    // holds `x` from the §7.15.1 copy — nothing to write.
+    if pri_str == 0 && sec_str == 0 {
+        return;
+    }
     // §7.15.3 line 17876: `(priStr >> coeffShift) & 1` selects the tap
     // row.
     let pri_row = ((pri_str >> coeff_shift) & 1) as usize;
     // The spec also uses `(priStr >> coeffShift) & 1` for the secondary
     // tap row (av1-spec p.323 line 17884), not `secStr`.
     let sec_row = pri_row;
-    let plane_w = src.cols as i32;
-    let plane_h = src.rows as i32;
+    let pri_taps = CDEF_PRI_TAPS[pri_row];
+    let sec_taps = CDEF_SEC_TAPS[sec_row];
+    // `constrain`'s `dampingAdj = Max(0, damping - FloorLog2(threshold))`
+    // depends only on the strength: hoisted out of the sample loop.
+    let pri_adj = if pri_str == 0 {
+        0
+    } else {
+        (damping - floor_log2(pri_str as u32) as i32).max(0)
+    };
+    let sec_adj = if sec_str == 0 {
+        0
+    } else {
+        (damping - floor_log2(sec_str as u32) as i32).max(0)
+    };
+    // Tap offsets `(dy, dx)` for the primary direction and the two
+    // secondary directions, per `k`.
+    let dir_p = (dir & 7) as usize;
+    let dir_s0 = ((dir - 2) & 7) as usize;
+    let dir_s1 = ((dir + 2) & 7) as usize;
+    let src_cols = src.cols as usize;
+    let dst_cols = dst.cols as usize;
     // §7.15.1 is_inside_filter_region (av1-spec p.103 §5.11.52) checks
     // the candidate position against `(0, 0)..(MiRows, MiCols)` in
     // 4×4 units. For the per-plane filter that's equivalent to
     // `(0, 0)..(plane_h, plane_w)` in samples after subsampling.
     for i in 0..h {
+        let py = y0 + i;
+        if py < 0 || py >= plane_h {
+            continue;
+        }
         for j in 0..w {
-            let py = y0 + i;
             let px = x0 + j;
-            if py < 0 || py >= plane_h || px < 0 || px >= plane_w {
+            if px < 0 || px >= plane_w {
                 continue;
             }
-            let x = src.samples[(py as usize) * (plane_w as usize) + (px as usize)];
+            let x = src.samples[(py as usize) * src_cols + (px as usize)];
             let mut sum = 0i32;
             let mut max_v = x;
             let mut min_v = x;
@@ -519,31 +575,23 @@ pub fn cdef_filter_block(
             for k in 0..2usize {
                 for sign in [-1i32, 1i32] {
                     // Primary tap along `dir`.
-                    if let Some(p_val) =
-                        cdef_sample_at(src, plane_w, plane_h, x0, y0, i, j, dir, k, sign)
-                    {
-                        sum += CDEF_PRI_TAPS[pri_row][k] * constrain(p_val - x, pri_str, damping);
-                        if p_val > max_v {
-                            max_v = p_val;
-                        }
-                        if p_val < min_v {
-                            min_v = p_val;
-                        }
+                    let (dy, dx) = (CDEF_DIRECTIONS[dir_p][k][0], CDEF_DIRECTIONS[dir_p][k][1]);
+                    let (ty, tx) = (py + sign * dy, px + sign * dx);
+                    if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
+                        let p_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                        sum += pri_taps[k] * constrain_adj(p_val - x, pri_str, pri_adj);
+                        max_v = max_v.max(p_val);
+                        min_v = min_v.min(p_val);
                     }
                     // Secondary taps along `(dir ± 2) & 7`.
-                    for dir_off in [-2i32, 2i32] {
-                        let dir2 = (dir + dir_off) & 7;
-                        if let Some(s_val) =
-                            cdef_sample_at(src, plane_w, plane_h, x0, y0, i, j, dir2, k, sign)
-                        {
-                            sum +=
-                                CDEF_SEC_TAPS[sec_row][k] * constrain(s_val - x, sec_str, damping);
-                            if s_val > max_v {
-                                max_v = s_val;
-                            }
-                            if s_val < min_v {
-                                min_v = s_val;
-                            }
+                    for d2 in [dir_s0, dir_s1] {
+                        let (dy, dx) = (CDEF_DIRECTIONS[d2][k][0], CDEF_DIRECTIONS[d2][k][1]);
+                        let (ty, tx) = (py + sign * dy, px + sign * dx);
+                        if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
+                            let s_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                            sum += sec_taps[k] * constrain_adj(s_val - x, sec_str, sec_adj);
+                            max_v = max_v.max(s_val);
+                            min_v = min_v.min(s_val);
                         }
                     }
                 }
@@ -551,36 +599,30 @@ pub fn cdef_filter_block(
             // av1-spec p.324 line 17892.
             let delta = (8 + sum - i32::from(sum < 0)) >> 4;
             let out = clip3(min_v, max_v, x + delta);
-            dst.samples[(py as usize) * (dst.cols as usize) + (px as usize)] = out;
+            dst.samples[(py as usize) * dst_cols + (px as usize)] = out;
         }
     }
 }
 
-/// §7.15.3 — `cdef_get_at` per av1-spec p.324 lines 17932-17944.
-/// Returns `Some(sample)` when the candidate position is inside the
-/// `is_inside_filter_region`; otherwise `None` (the spec's
-/// `CdefAvailable == 0` arm).
-#[allow(clippy::too_many_arguments)]
-fn cdef_sample_at(
-    src: &PlaneBuffer<'_>,
-    plane_w: i32,
-    plane_h: i32,
-    x0: i32,
-    y0: i32,
-    i: i32,
-    j: i32,
-    dir: i32,
-    k: usize,
-    sign: i32,
-) -> Option<i32> {
-    let dy = CDEF_DIRECTIONS[dir as usize & 7][k][0];
-    let dx = CDEF_DIRECTIONS[dir as usize & 7][k][1];
-    let y = y0 + i + sign * dy;
-    let x = x0 + j + sign * dx;
-    if y < 0 || y >= plane_h || x < 0 || x >= plane_w {
-        return None;
+/// [`constrain`] with the `dampingAdj` term precomputed by the caller.
+#[inline]
+fn constrain_adj(diff: i32, threshold: i32, damping_adj: i32) -> i32 {
+    if threshold == 0 {
+        return 0;
     }
-    Some(src.samples[(y as usize) * (src.cols as usize) + (x as usize)])
+    let abs_diff = diff.unsigned_abs() as i32;
+    let shifted = if damping_adj >= 31 {
+        0
+    } else {
+        abs_diff >> damping_adj
+    };
+    let inner = (threshold - shifted).max(0);
+    let v = abs_diff.min(inner);
+    if diff < 0 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// §7.15.3 `constrain` primitive — av1-spec p.324 lines 17919-17925.

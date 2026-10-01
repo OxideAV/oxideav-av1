@@ -82,7 +82,7 @@
 //! * Cross-plane SIMD / cache-friendly batched filtering — the
 //!   reference loop here mirrors the spec's per-sample formulation.
 
-use crate::cdf::{MI_SIZE, MI_SIZE_LOG2};
+use crate::cdf::MI_SIZE;
 use crate::loop_filter::PlaneBuffer;
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams};
 
@@ -284,25 +284,119 @@ pub fn loop_restoration_frame(
     if !ctx.lr_params.uses_lr {
         return;
     }
-    // av1-spec p.327 lines 18096-18106: walk in `MI_SIZE` steps over
-    // `(y, x) ∈ [0, FrameHeight) × [0, UpscaledWidth)`.
-    let mi_step = MI_SIZE as u32;
-    let mut y = 0u32;
-    while y < ctx.frame_height {
-        let mut x = 0u32;
-        while x < ctx.upscaled_width {
-            for plane in 0..num_planes {
-                let r_type = ctx.lr_params.frame_restoration_type[plane as usize];
-                if r_type == FrameRestorationType::None {
-                    continue;
-                }
-                let row = y >> (MI_SIZE_LOG2 as u32);
-                let col = x >> (MI_SIZE_LOG2 as u32);
-                loop_restore_block(ctx, curr_planes, cdef_planes, lr_planes, plane, row, col);
-            }
-            x += mi_step;
+    // av1-spec p.327 lines 18096-18106: the walk is specified in
+    // `MI_SIZE` steps over `(y, x) ∈ [0, FrameHeight) × [0,
+    // UpscaledWidth)`. r464: every MI block inside one (stripe, unit)
+    // rectangle derives the same `(unitRow, unitCol, StripeStartY,
+    // StripeEndY, PlaneEndX, PlaneEndY)` and the two filters are
+    // pointwise functions of absolute sample position under that
+    // geometry (the pass-0 row-parity weights ride an even rectangle
+    // origin exactly as they ride the even MI-block origin), so the
+    // frame is restored one rectangle at a time — identical output,
+    // a fraction of the per-block overhead.
+    for plane in 0..num_planes {
+        let r_type = ctx.lr_params.frame_restoration_type[plane as usize];
+        if r_type == FrameRestorationType::None {
+            continue;
         }
-        y += mi_step;
+        for geom in stripe_unit_rects(ctx, plane) {
+            loop_restore_rect(ctx, curr_planes, cdef_planes, lr_planes, plane, &geom);
+        }
+    }
+}
+
+/// r464 — the (stripe, restoration-unit) rectangles of `plane`, each
+/// carrying the §7.17.1 geometry every `MI_SIZE` block inside it
+/// derives: stripes are the §7.17.1 `(lumaY + 8) / 64` bands (the
+/// first starts at row 0, every later one at `(64·n - 8) >> subY`),
+/// columns are the §5.9.20 `LoopRestorationSize[plane]` units with
+/// the last unit absorbing the remainder, and `unitRow` / `unitCol`
+/// are pegged to the unit grid like §7.17.1's.
+#[must_use]
+pub fn stripe_unit_rects(ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> Vec<LrBlockGeometry> {
+    let (sub_x, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
+    let plane_w = round2(ctx.upscaled_width, sub_x);
+    let plane_h = round2(ctx.frame_height, sub_y);
+    let mut out = Vec::new();
+    if plane_w == 0 || plane_h == 0 {
+        return out;
+    }
+    let unit_size = ctx
+        .lr_params
+        .loop_restoration_size
+        .get(plane as usize)
+        .copied()
+        .unwrap_or(0)
+        .max(1);
+    let unit_rows = count_units_in_frame(unit_size, plane_h);
+    let unit_cols = count_units_in_frame(unit_size, plane_w);
+    let plane_end_x = plane_w as i32 - 1;
+    let plane_end_y = plane_h as i32 - 1;
+    let mut stripe = 0i32;
+    loop {
+        let stripe_start_y = (-8 + stripe * 64) >> sub_y;
+        let stripe_end_y = stripe_start_y + (64 >> sub_y) - 1;
+        let y0 = stripe_start_y.max(0);
+        if y0 > plane_end_y {
+            break;
+        }
+        let y1 = stripe_end_y.min(plane_end_y);
+        // `unitRow` from any luma row of the stripe: `((lumaY + 8) >>
+        // subY) / unitSize` with `lumaY = 64·stripe - 8`.
+        let unit_row = (((64 * stripe) as u32) >> sub_y) / unit_size;
+        let unit_row = unit_row.min(unit_rows.saturating_sub(1));
+        for unit_col in 0..unit_cols {
+            let x0 = unit_col * unit_size;
+            if x0 as i32 > plane_end_x {
+                break;
+            }
+            let x1 = if unit_col + 1 == unit_cols {
+                plane_end_x
+            } else {
+                (x0 + unit_size - 1).min(plane_end_x as u32) as i32
+            };
+            out.push(LrBlockGeometry {
+                unit_row,
+                unit_col,
+                x: x0,
+                y: y0 as u32,
+                w: (x1 - x0 as i32 + 1) as u32,
+                h: (y1 - y0 + 1) as u32,
+                stripe_start_y,
+                stripe_end_y,
+                plane_end_x,
+                plane_end_y,
+            });
+        }
+        stripe += 1;
+    }
+    out
+}
+
+/// r464 — restore one rectangle under an explicit §7.17.1 geometry
+/// (see [`stripe_unit_rects`]): `rType = LrType[plane][unitRow]
+/// [unitCol]` dispatches to the Wiener / self-guided / no-op arm
+/// exactly like [`loop_restore_block`].
+pub fn loop_restore_rect(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr_planes: &mut [PlaneBuffer<'_>],
+    plane: u8,
+    geom: &LrBlockGeometry,
+) {
+    if geom.w == 0 || geom.h == 0 {
+        return;
+    }
+    let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
+    match r_type {
+        FrameRestorationType::Wiener => {
+            wiener_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
+        }
+        FrameRestorationType::SgrProj => {
+            self_guided_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
+        }
+        FrameRestorationType::None | FrameRestorationType::Switchable => {}
     }
 }
 
@@ -504,7 +598,6 @@ pub fn self_guided_filter(
     // w0 - w1.
     let w0 = (ctx.lr_sgr_xqd)(plane, geom.unit_row, geom.unit_col, 0);
     let w1 = (ctx.lr_sgr_xqd)(plane, geom.unit_row, geom.unit_col, 1);
-    let w2 = (1i32 << SGRPROJ_PRJ_BITS) - w0 - w1;
     // av1-spec p.330 lines 18233-18241: box_filter twice, with the
     // per-pass `(r, eps)` from Sgr_Params[set].
     let flt0 = box_filter(
@@ -530,9 +623,6 @@ pub fn self_guided_filter(
     // av1-spec p.330 lines 18258-18272: per-sample projection.
     let h = geom.h as usize;
     let w = geom.w as usize;
-    let bit_depth = ctx.bit_depth as i32;
-    let max_sample = (1i32 << bit_depth) - 1;
-    let shift = SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS;
     let Some(lr) = lr_planes.get_mut(plane as usize) else {
         return;
     };
@@ -555,43 +645,64 @@ pub fn self_guided_filter(
             } else {
                 0
             };
-            // av1-spec p.330 lines 18261-18269: v = w1 * u + w0 * (...) +
-            // w2 * (...).
-            let mut v = w1 * u;
-            if r0 != 0 {
-                v += w0 * flt0[i * w + j];
-            } else {
-                v += w0 * u;
+            let out = sgr_project(
+                u,
+                flt0[i * w + j],
+                flt1[i * w + j],
+                w0,
+                w1,
+                r0,
+                r1,
+                ctx.bit_depth,
+            );
+            if py < 0 || py >= lr_rows || px < 0 || px >= lr_cols {
+                continue;
             }
-            if r1 != 0 {
-                v += w2 * flt1[i * w + j];
-            } else {
-                v += w2 * u;
-            }
-            // av1-spec p.330 lines 18270-18271: Round2 + Clip1.
-            let s = round2_i32(v, shift);
-            let out = clip3(0, max_sample, s);
-            if py >= 0 && py < lr_rows && px >= 0 && px < lr_cols {
-                lr.samples[(py as usize) * lr_cols_usize + px as usize] = out;
-            }
+            lr.samples[(py as usize) * lr_cols_usize + px as usize] = out;
         }
     }
 }
 
-/// §7.17.3 box filter process — av1-spec p.331-332 lines 18277-18389.
-///
-/// Builds the per-sample `(A, B)` tables across the `[-1, h + 1] ×
-/// [-1, w + 1]` extended neighbourhood via the `(2r + 1)²` box-sum
-/// kernel, then convolves them with the §7.17.3 weighted 3×3 footprint
-/// (pass-0 uses odd-row neighbours only with `(5, 6, 5, 0, 0, 0)` row
-/// weights; pass-1 uses the centre-plus-cross 4 / corner-3 footprint).
-///
-/// When `r == 0` the output buffer is returned filled with zeros — the
-/// §7.17.2 caller substitutes `u` for `flt` in that case (so the
-/// returned zeros are never read), matching the spec's "If r is equal
-/// to 0, then this process immediately terminates" guard at line 18294.
+/// §7.17.2 per-sample projection — av1-spec p.330 lines 18261-18272:
+/// `v = w1·u + w0·(flt0 or u) + w2·(flt1 or u)` (a zero-radius pass
+/// substitutes `u`), `s = Round2(v, RST_BITS + PRJ_BITS)`, `Clip1(s)`.
+/// `u` is the CDEF sample already shifted by `SGRPROJ_RST_BITS`.
+#[inline]
+#[must_use]
 #[allow(clippy::too_many_arguments)]
-fn box_filter(
+pub fn sgr_project(
+    u: i32,
+    flt0: i32,
+    flt1: i32,
+    w0: i32,
+    w1: i32,
+    r0: i32,
+    r1: i32,
+    bit_depth: u8,
+) -> i32 {
+    let w2 = (1i32 << SGRPROJ_PRJ_BITS) - w0 - w1;
+    let max_sample = (1i32 << bit_depth) - 1;
+    let shift = SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS;
+    let mut v = w1 * u;
+    v += w0 * if r0 != 0 { flt0 } else { u };
+    v += w2 * if r1 != 0 { flt1 } else { u };
+    let s = round2_i32(v, shift);
+    clip3(0, max_sample, s)
+}
+
+/// §7.17.3 box filter — av1-spec p.331-332 lines 18277-18389.
+///
+/// Returns `F[h][w]` (row-major) for one `pass` of the self-guided
+/// filter. `r == 0` returns a zero-filled buffer (the caller
+/// substitutes `u` per av1-spec p.330 line 18264 / 18268).
+///
+/// r464 — the `(2r + 1)²` window sums behind every `A[i][j]` /
+/// `B[i][j]` are built from one gathered source window and separable
+/// running sums (exact integer arithmetic, so the result is the
+/// spec's sample for sample) instead of re-fetching the window per
+/// output position.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn box_filter(
     curr_planes: &[PlaneBuffer<'_>],
     cdef_planes: &[PlaneBuffer<'_>],
     plane: u8,
@@ -609,6 +720,7 @@ fn box_filter(
     if r == 0 {
         return f;
     }
+    let ru = r as usize;
     // av1-spec p.332 lines 18309-18311: n = (2r + 1)²; n2e = n²·eps;
     // s = ((1 << MTABLE) + n2e/2) / n2e.
     let n = (2 * r + 1) * (2 * r + 1);
@@ -623,20 +735,70 @@ fn box_filter(
     let mut b_arr = vec![0i32; ah * aw];
     let bd_shift_a = 2 * (bit_depth as i32 - 8).max(0);
     let bd_shift_b = (bit_depth as i32 - 8).max(0);
-    // av1-spec p.332 lines 18312-18338: build (A, B) per (i, j).
-    for i in -1..=(h as i32) {
-        for j in -1..=(w as i32) {
-            let mut a_acc: i64 = 0;
-            let mut b_acc: i64 = 0;
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let sx = geom.x as i32 + j + dx;
-                    let sy = geom.y as i32 + i + dy;
-                    let c = get_source_sample(curr_planes, cdef_planes, plane, sx, sy, geom) as i64;
-                    a_acc += c * c;
-                    b_acc += c;
-                }
+    // Gather the source window once: rows `-1 - r ..= h + r`, columns
+    // `-1 - r ..= w + r` relative to the rectangle origin (§7.17.6
+    // routing per sample).
+    let sw = aw + 2 * ru;
+    let sh = ah + 2 * ru;
+    let mut src = vec![0i64; sh * sw];
+    for (sy, row) in src.chunks_mut(sw).enumerate() {
+        let y = geom.y as i32 + sy as i32 - 1 - r;
+        for (sx, v) in row.iter_mut().enumerate() {
+            let x = geom.x as i32 + sx as i32 - 1 - r;
+            *v = i64::from(get_source_sample(
+                curr_planes,
+                cdef_planes,
+                plane,
+                x,
+                y,
+                geom,
+            ));
+        }
+    }
+    // Horizontal running sums over `2r + 1` columns, then vertical
+    // over `2r + 1` rows: `b_acc = Σ c`, `a_acc = Σ c²`.
+    let win = 2 * ru + 1;
+    let mut row_b = vec![0i64; sh * aw];
+    let mut row_a = vec![0i64; sh * aw];
+    for sy in 0..sh {
+        let srow = &src[sy * sw..(sy + 1) * sw];
+        let mut sb: i64 = 0;
+        let mut sa: i64 = 0;
+        for &c in &srow[..win] {
+            sb += c;
+            sa += c * c;
+        }
+        row_b[sy * aw] = sb;
+        row_a[sy * aw] = sa;
+        for j in 1..aw {
+            let out = srow[j - 1];
+            let inc = srow[j - 1 + win];
+            sb += inc - out;
+            sa += inc * inc - out * out;
+            row_b[sy * aw + j] = sb;
+            row_a[sy * aw + j] = sa;
+        }
+    }
+    let mut col_b = vec![0i64; aw];
+    let mut col_a = vec![0i64; aw];
+    for sy in 0..win {
+        for j in 0..aw {
+            col_b[j] += row_b[sy * aw + j];
+            col_a[j] += row_a[sy * aw + j];
+        }
+    }
+    for ai in 0..ah {
+        if ai > 0 {
+            let out_row = ai - 1;
+            let in_row = ai - 1 + win;
+            for j in 0..aw {
+                col_b[j] += row_b[in_row * aw + j] - row_b[out_row * aw + j];
+                col_a[j] += row_a[in_row * aw + j] - row_a[out_row * aw + j];
             }
+        }
+        for aj in 0..aw {
+            let a_acc = col_a[aj];
+            let b_acc = col_b[aj];
             // av1-spec p.332 lines 18323-18324: Round2 by bit-depth shift.
             let a_r = round2_i64(a_acc, bd_shift_a as u32) as i32;
             let d_r = round2_i64(b_acc, bd_shift_b as u32) as i32;
@@ -659,9 +821,6 @@ fn box_filter(
             // 10/12-bit profiles before the `i64` multiply.
             let b_eff = b_acc.clamp(i32::MIN as i64, i32::MAX as i64);
             let b2 = i64::from((1i32 << SGRPROJ_SGR_BITS) - a2) * b_eff * i64::from(one_over_n);
-            // Store at offset (i + 1, j + 1) inside [0, ah) × [0, aw).
-            let ai = (i + 1) as usize;
-            let aj = (j + 1) as usize;
             a_arr[ai * aw + aj] = a2;
             b_arr[ai * aw + aj] = round2_i64(b2, SGRPROJ_RECIP_BITS) as i32;
         }
@@ -682,36 +841,40 @@ fn box_filter(
         } else {
             5u32
         };
+        let py = geom.y as i32 + i as i32;
+        let row_m = (i) * aw;
+        let row_c = (i + 1) * aw;
+        let row_p = (i + 2) * aw;
         for j in 0..w {
-            let mut a_sum: i64 = 0;
-            let mut b_sum: i64 = 0;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    // av1-spec p.332 lines 18369-18377: per-pass weights.
-                    let weight: i32 = if pass == 0 {
-                        let i_dy = i as i32 + dy;
-                        if (i_dy & 1) != 0 {
-                            if dx == 0 {
-                                6
-                            } else {
-                                5
-                            }
-                        } else {
-                            0
-                        }
-                    } else if dx == 0 || dy == 0 {
-                        4
-                    } else {
-                        3
-                    };
-                    let ai = ((i as i32) + dy + 1) as usize;
-                    let aj = ((j as i32) + dx + 1) as usize;
-                    a_sum += (weight as i64) * (a_arr[ai * aw + aj] as i64);
-                    b_sum += (weight as i64) * (b_arr[ai * aw + aj] as i64);
+            let (a_sum, b_sum): (i64, i64) = if pass == 0 {
+                // Odd-row neighbours only: weights 6 at dx = 0, 5 at
+                // dx = ±1, on the rows whose block-local index is odd.
+                let mut a: i64 = 0;
+                let mut b: i64 = 0;
+                for (dy, base) in [(-1i32, row_m), (0, row_c), (1, row_p)] {
+                    if ((i as i32 + dy) & 1) != 0 {
+                        a += 6 * a_arr[base + j + 1] as i64
+                            + 5 * (a_arr[base + j] as i64 + a_arr[base + j + 2] as i64);
+                        b += 6 * b_arr[base + j + 1] as i64
+                            + 5 * (b_arr[base + j] as i64 + b_arr[base + j + 2] as i64);
+                    }
                 }
-            }
+                (a, b)
+            } else {
+                let cross = |arr: &[i32]| -> i64 {
+                    4 * (arr[row_c + j + 1] as i64
+                        + arr[row_c + j] as i64
+                        + arr[row_c + j + 2] as i64
+                        + arr[row_m + j + 1] as i64
+                        + arr[row_p + j + 1] as i64)
+                        + 3 * (arr[row_m + j] as i64
+                            + arr[row_m + j + 2] as i64
+                            + arr[row_p + j] as i64
+                            + arr[row_p + j + 2] as i64)
+                };
+                (cross(&a_arr), cross(&b_arr))
+            };
             // av1-spec p.332 line 18382: v = a * UpscaledCdefFrame[..] + b.
-            let py = geom.y as i32 + i as i32;
             let px = geom.x as i32 + j as i32;
             let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
                 cdef.samples[(py as usize) * cdef_cols_usize + px as usize] as i64
@@ -777,16 +940,24 @@ pub fn wiener_filter(
     let h = geom.h as usize;
     let w = geom.w as usize;
     // av1-spec p.333 lines 18447-18455: horizontal pass into
-    // `intermediate[h + 6][w]`.
+    // `intermediate[h + 6][w]`. r464: the `(h + 6) × (w + 6)` source
+    // window is fetched once through §7.17.6 and the 7 taps read it.
+    let sw = w + 6;
+    let mut window = vec![0i32; (h + 6) * sw];
+    for (r, row) in window.chunks_mut(sw).enumerate() {
+        let sy = geom.y as i32 + r as i32 - 3;
+        for (c, v) in row.iter_mut().enumerate() {
+            let sx = geom.x as i32 + c as i32 - 3;
+            *v = get_source_sample(curr_planes, cdef_planes, plane, sx, sy, geom);
+        }
+    }
     let mut intermediate = vec![0i32; (h + 6) * w];
     for r in 0..(h + 6) {
+        let wrow = &window[r * sw..(r + 1) * sw];
         for c in 0..w {
             let mut s = 0i32;
             for (t, &hcoef) in hfilter.iter().enumerate() {
-                let sx = geom.x as i32 + c as i32 + t as i32 - 3;
-                let sy = geom.y as i32 + r as i32 - 3;
-                let src = get_source_sample(curr_planes, cdef_planes, plane, sx, sy, geom);
-                s += hcoef * src;
+                s += hcoef * wrow[c + t];
             }
             let v = round2_i32(s, inter_round0);
             let clipped = clip3(-offset, limit - offset, v);

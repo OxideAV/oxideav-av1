@@ -1849,6 +1849,57 @@ CDEF / restoration / deblock elections now dominate at 12 MP), 10-bit
 59 s / 51 s. Layouts below the §5.9.15 floor are raised to the legal
 minimum (a 12 MP picture cannot be one tile).
 
+#### Still-picture performance (r464)
+
+Measured on one 4032×3024 (12 MP) 8-bit 4:2:0 photograph at
+`base_q_idx = 128`, release build, Apple M4 Max; wall / CPU seconds
+and peak RSS of a process that holds the input and encodes once.
+"Before" is 0.1.19 (the r460 presets).
+
+**Where the time went (before, `Fast`, one thread, 84 s)** — sampled
+at 5 ms over the whole run:
+
+| Stage | Share |
+|---|---|
+| Tile search (§5.11.4 partition / mode / TX RD walk) | 31.5 % |
+| — of which intra mode pre-screen (66 candidate predictions per leaf) | 34 % of the search |
+| — rate-twin symbol pricing | 20 % of the search |
+| — forward + inverse transforms | 11 % of the search |
+| — TX-availability / CfL / allocation | 14 % of the search |
+| Per-superblock syntax-mirror clone (`RateTwin::snapshot`) | 2.9 % |
+| §7.17 loop-restoration election (256-sample units only) | 34.7 % |
+| §7.15 CDEF election (coarse + refine sweep, two dampings) | 27.7 % |
+| §7.14 deblock election | 1.3 % |
+| Tile assembly, re-emission, headers | ~1 % |
+
+The restoration election spent 98 % of its time in the §7.17.3 box
+filter (the spec's per-4×4-block, per-position `(2r + 1)²` window
+re-fetch, 900 sample reads per 16 output samples), the CDEF election
+87 % in the §7.15.3 filter kernel run over all three planes for every
+candidate of either plane set, and both elections first copied every
+plane to frame-sized `i32` buffers (72 MB per plane set at 12 MP —
+the owners of most of the encode's resident memory).
+
+**Before** (0.1.19):
+
+| Preset | Threads | Wall | CPU | Peak RSS | Bytes | PSNR Y / U / V |
+|---|---|---|---|---|---|---|
+| Fast | 1 | 83.8 s | 83.8 s | 558 MiB | 114 070 | 39.08 / 40.43 / 40.05 |
+| Fast | 4 | 61.5 s | 84.2 s | 1059 MiB | 114 600 | 39.09 / 40.43 / 40.04 |
+| Fast | 8 | 58.0 s | 86.6 s | 1526 MiB | 116 211 | 39.10 / 40.44 / 40.05 |
+| Balanced | 1 | 474.8 s | 466.3 s | 682 MiB | 108 636 | 39.00 / 40.39 / 39.99 |
+| Balanced | 4 | 308.6 s | 459.7 s | 1225 MiB | 109 673 | 39.01 / 40.38 / 39.99 |
+| Balanced | 8 | 287.7 s | 471.9 s | 1670 MiB | 111 319 | 39.01 / 40.40 / 40.00 |
+| Thorough | 1 | > 1 h (not run to completion) | | | | |
+| Thorough | 8 | 1485.7 s | 2587.7 s | 2242 MiB | 108 006 | 37.65 / 40.84 / 40.44 |
+| Decode (Fast stream) | 1 | 0.66 s | 0.66 s | 228 MiB | | |
+
+The third-party encoder at speed 6 (all-intra, `--cq-level=32`,
+`deltaq-mode=0`) codes the same picture in 0.55 s to 109 431 bytes at
+39.15 dB luma; the BD-rate (luma PSNR, four points each) of the `Fast`
+preset against it was **+12.1 %** before this round (the r460 +19.8 %
+figure was a 640×480 synthetic texture).
+
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5
 mi grid internally (the decoder reconstructs every mi block in full,

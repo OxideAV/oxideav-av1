@@ -810,6 +810,9 @@ pub(crate) struct SearchLimits {
     /// units only). Each rung is a complete per-unit election, and at
     /// 12 MP the ladder dominates the still's wall clock.
     pub lr_min_unit_shift: u8,
+    /// r464 — the reduced §5.9.19 CDEF sweep (see
+    /// [`crate::encoder::cdef_elect::CdefElectInput::fast`]).
+    pub cdef_fast: bool,
 }
 
 impl Default for SearchLimits {
@@ -826,6 +829,7 @@ impl Default for SearchLimits {
             lf_effort: 0,
             threads: 1,
             lr_min_unit_shift: 0,
+            cdef_fast: false,
         }
     }
 }
@@ -845,6 +849,7 @@ impl SearchLimits {
             lf_effort: 1,
             threads: 1,
             lr_min_unit_shift: 2,
+            cdef_fast: true,
         }
     }
 
@@ -862,6 +867,7 @@ impl SearchLimits {
             lf_effort: 2,
             threads: 1,
             lr_min_unit_shift: 1,
+            cdef_fast: false,
         }
     }
 }
@@ -2351,6 +2357,8 @@ fn encode_key_frame_yuv_core(
                 num_planes,
                 lambda: lambda_for(&recon.qp),
                 max_bits: if cdef_units { 3 } else { 0 },
+                fast: extras.search.cdef_fast,
+                threads: extras.search.threads.max(1),
             })
         {
             let lambda = lambda_for(&recon.qp);
@@ -2436,6 +2444,7 @@ fn encode_key_frame_yuv_core(
                 crate::encoder::cdef_elect::apply_cdef_plan(
                     state.mirror(),
                     &plan,
+                    input,
                     &mut recon.y,
                     &mut recon.u,
                     &mut recon.v,
@@ -2447,6 +2456,7 @@ fn encode_key_frame_yuv_core(
                     ssx,
                     ssy,
                     num_planes,
+                    extras.search.threads.max(1),
                 );
                 fh.cdef_params = Some(plan.params);
             }
@@ -2607,6 +2617,7 @@ fn encode_key_frame_yuv_core(
                     disable_cdf_update: fh.disable_cdf_update,
                     use_superres: superres.is_some(),
                     superres_denom: superres.map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
+                    threads: extras.search.threads.max(1),
                 })
             else {
                 continue;

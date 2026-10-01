@@ -60,9 +60,9 @@ use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::loop_filter::PlaneBuffer;
 use crate::loop_restoration::{
-    count_units_in_frame, derive_block_geometry, loop_restoration_frame, loop_restore_block,
-    LoopRestorationFrameContext, SGRPROJ_XQD_MAX, SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS,
-    WIENER_TAPS_MAX, WIENER_TAPS_MID, WIENER_TAPS_MIN,
+    box_filter, count_units_in_frame, loop_restore_rect, sgr_project, stripe_unit_rects,
+    LoopRestorationFrameContext, LrBlockGeometry, SGRPROJ_RST_BITS, SGRPROJ_XQD_MAX,
+    SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_MAX, WIENER_TAPS_MID, WIENER_TAPS_MIN,
 };
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams as HeaderLrParams};
 
@@ -142,68 +142,379 @@ pub(crate) struct LrElectInput<'a> {
     /// The §5.9.8 `SuperresDenom` (`SUPERRES_NUM` when
     /// `use_superres` is `false`).
     pub superres_denom: u32,
+    /// r464 — worker threads for the per-unit distortion search
+    /// (`1` = sequential; the election is identical either way).
+    pub threads: usize,
 }
 
-/// One unit's block list + covered rects (plane-local coordinates).
-struct UnitBlocks {
-    /// `(row, col)` mi coordinates fed to `loop_restore_block`.
-    blocks: Vec<(u32, u32)>,
-    /// `(x, y, w, h)` output rects (disjoint, union = the unit's
-    /// §7.17.1 footprint).
-    rects: Vec<(u32, u32, u32, u32)>,
+/// r464 — one (stripe, unit) rectangle of a plane lifted into a
+/// LOCAL window: the pre-CDEF (`curr`) and post-CDEF (`cdef`) samples
+/// of the rectangle plus a [`LOCAL_MARGIN`]-sample apron on every
+/// side (edge-replicated past the plane, exactly what the §7.17.6
+/// clamp returns), with the §7.17.1 geometry translated into window
+/// coordinates. Every kernel reads at most 3 samples past the
+/// rectangle (Wiener taps / box radius 2 + the A/B apron), so the
+/// window is self-contained and the filters evaluate sample-exact
+/// without a frame-sized `i32` copy of any plane.
+struct LocalRect {
+    /// Geometry in window coordinates (`x = y = LOCAL_MARGIN`).
+    geom: LrBlockGeometry,
+    /// Rectangle origin in plane coordinates.
+    abs_x: usize,
+    abs_y: usize,
+    rows: usize,
+    cols: usize,
+    curr: Vec<i32>,
+    cdef: Vec<i32>,
 }
 
-/// Shared geometry + plane data for the per-unit evaluator.
-struct EvalCtx<'a> {
-    input: &'a YuvFrame,
-    dims: Vec<(usize, usize)>,
-    num_planes: usize,
-    bit_depth: u8,
-    subsampling_x: u8,
-    subsampling_y: u8,
-    mi_rows: u32,
-    mi_cols: u32,
-    frame_height: u32,
-    upscaled_width: u32,
-    eval_lrp: HeaderLrParams,
-}
+const LOCAL_MARGIN: usize = 4;
 
-impl EvalCtx<'_> {
-    fn src_plane(&self, plane: usize) -> &[u16] {
-        match plane {
-            0 => &self.input.y,
-            1 => &self.input.u,
-            _ => &self.input.v,
+impl LocalRect {
+    fn build(
+        geom: &LrBlockGeometry,
+        curr: &[u16],
+        cdef: &[u16],
+        plane_w: usize,
+        plane_h: usize,
+    ) -> Self {
+        let m = LOCAL_MARGIN;
+        let (w, h) = (geom.w as usize, geom.h as usize);
+        let (rows, cols) = (h + 2 * m, w + 2 * m);
+        let (abs_x, abs_y) = (geom.x as usize, geom.y as usize);
+        let mut lc = vec![0i32; rows * cols];
+        let mut ld = vec![0i32; rows * cols];
+        for ly in 0..rows {
+            let ay = (abs_y as i64 + ly as i64 - m as i64).clamp(0, plane_h as i64 - 1) as usize;
+            for lx in 0..cols {
+                let ax =
+                    (abs_x as i64 + lx as i64 - m as i64).clamp(0, plane_w as i64 - 1) as usize;
+                lc[ly * cols + lx] = i32::from(curr[ay * plane_w + ax]);
+                ld[ly * cols + lx] = i32::from(cdef[ay * plane_w + ax]);
+            }
+        }
+        let (ox, oy) = (abs_x as i32 - m as i32, abs_y as i32 - m as i32);
+        Self {
+            geom: LrBlockGeometry {
+                unit_row: geom.unit_row,
+                unit_col: geom.unit_col,
+                x: m as u32,
+                y: m as u32,
+                w: geom.w,
+                h: geom.h,
+                stripe_start_y: geom.stripe_start_y - oy,
+                stripe_end_y: geom.stripe_end_y - oy,
+                plane_end_x: geom.plane_end_x - ox,
+                plane_end_y: geom.plane_end_y - oy,
+            },
+            abs_x,
+            abs_y,
+            rows,
+            cols,
+            curr: lc,
+            cdef: ld,
         }
     }
-}
 
-/// SSD between an i32 plane and a u16 plane over a rect list.
-fn rect_ssd(a: &[i32], b: &[u16], stride: usize, rects: &[(u32, u32, u32, u32)]) -> u64 {
-    let mut ssd = 0u64;
-    for &(x, y, w, h) in rects {
-        for row in y..y + h {
-            let base = row as usize * stride;
-            for col in x..x + w {
-                let d = i64::from(a[base + col as usize]) - i64::from(b[base + col as usize]);
+    fn bufs(&mut self) -> (PlaneBuffer<'_>, PlaneBuffer<'_>) {
+        (
+            PlaneBuffer {
+                rows: self.rows as u32,
+                cols: self.cols as u32,
+                samples: &mut self.curr,
+            },
+            PlaneBuffer {
+                rows: self.rows as u32,
+                cols: self.cols as u32,
+                samples: &mut self.cdef,
+            },
+        )
+    }
+
+    /// SSD of `out` (window layout) against the source over the
+    /// rectangle.
+    fn ssd(&self, out: &[i32], src: &[u16], src_stride: usize) -> u64 {
+        let m = LOCAL_MARGIN;
+        let mut ssd = 0u64;
+        for i in 0..self.geom.h as usize {
+            let orow =
+                &out[(m + i) * self.cols + m..(m + i) * self.cols + m + self.geom.w as usize];
+            let srow = &src[(self.abs_y + i) * src_stride + self.abs_x..];
+            for (o, s) in orow.iter().zip(srow) {
+                let d = i64::from(*o) - i64::from(*s);
                 ssd += (d * d) as u64;
             }
         }
+        ssd
     }
-    ssd
 }
 
-/// Wrap owned plane vectors as the kernel's `PlaneBuffer` views.
-fn make_bufs<'a>(owned: &'a mut [Vec<i32>], dims: &[(usize, usize)]) -> Vec<PlaneBuffer<'a>> {
-    owned
-        .iter_mut()
-        .zip(dims.iter())
-        .map(|(buf, &(w, h))| PlaneBuffer {
-            rows: h as u32,
-            cols: w as u32,
-            samples: buf,
-        })
-        .collect()
+/// Run one restoration candidate over a local rectangle into `out`
+/// (window layout; samples outside the rectangle are untouched) and
+/// return the rectangle's SSD vs the source.
+fn eval_rect(
+    lr: &mut LocalRect,
+    unit: &LrUnit,
+    plane: usize,
+    bit_depth: u8,
+    out: &mut Vec<i32>,
+    src: &[u16],
+    src_stride: usize,
+) -> u64 {
+    out.clear();
+    out.extend_from_slice(&lr.cdef);
+    if unit.restoration_type != RESTORE_NONE {
+        let rt = match unit.restoration_type {
+            RESTORE_WIENER => FrameRestorationType::Wiener,
+            RESTORE_SGRPROJ => FrameRestorationType::SgrProj,
+            _ => FrameRestorationType::None,
+        };
+        let geom = lr.geom;
+        let (rows, cols) = (lr.rows as u32, lr.cols as u32);
+        let wiener = unit.wiener;
+        let sgr_set = unit.sgr_set;
+        let sgr_xqd = unit.sgr_xqd;
+        let lrp = header_shape([FrameRestorationType::Switchable; 3], 0);
+        let ctx = LoopRestorationFrameContext {
+            mi_rows: 0,
+            mi_cols: 0,
+            num_planes: 1,
+            bit_depth,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_height: rows,
+            upscaled_width: cols,
+            lr_params: &lrp,
+            lr_type: &move |_, _, _| rt,
+            lr_wiener: &move |_, _, _, pass, i| wiener[pass as usize][i],
+            lr_sgr_set: &move |_, _, _| sgr_set as u8,
+            lr_sgr_xqd: &move |_, _, _, i| sgr_xqd[i],
+        };
+        let (curr_b, cdef_b) = lr.bufs();
+        let mut out_b = [PlaneBuffer {
+            rows,
+            cols,
+            samples: out,
+        }];
+        // The window is presented as plane 0 (the kernels only ever
+        // index the plane they are asked to restore; the plane's
+        // subsampling is already folded into the geometry).
+        let _ = plane;
+        loop_restore_rect(&ctx, &[curr_b], &[cdef_b], &mut out_b, 0, &geom);
+    }
+    lr.ssd(out, src, src_stride)
+}
+
+/// Exact §7.17.2 self-guided output of `(set, xqd)` from
+/// precomputed box-filter bases (window layout).
+fn sgr_apply_bases(
+    lr: &LocalRect,
+    flt0: &[i32],
+    flt1: &[i32],
+    set: usize,
+    xqd: [i32; 2],
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    let (r0, r1) = (SGR_PARAMS[set][0], SGR_PARAMS[set][2]);
+    let m = LOCAL_MARGIN;
+    let (w, h) = (lr.geom.w as usize, lr.geom.h as usize);
+    for i in 0..h {
+        for j in 0..w {
+            let u = lr.cdef[(m + i) * lr.cols + m + j] << SGRPROJ_RST_BITS;
+            out[(m + i) * lr.cols + m + j] = sgr_project(
+                u,
+                flt0[i * w + j],
+                flt1[i * w + j],
+                xqd[0],
+                xqd[1],
+                r0,
+                r1,
+                bit_depth,
+            );
+        }
+    }
+}
+
+/// Box-filter bases `flt` (rectangle layout `h × w`) for one
+/// `(r, eps, pass)` over a local rectangle.
+fn sgr_bases(lr: &mut LocalRect, r: i32, eps: i32, pass: u8, bit_depth: u8) -> Vec<i32> {
+    let geom = lr.geom;
+    let (curr_b, cdef_b) = lr.bufs();
+    box_filter(&[curr_b], &[cdef_b], 0, &geom, bit_depth, r, eps, pass)
+}
+
+/// Cached box-filter bases per `(r, eps, pass)`: one `h × w` table per
+/// rectangle of the unit.
+type BasesCache = Vec<((i32, i32, u8), Vec<Vec<i32>>)>;
+
+/// The distortion side of one unit's search (no pricing): the
+/// unfiltered SSD, the best Wiener fit and the best self-guided fit
+/// with their exact SSDs.
+struct UnitSearch {
+    d_none: u64,
+    wiener: (LrUnit, u64),
+    sgr: Option<(LrUnit, u64)>,
+}
+
+/// r464 — the per-unit search: Wiener alternating least squares and,
+/// per trialled §7.17.3 set, a least-squares projection fit on the
+/// EXACT box-filter bases (`flt0 - flt1`, `u - flt1`) followed by the
+/// exact kernel evaluation of the quantised weights. Independent of
+/// every other unit, so the caller runs the units in parallel.
+fn search_unit(
+    rects: &mut [LocalRect],
+    plane: usize,
+    src: &[u16],
+    src_stride: usize,
+    bit_depth: u8,
+    sgr_step: usize,
+) -> UnitSearch {
+    let first_coeff = usize::from(plane != 0);
+    let mut out: Vec<i32> = Vec::new();
+    let mut d_none = 0u64;
+    for lr in rects.iter_mut() {
+        d_none += eval_rect(
+            lr,
+            &LrUnit::NONE,
+            plane,
+            bit_depth,
+            &mut out,
+            src,
+            src_stride,
+        );
+    }
+    // Wiener.
+    let taps = fit_wiener(rects, src, src_stride, first_coeff);
+    let wiener_unit = LrUnit {
+        restoration_type: RESTORE_WIENER,
+        wiener: taps,
+        sgr_set: 0,
+        sgr_xqd: [0; 2],
+    };
+    let mut d_wiener = 0u64;
+    for lr in rects.iter_mut() {
+        d_wiener += eval_rect(
+            lr,
+            &wiener_unit,
+            plane,
+            bit_depth,
+            &mut out,
+            src,
+            src_stride,
+        );
+    }
+    // Self-guided: bases per (r, eps, pass) are cached across the set
+    // list (several sets share a pass).
+    let mut best_sgr: Option<(LrUnit, u64)> = None;
+    let mut cache: BasesCache = Vec::new();
+    fn bases(
+        cache: &mut BasesCache,
+        rects: &mut [LocalRect],
+        r: i32,
+        eps: i32,
+        pass: u8,
+        bit_depth: u8,
+    ) -> usize {
+        if let Some(k) = cache.iter().position(|(key, _)| *key == (r, eps, pass)) {
+            return k;
+        }
+        let v: Vec<Vec<i32>> = rects
+            .iter_mut()
+            .map(|lr| sgr_bases(lr, r, eps, pass, bit_depth))
+            .collect();
+        cache.push(((r, eps, pass), v));
+        cache.len() - 1
+    }
+    for set in (0..SGR_PARAMS.len()).step_by(sgr_step.max(1)) {
+        let params = SGR_PARAMS[set];
+        let (r0, eps0, r1, eps1) = (params[0], params[1], params[2], params[3]);
+        let k0 = bases(&mut cache, rects, r0, eps0, 0, bit_depth);
+        let k1 = bases(&mut cache, rects, r1, eps1, 1, bit_depth);
+        // Least squares: 128·((src << 4) - f1) ≈ w0·(f0 - f1) + w1·(u -
+        // f1), with a zero-radius pass substituting `u` for its `f`.
+        let (mut s00, mut s01, mut s11, mut b0, mut b1) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for (ri, lr) in rects.iter().enumerate() {
+            let f0 = &cache[k0].1[ri];
+            let f1 = &cache[k1].1[ri];
+            let m = LOCAL_MARGIN;
+            let (w, h) = (lr.geom.w as usize, lr.geom.h as usize);
+            for i in 0..h {
+                for j in 0..w {
+                    let u = lr.cdef[(m + i) * lr.cols + m + j] << SGRPROJ_RST_BITS;
+                    let a0 = if r0 != 0 { f0[i * w + j] } else { u };
+                    let a1 = if r1 != 0 { f1[i * w + j] } else { u };
+                    let s = i32::from(src[(lr.abs_y + i) * src_stride + lr.abs_x + j])
+                        << SGRPROJ_RST_BITS;
+                    let x0 = f64::from(a0 - a1);
+                    let x1 = f64::from(u - a1);
+                    let t = 128.0 * f64::from(s - a1);
+                    s00 += x0 * x0;
+                    s01 += x0 * x1;
+                    s11 += x1 * x1;
+                    b0 += x0 * t;
+                    b1 += x1 * t;
+                }
+            }
+        }
+        let (mut xq0, mut xq1) = (0i32, 0i32);
+        if r0 != 0 && r1 != 0 {
+            let det = s00 * s11 - s01 * s01;
+            if det.abs() > 1e-6 {
+                xq0 = ((s11 * b0 - s01 * b1) / det).round() as i32;
+                xq1 = ((s00 * b1 - s01 * b0) / det).round() as i32;
+            }
+        } else if r0 != 0 {
+            // r1 == 0: `u - f1 == 0`, the projection is w0 alone.
+            if s00 > 1e-6 {
+                xq0 = (b0 / s00).round() as i32;
+            }
+        } else if r1 != 0 {
+            // r0 == 0: `f0 - f1 == u - f1`, the projection is w1 alone
+            // (§5.11.58 forces xqd[0] = 0).
+            if s11 > 1e-6 {
+                xq1 = (b1 / s11).round() as i32;
+            }
+        }
+        // §5.11.58 constraints: clamp, derive radius-0 components.
+        xq0 = xq0.clamp(SGRPROJ_XQD_MIN[0], SGRPROJ_XQD_MAX[0]);
+        xq1 = xq1.clamp(SGRPROJ_XQD_MIN[1], SGRPROJ_XQD_MAX[1]);
+        if r0 == 0 {
+            xq0 = 0;
+        }
+        if r1 == 0 {
+            xq1 = (128 - xq0).clamp(SGRPROJ_XQD_MIN[1], SGRPROJ_XQD_MAX[1]);
+        }
+        let cand = LrUnit {
+            restoration_type: RESTORE_SGRPROJ,
+            wiener: [[0; WIENER_COEFFS]; 2],
+            sgr_set: set,
+            sgr_xqd: [xq0, xq1],
+        };
+        let mut d = 0u64;
+        for (ri, lr) in rects.iter().enumerate() {
+            out.clear();
+            out.extend_from_slice(&lr.cdef);
+            sgr_apply_bases(
+                lr,
+                &cache[k0].1[ri],
+                &cache[k1].1[ri],
+                set,
+                [xq0, xq1],
+                bit_depth,
+                &mut out,
+            );
+            d += lr.ssd(&out, src, src_stride);
+        }
+        if best_sgr.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
+            best_sgr = Some((cand, d));
+        }
+    }
+    UnitSearch {
+        d_none,
+        wiener: (wiener_unit, d_wiener),
+        sgr: best_sgr,
+    }
 }
 
 /// The §5.9.20 header block this election codes: `64 << unit_shift`
@@ -224,97 +535,17 @@ fn header_shape(frt: [FrameRestorationType; 3], unit_shift: u8) -> HeaderLrParam
     }
 }
 
-/// Fill the unit's rects of `lr[plane]` from `cdef[plane]`, run the
-/// decoder's §7.17.1 block driver for the unit's blocks under the
-/// candidate payload, and return the unit's SSD vs the source. The
-/// filtered samples stay in `lr[plane]` (the SGR probes read them
-/// back).
-#[allow(clippy::too_many_arguments)]
-fn eval_unit(
-    ec: &EvalCtx<'_>,
-    curr: &mut [Vec<i32>],
-    cdef: &mut [Vec<i32>],
-    lr: &mut [Vec<i32>],
-    plane: usize,
-    ur: u32,
-    uc: u32,
-    unit: &LrUnit,
-    ub: &UnitBlocks,
-) -> u64 {
-    let stride = ec.dims[plane].0;
-    for &(x, y, w, h) in &ub.rects {
-        for row in y..y + h {
-            let base = row as usize * stride;
-            for col in x..x + w {
-                lr[plane][base + col as usize] = cdef[plane][base + col as usize];
-            }
-        }
-    }
-    if unit.restoration_type != RESTORE_NONE {
-        let rt = match unit.restoration_type {
-            RESTORE_WIENER => FrameRestorationType::Wiener,
-            RESTORE_SGRPROJ => FrameRestorationType::SgrProj,
-            _ => FrameRestorationType::None,
-        };
-        let wiener = unit.wiener;
-        let sgr_set = unit.sgr_set;
-        let sgr_xqd = unit.sgr_xqd;
-        let ctx = LoopRestorationFrameContext {
-            mi_rows: ec.mi_rows,
-            mi_cols: ec.mi_cols,
-            num_planes: ec.num_planes as u8,
-            bit_depth: ec.bit_depth,
-            subsampling_x: ec.subsampling_x,
-            subsampling_y: ec.subsampling_y,
-            frame_height: ec.frame_height,
-            upscaled_width: ec.upscaled_width,
-            lr_params: &ec.eval_lrp,
-            lr_type: &move |p, r, c| {
-                if p as usize == plane && r == ur && c == uc {
-                    rt
-                } else {
-                    FrameRestorationType::None
-                }
-            },
-            lr_wiener: &move |_, _, _, pass, i| wiener[pass as usize][i],
-            lr_sgr_set: &move |_, _, _| sgr_set as u8,
-            lr_sgr_xqd: &move |_, _, _, i| sgr_xqd[i],
-        };
-        let curr_bufs = make_bufs(curr, &ec.dims);
-        let cdef_bufs = make_bufs(cdef, &ec.dims);
-        let mut lr_bufs = make_bufs(lr, &ec.dims);
-        for &(row, col) in &ub.blocks {
-            loop_restore_block(
-                &ctx,
-                &curr_bufs,
-                &cdef_bufs,
-                &mut lr_bufs,
-                plane as u8,
-                row,
-                col,
-            );
-        }
-    }
-    rect_ssd(&lr[plane], ec.src_plane(plane), stride, &ub.rects)
-}
-
 /// Alternating-least-squares Wiener tap fit for one unit (free
 /// encoder engineering; the exact §7.17.4 kernel evaluates the
 /// quantised result). `first_coeff = 1` on chroma (`taps[pass][0]`
-/// is forced 0 by §5.11.58).
+/// is forced 0 by §5.11.58). Reads the post-CDEF samples from the
+/// unit's local windows (edge-replicated aprons).
 fn fit_wiener(
-    cdef: &[i32],
+    rects: &[LocalRect],
     src: &[u16],
-    plane_w: usize,
-    plane_h: usize,
-    rects: &[(u32, u32, u32, u32)],
+    src_stride: usize,
     first_coeff: usize,
 ) -> [[i32; WIENER_COEFFS]; 2] {
-    let at = |x: i64, y: i64| -> f64 {
-        let xc = x.clamp(0, plane_w as i64 - 1) as usize;
-        let yc = y.clamp(0, plane_h as i64 - 1) as usize;
-        f64::from(cdef[yc * plane_w + xc])
-    };
     let taps7 = |t: &[f64; 3]| -> [f64; 7] {
         let c = 128.0 - 2.0 * (t[0] + t[1] + t[2]);
         [t[0], t[1], t[2], c, t[2], t[1], t[0]]
@@ -329,6 +560,7 @@ fn fit_wiener(
         vt[0] = 0.0;
         ht[0] = 0.0;
     }
+    let m = LOCAL_MARGIN as i64;
     for _round in 0..2 {
         for dir in 0..2usize {
             // dir 0: fit horizontal (pass 1) through the vertical
@@ -338,28 +570,33 @@ fn fit_wiener(
             let nvar = 3 - first_coeff;
             let mut ata = [[0f64; 3]; 3];
             let mut atb = [0f64; 3];
-            for &(rx, ry, rw, rh) in rects {
-                for y in ry..ry + rh {
-                    for x in rx..rx + rw {
-                        let mut m = [0f64; 7];
-                        for (j, mj) in m.iter_mut().enumerate() {
+            for lr in rects {
+                let cols = lr.cols as i64;
+                let at = |x: i64, y: i64| -> f64 { f64::from(lr.cdef[(y * cols + x) as usize]) };
+                for y in 0..lr.geom.h as i64 {
+                    for x in 0..lr.geom.w as i64 {
+                        let (lx, ly) = (x + m, y + m);
+                        let mut mm = [0f64; 7];
+                        for (j, mj) in mm.iter_mut().enumerate() {
                             let off = j as i64 - 3;
                             let mut acc = 0f64;
                             for (k, fk) in fixed.iter().enumerate() {
                                 let foff = k as i64 - 3;
                                 let (sx, sy) = if dir == 0 {
-                                    (x as i64 + off, y as i64 + foff)
+                                    (lx + off, ly + foff)
                                 } else {
-                                    (x as i64 + foff, y as i64 + off)
+                                    (lx + foff, ly + off)
                                 };
                                 acc += fk * at(sx, sy);
                             }
                             *mj = acc / 128.0;
                         }
-                        let target = f64::from(src[y as usize * plane_w + x as usize]) - m[3];
+                        let target = f64::from(
+                            src[(lr.abs_y + y as usize) * src_stride + lr.abs_x + x as usize],
+                        ) - mm[3];
                         let mut basis = [0f64; 3];
                         for (i, b) in basis.iter_mut().enumerate() {
-                            *b = (m[i] + m[6 - i] - 2.0 * m[3]) / 128.0;
+                            *b = (mm[i] + mm[6 - i] - 2.0 * mm[3]) / 128.0;
                         }
                         for i in first_coeff..3 {
                             for j in first_coeff..3 {
@@ -435,6 +672,12 @@ fn fit_wiener(
 /// no unit elected a filter. The caller re-emits the tile with the
 /// §5.11.57 interleave, settles LR-on vs LR-off on exact realized
 /// bytes, and applies via [`apply_lr_plan`].
+///
+/// r464 — the distortion side (Wiener fit, self-guided fits on the
+/// exact box-filter bases, exact kernel SSDs) runs per unit on local
+/// stripe-rectangle windows, `threads`-wide; the `D + λ·R` election
+/// then walks the units in §5.11.57 order with the running subexp
+/// reference state, exactly as before.
 pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
     let num_planes = inp.num_planes.min(3) as usize;
     let dims: Vec<(usize, usize)> = (0..num_planes)
@@ -446,92 +689,114 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
             }
         })
         .collect();
-    let ec = EvalCtx {
-        input: inp.input,
-        dims: dims.clone(),
-        num_planes,
+    // Eval-side header: every plane SWITCHABLE so the per-unit
+    // closure decides (the real header collapses below).
+    let eval_lrp = header_shape([FrameRestorationType::Switchable; 3], inp.unit_shift);
+    let geom_ctx = LoopRestorationFrameContext {
+        mi_rows: inp.mi_rows,
+        mi_cols: inp.mi_cols,
+        num_planes: num_planes as u8,
         bit_depth: inp.bit_depth,
         subsampling_x: inp.subsampling_x,
         subsampling_y: inp.subsampling_y,
-        mi_rows: inp.mi_rows,
-        mi_cols: inp.mi_cols,
         frame_height: inp.frame_height as u32,
         upscaled_width: inp.frame_width as u32,
-        // Eval-side header: every plane SWITCHABLE so the per-unit
-        // closure decides (the real header collapses below).
-        eval_lrp: header_shape([FrameRestorationType::Switchable; 3], inp.unit_shift),
+        lr_params: &eval_lrp,
+        lr_type: &|_, _, _| FrameRestorationType::None,
+        lr_wiener: &|_, _, _, _, _| 0,
+        lr_sgr_set: &|_, _, _| 0,
+        lr_sgr_xqd: &|_, _, _, _| 0,
     };
+    let currs: [&[u16]; 3] = [inp.curr_y, inp.curr_u, inp.curr_v];
+    let cdefs: [&[u16]; 3] = [inp.cdef_y, inp.cdef_u, inp.cdef_v];
+    let srcs: [&[u16]; 3] = [&inp.input.y, &inp.input.u, &inp.input.v];
 
-    let to_i32 = |p: &[u16]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
-    let mut curr_owned: Vec<Vec<i32>> = vec![to_i32(inp.curr_y)];
-    let mut cdef_owned: Vec<Vec<i32>> = vec![to_i32(inp.cdef_y)];
-    if num_planes > 1 {
-        curr_owned.push(to_i32(inp.curr_u));
-        curr_owned.push(to_i32(inp.curr_v));
-        cdef_owned.push(to_i32(inp.cdef_u));
-        cdef_owned.push(to_i32(inp.cdef_v));
-    }
-    let mut lr_owned: Vec<Vec<i32>> = cdef_owned.clone();
-
-    // Per-plane unit maps via the decoder's own §7.17.1 geometry
-    // (the `(lumaY + 8)` stripe shift makes unit membership
-    // non-obvious — derive it exactly).
-    let mut per_plane_units: Vec<Vec<UnitBlocks>> = Vec::new();
+    // Per plane: the unit grid + every unit's stripe rectangles (the
+    // decoder's own §7.17.1 geometry, one rectangle per stripe).
     let mut per_plane_grid: Vec<(u32, u32)> = Vec::new();
-    {
-        let geom_ctx = LoopRestorationFrameContext {
-            mi_rows: ec.mi_rows,
-            mi_cols: ec.mi_cols,
-            num_planes: num_planes as u8,
-            bit_depth: ec.bit_depth,
-            subsampling_x: ec.subsampling_x,
-            subsampling_y: ec.subsampling_y,
-            frame_height: ec.frame_height,
-            upscaled_width: ec.upscaled_width,
-            lr_params: &ec.eval_lrp,
-            lr_type: &|_, _, _| FrameRestorationType::None,
-            lr_wiener: &|_, _, _, _, _| 0,
-            lr_sgr_set: &|_, _, _| 0,
-            lr_sgr_xqd: &|_, _, _, _| 0,
+    let mut tasks: Vec<(usize, u32, u32, Vec<LrBlockGeometry>)> = Vec::new();
+    for plane in 0..num_planes {
+        let (sub_x, sub_y) = if plane == 0 {
+            (0u32, 0u32)
+        } else {
+            (u32::from(inp.subsampling_x), u32::from(inp.subsampling_y))
         };
-        for plane in 0..num_planes {
-            let (sub_x, sub_y) = if plane == 0 {
-                (0u32, 0u32)
-            } else {
-                (u32::from(inp.subsampling_x), u32::from(inp.subsampling_y))
-            };
-            let unit_size = 64u32 << inp.unit_shift.min(2);
-            let unit_rows = count_units_in_frame(unit_size, (ec.frame_height + sub_y) >> sub_y);
-            let unit_cols = count_units_in_frame(unit_size, (ec.upscaled_width + sub_x) >> sub_x);
-            let mut units: Vec<UnitBlocks> = (0..unit_rows * unit_cols)
-                .map(|_| UnitBlocks {
-                    blocks: Vec::new(),
-                    rects: Vec::new(),
-                })
-                .collect();
-            let mut y = 0u32;
-            while y < ec.frame_height {
-                let mut x = 0u32;
-                while x < ec.upscaled_width {
-                    let (row, col) = (y >> 2, x >> 2);
-                    let g = derive_block_geometry(&geom_ctx, plane as u8, row, col);
-                    if g.w > 0 && g.h > 0 {
-                        let k = (g.unit_row * unit_cols + g.unit_col) as usize;
-                        units[k].blocks.push((row, col));
-                        units[k].rects.push((g.x, g.y, g.w, g.h));
-                    }
-                    x += 4;
-                }
-                y += 4;
+        let unit_size = 64u32 << inp.unit_shift.min(2);
+        let unit_rows = count_units_in_frame(unit_size, (inp.frame_height as u32 + sub_y) >> sub_y);
+        let unit_cols = count_units_in_frame(unit_size, (inp.frame_width as u32 + sub_x) >> sub_x);
+        per_plane_grid.push((unit_rows, unit_cols));
+        let mut per_unit: Vec<Vec<LrBlockGeometry>> =
+            (0..unit_rows * unit_cols).map(|_| Vec::new()).collect();
+        for g in stripe_unit_rects(&geom_ctx, plane as u8) {
+            per_unit[(g.unit_row * unit_cols + g.unit_col) as usize].push(g);
+        }
+        for ur in 0..unit_rows {
+            for uc in 0..unit_cols {
+                let rects = std::mem::take(&mut per_unit[(ur * unit_cols + uc) as usize]);
+                tasks.push((plane, ur, uc, rects));
             }
-            per_plane_units.push(units);
-            per_plane_grid.push((unit_rows, unit_cols));
         }
     }
 
-    // Exact §5.11.58 bits for one unit from the given reference state
-    // (selection symbol priced from the frame-start CDFs under the
-    // SWITCHABLE arm).
+    // Phase 1 — the distortion-side search, `threads`-wide over the
+    // (plane, unit) list.
+    let run = |t: &(usize, u32, u32, Vec<LrBlockGeometry>)| -> Option<UnitSearch> {
+        let (plane, _, _, rects) = t;
+        if rects.is_empty() {
+            return None;
+        }
+        let (pw, ph) = dims[*plane];
+        let mut local: Vec<LocalRect> = rects
+            .iter()
+            .map(|g| LocalRect::build(g, currs[*plane], cdefs[*plane], pw, ph))
+            .collect();
+        Some(search_unit(
+            &mut local,
+            *plane,
+            srcs[*plane],
+            pw,
+            inp.bit_depth,
+            inp.sgr_step,
+        ))
+    };
+    let threads = inp.threads.max(1).min(tasks.len().max(1));
+    let searched: Vec<Option<UnitSearch>> = if threads <= 1 {
+        tasks.iter().map(run).collect()
+    } else {
+        let next = core::sync::atomic::AtomicUsize::new(0);
+        let mut slots: Vec<Option<UnitSearch>> = (0..tasks.len()).map(|_| None).collect();
+        let results: Vec<Vec<(usize, Option<UnitSearch>)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (next, tasks, run) = (&next, &tasks, &run);
+                    scope.spawn(move || {
+                        let mut outs = Vec::new();
+                        loop {
+                            let k = next.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                            if k >= tasks.len() {
+                                break;
+                            }
+                            outs.push((k, run(&tasks[k])));
+                        }
+                        outs
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("lr unit search thread panicked"))
+                .collect()
+        });
+        for outs in results {
+            for (k, o) in outs {
+                slots[k] = o;
+            }
+        }
+        slots
+    };
+
+    // Phase 2 — exact §5.11.58 pricing in unit order with the running
+    // subexp reference state, `argmin D + λ·R` per unit.
     let price_unit = |state: &LrWriteState, plane: usize, unit: &LrUnit| -> u64 {
         let mut w = SymbolWriter::new_counting(inp.disable_cdf_update, 0x8000);
         let mut cdfs = inp.price_cdfs.clone();
@@ -539,212 +804,38 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         let _ = write_lr_unit(&mut w, &mut cdfs, &mut st, plane, RESTORE_SWITCHABLE, unit);
         w.cost_bits256()
     };
-
     let mut plan_units: Vec<((usize, u32, u32), LrUnit)> = Vec::new();
     let mut frt = [FrameRestorationType::None; 3];
     let mut d_total = 0u64;
     let mut d_pre_total = 0u64;
     let mut lr_state = LrWriteState::new();
+    let mut task_idx = 0usize;
     for plane in 0..num_planes {
         let (unit_rows, unit_cols) = per_plane_grid[plane];
-        let (plane_w, plane_h) = dims[plane];
-        let first_coeff = usize::from(plane != 0);
         let mut plane_kinds = (false, false); // (any wiener, any sgr)
         let mut plane_units: Vec<((usize, u32, u32), LrUnit)> = Vec::new();
         let mut plane_d = 0u64;
         for ur in 0..unit_rows {
             for uc in 0..unit_cols {
-                let ub = &per_plane_units[plane][(ur * unit_cols + uc) as usize];
-                if ub.blocks.is_empty() {
+                let searched_unit = searched[task_idx].as_ref();
+                task_idx += 1;
+                let Some(su) = searched_unit else {
                     plane_units.push(((plane, ur, uc), LrUnit::NONE));
                     continue;
-                }
-                let d_none = eval_unit(
-                    &ec,
-                    &mut curr_owned,
-                    &mut cdef_owned,
-                    &mut lr_owned,
-                    plane,
-                    ur,
-                    uc,
-                    &LrUnit::NONE,
-                    ub,
-                );
-                d_pre_total += d_none;
-
-                // Wiener candidate.
-                let taps = fit_wiener(
-                    &cdef_owned[plane],
-                    ec.src_plane(plane),
-                    plane_w,
-                    plane_h,
-                    &ub.rects,
-                    first_coeff,
-                );
-                let wiener_unit = LrUnit {
-                    restoration_type: RESTORE_WIENER,
-                    wiener: taps,
-                    sgr_set: 0,
-                    sgr_xqd: [0; 2],
                 };
-                let d_wiener = eval_unit(
-                    &ec,
-                    &mut curr_owned,
-                    &mut cdef_owned,
-                    &mut lr_owned,
-                    plane,
-                    ur,
-                    uc,
-                    &wiener_unit,
-                    ub,
-                );
-
-                // Self-guided candidate: probe-fit each set, keep the
-                // best by exact SSD.
-                let mut best_sgr: Option<(LrUnit, u64)> = None;
-                for (set, params) in SGR_PARAMS.iter().enumerate().step_by(inp.sgr_step.max(1)) {
-                    let (r0, r1) = (params[0], params[2]);
-                    let read_delta = |lr: &[Vec<i32>], cdef: &[Vec<i32>]| -> Vec<i32> {
-                        let mut out = Vec::new();
-                        for &(x, y, w, h) in &ub.rects {
-                            for row in y..y + h {
-                                let base = row as usize * plane_w;
-                                for col in x..x + w {
-                                    out.push(
-                                        lr[plane][base + col as usize]
-                                            - cdef[plane][base + col as usize],
-                                    );
-                                }
-                            }
-                        }
-                        out
-                    };
-                    let mut probe = |xqd: [i32; 2]| -> Vec<i32> {
-                        let u = LrUnit {
-                            restoration_type: RESTORE_SGRPROJ,
-                            wiener: [[0; WIENER_COEFFS]; 2],
-                            sgr_set: set,
-                            sgr_xqd: xqd,
-                        };
-                        let _ = eval_unit(
-                            &ec,
-                            &mut curr_owned,
-                            &mut cdef_owned,
-                            &mut lr_owned,
-                            plane,
-                            ur,
-                            uc,
-                            &u,
-                            ub,
-                        );
-                        read_delta(&lr_owned, &cdef_owned)
-                    };
-                    let a0 = (r0 != 0).then(|| probe([128, 0]));
-                    let a1 = (r1 != 0).then(|| probe([0, 128]));
-                    // Targets: 128·(src - dgd) over the same traversal.
-                    let mut t: Vec<f64> = Vec::new();
-                    {
-                        let s = ec.src_plane(plane);
-                        for &(x, y, w, h) in &ub.rects {
-                            for row in y..y + h {
-                                let base = row as usize * plane_w;
-                                for col in x..x + w {
-                                    t.push(
-                                        128.0
-                                            * (f64::from(s[base + col as usize])
-                                                - f64::from(
-                                                    cdef_owned[plane][base + col as usize],
-                                                )),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // Least squares on 128·out_delta = xq0·a0 + xq1·a1.
-                    let (mut xq0, mut xq1) = (0i32, 0i32);
-                    match (&a0, &a1) {
-                        (Some(a0), Some(a1)) => {
-                            let (mut s00, mut s01, mut s11, mut b0, mut b1) =
-                                (0f64, 0f64, 0f64, 0f64, 0f64);
-                            for i in 0..t.len() {
-                                let (x0, x1) = (f64::from(a0[i]), f64::from(a1[i]));
-                                s00 += x0 * x0;
-                                s01 += x0 * x1;
-                                s11 += x1 * x1;
-                                b0 += x0 * t[i];
-                                b1 += x1 * t[i];
-                            }
-                            let det = s00 * s11 - s01 * s01;
-                            if det.abs() > 1e-6 {
-                                xq0 = ((s11 * b0 - s01 * b1) / det).round() as i32;
-                                xq1 = ((s00 * b1 - s01 * b0) / det).round() as i32;
-                            }
-                        }
-                        (Some(a0), None) => {
-                            let (mut s00, mut b0) = (0f64, 0f64);
-                            for i in 0..t.len() {
-                                let x0 = f64::from(a0[i]);
-                                s00 += x0 * x0;
-                                b0 += x0 * t[i];
-                            }
-                            if s00 > 1e-6 {
-                                xq0 = (b0 / s00).round() as i32;
-                            }
-                        }
-                        (None, Some(a1)) => {
-                            let (mut s11, mut b1) = (0f64, 0f64);
-                            for i in 0..t.len() {
-                                let x1 = f64::from(a1[i]);
-                                s11 += x1 * x1;
-                                b1 += x1 * t[i];
-                            }
-                            if s11 > 1e-6 {
-                                xq1 = (b1 / s11).round() as i32;
-                            }
-                        }
-                        (None, None) => {}
-                    }
-                    // §5.11.58 constraints: clamp, derive radius-0
-                    // components.
-                    xq0 = xq0.clamp(SGRPROJ_XQD_MIN[0], SGRPROJ_XQD_MAX[0]);
-                    xq1 = xq1.clamp(SGRPROJ_XQD_MIN[1], SGRPROJ_XQD_MAX[1]);
-                    if r0 == 0 {
-                        xq0 = 0;
-                    }
-                    if r1 == 0 {
-                        xq1 = (128 - xq0).clamp(SGRPROJ_XQD_MIN[1], SGRPROJ_XQD_MAX[1]);
-                    }
-                    let cand = LrUnit {
-                        restoration_type: RESTORE_SGRPROJ,
-                        wiener: [[0; WIENER_COEFFS]; 2],
-                        sgr_set: set,
-                        sgr_xqd: [xq0, xq1],
-                    };
-                    let d = eval_unit(
-                        &ec,
-                        &mut curr_owned,
-                        &mut cdef_owned,
-                        &mut lr_owned,
-                        plane,
-                        ur,
-                        uc,
-                        &cand,
-                        ub,
-                    );
-                    if best_sgr.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
-                        best_sgr = Some((cand, d));
-                    }
-                }
-
-                // Elect argmin D + λ·R.
+                d_pre_total += su.d_none;
                 let r_none = price_unit(&lr_state, plane, &LrUnit::NONE);
-                let r_wiener = price_unit(&lr_state, plane, &wiener_unit);
-                let mut best = (LrUnit::NONE, d_none, d_none * 256 + inp.lambda * r_none);
-                let s_wiener = d_wiener * 256 + inp.lambda * r_wiener;
+                let r_wiener = price_unit(&lr_state, plane, &su.wiener.0);
+                let mut best = (
+                    LrUnit::NONE,
+                    su.d_none,
+                    su.d_none * 256 + inp.lambda * r_none,
+                );
+                let s_wiener = su.wiener.1 * 256 + inp.lambda * r_wiener;
                 if s_wiener < best.2 {
-                    best = (wiener_unit, d_wiener, s_wiener);
+                    best = (su.wiener.0, su.wiener.1, s_wiener);
                 }
-                if let Some((sgr_unit, d_sgr)) = best_sgr {
+                if let Some((sgr_unit, d_sgr)) = su.sgr {
                     let r_sgr = price_unit(&lr_state, plane, &sgr_unit);
                     let s_sgr = d_sgr * 256 + inp.lambda * r_sgr;
                     if s_sgr < best.2 {
@@ -813,8 +904,8 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         loop_restoration_size: header.loop_restoration_size,
         subsampling_x: inp.subsampling_x,
         subsampling_y: inp.subsampling_y,
-        frame_height: ec.frame_height,
-        upscaled_width: ec.upscaled_width,
+        frame_height: inp.frame_height as u32,
+        upscaled_width: inp.frame_width as u32,
         use_superres: inp.use_superres,
         superres_denom: inp.superres_denom,
         allow_intrabc: false,
@@ -837,12 +928,16 @@ fn frt_ordinal(t: FrameRestorationType) -> u8 {
     }
 }
 
-/// Apply an elected plan: one §7.17 run through the decoder's own
-/// frame driver over the plan's unit grids — `curr` (pre-CDEF) and
-/// the current `recon` (post-CDEF) in, the restored planes written
-/// back over `recon_*` (the §7.20 reference store). Returns the
-/// applied whole-frame SSD vs the source (callers `debug_assert` it
-/// equals `plan.d`).
+/// Apply an elected plan: the §7.17 restoration of every plane over
+/// the plan's unit grids — `curr` (pre-CDEF) and the current `recon`
+/// (post-CDEF) in, the restored planes written back over `recon_*`
+/// (the §7.20 reference store). Returns the applied whole-frame SSD
+/// vs the source (callers `debug_assert` it equals `plan.d`).
+///
+/// r464 — runs rectangle by rectangle on local windows
+/// ([`LocalRect`]) into one plane-sized output at a time (no
+/// frame-sized `i32` copies); the kernels are the decoder's own, so
+/// the stored planes equal the decoder's byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_lr_plan(
     plan: &LrPlan,
@@ -876,57 +971,36 @@ pub(crate) fn apply_lr_plan(
             }
         })
         .collect();
-    let to_i32 = |p: &[u16]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
-    let mut curr_owned: Vec<Vec<i32>> = vec![to_i32(curr_y)];
-    let mut cdef_owned: Vec<Vec<i32>> = vec![to_i32(recon_y)];
-    if num_planes > 1 {
-        curr_owned.push(to_i32(curr_u));
-        curr_owned.push(to_i32(curr_v));
-        cdef_owned.push(to_i32(recon_u));
-        cdef_owned.push(to_i32(recon_v));
-    }
-    let mut lr_owned: Vec<Vec<i32>> = cdef_owned.clone();
-    let find = |plane: u8, ur: u32, uc: u32| -> LrUnit {
+    let find = |plane: usize, ur: u32, uc: u32| -> LrUnit {
         plan.units
             .iter()
-            .find(|(k, _)| *k == (plane as usize, ur, uc))
+            .find(|(k, _)| *k == (plane, ur, uc))
             .map(|(_, u)| *u)
             .unwrap_or(LrUnit::NONE)
     };
-    {
-        let ctx = LoopRestorationFrameContext {
-            mi_rows,
-            mi_cols,
-            num_planes: num_planes as u8,
-            bit_depth,
-            subsampling_x,
-            subsampling_y,
-            frame_height: frame_height as u32,
-            upscaled_width: frame_width as u32,
-            lr_params: &plan.header,
-            lr_type: &|p, r, c| match find(p, r, c).restoration_type {
-                RESTORE_WIENER => FrameRestorationType::Wiener,
-                RESTORE_SGRPROJ => FrameRestorationType::SgrProj,
-                _ => FrameRestorationType::None,
-            },
-            lr_wiener: &|p, r, c, pass, i| find(p, r, c).wiener[pass as usize][i],
-            lr_sgr_set: &|p, r, c| find(p, r, c).sgr_set as u8,
-            lr_sgr_xqd: &|p, r, c, i| find(p, r, c).sgr_xqd[i],
-        };
-        let curr_bufs = make_bufs(&mut curr_owned, &dims);
-        let cdef_bufs = make_bufs(&mut cdef_owned, &dims);
-        let mut lr_bufs = make_bufs(&mut lr_owned, &dims);
-        loop_restoration_frame(&ctx, &curr_bufs, &cdef_bufs, &mut lr_bufs);
-    }
-    // r460 — the SSD is measured over the CODED extent only (the
-    // election's per-unit rects never reach into the mi-grid padding
-    // of a non-multiple-of-8 picture; §7.17 leaves it untouched).
-    let mut ssd = 0u64;
+    let geom_ctx = LoopRestorationFrameContext {
+        mi_rows,
+        mi_cols,
+        num_planes: num_planes as u8,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_height: frame_height as u32,
+        upscaled_width: frame_width as u32,
+        lr_params: &plan.header,
+        lr_type: &|_, _, _| FrameRestorationType::None,
+        lr_wiener: &|_, _, _, _, _| 0,
+        lr_sgr_set: &|_, _, _| 0,
+        lr_sgr_xqd: &|_, _, _, _| 0,
+    };
+    let currs: [&[u16]; 3] = [curr_y, curr_u, curr_v];
     let srcs: [&[u16]; 3] = [&input.y, &input.u, &input.v];
-    let recons: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
-    for (p, recon) in recons.into_iter().enumerate().take(num_planes) {
-        let (plane_w, _) = dims[p];
-        let (fw, fh) = if p == 0 {
+    let mut recons: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
+    let mut ssd = 0u64;
+    let mut out: Vec<i32> = Vec::new();
+    for plane in 0..num_planes {
+        let (pw, ph) = dims[plane];
+        let (fw, fh) = if plane == 0 {
             (frame_width, frame_height)
         } else {
             (
@@ -934,14 +1008,36 @@ pub(crate) fn apply_lr_plan(
                 (frame_height + usize::from(subsampling_y)) >> subsampling_y,
             )
         };
-        for (i, (dst, (&out, &s))) in recon
-            .iter_mut()
-            .zip(lr_owned[p].iter().zip(srcs[p].iter()))
-            .enumerate()
-        {
-            *dst = out.max(0) as u16;
-            if i % plane_w < fw && i / plane_w < fh {
-                let d = i64::from(out) - i64::from(s);
+        let recon = &mut recons[plane];
+        if plan.header.frame_restoration_type[plane] != FrameRestorationType::None {
+            // Restore into a fresh plane (later rectangles read their
+            // neighbours' PRE-restoration samples), then swap in.
+            let mut restored: Vec<u16> = recon.to_vec();
+            for g in stripe_unit_rects(&geom_ctx, plane as u8) {
+                let unit = find(plane, g.unit_row, g.unit_col);
+                if unit.restoration_type == RESTORE_NONE {
+                    continue;
+                }
+                let mut lr = LocalRect::build(&g, currs[plane], recon, pw, ph);
+                eval_rect(&mut lr, &unit, plane, bit_depth, &mut out, srcs[plane], pw);
+                let m = LOCAL_MARGIN;
+                for i in 0..g.h as usize {
+                    let orow = &out[(m + i) * lr.cols + m..(m + i) * lr.cols + m + g.w as usize];
+                    let drow = &mut restored[(lr.abs_y + i) * pw + lr.abs_x..][..g.w as usize];
+                    for (d, o) in drow.iter_mut().zip(orow) {
+                        *d = (*o).max(0) as u16;
+                    }
+                }
+            }
+            recon.copy_from_slice(&restored);
+        }
+        // r460 — the SSD is measured over the CODED extent only (the
+        // election's per-unit rects never reach into the mi-grid
+        // padding of a non-multiple-of-8 picture; §7.17 leaves it
+        // untouched).
+        for y in 0..fh {
+            for x in 0..fw {
+                let d = i64::from(recon[y * pw + x]) - i64::from(srcs[plane][y * pw + x]);
                 ssd += (d * d) as u64;
             }
         }
