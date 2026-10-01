@@ -1888,7 +1888,7 @@ elections first copied every plane to frame-sized `i32` buffers.
 | Balanced | 1 | 474.8 s → **17.7 s** | 17.7 s | 682 → 377 MiB | 113 211 | 39.12 / 40.43 / 40.01 |
 | Balanced | 4 | 308.6 s → **5.5 s** | 18.4 s | 1225 → 473 MiB | 114 156 | 39.12 / 40.43 / 40.02 |
 | Balanced | 8 | 287.7 s → **3.4 s** | 19.5 s | 1670 → 502 MiB | 115 646 | 39.13 / 40.43 / 40.04 |
-| Thorough | 1 | > 1 h → THOROUGH1_AFTER | | | | |
+| Thorough | 1 | > 1 h → **928 s** | 927 s | — → 412 MiB | 104 855 | 37.69 / 40.93 / 40.48 |
 | Thorough | 8 | 1485.7 s → **136 s** | 1037 s | 2242 → 666 MiB | 108 445 | 37.70 / 40.93 / 40.53 |
 | Decode (Fast stream) | 1 | 0.66 s → 0.64 s | | 228 → 211 MiB | | |
 | Decode (third-party stream) | 1 | 0.40 s → 0.38 s | | 191 → 173 MiB | | |
