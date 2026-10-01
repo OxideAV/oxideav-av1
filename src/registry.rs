@@ -55,9 +55,10 @@ use oxideav_core::{
 use crate::codec_config::Av1CodecConfig;
 use crate::decoder::{SpecDecodeSession, SpecFrame};
 use crate::encoder::{
-    encode_key_frame_yuv_with_q, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
+    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
     StillOptions, StillSpeed, YuvFrame, DEFAULT_STILL_BASE_Q_IDX,
 };
+use oxideav_core::ExecutionContext;
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates to [`register`].
@@ -270,12 +271,12 @@ fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame 
 /// | `q`              | `base_q_idx` 0..=255 (0 lossless) | `DEFAULT_STILL_BASE_Q_IDX`   |
 /// | `quality`        | 0..=100 (100 lossless); overrides `q` | —                        |
 /// | `lossless`       | `true` forces `base_q_idx = 0`    | `false`                      |
-/// | `speed`          | `fast` / `balanced` / `thorough`  | `balanced`                   |
+/// | `speed`          | `fast` / `balanced` / `thorough`  | `fast` (r464 — the measured production point) |
 /// | `tile_cols_log2` | §5.9.15 `TileColsLog2`            | `0`                          |
 /// | `tile_rows_log2` | §5.9.15 `TileRowsLog2`            | `0`                          |
 /// | `full_range`     | `true` / `false` (§5.5.2 `color_range`) | from the pixel format (`YuvJ*` full) |
 /// | `color_primaries` / `transfer_characteristics` / `matrix_coefficients` | H.273 code points (§5.5.2 colour description; all three or none) | unspecified |
-/// | `threads`        | tile-search threads; > 1 derives an automatic tile layout unless `tile_*_log2` are given | `1` |
+/// | `threads`        | tile-search threads (`auto` = the [`ExecutionContext`] budget); > 1 derives an automatic tile layout unless `tile_*_log2` are given | `auto` (r464; serial until the caller grants a budget through `set_execution_context`) |
 ///
 /// `still = true` codes every frame as an independent still picture
 /// (`still_picture = 1` + `reduced_still_picture_header = 1`, one
@@ -300,10 +301,13 @@ pub struct Av1EncoderOptions {
     /// §5.5.2 colour description `(cp, tc, mc)` when all three keys
     /// are given.
     pub color_description: Option<(u8, u8, u8)>,
-    /// Tile-search threads.
-    pub threads: usize,
-    /// Derive the tile layout from `threads` (set when `threads > 1`
-    /// and no explicit `tile_*_log2` was given).
+    /// Tile-search threads. `None` = `auto`: the
+    /// [`ExecutionContext`] budget the caller grants (serial until
+    /// then).
+    pub threads: Option<usize>,
+    /// Derive the tile layout from the thread count (set when no
+    /// explicit `tile_*_log2` was given; only matters when more than
+    /// one thread runs).
     pub auto_tiles: bool,
 }
 
@@ -318,7 +322,7 @@ impl Av1EncoderOptions {
         let mut o = Self {
             still: false,
             base_q_idx: DEFAULT_STILL_BASE_Q_IDX,
-            speed: StillSpeed::Balanced,
+            speed: StillSpeed::Fast,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             full_range: matches!(
@@ -326,8 +330,8 @@ impl Av1EncoderOptions {
                 Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
             ),
             color_description: None,
-            threads: 1,
-            auto_tiles: false,
+            threads: None,
+            auto_tiles: true,
         };
         let mut cicp: [Option<u8>; 3] = [None; 3];
         let mut explicit_tiles = false;
@@ -369,7 +373,13 @@ impl Av1EncoderOptions {
                     o.tile_rows_log2 = v.parse().map_err(|_| bad(k, v))?;
                     explicit_tiles = true;
                 }
-                "threads" => o.threads = v.parse::<usize>().map_err(|_| bad(k, v))?.max(1),
+                "threads" => {
+                    o.threads = if v == "auto" {
+                        None
+                    } else {
+                        Some(v.parse::<usize>().map_err(|_| bad(k, v))?.max(1))
+                    }
+                }
                 "full_range" => o.full_range = parse_bool(k, v)?,
                 "color_primaries" => cicp[0] = Some(v.parse().map_err(|_| bad(k, v))?),
                 "transfer_characteristics" => cicp[1] = Some(v.parse().map_err(|_| bad(k, v))?),
@@ -397,11 +407,16 @@ impl Av1EncoderOptions {
         if lossless {
             o.base_q_idx = 0;
         }
-        o.auto_tiles = o.threads > 1 && !explicit_tiles;
+        o.auto_tiles = !explicit_tiles;
         Ok(o)
     }
 
-    fn still_options(&self) -> StillOptions {
+    /// The encoder options at a resolved thread count (`budget` = the
+    /// [`ExecutionContext`] budget, used when `threads` is `auto`).
+    /// The automatic tile layout only engages above one thread, so a
+    /// serial encode keeps the spec-minimum layout.
+    fn still_options(&self, budget: usize) -> StillOptions {
+        let threads = self.threads.unwrap_or(budget).max(1);
         StillOptions {
             base_q_idx: self.base_q_idx,
             tile_cols_log2: self.tile_cols_log2,
@@ -410,8 +425,8 @@ impl Av1EncoderOptions {
             full_range: self.full_range,
             reduced_header: true,
             color_description: self.color_description,
-            threads: self.threads,
-            auto_tiles: self.auto_tiles,
+            threads,
+            auto_tiles: self.auto_tiles && threads > 1,
         }
     }
 }
@@ -503,6 +518,7 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         next_pts: 0,
         queue: std::collections::VecDeque::new(),
         eof: false,
+        thread_budget: 1,
     }))
 }
 
@@ -520,6 +536,9 @@ struct Av1Encoder {
     next_pts: i64,
     queue: std::collections::VecDeque<Packet>,
     eof: bool,
+    /// r464 — the [`ExecutionContext`] thread budget (serial until
+    /// the caller grants one).
+    thread_budget: usize,
 }
 
 impl std::fmt::Debug for Av1Encoder {
@@ -609,14 +628,16 @@ impl Encoder for Av1Encoder {
             ));
         };
         let input = self.to_yuv(vf)?;
+        let opts = self.opts.still_options(self.thread_budget);
         let tu = if self.opts.still {
-            encode_still_yuv(&input, &self.opts.still_options())
+            encode_still_yuv(&input, &opts)
                 .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?
                 .temporal_unit_bytes
         } else {
-            // TODO(r460 followup): the all-intra arm ignores tiles /
-            // speed / full_range — it rides the historical KEY entry.
-            encode_key_frame_yuv_with_q(&input, self.opts.base_q_idx)
+            // r464 — the all-intra arm rides the same quality / speed /
+            // tile / thread controls under a full, non-still sequence
+            // header.
+            encode_key_frame_yuv_with_options(&input, &opts)
                 .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?
                 .temporal_unit_bytes
         };
@@ -643,6 +664,10 @@ impl Encoder for Av1Encoder {
     fn flush(&mut self) -> CoreResult<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.thread_budget = ctx.threads.max(1);
     }
 }
 
@@ -744,7 +769,7 @@ mod tests {
             assert_eq!(seq.color_config.color_range, pf == PixelFormat::YuvJ444P);
 
             let opts = Av1EncoderOptions::from_params(&params).unwrap();
-            let direct = encode_still_yuv(&yuv, &opts.still_options()).expect("direct still");
+            let direct = encode_still_yuv(&yuv, &opts.still_options(1)).expect("direct still");
             assert_eq!(
                 direct.temporal_unit_bytes, pkt.data,
                 "{pf:?}: framework != direct"
@@ -833,6 +858,78 @@ mod tests {
         params.options.insert("matrix_coefficients", "6");
         let o = Av1EncoderOptions::from_params(&params).unwrap();
         assert_eq!(o.color_description, Some((1, 13, 6)));
+    }
+
+    /// r464 — the production defaults: `speed = fast`, `threads =
+    /// auto` (the execution-context budget; serial until granted, the
+    /// automatic tile layout engaging above one thread), the all-intra
+    /// arm riding the same options. A budgeted 4-thread encode of a
+    /// multi-tile still equals the direct 4-thread encode byte for
+    /// byte, and the serial encode is the single-tile one.
+    #[test]
+    fn defaults_are_fast_and_auto_threaded_under_the_execution_budget() {
+        let params = video_params(512, 256, PixelFormat::Yuv420P);
+        let o = Av1EncoderOptions::from_params(&params).unwrap();
+        assert_eq!(o.speed, StillSpeed::Fast);
+        assert_eq!(o.threads, None);
+        assert!(o.auto_tiles);
+        assert_eq!(o.still_options(1).threads, 1);
+        assert!(!o.still_options(1).auto_tiles);
+        let four = o.still_options(4);
+        assert_eq!(four.threads, 4);
+        assert!(four.auto_tiles);
+        let mut explicit = params.clone();
+        explicit.options.insert("threads", "2");
+        explicit.options.insert("tile_rows_log2", "1");
+        let e = Av1EncoderOptions::from_params(&explicit).unwrap();
+        assert_eq!(e.still_options(8).threads, 2);
+        assert!(!e.still_options(8).auto_tiles);
+        let mut auto = params.clone();
+        auto.options.insert("threads", "auto");
+        assert_eq!(Av1EncoderOptions::from_params(&auto).unwrap().threads, None);
+
+        let (frame, yuv) = textured_frame(512, 256, PixelFormat::Yuv420P);
+        for still in [true, false] {
+            let mut p = params.clone();
+            p.options
+                .insert("still", if still { "true" } else { "false" });
+            let mut enc = make_encoder(&p).expect("encoder");
+            enc.set_execution_context(&ExecutionContext::with_threads(4));
+            enc.send_frame(&CoreFrame::Video(frame.clone()))
+                .expect("frame");
+            enc.flush().expect("flush");
+            let pkt = enc.receive_packet().expect("packet");
+            let direct = if still {
+                encode_still_yuv(&yuv, &o.still_options(4)).expect("direct")
+            } else {
+                encode_key_frame_yuv_with_options(&yuv, &o.still_options(4)).expect("direct")
+            };
+            assert_eq!(pkt.data, direct.temporal_unit_bytes, "still={still}");
+            let ti = direct.fh.tile_info.as_ref().expect("tile info");
+            assert!(
+                ti.tile_cols_log2 + ti.tile_rows_log2 > 0,
+                "auto tiles engaged"
+            );
+            let seq = crate::sequence_header::parse_sequence_header(
+                crate::obu::ObuIter::new(&pkt.data)
+                    .filter_map(Result::ok)
+                    .find(|d| d.obu_type == crate::obu::ObuType::SequenceHeader)
+                    .expect("in-band sequence header")
+                    .payload,
+            )
+            .expect("parses");
+            assert_eq!(seq.still_picture, still);
+            assert_eq!(seq.reduced_still_picture_header, still);
+            let frames = crate::decoder::decode_av1_spec(&direct.ivf_bytes).expect("decodes");
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0].planes[0]
+                    .iter()
+                    .map(|&b| u16::from(b))
+                    .collect::<Vec<_>>(),
+                direct.recon_y
+            );
+        }
     }
 
     #[test]

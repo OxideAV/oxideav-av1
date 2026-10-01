@@ -1946,12 +1946,19 @@ packet (`keyframe` set, running pts). `CodecOptions` keys
 still per frame — the `av01` item payload; default `false` = KEY
 frames under a full sequence header, an all-intra video), `q` /
 `base_q_idx` (0..=255, default 120), `quality` (0..=100, overrides
-`q`), `lossless`, `speed` (`fast` / `balanced` / `thorough`),
-`tile_cols_log2` / `tile_rows_log2`, `full_range` (default from the
-pixel format), `color_primaries` / `transfer_characteristics` /
-`matrix_coefficients`. `output_params().extradata` carries the `av1C` record
-bytes (no `configOBUs`), so a container writer fills its
-codec-configuration property directly.
+`q`), `lossless`, `speed` (`fast` / `balanced` / `thorough`; default
+`fast` since r464 — the measured production point, see the
+performance section), `threads` (a count, or `auto` — the default —
+which follows the `ExecutionContext` budget the caller grants through
+`set_execution_context`: serial until granted, the automatic tile
+layout engaging above one thread), `tile_cols_log2` /
+`tile_rows_log2` (explicit layouts win over the automatic one),
+`full_range` (default from the pixel format), `color_primaries` /
+`transfer_characteristics` / `matrix_coefficients`. The `still =
+false` all-intra arm rides the same controls (r464;
+`encoder::encode_key_frame_yuv_with_options`). `output_params().extradata`
+carries the `av1C` record bytes (no `configOBUs`), so a container
+writer fills its codec-configuration property directly.
 
 **Decode interop** (r460): 114 stills from four real-world producers
 (a libheif-driven encoder via `heif-enc` and ImageMagick, an SVT-AV1

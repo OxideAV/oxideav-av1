@@ -41,19 +41,25 @@ use crate::Error;
 /// Search-effort presets for [`StillOptions::speed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StillSpeed {
-    /// The frame-level elections that each run a complete second
-    /// search (the §5.9.12 quantizer-matrix ladder, the §5.9.17
-    /// delta-q plan) stay off; the block-level RD search is
-    /// unchanged. Roughly a third of `Balanced`'s wall clock on
-    /// textured content.
-    Fast,
-    /// The KEY-frame encoder's production shape: QM + delta-q
-    /// elections on, the §5.9.8 superres election off (it costs one
-    /// full search per candidate denominator and a still gains
-    /// nothing from a downscaled coding extent).
+    /// r464 — the production point (the framework encoder's default):
+    /// the largest transform size per leaf, the intra-mode pre-screen,
+    /// proxy-priced transform-type choice, partition early
+    /// termination, the reduced CDEF / restoration / deblock
+    /// elections. A 12 MP 8-bit still in ~7 s single-thread / ~1.2 s
+    /// on 8 threads at +7.9 % BD-rate against a third-party encoder's
+    /// speed 6 (see the README's performance section).
     #[default]
+    Fast,
+    /// `Fast` plus the §5.11.4 rect partition arms, the refined
+    /// deblock ladder, a fuller CDEF sweep and two restoration
+    /// unit-size rungs: ~2.5× `Fast`'s wall clock for −0.7 % BD-rate
+    /// on the same picture.
     Balanced,
-    /// Everything `Balanced` runs plus the §5.9.8 superres election.
+    /// The exhaustive pre-r460 search (every transform size and type,
+    /// 4×4 leaves, the full mode ladders, exact per-TU pricing, the
+    /// full CDEF / restoration ladders) plus the §5.9.12 QM, §5.9.17
+    /// delta-q and §5.9.8 superres elections. Minutes per 12 MP
+    /// picture.
     Thorough,
 }
 
@@ -106,15 +112,15 @@ pub struct StillOptions {
 }
 
 impl StillOptions {
-    /// Lossy still at `base_q_idx`, single tile, `Balanced` effort,
-    /// studio range, reduced header.
+    /// Lossy still at `base_q_idx`, single tile, `Fast` effort (r464;
+    /// `Balanced` before), studio range, reduced header.
     #[must_use]
     pub fn new(base_q_idx: u8) -> Self {
         Self {
             base_q_idx,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
-            speed: StillSpeed::Balanced,
+            speed: StillSpeed::Fast,
             full_range: false,
             reduced_header: true,
             color_description: None,
@@ -300,7 +306,34 @@ pub fn apply_still_picture_shape(seq: &mut SequenceHeader) {
 ///   [`Error::PartitionWalkOutOfRange`].
 /// * Internal writer overflow surfaces the underlying [`Error`].
 pub fn encode_still_yuv(input: &YuvFrame, opts: &StillOptions) -> Result<EncodedStill, Error> {
-    let elections = opts.speed != StillSpeed::Fast && opts.base_q_idx > 0;
+    encode_intra_yuv(input, opts, true)
+}
+
+/// r464 — the KEY-frame twin of [`encode_still_yuv`]: the same picture
+/// coded as a KEY frame under a FULL, non-still sequence header
+/// (`still_picture = 0` — one sync sample of an all-intra AV1 video)
+/// with the same quality / speed / tile / thread controls. The
+/// framework encoder's `still = false` arm.
+///
+/// ## Errors
+///
+/// As [`encode_still_yuv`].
+pub fn encode_key_frame_yuv_with_options(
+    input: &YuvFrame,
+    opts: &StillOptions,
+) -> Result<EncodedStill, Error> {
+    encode_intra_yuv(input, opts, false)
+}
+
+fn encode_intra_yuv(
+    input: &YuvFrame,
+    opts: &StillOptions,
+    still_picture: bool,
+) -> Result<EncodedStill, Error> {
+    // r464 — the §5.9.17 delta-q election is `Thorough`-only: on the
+    // 12 MP photograph it cost 0.26 % BD-rate and doubled the
+    // `Balanced` wall clock (a second complete tile search).
+    let elections = opts.speed == StillSpeed::Thorough && opts.base_q_idx > 0;
     let tiles = if opts.auto_tiles {
         auto_tile_layout(input.width, input.height, opts.threads)
     } else {
@@ -319,9 +352,9 @@ pub fn encode_still_yuv(input: &YuvFrame, opts: &StillOptions) -> Result<Encoded
         // (a perceptual shaping); it stays a `Thorough`-only arm.
         qm: opts.speed == StillSpeed::Thorough && opts.base_q_idx > 0,
         superres_elect: opts.speed == StillSpeed::Thorough && opts.base_q_idx > 0,
-        still: opts.reduced_header,
+        still: still_picture && opts.reduced_header,
         full_range: opts.full_range,
-        still_full_header: !opts.reduced_header,
+        still_full_header: still_picture && !opts.reduced_header,
         color_description: opts.color_description,
         search,
         ..KeyExtras::default()

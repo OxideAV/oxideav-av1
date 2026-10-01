@@ -478,8 +478,9 @@ pub use scalable_gop::{
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 pub use still::{
-    elect_seq_level_idx, encode_still_yuv, encode_still_yuv420, quality_to_base_q_idx,
-    EncodedStill, StillOptions, StillSpeed, DEFAULT_STILL_BASE_Q_IDX, SEQ_LEVEL_IDX_MAX_PARAMETERS,
+    elect_seq_level_idx, encode_key_frame_yuv_with_options, encode_still_yuv, encode_still_yuv420,
+    quality_to_base_q_idx, EncodedStill, StillOptions, StillSpeed, DEFAULT_STILL_BASE_Q_IDX,
+    SEQ_LEVEL_IDX_MAX_PARAMETERS,
 };
 #[doc(hidden)]
 pub use symbol_writer::SymbolWriter;
