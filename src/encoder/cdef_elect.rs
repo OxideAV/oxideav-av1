@@ -108,13 +108,15 @@ pub(crate) struct CdefElectInput<'a> {
     /// Highest §5.9.19 `cdef_bits` the election may propose
     /// (`0` = frame-level only — the r428 shape; spec cap is 3).
     pub max_bits: u8,
-    /// r464 — the reduced sweep: the coarse strength ladder is
-    /// scored on a quarter of the units (every other unit row and
-    /// column), the three best luma / chroma strengths per plane
-    /// set at the better damping are then evaluated on every unit
-    /// for the per-unit arm. `false` = the full ladder on every unit
+    /// r464 — the reduced sweep: `Some((step, top))` scores the
+    /// coarse strength ladder on every `step`-th unit row and
+    /// column at both dampings (`step = 0` picks the step from the
+    /// unit count: one in 16 at 12 MP), refines at the better
+    /// damping on the same subsample, then evaluates that damping's
+    /// `top` best luma / chroma strengths per plane set on every unit
+    /// for the per-unit arm. `None` = the full ladder on every unit
     /// (the r429 election, unchanged).
-    pub fast: bool,
+    pub fast: Option<(u8, u8)>,
     /// r464 — worker threads for the per-unit evaluation (`1` =
     /// sequential; the election is identical either way).
     pub threads: usize,
@@ -377,10 +379,29 @@ impl<'a> UnitEngine<'a> {
         (y, uv)
     }
 
-    /// The Fast subsample: every other unit row and column.
+    /// The Fast subsample: every `step`-th unit row and column, the
+    /// step chosen so the subsample keeps at least ~16 units (4 on
+    /// small pictures) — one in 16 at 12 MP.
+    fn subsample_step(&self) -> usize {
+        if let Some((step, _)) = self.inp.fast {
+            if step > 0 {
+                return usize::from(step);
+            }
+        }
+        let n = self.sb_rows * self.sb_cols;
+        if n >= 256 {
+            4
+        } else if n >= 64 {
+            2
+        } else {
+            1
+        }
+    }
+
     fn in_subsample(&self, k: usize) -> bool {
         let (ur, uc) = (k / self.sb_cols, k % self.sb_cols);
-        ur % 2 == 0 && uc % 2 == 0
+        let step = self.subsample_step();
+        ur % step == 0 && uc % step == 0
     }
 
     /// Restrict a per-unit row to the subsample (other units zeroed —
@@ -767,7 +788,7 @@ pub(crate) fn elect_cdef(inp: &CdefElectInput<'_>) -> Option<CdefElection> {
         ssd: vec![base_uv_units.clone()],
         damping,
     };
-    if !inp.fast {
+    if inp.fast.is_none() {
         // The r429 election: coarse-then-refine on every unit, both
         // dampings.
         for &d in &dampings {
@@ -788,13 +809,13 @@ pub(crate) fn elect_cdef(inp: &CdefElectInput<'_>) -> Option<CdefElection> {
             tables.push((ty, tuv));
         }
     } else {
-        // r464 Fast: coarse + refine on the unit subsample at both
-        // dampings, then the best damping's top-3 per plane set on
+        // r464 Fast: the coarse ladder on the unit subsample at both
+        // dampings, the refinement on the subsample at the better
+        // damping only, then that damping's top-3 per plane set on
         // every unit (one table).
         let sub_base_y: Vec<u64> = engine.subsample_row(&base_y_units);
         let sub_base_uv: Vec<u64> = engine.subsample_row(&base_uv_units);
-        let mut best: Option<(u8, Vec<Strength>, Vec<Strength>)> = None;
-        let mut best_total = u64::MAX;
+        let mut sub_tables: Vec<(SetTables, SetTables)> = Vec::new();
         for &d in &dampings {
             let mut ty = SetTables {
                 cands: vec![ZERO],
@@ -802,8 +823,6 @@ pub(crate) fn elect_cdef(inp: &CdefElectInput<'_>) -> Option<CdefElection> {
                 damping: d,
             };
             extend_table(&mut ty, d, 0, &coarse, true);
-            let center = ty.cands[ty.best_by_total()];
-            extend_table(&mut ty, d, 0, &refine_of(center), true);
             let mut tuv = SetTables {
                 cands: vec![ZERO],
                 ssd: vec![sub_base_uv.clone()],
@@ -811,21 +830,27 @@ pub(crate) fn elect_cdef(inp: &CdefElectInput<'_>) -> Option<CdefElection> {
             };
             if has_chroma {
                 extend_table(&mut tuv, d, 1, &coarse, true);
-                let center = tuv.cands[tuv.best_by_total()];
-                extend_table(&mut tuv, d, 1, &refine_of(center), true);
             }
-            let top = |t: &SetTables| -> Vec<Strength> {
-                let mut order: Vec<usize> = (1..t.cands.len()).collect();
-                order.sort_by_key(|&i| t.total(i));
-                order.into_iter().take(3).map(|i| t.cands[i]).collect()
-            };
-            let total = t_best(&ty) + t_best(&tuv);
-            if total < best_total {
-                best_total = total;
-                best = Some((d, top(&ty), top(&tuv)));
-            }
+            sub_tables.push((ty, tuv));
         }
-        let (d, top_y, top_uv) = best.expect("two dampings swept");
+        let best_di = (0..sub_tables.len())
+            .min_by_key(|&i| t_best(&sub_tables[i].0) + t_best(&sub_tables[i].1))
+            .expect("two dampings swept");
+        let (mut ty, mut tuv) = sub_tables.swap_remove(best_di);
+        let d = ty.damping;
+        let center = ty.cands[ty.best_by_total()];
+        extend_table(&mut ty, d, 0, &refine_of(center), true);
+        if has_chroma {
+            let center = tuv.cands[tuv.best_by_total()];
+            extend_table(&mut tuv, d, 1, &refine_of(center), true);
+        }
+        let top = |t: &SetTables| -> Vec<Strength> {
+            let mut order: Vec<usize> = (1..t.cands.len()).collect();
+            order.sort_by_key(|&i| t.total(i));
+            let top_n = usize::from(inp.fast.map_or(3, |(_, t)| t)).max(1);
+            order.into_iter().take(top_n).map(|i| t.cands[i]).collect()
+        };
+        let (top_y, top_uv) = (top(&ty), top(&tuv));
         let mut ty = SetTables {
             cands: vec![ZERO],
             ssd: vec![base_y_units.clone()],
@@ -852,7 +877,7 @@ pub(crate) fn elect_cdef(inp: &CdefElectInput<'_>) -> Option<CdefElection> {
             (fl_damping, fl_y, fl_uv, fl_total) = (d, ty.cands[yi], tuv.cands[uvi], total);
         }
     }
-    if (fl_y != ZERO || fl_uv != ZERO) && !inp.fast {
+    if (fl_y != ZERO || fl_uv != ZERO) && inp.fast.is_none() {
         let params: Vec<CdefParams> = [4u8, 6]
             .iter()
             .map(|&d| params_for(d, fl_y, fl_uv))
@@ -1133,7 +1158,7 @@ pub(crate) fn apply_cdef_plan(
         num_planes,
         lambda: 0,
         max_bits: 0,
-        fast: false,
+        fast: None,
         threads,
     };
     let n_units = mirror.mi_rows().div_ceil(16) as usize * mirror.mi_cols().div_ceil(16) as usize;

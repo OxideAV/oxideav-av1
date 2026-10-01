@@ -13946,6 +13946,349 @@ pub fn tx_size_sqr_index(tx_size: usize) -> usize {
 }
 
 impl PartitionWalker {
+    /// r464 — import the per-mi grids of a `h4 × w4` rect from
+    /// `src` (at `src_row`, `src_col`) into this walker at `dst_row`,
+    /// `dst_col`: every per-cell grid, the `TxTypes[]` / `cdef_idx[]`
+    /// cells, the per-column above and per-row left coefficient /
+    /// segment contexts of the rect's span, and the decoded-block
+    /// records. The encoder's tile-parallel search walks each tile on
+    /// a TILE-SIZED walker (the tile at the origin of its own frame —
+    /// every §5.11 context and availability is tile-scoped, so the
+    /// walk is the frame walk's) and stitches the result back here.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_rect_from(
+        &mut self,
+        src: &Self,
+        src_row: u32,
+        src_col: u32,
+        dst_row: u32,
+        dst_col: u32,
+        h4: u32,
+        w4: u32,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) {
+        let h4 = h4
+            .min(src.mi_rows - src_row.min(src.mi_rows))
+            .min(self.mi_rows - dst_row.min(self.mi_rows));
+        let w4 = w4
+            .min(src.mi_cols - src_col.min(src.mi_cols))
+            .min(self.mi_cols - dst_col.min(self.mi_cols));
+        let (sa, da) = (
+            (src.mi_rows as usize) * (src.mi_cols as usize),
+            (self.mi_rows as usize) * (self.mi_cols as usize),
+        );
+        if !src.palette_colors.is_empty() {
+            self.ensure_palette_colors();
+        }
+        for rr in 0..h4 {
+            let sbase = ((src_row + rr) * src.mi_cols + src_col) as usize;
+            let dbase = ((dst_row + rr) * self.mi_cols + dst_col) as usize;
+            let n = w4 as usize;
+            macro_rules! copy_cells {
+                ($field:ident, $mult:expr) => {
+                    self.$field[dbase * $mult..(dbase + n) * $mult]
+                        .copy_from_slice(&src.$field[sbase * $mult..(sbase + n) * $mult]);
+                };
+            }
+            copy_cells!(mi_sizes, 1);
+            copy_cells!(skips, 1);
+            copy_cells!(skip_modes, 1);
+            copy_cells!(delta_lfs, FRAME_LF_COUNT);
+            copy_cells!(cdef_idx, 1);
+            copy_cells!(is_inters, 1);
+            copy_cells!(segment_ids, 1);
+            copy_cells!(y_modes, 1);
+            copy_cells!(uv_modes, 1);
+            copy_cells!(tx_sizes, 1);
+            copy_cells!(inter_tx_sizes, 1);
+            copy_cells!(tx_types, 1);
+            copy_cells!(ref_frames, 2);
+            copy_cells!(mvs, 4);
+            copy_cells!(comp_group_idxs, 1);
+            copy_cells!(compound_idxs, 1);
+            copy_cells!(interp_filters, 2);
+            copy_cells!(compound_types, 1);
+            copy_cells!(compound_wedge_indices, 1);
+            copy_cells!(compound_wedge_signs, 1);
+            copy_cells!(compound_mask_types, 1);
+            copy_cells!(interintra_modes, 1);
+            copy_cells!(wedge_interintras, 1);
+            copy_cells!(interintra_wedge_indices, 1);
+            copy_cells!(motion_modes, 1);
+            if !src.local_warp_params.is_empty() {
+                self.ensure_local_warp_params();
+                copy_cells!(local_warp_params, 6);
+            }
+            copy_cells!(local_warp_valid, 1);
+            for plane in 0..3usize {
+                let (sp, dp) = (plane * sa + sbase, plane * da + dbase);
+                self.palette_sizes[dp..dp + n].copy_from_slice(&src.palette_sizes[sp..sp + n]);
+                if !src.palette_colors.is_empty() {
+                    self.palette_colors[dp * PALETTE_COLORS..(dp + n) * PALETTE_COLORS]
+                        .copy_from_slice(
+                            &src.palette_colors[sp * PALETTE_COLORS..(sp + n) * PALETTE_COLORS],
+                        );
+                }
+            }
+        }
+        // Per-column above / per-row left contexts of the rect's span
+        // (three planes, the chroma planes at their subsampled index).
+        for plane in 0..3usize {
+            let (ssx, ssy) = if plane == 0 {
+                (0u32, 0u32)
+            } else {
+                (u32::from(subsampling_x), u32::from(subsampling_y))
+            };
+            let (sab, dab) = (plane * src.mi_cols as usize, plane * self.mi_cols as usize);
+            let (slb, dlb) = (plane * src.mi_rows as usize, plane * self.mi_rows as usize);
+            let c_n = ((w4 + ssx) >> ssx) as usize;
+            let r_n = ((h4 + ssy) >> ssy) as usize;
+            let (sc0, dc0) = ((src_col >> ssx) as usize, (dst_col >> ssx) as usize);
+            let (sr0, dr0) = ((src_row >> ssy) as usize, (dst_row >> ssy) as usize);
+            let c_n = c_n
+                .min(src.mi_cols as usize - sc0.min(src.mi_cols as usize))
+                .min(self.mi_cols as usize - dc0.min(self.mi_cols as usize));
+            let r_n = r_n
+                .min(src.mi_rows as usize - sr0.min(src.mi_rows as usize))
+                .min(self.mi_rows as usize - dr0.min(self.mi_rows as usize));
+            self.above_level_context[dab + dc0..dab + dc0 + c_n]
+                .copy_from_slice(&src.above_level_context[sab + sc0..sab + sc0 + c_n]);
+            self.above_dc_context[dab + dc0..dab + dc0 + c_n]
+                .copy_from_slice(&src.above_dc_context[sab + sc0..sab + sc0 + c_n]);
+            self.left_level_context[dlb + dr0..dlb + dr0 + r_n]
+                .copy_from_slice(&src.left_level_context[slb + sr0..slb + sr0 + r_n]);
+            self.left_dc_context[dlb + dr0..dlb + dr0 + r_n]
+                .copy_from_slice(&src.left_dc_context[slb + sr0..slb + sr0 + r_n]);
+        }
+        {
+            let (sc, dc, n) = (src_col as usize, dst_col as usize, w4 as usize);
+            self.above_seg_pred_context[dc..dc + n]
+                .copy_from_slice(&src.above_seg_pred_context[sc..sc + n]);
+            let (sr, dr, n) = (src_row as usize, dst_row as usize, h4 as usize);
+            self.left_seg_pred_context[dr..dr + n]
+                .copy_from_slice(&src.left_seg_pred_context[sr..sr + n]);
+        }
+        for b in &src.blocks {
+            if b.mi_row >= src_row
+                && b.mi_row < src_row + h4
+                && b.mi_col >= src_col
+                && b.mi_col < src_col + w4
+            {
+                self.blocks.push(DecodedBlockRecord {
+                    mi_row: b.mi_row - src_row + dst_row,
+                    mi_col: b.mi_col - src_col + dst_col,
+                    sub_size: b.sub_size,
+                });
+            }
+        }
+    }
+}
+
+impl PartitionWalker {
+    /// r464 — diagnostic: the names of the fields on which `self` and
+    /// `other` differ (empty when equal).
+    #[doc(hidden)]
+    pub fn differing_fields(&self, other: &Self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        // The palette-colour and local-warp grids are materialised
+        // lazily: an empty grid equals an all-zero one.
+        let pal_eq_i32 = |a: &[i32], b: &[i32]| -> bool {
+            if a.len() == b.len() {
+                a == b
+            } else {
+                let (short, long) = if a.is_empty() { (a, b) } else { (b, a) };
+                short.is_empty() && long.iter().all(|&v| v == 0)
+            }
+        };
+        let pal_eq = |a: &[u16], b: &[u16]| -> bool {
+            if a.len() == b.len() {
+                a == b
+            } else {
+                let (short, long) = if a.is_empty() { (a, b) } else { (b, a) };
+                short.is_empty() && long.iter().all(|&v| v == 0)
+            }
+        };
+        if self.mi_rows != other.mi_rows {
+            out.push("mi_rows");
+        }
+        if self.mi_cols != other.mi_cols {
+            out.push("mi_cols");
+        }
+        if self.geometry != other.geometry {
+            out.push("geometry");
+        }
+        if self.enable_intra_edge_filter != other.enable_intra_edge_filter {
+            out.push("enable_intra_edge_filter");
+        }
+        if self.walk_avail_u != other.walk_avail_u {
+            out.push("walk_avail_u");
+        }
+        if self.walk_avail_l != other.walk_avail_l {
+            out.push("walk_avail_l");
+        }
+        if self.inter_pred_scratch != other.inter_pred_scratch {
+            out.push("inter_pred_scratch");
+        }
+        if !pal_eq_i32(&self.local_warp_params, &other.local_warp_params) {
+            out.push("local_warp_params");
+        }
+        if self.local_warp_valid != other.local_warp_valid {
+            out.push("local_warp_valid");
+        }
+        if self.mi_sizes != other.mi_sizes {
+            out.push("mi_sizes");
+        }
+        if self.skips != other.skips {
+            out.push("skips");
+        }
+        if self.skip_modes != other.skip_modes {
+            out.push("skip_modes");
+        }
+        if self.current_q_index != other.current_q_index {
+            out.push("current_q_index");
+        }
+        if self.read_deltas_pending != other.read_deltas_pending {
+            out.push("read_deltas_pending");
+        }
+        if self.current_delta_lf != other.current_delta_lf {
+            out.push("current_delta_lf");
+        }
+        if self.delta_lfs != other.delta_lfs {
+            out.push("delta_lfs");
+        }
+        if self.cdef_idx != other.cdef_idx {
+            out.push("cdef_idx");
+        }
+        if self.is_inters != other.is_inters {
+            out.push("is_inters");
+        }
+        if self.segment_ids != other.segment_ids {
+            out.push("segment_ids");
+        }
+        if self.above_seg_pred_context != other.above_seg_pred_context {
+            out.push("above_seg_pred_context");
+        }
+        if self.left_seg_pred_context != other.left_seg_pred_context {
+            out.push("left_seg_pred_context");
+        }
+        if self.above_level_context != other.above_level_context {
+            out.push("above_level_context");
+        }
+        if self.above_dc_context != other.above_dc_context {
+            out.push("above_dc_context");
+        }
+        if self.left_level_context != other.left_level_context {
+            out.push("left_level_context");
+        }
+        if self.left_dc_context != other.left_dc_context {
+            out.push("left_dc_context");
+        }
+        if self.y_modes != other.y_modes {
+            out.push("y_modes");
+        }
+        if self.uv_modes != other.uv_modes {
+            out.push("uv_modes");
+        }
+        if self.tx_sizes != other.tx_sizes {
+            out.push("tx_sizes");
+        }
+        if self.inter_tx_sizes != other.inter_tx_sizes {
+            out.push("inter_tx_sizes");
+        }
+        if self.tx_types != other.tx_types {
+            out.push("tx_types");
+        }
+        if self.ref_frames != other.ref_frames {
+            out.push("ref_frames");
+        }
+        if self.palette_sizes != other.palette_sizes {
+            out.push("palette_sizes");
+        }
+        if !pal_eq(&self.palette_colors, &other.palette_colors) {
+            out.push("palette_colors");
+        }
+        if self.mvs != other.mvs {
+            out.push("mvs");
+        }
+        if self.comp_group_idxs != other.comp_group_idxs {
+            out.push("comp_group_idxs");
+        }
+        if self.compound_idxs != other.compound_idxs {
+            out.push("compound_idxs");
+        }
+        if self.interp_filters != other.interp_filters {
+            out.push("interp_filters");
+        }
+        if self.compound_types != other.compound_types {
+            out.push("compound_types");
+        }
+        if self.compound_wedge_indices != other.compound_wedge_indices {
+            out.push("compound_wedge_indices");
+        }
+        if self.compound_wedge_signs != other.compound_wedge_signs {
+            out.push("compound_wedge_signs");
+        }
+        if self.compound_mask_types != other.compound_mask_types {
+            out.push("compound_mask_types");
+        }
+        if self.interintra_modes != other.interintra_modes {
+            out.push("interintra_modes");
+        }
+        if self.wedge_interintras != other.wedge_interintras {
+            out.push("wedge_interintras");
+        }
+        if self.interintra_wedge_indices != other.interintra_wedge_indices {
+            out.push("interintra_wedge_indices");
+        }
+        if self.motion_modes != other.motion_modes {
+            out.push("motion_modes");
+        }
+        if self.blocks != other.blocks {
+            out.push("blocks");
+        }
+        if self.curr_frame != other.curr_frame {
+            out.push("curr_frame");
+        }
+        if self.luma_overhang != other.luma_overhang {
+            out.push("luma_overhang");
+        }
+        if self.ref_lr_wiener != other.ref_lr_wiener {
+            out.push("ref_lr_wiener");
+        }
+        if self.ref_sgr_xqd != other.ref_sgr_xqd {
+            out.push("ref_sgr_xqd");
+        }
+        if self.lr_units != other.lr_units {
+            out.push("lr_units");
+        }
+        if self.block_decoded != other.block_decoded {
+            out.push("block_decoded");
+        }
+        if self.max_luma_w != other.max_luma_w {
+            out.push("max_luma_w");
+        }
+        if self.max_luma_h != other.max_luma_h {
+            out.push("max_luma_h");
+        }
+        if self.current_palette_size_y != other.current_palette_size_y {
+            out.push("current_palette_size_y");
+        }
+        if self.current_palette_size_uv != other.current_palette_size_uv {
+            out.push("current_palette_size_uv");
+        }
+        if self.current_color_map_y != other.current_color_map_y {
+            out.push("current_color_map_y");
+        }
+        if self.current_color_map_uv != other.current_color_map_uv {
+            out.push("current_color_map_uv");
+        }
+        out
+    }
+}
+
+impl PartitionWalker {
     /// `transform_type( x4, y4, txSz )` per §5.11.47 (av1-spec p.99-100).
     /// Decodes the per-luma-TU `TxType` from the bitstream and emits
     /// the value the caller stamps into `TxTypes[ y4 + j ][ x4 + i ]`.
@@ -15935,7 +16278,7 @@ struct CurrFramePlane {
 /// `x ∈ [cols, cols + LUMA_OH)`, `bottom` covers `y ∈ [rows, rows +
 /// LUMA_OH)`, `corner` both. `LUMA_OH = 64` bounds the largest
 /// possible overhang (`Tx_Width ≤ 64`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LumaOverhang {
     rows: u32,
     cols: u32,
@@ -16528,12 +16871,11 @@ impl PartitionWalker {
             walk_avail_u,
             walk_avail_l,
             inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
-            local_warp_params: {
-                let mut v: Vec<i32> = Vec::new();
-                v.try_reserve_exact(area * 6).ok()?;
-                v.resize(area * 6, 0);
-                v
-            },
+            // r464 — materialised lazily by the first WARPED_CAUSAL
+            // stamp (`ensure_local_warp_params`): 24 bytes per mi, 18
+            // MB of zeros per walker at 12 MP that an intra frame
+            // never reads.
+            local_warp_params: Vec::new(),
             local_warp_valid: {
                 let mut v: Vec<u8> = Vec::new();
                 v.try_reserve_exact(area).ok()?;
@@ -20509,7 +20851,43 @@ impl PartitionWalker {
         frame_height: u32,
         planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::loop_filter::{loop_filter_frame, LoopFilterFrameContext};
+        self.loop_filter_rows_from_grid(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            planes,
+            0,
+            self.mi_rows,
+        );
+    }
+
+    /// r464 — [`Self::loop_filter_frame_from_grid`] over the edge rows
+    /// `mi_row_start..mi_row_end` only (see
+    /// [`crate::loop_filter::loop_filter_rows`]).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_filter_rows_from_grid(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        mi_row_start: u32,
+        mi_row_end: u32,
+    ) {
+        use crate::loop_filter::{loop_filter_rows, LoopFilterFrameContext};
         let ctx = LoopFilterFrameContext {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
@@ -20587,7 +20965,7 @@ impl PartitionWalker {
             // §7.14.2 line 17065: `MiSizes[ row ][ col ]`.
             mi_size: &|r, c| self.mi_size_at(r as i32, c as i32),
         };
-        loop_filter_frame(&ctx, planes);
+        loop_filter_rows(&ctx, planes, mi_row_start, mi_row_end);
     }
 
     /// Reconstruct `LoopfilterTxSizes[ plane ][ subRow ][ subCol ]` from
@@ -21028,6 +21406,15 @@ impl PartitionWalker {
 
     /// r453 — materialize the `PaletteColors[]` grid on the first
     /// real §5.11.46 palette write (see the constructor note).
+    /// r464 — materialise the lazily allocated per-mi local-warp grid
+    /// (see `PartitionWalker::new`).
+    fn ensure_local_warp_params(&mut self) {
+        if self.local_warp_params.is_empty() {
+            let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+            self.local_warp_params.resize(area * 6, 0);
+        }
+    }
+
     fn ensure_palette_colors(&mut self) {
         if self.palette_colors.is_empty() {
             let area = (self.mi_rows as usize) * (self.mi_cols as usize);
@@ -31180,6 +31567,7 @@ impl PartitionWalker {
                     [inter_block.mv[0][0] as i16, inter_block.mv[0][1] as i16],
                 );
                 let origin = (mi_row * self.mi_cols + mi_col) as usize;
+                self.ensure_local_warp_params();
                 self.local_warp_params[origin * 6..origin * 6 + 6]
                     .copy_from_slice(&lw.local_warp_params);
                 self.local_warp_valid[origin] = u8::from(lw.local_valid);

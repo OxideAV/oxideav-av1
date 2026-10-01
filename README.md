@@ -1801,9 +1801,11 @@ emits — at every §6.4.1 (bit depth, chroma format) pairing including
 monochrome (an alpha auxiliary item). `StillOptions`: `base_q_idx`
 (0 = lossless; `StillOptions::from_quality(0..=100)` maps a quality
 dial onto it, `DEFAULT_STILL_BASE_Q_IDX = 120`), `tile_cols_log2` /
-`tile_rows_log2`, `speed` (`Fast` skips the frame-level QM / delta-q
-elections, `Balanced` runs them, `Thorough` adds the §5.9.8 superres
-election), `full_range` (§5.5.2 `color_range`) and `reduced_header`
+`tile_rows_log2`, `speed` (`Fast` — the default since r464 — the
+production ladders; `Balanced` adds the rect partition arms and
+fuller filter elections; `Thorough` the exhaustive search plus the
+QM / delta-q / superres elections — see the performance section),
+`full_range` (§5.5.2 `color_range`) and `reduced_header`
 (`false` codes `still_picture = 1` under a full header). Every field
 §5.5.1 / §5.9.2 infers on the reduced arm is set to its inferred
 value (`OrderHintBits = 0`, the inter tool gates closed,
@@ -1830,34 +1832,31 @@ was wrong at every transform size but 16×16 (the decoder rebuilt 4×4
 residuals at a quarter of their amplitude, 32×32 at four times) —
 fixed, the `Fast` still preset moved from +70.7 % to +17.1 % BD-rate
 (PSNR) against a third-party encoder at its default speed on a
-640×480 textured still, at `base_q_idx = 100` 16.5 KB / 42.9 dB vs
-the reference's 15.0 KB / 43.6 dB at the same qindex. The `speed`
-presets tighten the RD ladders (`Fast` ≈ 3 s for 640×480, `Balanced`
-the full partition / TX ladders with a pruned transform-type
-shortlist, `Thorough` the exhaustive search plus the QM / superres
-elections), run a §7.14 deblocking-level election (the pre-r460 intra
-frames never deblocked), elect the §7.17 restoration unit size from
-the 64 / 128 / 256 ladder, quantise AC with a dead zone, and gate the
-screen-content tools behind a colour-count probe. `StillOptions::threads(n)`
-(encoder option `threads`) searches a multi-tile still `n`-wide over an
-automatically derived tile layout, bit-identical to the sequential
-encode of the same layout; a 4032×3024 8-bit still (`Fast`,
-`base_q_idx = 128`) takes 46 s single-thread / 37 s on 8 threads
-(116.8 KB / 41.8 dB; the third-party encoder at its default speed:
-0.5 s, 147.8 KB / 47.3 dB at the same qindex — the frame-level
-CDEF / restoration / deblock elections now dominate at 12 MP), 10-bit
-59 s / 51 s. Layouts below the §5.9.15 floor are raised to the legal
-minimum (a 12 MP picture cannot be one tile).
+640×480 textured still. The `speed` presets tighten the RD ladders,
+run a §7.14 deblocking-level election (the pre-r460 intra frames
+never deblocked), elect the §7.17 restoration unit size from the
+64 / 128 / 256 ladder, quantise AC with a dead zone, and gate the
+screen-content tools behind a colour-count probe.
+`StillOptions::threads(n)` (encoder option `threads`) searches a
+multi-tile still `n`-wide over an automatically derived tile layout,
+bit-identical to the sequential encode of the same layout. Layouts
+below the §5.9.15 floor are raised to the legal minimum (a 12 MP
+picture cannot be one tile).
 
 #### Still-picture performance (r464)
 
 Measured on one 4032×3024 (12 MP) 8-bit 4:2:0 photograph at
 `base_q_idx = 128`, release build, Apple M4 Max; wall / CPU seconds
-and peak RSS of a process that holds the input and encodes once.
-"Before" is 0.1.19 (the r460 presets).
+and peak RSS of a process that holds the source (54 MiB of the RSS is
+the harness's own input copies) and encodes once. "Before" is 0.1.19
+(the r460 presets). The reference encoder is the third-party one at
+speed 6 (all-intra, `cq-level 32`, `deltaq-mode 0`): 0.55 s, 109 431
+bytes at 39.15 dB luma; BD-rate is Bjontegaard on luma PSNR over four
+quantisers (`base_q_idx` 96 / 128 / 160 / 192 vs its `cq-level` 24 /
+32 / 40 / 48).
 
-**Where the time went (before, `Fast`, one thread, 84 s)** — sampled
-at 5 ms over the whole run:
+**Where the time went before** (`Fast`, one thread, 84 s; sampled at
+5 ms over the whole run):
 
 | Stage | Share |
 |---|---|
@@ -1874,31 +1873,49 @@ at 5 ms over the whole run:
 
 The restoration election spent 98 % of its time in the §7.17.3 box
 filter (the spec's per-4×4-block, per-position `(2r + 1)²` window
-re-fetch, 900 sample reads per 16 output samples), the CDEF election
-87 % in the §7.15.3 filter kernel run over all three planes for every
-candidate of either plane set, and both elections first copied every
-plane to frame-sized `i32` buffers (72 MB per plane set at 12 MP —
-the owners of most of the encode's resident memory).
+re-fetch), the CDEF election 87 % in the §7.15.3 kernel run over all
+three planes for every candidate of either plane set, and both
+elections first copied every plane to frame-sized `i32` buffers.
 
-**Before** (0.1.19):
+**After** (this round; `Fast` one thread is now 55 % tile search,
+15 % CDEF, 11 % restoration, 5 % deblock, the rest assembly):
 
-| Preset | Threads | Wall | CPU | Peak RSS | Bytes | PSNR Y / U / V |
+| Preset | Threads | Wall before → after | CPU after | Peak RSS before → after | Bytes | PSNR Y / U / V after |
 |---|---|---|---|---|---|---|
-| Fast | 1 | 83.8 s | 83.8 s | 558 MiB | 114 070 | 39.08 / 40.43 / 40.05 |
-| Fast | 4 | 61.5 s | 84.2 s | 1059 MiB | 114 600 | 39.09 / 40.43 / 40.04 |
-| Fast | 8 | 58.0 s | 86.6 s | 1526 MiB | 116 211 | 39.10 / 40.44 / 40.05 |
-| Balanced | 1 | 474.8 s | 466.3 s | 682 MiB | 108 636 | 39.00 / 40.39 / 39.99 |
-| Balanced | 4 | 308.6 s | 459.7 s | 1225 MiB | 109 673 | 39.01 / 40.38 / 39.99 |
-| Balanced | 8 | 287.7 s | 471.9 s | 1670 MiB | 111 319 | 39.01 / 40.40 / 40.00 |
-| Thorough | 1 | > 1 h (not run to completion) | | | | |
-| Thorough | 8 | 1485.7 s | 2587.7 s | 2242 MiB | 108 006 | 37.65 / 40.84 / 40.44 |
-| Decode (Fast stream) | 1 | 0.66 s | 0.66 s | 228 MiB | | |
+| Fast | 1 | 83.8 s → **6.7 s** | 6.7 s | 558 → 378 MiB | 116 173 | 39.15 / 40.48 / 40.08 |
+| Fast | 4 | 61.5 s → **2.0 s** | 6.9 s | 1059 → 474 MiB | 116 963 | 39.16 / 40.48 / 40.08 |
+| Fast | 8 | 58.0 s → **1.2 s** | 7.4 s | 1526 → 489 MiB | 118 000 | 39.16 / 40.49 / 40.08 |
+| Balanced | 1 | 474.8 s → **17.7 s** | 17.7 s | 682 → 377 MiB | 113 211 | 39.12 / 40.43 / 40.01 |
+| Balanced | 4 | 308.6 s → **5.5 s** | 18.4 s | 1225 → 473 MiB | 114 156 | 39.12 / 40.43 / 40.02 |
+| Balanced | 8 | 287.7 s → **3.4 s** | 19.5 s | 1670 → 502 MiB | 115 646 | 39.13 / 40.43 / 40.04 |
+| Thorough | 1 | > 1 h → THOROUGH1_AFTER | | | | |
+| Thorough | 8 | 1485.7 s → **136 s** | 1037 s | 2242 → 666 MiB | 108 445 | 37.70 / 40.93 / 40.53 |
+| Decode (Fast stream) | 1 | 0.66 s → 0.64 s | | 228 → 211 MiB | | |
+| Decode (third-party stream) | 1 | 0.40 s → 0.38 s | | 191 → 173 MiB | | |
 
-The third-party encoder at speed 6 (all-intra, `--cq-level=32`,
-`deltaq-mode=0`) codes the same picture in 0.55 s to 109 431 bytes at
-39.15 dB luma; the BD-rate (luma PSNR, four points each) of the `Fast`
-preset against it was **+12.1 %** before this round (the r460 +19.8 %
-figure was a 640×480 synthetic texture).
+BD-rate against the third-party speed-6 encoder: `Fast` **+12.1 % →
++7.9 %**, `Balanced` (the r464 shape) **+7.2 %**. The `Fast` preset
+was re-tuned on this picture: the largest transform size only (the
+split-size trial cost 1.9 % BD-rate AND a third of the search), the
+intra-mode pre-screen (`±1` around the two best directional modes —
+the wider refinements cost 0.6 %; chroma on a six-mode shortlist +
+the luma mode), proxy-priced TU transform-type choice, partition
+early termination at `4/65536 · step²` per sample (free; `8` costs
+1.1 % for −14 % search), every eighth self-guided set, one Wiener
+round, the CDEF sweep on one unit in 16. The §5.9.17 delta-q election
+is `Thorough`-only (it cost 0.26 % BD-rate and doubled `Balanced`).
+Exact (bit-identical) speedups: one rate twin per tile, the running-
+cost split abort, TU-rect pricing scopes, the O(samples) box filter,
+the per-unit CDEF / restoration engines, the luma-only / chroma-only
+deblock trials. The threaded walk runs each tile on tile-sized state
+(the r460 walk cloned the frame per thread). Memory: sparse
+coefficient storage in the committed trees (69 MiB dense before),
+lazy local-warp grid, stripe-boundary rows instead of a pre-CDEF
+frame copy, band-sampled deblock trials. Every stream decodes to the
+encoder's reconstruction sample for sample; the decoder's resident
+set is three frame-sized `i32` in-loop buffers plus the mirror
+(`PlaneBuffer<i32>` kernels — a `u16` pipeline is the next step
+towards the 120 MiB target).
 
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5

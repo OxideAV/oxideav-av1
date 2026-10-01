@@ -91,10 +91,10 @@ pub(crate) struct LrPlan {
 pub(crate) struct LrElectInput<'a> {
     pub input: &'a YuvFrame,
     /// Pre-CDEF reconstruction (§7.17 reads `CurrFrame` across stripe
-    /// boundaries).
-    pub curr_y: &'a [u16],
-    pub curr_u: &'a [u16],
-    pub curr_v: &'a [u16],
+    /// boundaries) — whole planes or their stripe-boundary rows.
+    pub curr_y: LrCurr<'a>,
+    pub curr_u: LrCurr<'a>,
+    pub curr_v: LrCurr<'a>,
     /// Post-CDEF reconstruction (the LR input planes).
     pub cdef_y: &'a [u16],
     pub cdef_u: &'a [u16],
@@ -145,6 +145,89 @@ pub(crate) struct LrElectInput<'a> {
     /// r464 — worker threads for the per-unit distortion search
     /// (`1` = sequential; the election is identical either way).
     pub threads: usize,
+    /// r464 — alternating-least-squares rounds of the Wiener fit.
+    pub wiener_rounds: u8,
+}
+
+/// r464 — the pre-CDEF samples §7.17 reads across stripe boundaries
+/// (§7.17.6 routes `y < StripeStartY` / `y > StripeEndY` to
+/// `UpscaledCurrFrame`, at most 2 rows past the stripe edge for the
+/// box filter and 3 for the Wiener taps), kept as the 4 rows above and
+/// 4 rows below every stripe boundary instead of a frame-sized copy
+/// of the pre-CDEF reconstruction (36 MB at 12 MP; 4.5 MB here).
+pub(crate) struct StripeRows {
+    width: usize,
+    /// `(first plane row, offset into `rows`)` per stored band.
+    bands: Vec<(usize, usize)>,
+    rows: Vec<u16>,
+    band_h: usize,
+}
+
+impl StripeRows {
+    /// Capture the boundary rows of `plane` (`width × height`,
+    /// `sub_y` the plane's vertical subsampling).
+    pub(crate) fn capture(plane: &[u16], width: usize, height: usize, sub_y: u8) -> Self {
+        let band_h = 8usize;
+        let mut bands = Vec::new();
+        let mut rows = Vec::new();
+        let mut n = 1usize;
+        loop {
+            let boundary = (64 * n - 8) >> sub_y;
+            if boundary >= height {
+                break;
+            }
+            let y0 = boundary.saturating_sub(band_h / 2);
+            let y1 = (boundary + band_h / 2).min(height);
+            bands.push((y0, rows.len()));
+            rows.extend_from_slice(&plane[y0 * width..y1 * width]);
+            // Keep every band `band_h` rows long in the index: a
+            // clipped bottom band is padded by repeating its last row.
+            for _ in y1..y0 + band_h {
+                let last = rows.len() - width;
+                rows.extend_from_within(last..);
+            }
+            n += 1;
+        }
+        Self {
+            width,
+            bands,
+            rows,
+            band_h,
+        }
+    }
+
+    /// The stored sample at `(y, x)`, `None` outside the kept rows.
+    #[inline]
+    fn get(&self, y: usize, x: usize) -> Option<u16> {
+        // Bands are sorted and disjoint (64-row pitch, 8-row bands).
+        let i = self.bands.partition_point(|&(y0, _)| y0 + self.band_h <= y);
+        let &(y0, off) = self.bands.get(i)?;
+        if y < y0 {
+            return None;
+        }
+        Some(self.rows[off + (y - y0) * self.width + x])
+    }
+}
+
+/// A pre-CDEF plane for the §7.17 election / application: the whole
+/// plane, or just its stripe-boundary rows ([`StripeRows`]).
+#[derive(Clone, Copy)]
+pub(crate) enum LrCurr<'a> {
+    Full(&'a [u16]),
+    Rows(&'a StripeRows),
+}
+
+impl LrCurr<'_> {
+    /// The pre-CDEF sample at `(y, x)` (`stride` = the plane width),
+    /// or `fallback` where only boundary rows are kept — those rows
+    /// are the only ones §7.17 ever reads from this plane.
+    #[inline]
+    fn at(&self, y: usize, x: usize, stride: usize, fallback: u16) -> u16 {
+        match self {
+            LrCurr::Full(p) => p[y * stride + x],
+            LrCurr::Rows(r) => r.get(y, x).unwrap_or(fallback),
+        }
+    }
 }
 
 /// r464 — one (stripe, unit) rectangle of a plane lifted into a
@@ -173,7 +256,7 @@ const LOCAL_MARGIN: usize = 4;
 impl LocalRect {
     fn build(
         geom: &LrBlockGeometry,
-        curr: &[u16],
+        curr: LrCurr<'_>,
         cdef: &[u16],
         plane_w: usize,
         plane_h: usize,
@@ -189,8 +272,9 @@ impl LocalRect {
             for lx in 0..cols {
                 let ax =
                     (abs_x as i64 + lx as i64 - m as i64).clamp(0, plane_w as i64 - 1) as usize;
-                lc[ly * cols + lx] = i32::from(curr[ay * plane_w + ax]);
-                ld[ly * cols + lx] = i32::from(cdef[ay * plane_w + ax]);
+                let cd = cdef[ay * plane_w + ax];
+                lc[ly * cols + lx] = i32::from(curr.at(ay, ax, plane_w, cd));
+                ld[ly * cols + lx] = i32::from(cd);
             }
         }
         let (ox, oy) = (abs_x as i32 - m as i32, abs_y as i32 - m as i32);
@@ -369,6 +453,7 @@ fn search_unit(
     src_stride: usize,
     bit_depth: u8,
     sgr_step: usize,
+    wiener_rounds: u8,
 ) -> UnitSearch {
     let first_coeff = usize::from(plane != 0);
     let mut out: Vec<i32> = Vec::new();
@@ -385,7 +470,7 @@ fn search_unit(
         );
     }
     // Wiener.
-    let taps = fit_wiener(rects, src, src_stride, first_coeff);
+    let taps = fit_wiener(rects, src, src_stride, first_coeff, wiener_rounds);
     let wiener_unit = LrUnit {
         restoration_type: RESTORE_WIENER,
         wiener: taps,
@@ -545,6 +630,7 @@ fn fit_wiener(
     src: &[u16],
     src_stride: usize,
     first_coeff: usize,
+    rounds: u8,
 ) -> [[i32; WIENER_COEFFS]; 2] {
     let taps7 = |t: &[f64; 3]| -> [f64; 7] {
         let c = 128.0 - 2.0 * (t[0] + t[1] + t[2]);
@@ -561,7 +647,7 @@ fn fit_wiener(
         ht[0] = 0.0;
     }
     let m = LOCAL_MARGIN as i64;
-    for _round in 0..2 {
+    for _round in 0..rounds.max(1) {
         for dir in 0..2usize {
             // dir 0: fit horizontal (pass 1) through the vertical
             // taps; dir 1: fit vertical (pass 0) through the
@@ -573,23 +659,43 @@ fn fit_wiener(
             for lr in rects {
                 let cols = lr.cols as i64;
                 let at = |x: i64, y: i64| -> f64 { f64::from(lr.cdef[(y * cols + x) as usize]) };
+                // r464 — the fixed-direction pass is separable: filter
+                // the window once along the fixed axis (`pre`, the
+                // same per-sample sum in the same order as the
+                // per-pixel evaluation it replaces — bit-identical
+                // taps), then the 7 free-axis offsets read it.
+                let (pw, ph) = (lr.cols, lr.rows);
+                let mut pre = vec![0f64; pw * ph];
+                for yy in 0..ph as i64 {
+                    for xx in 0..pw as i64 {
+                        let mut acc = 0f64;
+                        for (k, fk) in fixed.iter().enumerate() {
+                            let foff = k as i64 - 3;
+                            let (sx, sy) = if dir == 0 {
+                                (xx, yy + foff)
+                            } else {
+                                (xx + foff, yy)
+                            };
+                            if sx < 0 || sy < 0 || sx >= pw as i64 || sy >= ph as i64 {
+                                continue;
+                            }
+                            acc += fk * at(sx, sy);
+                        }
+                        pre[(yy * pw as i64 + xx) as usize] = acc;
+                    }
+                }
                 for y in 0..lr.geom.h as i64 {
                     for x in 0..lr.geom.w as i64 {
                         let (lx, ly) = (x + m, y + m);
                         let mut mm = [0f64; 7];
                         for (j, mj) in mm.iter_mut().enumerate() {
                             let off = j as i64 - 3;
-                            let mut acc = 0f64;
-                            for (k, fk) in fixed.iter().enumerate() {
-                                let foff = k as i64 - 3;
-                                let (sx, sy) = if dir == 0 {
-                                    (lx + off, ly + foff)
-                                } else {
-                                    (lx + foff, ly + off)
-                                };
-                                acc += fk * at(sx, sy);
-                            }
-                            *mj = acc / 128.0;
+                            let (sx, sy) = if dir == 0 {
+                                (lx + off, ly)
+                            } else {
+                                (lx, ly + off)
+                            };
+                            *mj = pre[(sy * pw as i64 + sx) as usize] / 128.0;
                         }
                         let target = f64::from(
                             src[(lr.abs_y + y as usize) * src_stride + lr.abs_x + x as usize],
@@ -707,7 +813,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
         lr_sgr_set: &|_, _, _| 0,
         lr_sgr_xqd: &|_, _, _, _| 0,
     };
-    let currs: [&[u16]; 3] = [inp.curr_y, inp.curr_u, inp.curr_v];
+    let currs: [LrCurr<'_>; 3] = [inp.curr_y, inp.curr_u, inp.curr_v];
     let cdefs: [&[u16]; 3] = [inp.cdef_y, inp.cdef_u, inp.cdef_v];
     let srcs: [&[u16]; 3] = [&inp.input.y, &inp.input.u, &inp.input.v];
 
@@ -757,6 +863,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
             pw,
             inp.bit_depth,
             inp.sgr_step,
+            inp.wiener_rounds,
         ))
     };
     let threads = inp.threads.max(1).min(tasks.len().max(1));
@@ -942,9 +1049,9 @@ fn frt_ordinal(t: FrameRestorationType) -> u8 {
 pub(crate) fn apply_lr_plan(
     plan: &LrPlan,
     input: &YuvFrame,
-    curr_y: &[u16],
-    curr_u: &[u16],
-    curr_v: &[u16],
+    curr_y: LrCurr<'_>,
+    curr_u: LrCurr<'_>,
+    curr_v: LrCurr<'_>,
     recon_y: &mut [u16],
     recon_u: &mut [u16],
     recon_v: &mut [u16],
@@ -993,7 +1100,7 @@ pub(crate) fn apply_lr_plan(
         lr_sgr_set: &|_, _, _| 0,
         lr_sgr_xqd: &|_, _, _, _| 0,
     };
-    let currs: [&[u16]; 3] = [curr_y, curr_u, curr_v];
+    let currs: [LrCurr<'_>; 3] = [curr_y, curr_u, curr_v];
     let srcs: [&[u16]; 3] = [&input.y, &input.u, &input.v];
     let mut recons: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
     let mut ssd = 0u64;

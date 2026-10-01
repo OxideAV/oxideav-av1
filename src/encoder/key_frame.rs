@@ -812,7 +812,28 @@ pub(crate) struct SearchLimits {
     pub lr_min_unit_shift: u8,
     /// r464 — the reduced §5.9.19 CDEF sweep (see
     /// [`crate::encoder::cdef_elect::CdefElectInput::fast`]).
-    pub cdef_fast: bool,
+    pub cdef_fast: Option<(u8, u8)>,
+    /// r464 — intra mode pre-screen: the pickers score the 13 §6.10.x
+    /// modes at `angle_delta = 0` (plus filter-intra on luma) and
+    /// refine the §5.11.42 `-3..=3` deltas only around the two best
+    /// directional modes (30 predictions per block instead of 66).
+    pub intra_mode_prescreen: bool,
+    /// r464 — partition early termination, in 1/64 of the luma AC
+    /// quantiser step squared per sample: a fully-inside square leaf
+    /// whose `D` (SSD over the node, every plane) is at most
+    /// `samples · step² · k / 65536` ends the descent — no split /
+    /// rect arm is trialled below it. `0` = off.
+    pub split_early_term_k64: u32,
+    /// r464 — a leaf that codes no residual at the largest §5.11.15
+    /// transform size skips the split-size trials.
+    pub tx_split_prescreen: bool,
+    /// r464 — the per-TU §5.11.47 transform-type choice scores rate
+    /// with the magnitude proxy instead of the exact twin chain (the
+    /// leaf as a whole is still priced exactly).
+    pub tu_proxy_pricing: bool,
+    /// r464 — alternating-least-squares rounds of the §7.17.4 Wiener
+    /// fit (`2` = the r429 fit).
+    pub wiener_rounds: u8,
 }
 
 impl Default for SearchLimits {
@@ -829,7 +850,12 @@ impl Default for SearchLimits {
             lf_effort: 0,
             threads: 1,
             lr_min_unit_shift: 0,
-            cdef_fast: false,
+            cdef_fast: None,
+            intra_mode_prescreen: false,
+            split_early_term_k64: 0,
+            tx_split_prescreen: false,
+            tu_proxy_pricing: false,
+            wiener_rounds: 2,
         }
     }
 }
@@ -838,38 +864,156 @@ impl SearchLimits {
     /// The `StillSpeed::Fast` shape.
     pub(crate) fn fast() -> Self {
         Self {
-            tx_depth_steps: 1,
+            tx_depth_steps: 0,
             prune_tx_types: true,
             rect_partitions: false,
             min_leaf: crate::cdf::BLOCK_8X8,
             skip_leaf_early_exit: true,
-            sgr_step: 4,
+            sgr_step: 8,
             screen_content_probe: true,
             quant_round_64: 22,
             lf_effort: 1,
             threads: 1,
             lr_min_unit_shift: 2,
-            cdef_fast: true,
+            cdef_fast: Some((0, 3)),
+            intra_mode_prescreen: true,
+            split_early_term_k64: 4,
+            tx_split_prescreen: true,
+            tu_proxy_pricing: true,
+            wiener_rounds: 1,
         }
     }
 
-    /// The `StillSpeed::Balanced` shape.
+    /// The `StillSpeed::Balanced` shape (r464): the `Fast` ladders
+    /// plus the §5.11.4 rect partition arms, the refined §7.14
+    /// deblock ladder, the §5.9.19 CDEF sweep on a quarter of the
+    /// units with the four best strengths tabled everywhere, two
+    /// §7.17 unit-size rungs with every fourth self-guided set and
+    /// two Wiener fit rounds, no partition early termination.
     pub(crate) fn balanced() -> Self {
         Self {
-            tx_depth_steps: MAX_TX_DEPTH,
+            tx_depth_steps: 0,
             prune_tx_types: true,
             rect_partitions: true,
-            min_leaf: BLOCK_4X4,
+            min_leaf: crate::cdf::BLOCK_8X8,
             skip_leaf_early_exit: true,
-            sgr_step: 2,
+            sgr_step: 4,
             screen_content_probe: true,
             quant_round_64: 22,
             lf_effort: 2,
             threads: 1,
             lr_min_unit_shift: 1,
-            cdef_fast: false,
+            cdef_fast: Some((2, 4)),
+            intra_mode_prescreen: true,
+            split_early_term_k64: 0,
+            tx_split_prescreen: true,
+            tu_proxy_pricing: true,
+            wiener_rounds: 2,
         }
     }
+}
+
+/// r464 — [`tile_local_state`]'s result: the local geometry, the local
+/// superblock origins, the tile origin in frame mi units, the cropped
+/// source, the tile reconstruction and the tile syntax driver.
+type TileLocalState = (
+    TileGeometry,
+    Vec<(u32, u32)>,
+    (u32, u32),
+    YuvFrame,
+    ReconState,
+    PartitionSyntaxWriter,
+);
+
+/// r464 — the tile-sized search state for the threaded tile walk (see
+/// the tile loop in `encode_key_frame_yuv_core`): the source cropped
+/// to the tile, a tile-extent [`ReconState`] (quantiser, limits and
+/// gates copied from the frame state) and a tile-extent
+/// [`PartitionSyntaxWriter`], with the tile at the origin. Returns the
+/// local geometry, the local superblock origins, the tile origin in
+/// frame mi units, and the three objects.
+fn tile_local_state(
+    input: &YuvFrame,
+    frame: &ReconState,
+    geo: TileGeometry,
+    origins: &[(u32, u32)],
+) -> TileLocalState {
+    let (ssx, ssy) = (frame.subsampling_x, frame.subsampling_y);
+    let mi_rows = geo.mi_row_end - geo.mi_row_start;
+    let mi_cols = geo.mi_col_end - geo.mi_col_start;
+    let (row0, col0) = (
+        (geo.mi_row_start as usize) * 4,
+        (geo.mi_col_start as usize) * 4,
+    );
+    let width = ((mi_cols as usize) * 4).min(frame.width - col0);
+    let height = ((mi_rows as usize) * 4).min(frame.height - row0);
+    let (crow0, ccol0) = frame.chroma_origin(geo.mi_row_start, geo.mi_col_start);
+    let (chroma_w, chroma_h) = if frame.num_planes > 1 {
+        (
+            ((width + usize::from(ssx)) >> ssx).min(frame.chroma_w - ccol0),
+            ((height + usize::from(ssy)) >> ssy).min(frame.chroma_h - crow0),
+        )
+    } else {
+        (0, 0)
+    };
+    let crop = |src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize| -> Vec<u16> {
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            out.extend_from_slice(&src[(y0 + y) * stride + x0..(y0 + y) * stride + x0 + w]);
+        }
+        out
+    };
+    let lin = YuvFrame {
+        width: width as u32,
+        height: height as u32,
+        bit_depth: input.bit_depth,
+        format: input.format,
+        y: crop(&input.y, frame.width, col0, row0, width, height),
+        u: crop(&input.u, frame.chroma_w, ccol0, crow0, chroma_w, chroma_h),
+        v: crop(&input.v, frame.chroma_w, ccol0, crow0, chroma_w, chroma_h),
+    };
+    let lgeo = TileGeometry {
+        mi_row_start: 0,
+        mi_row_end: mi_rows,
+        mi_col_start: 0,
+        mi_col_end: mi_cols,
+    };
+    let rc = ReconState {
+        y: vec![0u16; width * height],
+        u: vec![0u16; chroma_w * chroma_h],
+        v: vec![0u16; chroma_w * chroma_h],
+        width,
+        height,
+        chroma_w,
+        chroma_h,
+        bit_depth: frame.bit_depth,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        num_planes: frame.num_planes,
+        mi_rows,
+        mi_cols,
+        lossless: frame.lossless,
+        allow_screen_content_tools: frame.allow_screen_content_tools,
+        allow_intrabc: false,
+        qp: frame.qp,
+        search: frame.search,
+        bd: BlockDecodedMirror::new(ssx, ssy, frame.num_planes),
+        dv_hash: crate::encoder::dv_hash::DvHashIndex::default(),
+    };
+    let st = PartitionSyntaxWriter::new(mi_rows, mi_cols, lgeo)
+        .expect("tile geometry is a valid frame geometry");
+    let local_origins: Vec<(u32, u32)> = origins
+        .iter()
+        .map(|&(r, c)| (r - geo.mi_row_start, c - geo.mi_col_start))
+        .collect();
+    (
+        lgeo,
+        local_origins,
+        (geo.mi_row_start, geo.mi_col_start),
+        lin,
+        rc,
+        st,
+    )
 }
 
 /// r460 — the luma colour-count probe behind
@@ -1990,8 +2134,17 @@ fn encode_key_frame_yuv_core(
     // and the results are stitched back in tile order, bit-identical
     // to the sequential walk).
     let disable_cdf_update_search = fh.disable_cdf_update;
+    let frame_mi_cols = mi_cols;
+    // r464 — `input` / `rc` / `st` are either the frame-scope objects
+    // (sequential walk) or TILE-SIZED objects with the tile at their
+    // origin (the threaded walk — see `tile_local` below); `abs` is
+    // the tile origin in frame mi units (the §5.9.17 delta plan is
+    // frame-raster indexed), and the returned superblock origins are
+    // frame coordinates.
     let run_tile = |geo: TileGeometry,
                     origins: &[(u32, u32)],
+                    abs: (u32, u32),
+                    input: &YuvFrame,
                     rc: &mut ReconState,
                     st: &mut PartitionSyntaxWriter|
      -> Result<TileSearchOut, Error> {
@@ -2001,13 +2154,21 @@ fn encode_key_frame_yuv_core(
             return Err(Error::PartitionWalkOutOfRange);
         }
         rc.bd.set_tile(geo);
+        let (mi_rows, mi_cols) = (rc.mi_rows, rc.mi_cols);
         let mut writer = SymbolWriter::new(disable_cdf_update_search);
         let mut tile_cdfs = TileCdfContext::new_from_defaults();
         tile_cdfs.init_coeff_cdfs(base_q_idx);
         // §5.11.1 per-tile prologue: `CurrentQIndex = base_q_idx` at
         // every tile entry.
         rc.qp.current_q_index = base_q_idx;
-        let sb_cols_frame = mi_cols.div_ceil(16);
+        let sb_cols_frame = (mi_cols + abs.1).max(frame_mi_cols).div_ceil(16);
+        // r464 — ONE rate twin per tile: its syntax mirror is committed
+        // to exactly the trees the writer emits, so after each
+        // superblock it equals the live state (asserted below) and
+        // only the coder side is re-seated per superblock. The
+        // pre-r464 per-superblock `snapshot` cloned the whole-frame
+        // mirror (~40 MB at 12 MP) 3000 times per picture.
+        let mut twin = RateTwin::snapshot(&tile_cdfs, st, &writer);
         for &(sb_r, sb_c) in origins {
             rc.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
             // r431 — §5.11.13 `CurrentQIndex` walk (the KEY twin of
@@ -2021,7 +2182,7 @@ fn encode_key_frame_yuv_core(
             // truncates.
             let prev_q = rc.qp.current_q_index;
             let dq_units = if let Some(p) = delta_plan {
-                let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
+                let k = (((sb_r + abs.0) / 16) * sb_cols_frame + ((sb_c + abs.1) / 16)) as usize;
                 let step = 1i32 << params.delta_q_res;
                 let want = (i32::from(base_q_idx) + p[k] * step).clamp(1, 255);
                 let units = (want - i32::from(prev_q)) / step;
@@ -2034,7 +2195,7 @@ fn encode_key_frame_yuv_core(
             // AND the rate twin's fork, so both enter the superblock
             // identically.
             st.arm_read_deltas();
-            let mut twin = RateTwin::snapshot(&tile_cdfs, st, &writer);
+            twin.resync_coder(&tile_cdfs, &writer);
             twin.arm_read_deltas();
             let seg_demand = exact_mask.map(|mask| KeySegDemand {
                 mask,
@@ -2067,8 +2228,9 @@ fn encode_key_frame_yuv_core(
             // and coder range must equal the live state — always, in
             // both rate models (commits are model-independent).
             debug_assert!(
-                twin.matches(&tile_cdfs, &writer),
-                "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+                twin.matches_state(&tile_cdfs, st, &writer),
+                "rate twin desynced from the writer after superblock ({sb_r},{sb_c}): {:?}",
+                twin.differing_state_fields(st)
             );
             // r431 — realized `CurrentQIndex`: a full-superblock skip
             // leaf takes the §5.11.13 short-circuit arm (no delta on
@@ -2082,7 +2244,7 @@ fn encode_key_frame_yuv_core(
                 }
             }
             out_trees.push(tree);
-            out_sbs.push((sb_r, sb_c));
+            out_sbs.push((sb_r + abs.0, sb_c + abs.1));
         }
         Ok(TileSearchOut {
             payload: writer.finish(),
@@ -2094,44 +2256,70 @@ fn encode_key_frame_yuv_core(
     let threads = extras.search.threads.max(1).min(num_tiles as usize);
     if threads <= 1 {
         for (geo, origins) in tile_plan.iter() {
-            let out = run_tile(*geo, origins, &mut recon, &mut state)?;
+            let out = run_tile(*geo, origins, (0, 0), input, &mut recon, &mut state)?;
             tile_payloads.push(out.payload);
             all_cdfs.push(out.cdfs);
             trees.extend(out.trees);
             tree_sb.extend(out.sbs);
         }
     } else {
+        // r464 — each tile is searched on TILE-SIZED state: a crop of
+        // the source, a tile-extent reconstruction and a tile-extent
+        // syntax driver with the tile at the origin. Every §5.11
+        // context, neighbour availability and intra edge is
+        // tile-scoped (and the tile boundaries are superblock
+        // aligned, so "inside the frame" means the same thing), so
+        // the walk is the frame walk's, bit for bit — and the
+        // per-thread footprint is one tile instead of one frame (the
+        // r460 walk cloned the whole-frame reconstruction and mirror
+        // per thread: ~130 MB per thread at 12 MP). The results are
+        // stitched back in tile order. The §5.11.7 intra-block-copy
+        // arm indexes the frame-level hash and the frame-level
+        // reconstruction, so it keeps the frame-scope clone.
+        let tile_local = !recon.allow_intrabc && exact_mask.is_none();
         let next = core::sync::atomic::AtomicUsize::new(0);
-        let results: Vec<Result<(usize, TileSearchOut, ReconState, PartitionSyntaxWriter), Error>> =
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for _ in 0..threads {
-                    let recon_ref = &recon;
-                    let state_ref = &state;
-                    let plan_ref = &tile_plan;
-                    let next_ref = &next;
-                    let run = &run_tile;
-                    handles.push(scope.spawn(move || {
-                        let mut outs = Vec::new();
-                        loop {
-                            let t = next_ref.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-                            if t >= plan_ref.len() {
-                                break;
-                            }
-                            let (geo, origins) = &plan_ref[t];
+        type TileRun = (usize, TileSearchOut, ReconState, PartitionSyntaxWriter);
+        let results: Vec<Result<TileRun, Error>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for _ in 0..threads {
+                let recon_ref = &recon;
+                let state_ref = &state;
+                let plan_ref = &tile_plan;
+                let next_ref = &next;
+                let run = &run_tile;
+                handles.push(scope.spawn(move || {
+                    let mut outs = Vec::new();
+                    loop {
+                        let t = next_ref.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                        if t >= plan_ref.len() {
+                            break;
+                        }
+                        let (geo, origins) = &plan_ref[t];
+                        if tile_local {
+                            let (lgeo, local_origins, abs, lin, mut rc, mut st) =
+                                tile_local_state(input, recon_ref, *geo, origins);
+                            outs.push(
+                                run(lgeo, &local_origins, abs, &lin, &mut rc, &mut st)
+                                    .map(|o| (t, o, rc, st)),
+                            );
+                        } else {
                             let mut rc = recon_ref.clone();
                             let mut st = state_ref.clone();
-                            outs.push(run(*geo, origins, &mut rc, &mut st).map(|o| (t, o, rc, st)));
+                            outs.push(
+                                run(*geo, origins, (0, 0), input, &mut rc, &mut st)
+                                    .map(|o| (t, o, rc, st)),
+                            );
                         }
-                        outs
-                    }));
-                }
-                let mut all = Vec::with_capacity(tile_plan.len());
-                for h in handles {
-                    all.extend(h.join().expect("tile search thread panicked"));
-                }
-                all
-            });
+                    }
+                    outs
+                }));
+            }
+            let mut all = Vec::with_capacity(tile_plan.len());
+            for h in handles {
+                all.extend(h.join().expect("tile search thread panicked"));
+            }
+            all
+        });
         let mut per_tile: Vec<Option<(TileSearchOut, ReconState, PartitionSyntaxWriter)>> =
             (0..tile_plan.len()).map(|_| None).collect();
         for r in results {
@@ -2148,28 +2336,45 @@ fn encode_key_frame_yuv_core(
                 geo.mi_col_start as usize * 4,
                 (geo.mi_col_end as usize * 4).min(width),
             );
+            // Source rect origin inside `rc` (tile-local: the origin).
+            let (sr0, sc0, sw) = if tile_local {
+                (0usize, 0usize, rc.width)
+            } else {
+                (r0, c0, width)
+            };
             for y in r0..r1 {
+                let sy = y - r0 + sr0;
                 recon.y[y * width + c0..y * width + c1]
-                    .copy_from_slice(&rc.y[y * width + c0..y * width + c1]);
+                    .copy_from_slice(&rc.y[sy * sw + sc0..sy * sw + sc0 + (c1 - c0)]);
             }
             if num_planes > 1 {
                 let (cr0, cr1) = (r0 >> ssy, ((r1 + usize::from(ssy)) >> ssy).min(chroma_h));
                 let (cc0, cc1) = (c0 >> ssx, ((c1 + usize::from(ssx)) >> ssx).min(chroma_w));
+                let (scr0, scc0, scw) = if tile_local {
+                    (0usize, 0usize, rc.chroma_w)
+                } else {
+                    (cr0, cc0, chroma_w)
+                };
                 for y in cr0..cr1 {
+                    let sy = y - cr0 + scr0;
                     recon.u[y * chroma_w + cc0..y * chroma_w + cc1]
-                        .copy_from_slice(&rc.u[y * chroma_w + cc0..y * chroma_w + cc1]);
+                        .copy_from_slice(&rc.u[sy * scw + scc0..sy * scw + scc0 + (cc1 - cc0)]);
                     recon.v[y * chroma_w + cc0..y * chroma_w + cc1]
-                        .copy_from_slice(&rc.v[y * chroma_w + cc0..y * chroma_w + cc1]);
+                        .copy_from_slice(&rc.v[sy * scw + scc0..sy * scw + scc0 + (cc1 - cc0)]);
                 }
             }
-            let snap = st.snapshot_price_scope(
-                geo.mi_row_start,
-                geo.mi_col_start,
-                geo.mi_col_end - geo.mi_col_start,
-                geo.mi_row_end - geo.mi_row_start,
-                &params,
-            );
-            state.restore_price_scope(&snap);
+            if tile_local {
+                state.import_tile_from(&st, geo, ssx, ssy);
+            } else {
+                let snap = st.snapshot_price_scope(
+                    geo.mi_row_start,
+                    geo.mi_col_start,
+                    geo.mi_col_end - geo.mi_col_start,
+                    geo.mi_row_end - geo.mi_row_start,
+                    &params,
+                );
+                state.restore_price_scope(&snap);
+            }
             tile_payloads.push(o.payload);
             all_cdfs.push(o.cdfs);
             trees.extend(o.trees);
@@ -2334,8 +2539,21 @@ fn encode_key_frame_yuv_core(
     }
     let lr_armed =
         lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
-    let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> =
-        lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
+    // r464 — on a flat-width frame only the stripe-boundary rows of
+    // the pre-CDEF reconstruction are kept (`StripeRows`: what §7.17
+    // reads from `CurrFrame`); the §5.9.8 superres arm keeps the whole
+    // planes (it upscales them below).
+    let pre_cdef: Option<(Vec<u16>, Vec<u16>, Vec<u16>)> = (lr_armed && superres.is_some())
+        .then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
+    let pre_cdef_rows: Option<[crate::encoder::lr_elect::StripeRows; 3]> =
+        (lr_armed && superres.is_none()).then(|| {
+            use crate::encoder::lr_elect::StripeRows;
+            [
+                StripeRows::capture(&recon.y, width, height, 0),
+                StripeRows::capture(&recon.u, chroma_w, chroma_h, ssy),
+                StripeRows::capture(&recon.v, chroma_w, chroma_h, ssy),
+            ]
+        });
     // The §5.9.19 `cdef_bits` the FINAL committed tile was emitted
     // under (the LR re-emission below must replay the same literals).
     let mut committed_cdef_bits: u32 = 0;
@@ -2518,7 +2736,21 @@ fn encode_key_frame_yuv_core(
     // LR-off settles on EXACT realized bytes. On adoption the plan
     // is applied through the §7.17 frame driver, so the stored
     // reference planes equal the decoder's byte-for-byte.
-    if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
+    let pre_cdef_curr: Option<[crate::encoder::lr_elect::LrCurr<'_>; 3]> =
+        match (pre_cdef.as_ref(), pre_cdef_rows.as_ref()) {
+            (Some((y, u, v)), _) => Some([
+                crate::encoder::lr_elect::LrCurr::Full(y),
+                crate::encoder::lr_elect::LrCurr::Full(u),
+                crate::encoder::lr_elect::LrCurr::Full(v),
+            ]),
+            (None, Some(rows)) => Some([
+                crate::encoder::lr_elect::LrCurr::Rows(&rows[0]),
+                crate::encoder::lr_elect::LrCurr::Rows(&rows[1]),
+                crate::encoder::lr_elect::LrCurr::Rows(&rows[2]),
+            ]),
+            (None, None) => None,
+        };
+    if let Some([pcy, pcu, pcv]) = pre_cdef_curr {
         let price_cdfs = {
             let mut c = TileCdfContext::new_from_defaults();
             c.init_coeff_cdfs(base_q_idx);
@@ -2611,6 +2843,7 @@ fn encode_key_frame_yuv_core(
                     },
                     frame_height: coded_h as usize,
                     sgr_step: extras.search.sgr_step,
+                    wiener_rounds: extras.search.wiener_rounds,
                     unit_shift,
                     lambda,
                     price_cdfs: &price_cdfs,
@@ -3923,25 +4156,52 @@ fn pick_y_mode(
     };
     let mut best = (DC_PRED as u8, 0i8, None);
     let mut best_ssd = u64::MAX;
-    for mode in 0..INTRA_MODES {
-        for delta in angle_delta_candidates(mode, bw.min(bh)) {
-            let Some(pred) = predict_mode_from_neighbours(
-                mode,
-                delta,
-                bw,
-                bh,
-                &above_ext,
-                &left_ext,
-                have_above,
-                have_left,
-                recon.bit_depth,
-            ) else {
-                continue;
-            };
-            let ssd = ssd_of(&pred);
-            if ssd < best_ssd {
-                best_ssd = ssd;
-                best = (mode as u8, delta as i8, None);
+    let try_mode = |mode: usize,
+                    delta: i32,
+                    best: &mut (u8, i8, Option<u8>),
+                    best_ssd: &mut u64|
+     -> Option<u64> {
+        let pred = predict_mode_from_neighbours(
+            mode,
+            delta,
+            bw,
+            bh,
+            &above_ext,
+            &left_ext,
+            have_above,
+            have_left,
+            recon.bit_depth,
+        )?;
+        let ssd = ssd_of(&pred);
+        if ssd < *best_ssd {
+            *best_ssd = ssd;
+            *best = (mode as u8, delta as i8, None);
+        }
+        Some(ssd)
+    };
+    if recon.search.intra_mode_prescreen {
+        // r464 — delta-0 screen over every mode, then the §5.11.42
+        // delta refinement around the two best directional modes.
+        let mut dir_scores: Vec<(u64, usize)> = Vec::with_capacity(8);
+        for mode in 0..INTRA_MODES {
+            if let Some(ssd) = try_mode(mode, 0, &mut best, &mut best_ssd) {
+                if (V_PRED..=D67_PRED).contains(&mode) {
+                    dir_scores.push((ssd, mode));
+                }
+            }
+        }
+        dir_scores.sort_unstable();
+        for &(_, mode) in dir_scores.iter().take(2) {
+            for delta in angle_delta_candidates(mode, bw.min(bh)) {
+                if delta != 0 && delta.abs() <= 1 {
+                    try_mode(mode, delta, &mut best, &mut best_ssd);
+                }
+            }
+        }
+    } else {
+        for mode in 0..INTRA_MODES {
+            for delta in angle_delta_candidates(mode, bw.min(bh)) {
+                try_mode(mode, delta, &mut best, &mut best_ssd);
             }
         }
     }
@@ -3987,6 +4247,10 @@ fn pick_uv_mode(
     luma_n: usize,
     max_luma_w: usize,
     max_luma_h: usize,
+    // r464 — the leaf's luma `(y_mode, angle_delta_y)`: under the
+    // pre-screen the chroma shortlist is DC / V / H / SMOOTH / PAETH
+    // plus the luma mode at its delta, and the CfL seed ± 1 per axis.
+    luma_hint: (u8, i8),
 ) -> (u8, i8, Option<(i8, i8)>) {
     let pw = recon.chroma_w;
     let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cbw, cbh);
@@ -4043,44 +4307,97 @@ fn pick_uv_mode(
     let mut best_ssd = u64::MAX;
     let mut dc_pred_u: Vec<u16> = Vec::new();
     let mut dc_pred_v: Vec<u16> = Vec::new();
-    for mode in 0..INTRA_MODES {
-        for delta in angle_delta_candidates(mode, luma_n) {
-            let Some(pred_u) = predict_mode_from_neighbours(
-                mode,
-                delta,
-                cbw,
-                cbh,
-                &above_u,
-                &left_u,
-                ha_u,
-                hl_u,
-                recon.bit_depth,
-            ) else {
-                continue;
+    let try_mode = |mode: usize,
+                    delta: i32,
+                    best_mode: &mut u8,
+                    best_delta: &mut i8,
+                    best_alpha: &mut Option<(i8, i8)>,
+                    best_ssd: &mut u64,
+                    dc_pred_u: &mut Vec<u16>,
+                    dc_pred_v: &mut Vec<u16>|
+     -> Option<u64> {
+        let pred_u = predict_mode_from_neighbours(
+            mode,
+            delta,
+            cbw,
+            cbh,
+            &above_u,
+            &left_u,
+            ha_u,
+            hl_u,
+            recon.bit_depth,
+        )?;
+        let pred_v = predict_mode_from_neighbours(
+            mode,
+            delta,
+            cbw,
+            cbh,
+            &above_v,
+            &left_v,
+            ha_v,
+            hl_v,
+            recon.bit_depth,
+        )?;
+        let ssd = ssd_uv(&pred_u, &pred_v);
+        if ssd < *best_ssd {
+            *best_ssd = ssd;
+            *best_mode = mode as u8;
+            *best_delta = delta as i8;
+            *best_alpha = None;
+        }
+        if mode == DC_PRED {
+            *dc_pred_u = pred_u;
+            *dc_pred_v = pred_v;
+        }
+        Some(ssd)
+    };
+    if recon.search.intra_mode_prescreen {
+        // r464 — the chroma shortlist: DC / V / H / SMOOTH / PAETH at
+        // delta 0 plus the luma mode at the luma delta (chroma
+        // structure follows luma on photographic content).
+        let mut list: Vec<(usize, i32)> = vec![
+            (DC_PRED, 0),
+            (V_PRED, 0),
+            (H_PRED, 0),
+            (SMOOTH_PRED, 0),
+            (PAETH_PRED, 0),
+        ];
+        let (ym, yd) = (luma_hint.0 as usize, i32::from(luma_hint.1));
+        if ym < INTRA_MODES && !list.contains(&(ym, yd)) {
+            let yd = if angle_delta_candidates(ym, luma_n).contains(&yd) {
+                yd
+            } else {
+                0
             };
-            let Some(pred_v) = predict_mode_from_neighbours(
-                mode,
-                delta,
-                cbw,
-                cbh,
-                &above_v,
-                &left_v,
-                ha_v,
-                hl_v,
-                recon.bit_depth,
-            ) else {
-                continue;
-            };
-            let ssd = ssd_uv(&pred_u, &pred_v);
-            if mode == DC_PRED {
-                dc_pred_u = pred_u;
-                dc_pred_v = pred_v;
+            if !list.contains(&(ym, yd)) {
+                list.push((ym, yd));
             }
-            if ssd < best_ssd {
-                best_ssd = ssd;
-                best_mode = mode as u8;
-                best_delta = delta as i8;
-                best_alpha = None;
+        }
+        for (mode, delta) in list {
+            try_mode(
+                mode,
+                delta,
+                &mut best_mode,
+                &mut best_delta,
+                &mut best_alpha,
+                &mut best_ssd,
+                &mut dc_pred_u,
+                &mut dc_pred_v,
+            );
+        }
+    } else {
+        for mode in 0..INTRA_MODES {
+            for delta in angle_delta_candidates(mode, luma_n) {
+                try_mode(
+                    mode,
+                    delta,
+                    &mut best_mode,
+                    &mut best_delta,
+                    &mut best_alpha,
+                    &mut best_ssd,
+                    &mut dc_pred_u,
+                    &mut dc_pred_v,
+                );
             }
         }
     }
@@ -4124,10 +4441,26 @@ fn pick_uv_mode(
         let around =
             |a: i8| -> [i8; 3] { [a.saturating_sub(1).max(-16), a, a.saturating_add(1).min(16)] };
         let mut cands: Vec<(i8, i8)> = Vec::with_capacity(9);
-        for &au in &around(su) {
-            for &av in &around(sv) {
+        if recon.search.intra_mode_prescreen {
+            // r464 — the seed and its four axis-aligned neighbours.
+            let (ar, av_) = (around(su), around(sv));
+            for &(au, av) in &[
+                (su, sv),
+                (ar[0], sv),
+                (ar[2], sv),
+                (su, av_[0]),
+                (su, av_[2]),
+            ] {
                 if (au != 0 || av != 0) && !cands.contains(&(au, av)) {
                     cands.push((au, av));
+                }
+            }
+        } else {
+            for &au in &around(su) {
+                for &av in &around(sv) {
+                    if (au != 0 || av != 0) && !cands.contains(&(au, av)) {
+                        cands.push((au, av));
+                    }
                 }
             }
         }
@@ -4316,7 +4649,9 @@ pub(crate) fn encode_leaf_sq_seg(
     } else {
         None
     };
-    if single_shape && combos.len() == 1 && intrabc_dv.is_none() {
+    // r464 — a one-candidate ladder (one TX shape, no palette / intra-bc
+    // arm) needs no pricing: the leaf is taken as coded.
+    if (single_shape || cands.len() == 1) && combos.len() == 1 && intrabc_dv.is_none() {
         let mut leaf = encode_leaf_with_tx(
             mi_r, mi_c, b_size, cands[0], input, recon, None, None, pricing,
         )?;
@@ -4416,6 +4751,15 @@ pub(crate) fn encode_leaf_sq_seg(
     };
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for (depth, &cand) in cands.iter().enumerate() {
+        // r464 — TX-size pre-screen: a residual-free leaf at the
+        // largest transform size is below the quantiser floor; the
+        // split sizes are not trialled (`SearchLimits::tx_split_prescreen`).
+        if depth > 0
+            && recon.search.tx_split_prescreen
+            && best.as_ref().is_some_and(|(leaf, _, _)| leaf.skip == 1)
+        {
+            break;
+        }
         for &(py, puv) in combos.iter() {
             let mut leaf =
                 encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon, py, puv, pricing)?;
@@ -5198,7 +5542,7 @@ fn encode_intrabc_leaf(
     let lossless = recon.lossless;
     let qp = recon.qp;
     let mut tu_fork = match (&pricing, lossless) {
-        (Some((twin, _)), false) => Some(twin.tu_fork()),
+        (Some((twin, _)), false) if !recon.search.tu_proxy_pricing => Some(twin.tu_fork()),
         _ => None,
     };
     let tu_ctx = pricing.map(|(_, params)| TuCtx {
@@ -5377,7 +5721,7 @@ fn encode_intrabc_leaf(
     let mut block = SyntaxBlock::skip_leaf(0, None);
     block.skip = skip;
     block.intrabc_mv = Some([dv_r * 8, dv_c * 8]);
-    block.residual_quant = residual_quant;
+    block.residual_quant = residual_quant.into();
     block.residual_tx_type = luma_tx_types;
     if !lossless && skip == 0 {
         block.var_tx_trees = vec![crate::encoder::inter_frame::uniform_var_tx_tree(
@@ -5434,7 +5778,7 @@ pub(crate) fn encode_leaf_with_tx(
     // r424 — the running per-TU fork (lossy arm only), armed with the
     // leaf's §8.3.2 `intra_dir` inputs.
     let mut tu_fork = match (&pricing, lossless) {
-        (Some((twin, _)), false) => Some(twin.tu_fork()),
+        (Some((twin, _)), false) if !recon.search.tu_proxy_pricing => Some(twin.tu_fork()),
         _ => None,
     };
     let tu_ctx = pricing.map(|(_, params)| TuCtx {
@@ -5636,6 +5980,7 @@ pub(crate) fn encode_leaf_with_tx(
                 bw.min(bh),
                 max_luma_w,
                 max_luma_h,
+                (y_mode, angle_delta_y),
             ),
         };
         uv_mode = Some(m);
@@ -5793,7 +6138,7 @@ pub(crate) fn encode_leaf_with_tx(
         use_filter_intra: u8::from(filter_intra_mode.is_some()),
         filter_intra_mode,
         palette,
-        residual_quant,
+        residual_quant: residual_quant.into(),
         // §5.11.15 TxSize commitment: on the lossy TX_MODE_SELECT arm
         // the tx_depth S() fires for every MiSize > BLOCK_4X4 block
         // (intra ⇒ allowSelect); lossless / BLOCK_4X4 stay on the
@@ -5913,6 +6258,29 @@ pub(crate) fn region_distortion(
     region_distortion_wh(recon, input, r, c, n4, n4)
 }
 
+/// r464 — the luma term of [`region_distortion`] alone (the running
+/// lower bound of the split arm at the 8×8 level).
+pub(crate) fn region_distortion_luma(
+    recon: &ReconState,
+    input: &YuvFrame,
+    r: u32,
+    c: u32,
+    n4: usize,
+) -> u64 {
+    let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+    let w = (n4 * 4).min(recon.width.saturating_sub(col0));
+    let h = (n4 * 4).min(recon.height.saturating_sub(row0));
+    let mut d = 0u64;
+    for i in 0..h {
+        let base = (row0 + i) * recon.width + col0;
+        for (a, b) in recon.y[base..base + w].iter().zip(&input.y[base..base + w]) {
+            let diff = i64::from(*a) - i64::from(*b);
+            d += (diff * diff) as u64;
+        }
+    }
+    d
+}
+
 /// r412 — rectangular twin of [`region_distortion`].
 pub(crate) fn region_distortion_wh(
     recon: &ReconState,
@@ -6003,10 +6371,8 @@ pub(crate) fn lambda_for(qp: &QuantizerParams) -> u64 {
 pub(crate) fn leaf_rate(block: &SyntaxBlock) -> u64 {
     let mut rate = 24u64;
     for tu in &block.residual_quant {
-        for &q in tu {
-            if q != 0 {
-                rate += 3 + u64::from(32 - q.unsigned_abs().leading_zeros());
-            }
+        for &(_, q) in tu.nonzeros() {
+            rate += 3 + u64::from(32 - q.unsigned_abs().leading_zeros());
         }
     }
     // §5.11.7 intra-block-copy proxy (r418): the `use_intrabc` S()
@@ -6313,6 +6679,24 @@ fn build_search_tree(
         // rect arm is trialled below it.
         return Ok((node_a, cost_a));
     }
+    if recon.search.split_early_term_k64 > 0 {
+        // r464 — the leaf already codes the node near the quantiser's
+        // distortion floor: no finer partition can buy enough `D`
+        // back to pay for its symbols. Threshold in units of the luma
+        // AC step squared per sample (every plane counted).
+        let n = (n4 as u64) * 4;
+        let samples = n * n
+            + if recon.num_planes > 1 {
+                2 * (n >> recon.subsampling_x) * (n >> recon.subsampling_y)
+            } else {
+                0
+            };
+        let step = u64::from(crate::cdf::get_ac_quant(&recon.qp, 0, 0).unsigned_abs());
+        let thresh = samples * step * step * u64::from(recon.search.split_early_term_k64) / 65536;
+        if d_a <= thresh {
+            return Ok((node_a, cost_a));
+        }
+    }
     let twin_a = twin.scope(r, c, b_size, params);
     twin.restore(&origin);
     let after_a = save_region(recon, r, c, n4 as usize);
@@ -6403,46 +6787,57 @@ fn build_search_tree(
     // quadrants (NW/NE/SW/SE dispatch order — the writer's order),
     // each child searched against the twin state its symbols will
     // actually be written under (SPLIT arm + earlier siblings).
+    // r464 — running-cost abort: the quadrants' regions are disjoint
+    // and their twin costs add, so the split's final score is at
+    // least the partial `D·256 + λ·R` after any prefix of quadrants
+    // (`Twin` model: exact costs; the heuristic proxy is summed the
+    // same way). Once the partial exceeds the running best, the split
+    // cannot win (`best.2 <= score_b` keeps the best on ties) — the
+    // remaining quadrants are never searched. Decision-identical to
+    // the exhaustive walk.
     let mut cost_b = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
-    let (nw, c0) = build_search_tree(r, c, sub, input, recon, twin, params, model, seg, dq_units)?;
-    let (ne, c1) = build_search_tree(
-        r,
-        c + half,
-        sub,
-        input,
-        recon,
-        twin,
-        params,
-        model,
-        seg,
-        dq_units,
-    )?;
-    let (sw, c2) = build_search_tree(
-        r + half,
-        c,
-        sub,
-        input,
-        recon,
-        twin,
-        params,
-        model,
-        seg,
-        dq_units,
-    )?;
-    let (se, c3) = build_search_tree(
-        r + half,
-        c + half,
-        sub,
-        input,
-        recon,
-        twin,
-        params,
-        model,
-        seg,
-        dq_units,
-    )?;
-    cost_b += c0 + c1 + c2 + c3;
-    let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
+    let quadrants = [(r, c), (r, c + half), (r + half, c), (r + half, c + half)];
+    let mut children: Vec<Box<SyntaxNode>> = Vec::with_capacity(4);
+    let mut partial_d = 0u64;
+    let mut partial_rate = 0u64;
+    let mut twin_cost = 0u64;
+    for (qi, &(qr, qc)) in quadrants.iter().enumerate() {
+        let (node, cost) = build_search_tree(
+            qr, qc, sub, input, recon, twin, params, model, seg, dq_units,
+        )?;
+        twin_cost += cost;
+        partial_rate += match model {
+            RateModel::Twin => cost,
+            RateModel::Heuristic => tree_rate(&node) * 256,
+        };
+        children.push(Box::new(node));
+        if qi == 3 {
+            break;
+        }
+        // The quadrants' chroma is final only when each quadrant
+        // carries its own chroma (`sub >= BLOCK_8X8`); the four 4×4
+        // leaves of an 8×8 node share one chroma block coded by the
+        // last of them, so that level bounds on luma alone.
+        partial_d += if sub >= BLOCK_8X8 {
+            region_distortion(recon, input, qr, qc, half as usize)
+        } else {
+            region_distortion_luma(recon, input, qr, qc, half as usize)
+        };
+        let partial_rate_total = match model {
+            RateModel::Twin => cost_b + partial_rate,
+            RateModel::Heuristic => partial_rate + 4 * 256,
+        };
+        if best.2 < score256(partial_d, lambda, partial_rate_total) {
+            let (node, after, _, twin_best, cost) = best;
+            restore_region(recon, r, c, &after);
+            twin.restore(&twin_best);
+            return Ok((node, cost));
+        }
+    }
+    cost_b += twin_cost;
+    let children: [Box<SyntaxNode>; 4] = children
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("four quadrants searched"));
     let d_b = region_distortion(recon, input, r, c, n4 as usize);
 
     let r_b = match model {

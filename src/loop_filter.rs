@@ -269,7 +269,22 @@ impl std::fmt::Debug for LoopFilterFrameContext<'_> {
 ///
 /// Modifies the per-plane buffers in place.
 pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBuffer<'_>]) {
+    loop_filter_rows(ctx, planes, 0, ctx.mi_rows);
+}
+
+/// r464 — [`loop_filter_frame`] restricted to the edges whose `row`
+/// lies in `mi_row_start..mi_row_end` (both passes, every plane). On
+/// the whole range this IS the frame process; on a band it is the
+/// encoder's level-election probe (the band's first horizontal edge
+/// reads samples above the band as the band left them).
+pub fn loop_filter_rows(
+    ctx: &LoopFilterFrameContext<'_>,
+    planes: &mut [PlaneBuffer<'_>],
+    mi_row_start: u32,
+    mi_row_end: u32,
+) {
     let num_planes = ctx.num_planes.min(planes.len() as u8);
+    let mi_row_end = mi_row_end.min(ctx.mi_rows);
     for plane in 0..num_planes {
         // av1-spec p.307 line 16961: skip chroma planes whose
         // `loop_filter_level[1 + plane]` slot is zero.
@@ -280,8 +295,8 @@ pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBu
         let row_step: u32 = if plane == 0 { 1 } else { 1 << sub_y };
         let col_step: u32 = if plane == 0 { 1 } else { 1 << sub_x };
         for pass in 0..2u8 {
-            let mut row = 0u32;
-            while row < ctx.mi_rows {
+            let mut row = mi_row_start;
+            while row < mi_row_end {
                 let mut col = 0u32;
                 while col < ctx.mi_cols {
                     loop_filter_edge(ctx, planes, plane, pass, row, col);

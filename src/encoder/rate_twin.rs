@@ -367,6 +367,40 @@ impl RateTwin {
         g.range == writer.range() && g.cdfs == *cdfs
     }
 
+    /// r464 — [`Self::matches`] extended to the syntax mirror: the
+    /// twin's whole write state equals the live `state`. The
+    /// per-tile twin reuse (one twin per tile, carried across
+    /// superblocks) rests on this invariant; the KEY driver
+    /// `debug_assert!`s it after every superblock's emission.
+    pub fn matches_state(
+        &self,
+        cdfs: &TileCdfContext,
+        state: &PartitionSyntaxWriter,
+        writer: &SymbolWriter,
+    ) -> bool {
+        let g = self.inner.borrow();
+        g.range == writer.range() && g.cdfs == *cdfs && g.state.differing_fields(state).is_empty()
+    }
+
+    /// r464 — re-seat the coder side of the twin (CDF tables + range)
+    /// on the live writer at a superblock boundary. The syntax mirror
+    /// is left as the twin committed it (equal to the live state by
+    /// construction — see [`Self::matches_state`]), so the superblock
+    /// entry costs one 15.7 KB table copy instead of a whole-frame
+    /// mirror clone.
+    /// r464 — diagnostic: the mirror fields on which the twin and the
+    /// live `state` differ.
+    #[doc(hidden)]
+    pub fn differing_state_fields(&self, state: &PartitionSyntaxWriter) -> Vec<&'static str> {
+        self.inner.borrow().state.differing_fields(state)
+    }
+
+    pub fn resync_coder(&mut self, cdfs: &TileCdfContext, writer: &SymbolWriter) {
+        let g = self.inner.get_mut();
+        g.cdfs.clone_from(cdfs);
+        g.range = writer.range();
+    }
+
     /// r424 — open a per-transform-unit fork: TU decisions commit onto
     /// the fork progressively (so later TUs are priced with earlier
     /// ones' §5.11.39 contexts in place) and the whole fork is rolled
@@ -411,7 +445,7 @@ impl TuCtx<'_> {
         b.segment_id = self.segment_id;
         b.use_filter_intra = u8::from(self.use_filter_intra);
         b.filter_intra_mode = self.filter_intra_mode;
-        b.residual_quant = vec![quant.to_vec()];
+        b.residual_quant = vec![quant.to_vec()].into();
         b.residual_tx_type = vec![tx_type];
         b
     }
@@ -442,11 +476,19 @@ impl TuFork<'_> {
         self.ensure_origin(ctx);
         let mut g = self.twin.inner.borrow_mut();
         let g = &mut *g;
+        // r464 — the scope is the TRANSFORM UNIT's own rect, not the
+        // whole block: a single luma transform block stamps
+        // `TxTypes[]` over its rect and the §5.11.39 above / left
+        // level + DC contexts over its span (both inside the TU-rect
+        // snapshot, whose context spans are widened by one mi), and
+        // nothing block-level (the fork's origin scope still covers
+        // the block for the drop-time rollback). A 64×64 leaf priced
+        // 256 cells × every grid per candidate before.
         let scope = g.state.snapshot_price_scope(
-            ctx.mi_row,
-            ctx.mi_col,
-            NUM_4X4_BLOCKS_WIDE[ctx.mi_size] as u32,
-            NUM_4X4_BLOCKS_HIGH[ctx.mi_size] as u32,
+            ctx.mi_row + y,
+            ctx.mi_col + x,
+            (crate::cdf::TX_WIDTH[tx_sz] / 4) as u32,
+            (crate::cdf::TX_HEIGHT[tx_sz] / 4) as u32,
             ctx.params,
         );
         let cdfs = g.cdfs.clone();

@@ -614,6 +614,137 @@ pub struct SyntaxPalette {
     pub color_map_uv: Vec<u8>,
 }
 
+/// r464 — one transform unit's committed `Quant[]` array, stored
+/// SPARSELY (the non-zero coefficients with their raster index). The
+/// committed trees of a 12 MP picture held every sample as a dense
+/// `i32` (69 MiB); at production quantisers a few per cent of the
+/// coefficients are non-zero. [`TuQuant::dense`] materialises the
+/// array the §5.11.39 writer consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TuQuant {
+    len: u32,
+    nz: Vec<(u16, i32)>,
+}
+
+impl TuQuant {
+    /// Number of coefficients (the transform unit's `w × h`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// `len() == 0`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every coefficient is zero (the §5.11.39 `all_zero` symbol).
+    #[must_use]
+    pub fn is_all_zero(&self) -> bool {
+        self.nz.is_empty()
+    }
+
+    /// Number of non-zero coefficients.
+    #[must_use]
+    pub fn nonzero_count(&self) -> usize {
+        self.nz.len()
+    }
+
+    /// The non-zero coefficients as `(raster index, value)`.
+    #[must_use]
+    pub fn nonzeros(&self) -> &[(u16, i32)] {
+        &self.nz
+    }
+
+    /// The dense `Quant[]` array.
+    #[must_use]
+    pub fn dense(&self) -> Vec<i32> {
+        let mut v = vec![0i32; self.len as usize];
+        for &(i, q) in &self.nz {
+            v[i as usize] = q;
+        }
+        v
+    }
+}
+
+impl From<Vec<i32>> for TuQuant {
+    fn from(v: Vec<i32>) -> Self {
+        Self::from(&v[..])
+    }
+}
+
+impl From<&[i32]> for TuQuant {
+    fn from(v: &[i32]) -> Self {
+        debug_assert!(v.len() <= u16::MAX as usize + 1);
+        Self {
+            len: v.len() as u32,
+            nz: v
+                .iter()
+                .enumerate()
+                .filter(|(_, &q)| q != 0)
+                .map(|(i, &q)| (i as u16, q))
+                .collect(),
+        }
+    }
+}
+
+/// r464 — the committed per-TU coefficient list of a leaf (see
+/// [`TuQuant`]); built from the search's dense arrays through
+/// `From<Vec<Vec<i32>>>`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TuQuantList(pub Vec<TuQuant>);
+
+impl TuQuantList {
+    /// The list as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[TuQuant] {
+        &self.0
+    }
+
+    /// Number of transform units.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// No transform units (a `skip` leaf).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The `i`-th transform unit.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<&TuQuant> {
+        self.0.get(i)
+    }
+
+    /// Iterate the transform units.
+    pub fn iter(&self) -> core::slice::Iter<'_, TuQuant> {
+        self.0.iter()
+    }
+
+    /// Drop every transform unit.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl From<Vec<Vec<i32>>> for TuQuantList {
+    fn from(v: Vec<Vec<i32>>) -> Self {
+        Self(v.into_iter().map(TuQuant::from).collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a TuQuantList {
+    type Item = &'a TuQuant;
+    type IntoIter = core::slice::Iter<'a, TuQuant>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// One §5.11.5 leaf of the full-syntax write tree — the per-block
 /// §5.11.7 scalars the encoder committed and the
 /// [`write_partition_tree_syntax`] driver replays bit-for-bit.
@@ -687,7 +818,7 @@ pub struct SyntaxBlock {
     /// exactly the visited-TU count when `skip == 0` — both mismatches
     /// are caller bugs ([`crate::Error::PartitionWalkOutOfRange`]).
     /// Added r283.
-    pub residual_quant: Vec<Vec<i32>>,
+    pub residual_quant: TuQuantList,
     /// §5.11.15 `TxSize` commitment for the §5.11.16 `else` arm
     /// (r285). `None` ⇒ the spec-forced default (`TX_4X4` when the
     /// segment is lossless, `Max_Tx_Size_Rect[ MiSize ]` otherwise).
@@ -1012,7 +1143,7 @@ impl SyntaxBlock {
             use_filter_intra: 0,
             filter_intra_mode: None,
             palette: SyntaxPalette::default(),
-            residual_quant: Vec::new(),
+            residual_quant: TuQuantList::default(),
             tx_size: None,
             residual_tx_type: Vec::new(),
             var_tx_trees: Vec::new(),
@@ -1311,6 +1442,43 @@ impl PartitionSyntaxWriter {
     /// the writer will code it from.
     pub fn deltas_pending(&self) -> bool {
         self.write_deltas_pending
+    }
+
+    /// r464 — stitch a tile searched on a tile-sized driver (`src`,
+    /// the tile at its origin) back into this frame-scope driver at
+    /// `geo` (see [`PartitionWalker::import_rect_from`]).
+    pub(crate) fn import_tile_from(
+        &mut self,
+        src: &Self,
+        geo: TileGeometry,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) {
+        self.mirror.import_rect_from(
+            &src.mirror,
+            0,
+            0,
+            geo.mi_row_start,
+            geo.mi_col_start,
+            geo.mi_row_end - geo.mi_row_start,
+            geo.mi_col_end - geo.mi_col_start,
+            subsampling_x,
+            subsampling_y,
+        );
+    }
+
+    /// r464 — diagnostic twin of [`PartitionWalker::differing_fields`]
+    /// over the driver's own fields plus its mirror.
+    #[doc(hidden)]
+    pub fn differing_fields(&self, other: &Self) -> Vec<&'static str> {
+        let mut out = self.mirror.differing_fields(&other.mirror);
+        if self.geometry != other.geometry {
+            out.push("writer.geometry");
+        }
+        if self.write_deltas_pending != other.write_deltas_pending {
+            out.push("writer.write_deltas_pending");
+        }
+        out
     }
 
     /// r431 — write-side twin of the decode walker's
@@ -3900,15 +4068,17 @@ fn write_transform_block(
     // the §5.11.47 `transform_type()` emission (r384 fix — the spec's
     // else-arm ordering), and `all_zero` is a property of the committed
     // coefficients.
-    let quant = block
+    let quant_tu = block
         .residual_quant
         .get(*tu_idx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
     *tu_idx += 1;
-    if quant.len() != tx_w * tx_h {
+    if quant_tu.len() != tx_w * tx_h {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    let all_zero = quant.iter().all(|&q| q == 0);
+    let all_zero = quant_tu.is_all_zero();
+    let quant_dense = quant_tu.dense();
+    let quant: &[i32] = &quant_dense;
     // §8.3.2 `all_zero` / `dc_sign` ctx — the same neighbour-array
     // derivations the decode walker's `transform_block_emit` performs,
     // computed against the mirror's §6.10.2 context arrays (r284).
@@ -5433,7 +5603,7 @@ mod tests {
         let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
         let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         block.skip = 0;
-        block.residual_quant = vec![vec![0i32; 16], vec![0i32; 64], vec![0i32; 64]];
+        block.residual_quant = vec![vec![0i32; 16], vec![0i32; 64], vec![0i32; 64]].into();
         let err = super::write_block_syntax(
             &mut writer,
             &mut cdfs,
@@ -5451,7 +5621,7 @@ mod tests {
         let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
         let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         block.skip = 0;
-        block.residual_quant = vec![vec![0i32; 64]; 4];
+        block.residual_quant = vec![vec![0i32; 64]; 4].into();
         let err = super::write_block_syntax(
             &mut writer,
             &mut cdfs,
@@ -5469,7 +5639,7 @@ mod tests {
         // §5.11.35 `!skip` gate never consumes them).
         let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
         let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
-        block.residual_quant = vec![vec![0i32; 64]; 3];
+        block.residual_quant = vec![vec![0i32; 64]; 3].into();
         let err = super::write_block_syntax(
             &mut writer,
             &mut cdfs,
@@ -5580,7 +5750,8 @@ mod tests {
             // V: a magnitude past the §5.11.39 base-range cap (golomb
             // tail) at DC plus a mid-scan tap.
             quant_with(256, &[(0, 40), (2, 3)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xA7);
         assert!(
@@ -5613,18 +5784,19 @@ mod tests {
             quant_with(64, &[(0, 3), (1, 1)]),
             quant_with(64, &[(0, -1)]),
             quant_with(64, &[(8, 2)]),
-        ];
+        ]
+        .into();
         // NE: skip leaf (no TUs).
         let ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         // SW: non-skip with ALL-ZERO commitments — every plane writes
         // `all_zero = 1`.
         let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         sw.skip = 0;
-        sw.residual_quant = vec![vec![0i32; 64]; 3];
+        sw.residual_quant = vec![vec![0i32; 64]; 3].into();
         // SE: single negative DC on luma, zeros on chroma.
         let mut se = SyntaxBlock::skip_leaf(2, Some(DC_PRED as u8));
         se.skip = 0;
-        se.residual_quant = vec![quant_with(64, &[(0, -4)]), vec![0i32; 64], vec![0i32; 64]];
+        se.residual_quant = vec![quant_with(64, &[(0, -4)]), vec![0i32; 64], vec![0i32; 64]].into();
 
         let node = SyntaxNode::Split([
             Box::new(SyntaxNode::Leaf(Box::new(nw))),
@@ -5669,7 +5841,7 @@ mod tests {
                 });
             }
         }
-        leaf.residual_quant = tus;
+        leaf.residual_quant = tus.into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 2, 2, BLOCK_8X8, &params, 0xE1);
         assert!(
@@ -5694,7 +5866,8 @@ mod tests {
             quant_with(256, &[(0, 2), (1, 1)]),
             quant_with(64, &[(0, -3)]),
             quant_with(64, &[(0, 6), (8, -1)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x4B);
     }
@@ -5709,7 +5882,7 @@ mod tests {
 
         let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
         leaf.skip = 0;
-        leaf.residual_quant = vec![quant_with(256, &[(0, 9), (3, -2)])];
+        leaf.residual_quant = vec![quant_with(256, &[(0, 9), (3, -2)])].into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xD2);
     }
@@ -5727,7 +5900,8 @@ mod tests {
             quant_with(256, &[(0, 1)]),
             quant_with(256, &[(0, 2), (16, 1)]),
             quant_with(256, &[(0, -2)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x78);
     }
@@ -5769,7 +5943,8 @@ mod tests {
             quant_with(64, &[(0, -3), (1, 1)]),
             quant_with(64, &[(0, -1)]),
             quant_with(64, &[(8, 2)]),
-        ];
+        ]
+        .into();
         // NE: skip ⇒ §5.11.42 reset over columns 2..3 + rows 0..1.
         let ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         // SW: negative Y DC (dcCategory = 1), culLevel = 5 + 2 + 1 = 8.
@@ -5779,7 +5954,8 @@ mod tests {
             quant_with(64, &[(0, -5), (1, 2), (8, 1)]),
             vec![0i32; 64],
             quant_with(64, &[(0, 4)]),
-        ];
+        ]
+        .into();
         // SE: positive Y DC (dcCategory = 2), culLevel = 6 + 1 = 7.
         let mut se = SyntaxBlock::skip_leaf(2, Some(DC_PRED as u8));
         se.skip = 0;
@@ -5787,7 +5963,8 @@ mod tests {
             quant_with(64, &[(0, 6), (2, 1)]),
             vec![0i32; 64],
             vec![0i32; 64],
-        ];
+        ]
+        .into();
 
         let node = SyntaxNode::Split([
             Box::new(SyntaxNode::Leaf(Box::new(nw))),
@@ -5850,7 +6027,7 @@ mod tests {
                 });
             }
         }
-        leaf.residual_quant = tus;
+        leaf.residual_quant = tus.into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x9E);
 
@@ -5894,7 +6071,8 @@ mod tests {
             quant_with(64, &[(0, -3), (1, 2)]),
             quant_with(64, &[(0, 4)]),
             quant_with(64, &[(2, 1)]),
-        ];
+        ]
+        .into();
         // NE: skip intrabc leaf (the r282 shape — §5.11.42 reset).
         let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         ne.intrabc_mv = Some([-8, -2560]);
@@ -5906,7 +6084,8 @@ mod tests {
             quant_with(64, &[(0, 7)]),
             vec![0i32; 64],
             quant_with(64, &[(0, -2)]),
-        ];
+        ]
+        .into();
         // SE: plain skip leaf.
         let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
 
@@ -5952,7 +6131,8 @@ mod tests {
             // U / V: one TX_16X16 TU each.
             quant_with(256, &[(0, -7)]),
             quant_with(256, &[(0, 40), (2, 3)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xC1);
         assert!(
@@ -6060,7 +6240,8 @@ mod tests {
             // U / V: one TX_32X32 TU each.
             quant_with(1024, &[(0, 6)]),
             quant_with(1024, &[(0, -2), (1, 1)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 8, 8, BLOCK_32X32, &params, 0xC3);
 
@@ -6127,7 +6308,8 @@ mod tests {
             // U / V: one TX_32X32 TU each.
             quant_with(1024, &[(0, -6)]),
             quant_with(1024, &[(0, 1)]),
-        ];
+        ]
+        .into();
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let (_enc, walker) = syntax_round_trip(&node, 6, 8, BLOCK_32X32, &params, 0xC5);
 
@@ -6357,7 +6539,8 @@ mod tests {
             quant_with(64, &[(0, 5), (1, -2), (8, 1)]),
             quant_with(64, &[(0, -3)]),
             quant_with(64, &[(0, 4), (2, 1)]),
-        ];
+        ]
+        .into();
         // §5.11.47 luma-only `TxType` commitment — ADST_ADST is in
         // `Tx_Type_Intra_Inv_Set1`.
         leaf.residual_tx_type = vec![crate::cdf::ADST_ADST as u8];
@@ -6403,7 +6586,8 @@ mod tests {
             // luma S()).
             quant_with(256, &[(0, -4)]),
             quant_with(256, &[(0, 6)]),
-        ];
+        ]
+        .into();
         // Four luma `TxType`s, all admissible in `TX_SET_INTRA_1`.
         leaf.residual_tx_type = vec![
             crate::cdf::ADST_DCT as u8,
@@ -6428,7 +6612,7 @@ mod tests {
         let params0 = SyntaxFrameParams::intra_8bit_baseline();
         let mut leaf0 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         leaf0.skip = 0;
-        leaf0.residual_quant = vec![quant_with(256, &[(0, 2)]); 3];
+        leaf0.residual_quant = vec![quant_with(256, &[(0, 2)]); 3].into();
         // Empty commitment ⇒ DCT_DCT default; bit-silent.
         let node0 = SyntaxNode::Leaf(Box::new(leaf0));
         let (_e0, w0) = syntax_round_trip(&node0, 4, 4, BLOCK_16X16, &params0, 0x11);
@@ -6450,7 +6634,8 @@ mod tests {
             quant_with(1024, &[(0, 3)]),
             quant_with(1024, &[(0, -1)]),
             quant_with(1024, &[(0, 2)]),
-        ];
+        ]
+        .into();
         // Commitment MUST be DCT_DCT on the DCTONLY path (a non-DCT_DCT
         // value here is a caller bug — exercised in the reject battery).
         leaf1.residual_tx_type = vec![DCT_DCT as u8];
@@ -6483,7 +6668,8 @@ mod tests {
             quant_with(1024, &[(0, 3)]),
             quant_with(1024, &[(0, -1)]),
             quant_with(1024, &[(0, 2)]),
-        ];
+        ]
+        .into();
         block.residual_tx_type = vec![crate::cdf::ADST_ADST as u8];
         let err = super::write_block_syntax(
             &mut writer,
@@ -6510,7 +6696,7 @@ mod tests {
         let mut state2 = PartitionSyntaxWriter::new(2, 2, single_tile(2, 2)).unwrap();
         let mut block2 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         block2.skip = 0;
-        block2.residual_quant = vec![quant_with(64, &[(0, 1)]); 3];
+        block2.residual_quant = vec![quant_with(64, &[(0, 1)]); 3].into();
         block2.residual_tx_type = vec![crate::cdf::FLIPADST_DCT as u8];
         let err2 = super::write_block_syntax(
             &mut writer2,
@@ -6538,7 +6724,7 @@ mod tests {
         let mut state3 = PartitionSyntaxWriter::new(2, 2, single_tile(2, 2)).unwrap();
         let mut block3 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         block3.skip = 0;
-        block3.residual_quant = vec![quant_with(64, &[(0, 1)]); 3];
+        block3.residual_quant = vec![quant_with(64, &[(0, 1)]); 3].into();
         block3.residual_tx_type = vec![DCT_DCT as u8, DCT_DCT as u8];
         let err3 = super::write_block_syntax(
             &mut writer3,
@@ -6787,7 +6973,7 @@ mod tests {
         // 8×8 luma TUs + 4×4 chroma TUs per plane.
         let mut se = inter_skip_leaf(MODE_NEWMV, [-8, 24]);
         se.skip = 0;
-        se.residual_quant = vec![vec![0i32; 16]; 64 + 16 + 16];
+        se.residual_quant = vec![vec![0i32; 16]; 64 + 16 + 16].into();
 
         let node = SyntaxNode::Split([
             Box::new(SyntaxNode::Leaf(Box::new(nw))),
@@ -7645,13 +7831,13 @@ mod tests {
         luma[1] = -2;
         let mut chroma = vec![0i32; 16 * 16];
         chroma[0] = 3;
-        nw.residual_quant = vec![luma, chroma.clone(), chroma];
+        nw.residual_quant = vec![luma, chroma.clone(), chroma].into();
 
         let mut ne = inter_skip_leaf(MODE_NEWMV, [-4, 2]);
         ne.skip = 0;
         let mut luma2 = vec![0i32; 32 * 32];
         luma2[0] = 1;
-        ne.residual_quant = vec![luma2, vec![0i32; 16 * 16], vec![0i32; 16 * 16]];
+        ne.residual_quant = vec![luma2, vec![0i32; 16 * 16], vec![0i32; 16 * 16]].into();
 
         let sw = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
         let se = inter_skip_leaf(MODE_NEWMV, [8, 8]);

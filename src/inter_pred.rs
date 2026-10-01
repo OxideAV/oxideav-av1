@@ -6879,8 +6879,11 @@ pub fn reconstruct_inter_frame(
     // bug.
     if let Some(wc) = grid.warp.as_ref() {
         let refs = crate::uncompressed_header_tail::ALTREF_FRAME + 1;
+        // r464 — an EMPTY `local_warp_params` is the lazily
+        // materialised all-zero grid (no WARPED_CAUSAL leaf stamped a
+        // fit yet; every read below sees 0).
         if wc.motion_modes.len() < cells
-            || wc.local_warp_params.len() < cells * 6
+            || (!wc.local_warp_params.is_empty() && wc.local_warp_params.len() < cells * 6)
             || wc.local_warp_valid.len() < cells
             || wc.y_modes.len() < cells
             || wc.gm_types.len() < refs
@@ -7307,14 +7310,8 @@ pub(crate) fn reconstruct_inter_leaf_at(
             return None;
         }
         let lw_base = origin * 6;
-        let lwp: [i32; 6] = [
-            wc.local_warp_params[lw_base],
-            wc.local_warp_params[lw_base + 1],
-            wc.local_warp_params[lw_base + 2],
-            wc.local_warp_params[lw_base + 3],
-            wc.local_warp_params[lw_base + 4],
-            wc.local_warp_params[lw_base + 5],
-        ];
+        let lw_at = |k: usize| wc.local_warp_params.get(lw_base + k).copied().unwrap_or(0);
+        let lwp: [i32; 6] = [lw_at(0), lw_at(1), lw_at(2), lw_at(3), lw_at(4), lw_at(5)];
         let rf0 = ref_frame0 as usize;
         let gm_base = rf0 * 6;
         let gmp: [i32; 6] = [

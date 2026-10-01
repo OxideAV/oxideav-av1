@@ -4509,7 +4509,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 num_planes,
                 lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
                 max_bits: if cfg.cdef_units { 3 } else { 0 },
-                fast: false,
+                fast: None,
                 threads: 1,
             })
         {
@@ -4716,9 +4716,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
             let Some(plan) =
                 crate::encoder::lr_elect::elect_lr(&crate::encoder::lr_elect::LrElectInput {
                     input: lr_src,
-                    curr_y: pcy,
-                    curr_u: pcu,
-                    curr_v: pcv,
+                    curr_y: crate::encoder::lr_elect::LrCurr::Full(pcy),
+                    curr_u: crate::encoder::lr_elect::LrCurr::Full(pcu),
+                    curr_v: crate::encoder::lr_elect::LrCurr::Full(pcv),
                     cdef_y: &recon.y,
                     cdef_u: &recon.u,
                     cdef_v: &recon.v,
@@ -4744,6 +4744,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                         .superres
                         .map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
                     threads: 1,
+                    wiener_rounds: 2,
                 })
             else {
                 continue;
@@ -4781,9 +4782,9 @@ pub(crate) fn encode_inter_frame_generic_gm(
             let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                 &plan,
                 lr_src,
-                pcy,
-                pcu,
-                pcv,
+                crate::encoder::lr_elect::LrCurr::Full(pcy),
+                crate::encoder::lr_elect::LrCurr::Full(pcu),
+                crate::encoder::lr_elect::LrCurr::Full(pcv),
                 &mut recon.y,
                 &mut recon.u,
                 &mut recon.v,
@@ -8491,7 +8492,7 @@ fn encode_inter_leaf_residual(
     } else {
         segment_id
     };
-    block.residual_quant = residual_quant;
+    block.residual_quant = residual_quant.into();
     block.residual_tx_type = luma_tx_types;
     if !lossless && skip == 0 && b_size > crate::cdf::BLOCK_4X4 {
         // §5.11.16 var-tx arm: one uniform tree per max-TU position
