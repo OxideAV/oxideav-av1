@@ -472,9 +472,9 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     let height = params
         .height
         .ok_or_else(|| CoreError::invalid("oxideav-av1: encoder needs height"))?;
-    let pf = params
-        .pixel_format
-        .ok_or_else(|| CoreError::invalid("oxideav-av1: encoder needs pixel_format"))?;
+    // No declared layout: 8-bit 4:2:0, the Main profile's format and
+    // the layout a pipeline converts to when the source has none.
+    let pf = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
     let (bit_depth, format) = pixel_format_layout(pf).ok_or_else(|| {
         CoreError::invalid(format!("oxideav-av1: unsupported pixel format {pf:?}"))
     })?;
@@ -501,6 +501,7 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     }
     let mut out = params.clone();
     out.codec_id = CodecId::new(CODEC_ID_STR);
+    out.pixel_format = Some(pf);
     out.extradata = Av1CodecConfig::from_sequence_header(&seq).to_bytes();
     let time_base = match params.frame_rate {
         Some(r) if r.num > 0 && r.den > 0 => TimeBase::new(r.den, r.num),
