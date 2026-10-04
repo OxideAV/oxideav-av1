@@ -4,6 +4,12 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/OxideAV/oxideav-av1/compare/v0.1.20...v0.1.21) - 2026-10-04
+
+### Other
+
+- default the pixel format to yuv420p
+
 ## [0.1.20](https://github.com/OxideAV/oxideav-av1/compare/v0.1.19...v0.1.20) - 2026-10-01
 
 ### Other
