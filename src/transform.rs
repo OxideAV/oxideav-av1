@@ -222,11 +222,38 @@ pub fn butterfly_h(t: &mut [i64], a: usize, b: usize, flip: u8, r: u32) {
 /// length-`2^n` array `T` in place via `T[i] = copyT[brev(n, i)]`.
 pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
     let len = 1usize << n;
-    let copy: Vec<i64> = t[..len].to_vec();
-    for i in 0..len {
-        t[i] = copy[brev(n, i as u32) as usize];
+    // r475 — a stack copy + the precomputed bit-reversal table (the
+    // per-call heap copy was 7 % of a 12 MP still decode).
+    let mut copy = [0i64; 64];
+    copy[..len].copy_from_slice(&t[..len]);
+    let table = &BREV_TABLE[n.min(6) as usize];
+    for (i, slot) in t.iter_mut().take(len).enumerate() {
+        *slot = copy[table[i] as usize];
     }
 }
+
+/// `brev( n, i )` for `n ∈ 0..=6`, `i < 1 << n` — the §7.13.2.2 bit
+/// reversal the DCT permutation step indexes by.
+const BREV_TABLE: [[u8; 64]; 7] = {
+    let mut table = [[0u8; 64]; 7];
+    let mut n = 0;
+    while n < 7 {
+        let len = 1usize << n;
+        let mut i = 0;
+        while i < len {
+            let mut t = 0u32;
+            let mut b = 0;
+            while b < n {
+                t += ((i as u32 >> b) & 1) << (n - 1 - b);
+                b += 1;
+            }
+            table[n][i] = t as u8;
+            i += 1;
+        }
+        n += 1;
+    }
+    table
+};
 
 /// §7.13.2.3 inverse DCT process for arrays of length `2^n` with
 /// `2 <= n <= 6` (av1-spec p.297-300). Performs the §7.13.2.2
@@ -735,16 +762,26 @@ pub fn inverse_transform_2d(
     let col_clamp_range = core::cmp::max(bit_depth + 6, 16);
 
     let mut residual = vec![0i64; w * h];
-    // Row transforms.
-    let mut tbuf = vec![0i64; w];
+    // Row transforms. r475 — stack scratch (the per-call heap buffers
+    // were measurable at 12 MP), and an all-zero input row is left as
+    // the all-zero output row it transforms to (every §7.13.2 kernel
+    // maps zeros to zeros and `Round2( 0, n ) == 0`), which skips the
+    // kernel for the rows past the block's non-zero extent.
+    let mut tbuf = [0i64; 64];
+    let tbuf = &mut tbuf[..w];
     for i in 0..h {
         // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
+        let mut any_nonzero = false;
         for j in 0..w {
             tbuf[j] = if i < 32 && j < 32 {
                 dequant[i * w + j]
             } else {
                 0
             };
+            any_nonzero |= tbuf[j] != 0;
+        }
+        if !any_nonzero {
+            continue;
         }
         // Abs(log2W - log2H) == 1 scaling.
         if log2_w.abs_diff(log2_h) == 1 {
@@ -756,9 +793,9 @@ pub fn inverse_transform_2d(
             // §7.13.3 Lossless row pass: inverse WHT, shift = 2.
             // Only reachable for TX_4X4 (the spec's Lossless
             // constraint).
-            inverse_wht4(&mut tbuf, 2);
+            inverse_wht4(tbuf, 2);
         } else {
-            apply_row_kernel(&mut tbuf, tx_type, log2_w, row_clamp_range);
+            apply_row_kernel(tbuf, tx_type, log2_w, row_clamp_range);
         }
         for j in 0..w {
             residual[i * w + j] = round2(tbuf[j], row_shift);
@@ -771,15 +808,16 @@ pub fn inverse_transform_2d(
         *cell = clip3(lo, hi, *cell);
     }
     // Column transforms.
-    let mut tbuf = vec![0i64; h];
+    let mut tbuf = [0i64; 64];
+    let tbuf = &mut tbuf[..h];
     for j in 0..w {
         for i in 0..h {
             tbuf[i] = residual[i * w + j];
         }
         if lossless {
-            inverse_wht4(&mut tbuf, 0);
+            inverse_wht4(tbuf, 0);
         } else {
-            apply_col_kernel(&mut tbuf, tx_type, log2_h, col_clamp_range);
+            apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
         }
         for i in 0..h {
             residual[i * w + j] = round2(tbuf[i], col_shift);

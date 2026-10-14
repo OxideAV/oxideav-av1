@@ -144,6 +144,16 @@ impl PlaneBuffer<'_> {
     /// The on-screen gate ensures the central edge samples land
     /// inside the buffer; this is a safety net for the wide filter's
     /// outermost taps.
+    /// r475 — the flat index of `(y, x)` when it lies inside the
+    /// buffer, `None` otherwise (the callers' in-range fast paths).
+    #[inline]
+    fn index_or_none(&self, y: i32, x: i32) -> Option<usize> {
+        if y < 0 || x < 0 || y >= self.rows as i32 || x >= self.cols as i32 {
+            return None;
+        }
+        Some((y as usize) * (self.cols as usize) + (x as usize))
+    }
+
     #[inline]
     fn set(&mut self, y: i32, x: i32, v: i32) {
         if y < 0 || x < 0 {
@@ -669,21 +679,35 @@ pub fn filter_mask(
     bit_depth: u8,
 ) -> FilterMaskOutput {
     // Sample reads — av1-spec p.314 lines 17352-17365. Up to 7 either
-    // side; only the wide path reads `p3..p6` / `q3..q6`.
-    let q0 = plane_buf.get(y, x);
-    let q1 = plane_buf.get(y + dy, x + dx);
-    let q2 = plane_buf.get(y + 2 * dy, x + 2 * dx);
-    let q3 = plane_buf.get(y + 3 * dy, x + 3 * dx);
-    let q4 = plane_buf.get(y + 4 * dy, x + 4 * dx);
-    let q5 = plane_buf.get(y + 5 * dy, x + 5 * dx);
-    let q6 = plane_buf.get(y + 6 * dy, x + 6 * dx);
-    let p0 = plane_buf.get(y - dy, x - dx);
-    let p1 = plane_buf.get(y - 2 * dy, x - 2 * dx);
-    let p2 = plane_buf.get(y - 3 * dy, x - 3 * dx);
-    let p3 = plane_buf.get(y - 4 * dy, x - 4 * dx);
-    let p4 = plane_buf.get(y - 5 * dy, x - 5 * dx);
-    let p5 = plane_buf.get(y - 6 * dy, x - 6 * dx);
-    let p6 = plane_buf.get(y - 7 * dy, x - 7 * dx);
+    // side; only the wide path reads `p3..p6` / `q3..q6`. r475 — the
+    // reach is gathered once per `filter_size` (a 4-tap edge touches
+    // `p1..q1` only), directly when the whole reach is inside the
+    // plane and through the clamped `get` otherwise.
+    let reach: i32 = if filter_size >= 16 {
+        7
+    } else if filter_size >= 8 {
+        4
+    } else {
+        2
+    };
+    let mut taps = [0i32; 14];
+    let base = plane_buf.index_or_none(y - reach * dy, x - reach * dx);
+    let end = plane_buf.index_or_none(y + (reach - 1) * dy, x + (reach - 1) * dx);
+    match (base, end) {
+        (Some(base), Some(_)) => {
+            let stride = (dx + dy * plane_buf.cols as i32) as usize;
+            let first = 7 - reach as usize;
+            for k in 0..(2 * reach) as usize {
+                taps[first + k] = plane_buf.samples[base + k * stride];
+            }
+        }
+        _ => {
+            for p in -reach..reach {
+                taps[(p + 7) as usize] = plane_buf.get(y + p * dy, x + p * dx);
+            }
+        }
+    }
+    let [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6] = taps;
     let bd_shift = bit_depth - 8;
     // hevMask — av1-spec p.314 lines 17381-17385.
     let thresh_bd = (thresh as i32) << bd_shift;
@@ -820,19 +844,63 @@ pub fn wide_filter(
         2
     };
     let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
-    // av1-spec p.317 lines 17570-17578.
-    let mut f: Vec<i32> = vec![0; (2 * n) as usize];
-    for (idx, i) in (-n..n).enumerate() {
-        let mut t: i64 = 0;
-        for j in -n..=n {
-            let p = clip3_i32(-(n + 1), n, i + j);
-            let tap: i64 = if j.unsigned_abs() as i32 <= n2 { 2 } else { 1 };
-            t += plane_buf.get(y + p * dy, x + p * dx) as i64 * tap;
+    // r475 — gather the `p[-(n+1)..=n]` taps once (clamped reads at
+    // the plane edge exactly as the per-tap `get` did), run the
+    // §7.14.6.4 sums in `i32` (at most 14 taps of weight ≤ 2 on
+    // 12-bit samples) and write the `2n` outputs back. The per-call
+    // heap buffer and the 13-fold re-reads were 15 % of a 12 MP
+    // still decode.
+    let mut taps = [0i32; 14];
+    let base = plane_buf.index_or_none(y - (n + 1) * dy, x - (n + 1) * dx);
+    let end = plane_buf.index_or_none(y + n * dy, x + n * dx);
+    let stride = (dx + dy * plane_buf.cols as i32) as usize;
+    match (base, end) {
+        (Some(base), Some(_)) => {
+            for (k, slot) in taps.iter_mut().take((2 * n + 2) as usize).enumerate() {
+                *slot = plane_buf.samples[base + k * stride];
+            }
         }
-        f[idx] = round2_i64(t, log2_size) as i32;
+        _ => {
+            for (k, slot) in taps.iter_mut().take((2 * n + 2) as usize).enumerate() {
+                let p = k as i32 - (n + 1);
+                *slot = plane_buf.get(y + p * dy, x + p * dx);
+            }
+        }
     }
+    // av1-spec p.317 lines 17570-17578: `F[ i ] = Round2( Σ_{j=-n..n}
+    // tap( j ) · p[ Clip3( -(n+1), n, i + j ) ], log2Size )` with
+    // `tap( j ) = 2` for `|j| <= n2`, else `1`. r475 — the same
+    // integer sum as a sliding window: the unit-weight window
+    // `Σ_{j=-n..n} p[ Clip3( .., i + j ) ]` advances by one clamped
+    // sample per output, and the `|j| <= n2` taps add their second
+    // copy. Integer addition is associative, so the sums — and the
+    // rounded outputs — are the spec's, at a fraction of the 13 × 12
+    // multiplies.
+    let tap_at = |k: i32| taps[(clip3_i32(-(n + 1), n, k) + n + 1) as usize];
+    let mut window: i32 = 0;
+    for j in -n..=n {
+        window += tap_at(-n + j);
+    }
+    let mut f = [0i32; 12];
     for (idx, i) in (-n..n).enumerate() {
-        plane_buf.set(y + i * dy, x + i * dx, f[idx]);
+        if i > -n {
+            window += tap_at(i + n) - tap_at(i - 1 - n);
+        }
+        let mut t = window;
+        for j in -n2..=n2 {
+            t += tap_at(i + j);
+        }
+        f[idx] = round2_i32(t, log2_size);
+    }
+    if let Some(base) = base {
+        let first = base + stride;
+        for (idx, _) in (-n..n).enumerate() {
+            plane_buf.samples[first + idx * stride] = f[idx];
+        }
+    } else {
+        for (idx, i) in (-n..n).enumerate() {
+            plane_buf.set(y + i * dy, x + i * dx, f[idx]);
+        }
     }
 }
 
@@ -894,18 +962,6 @@ fn round2_i32(x: i32, n: u32) -> i32 {
         x
     } else {
         (x + (1 << (n - 1))) >> n
-    }
-}
-
-/// `Round2(x, n)` for `i64` accumulators — used by [`wide_filter`]
-/// where the sum-of-taps stays in `i64` to avoid overflow for the
-/// 14-tap luma path.
-#[inline]
-fn round2_i64(x: i64, n: u32) -> i64 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1i64 << (n - 1))) >> n
     }
 }
 

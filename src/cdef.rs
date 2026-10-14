@@ -406,11 +406,18 @@ pub fn cdef_direction(
     let shift = ctx.bit_depth as i32 - 8;
     // av1-spec p.321 lines 17756-17768: per-pixel projection-sum
     // accumulator across the 8×8 luma block.
+    let cols = plane0.cols as usize;
+    let inside = x0 >= 0 && y0 >= 0 && x0 + 8 <= plane0.cols as i32 && y0 + 8 <= plane0.rows as i32;
     for i in 0..8i32 {
         for j in 0..8i32 {
-            let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
-            let sy = (y0 + i).clamp(0, plane0.rows as i32 - 1) as usize;
-            let raw = plane0.samples[sy * (plane0.cols as usize) + sx];
+            // r475 — the clamps are the identity for an interior block.
+            let raw = if inside {
+                plane0.samples[(y0 + i) as usize * cols + (x0 + j) as usize]
+            } else {
+                let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
+                let sy = (y0 + i).clamp(0, plane0.rows as i32 - 1) as usize;
+                plane0.samples[sy * cols + sx]
+            };
             let x = (raw >> shift) - 128;
             partial[0][(i + j) as usize] += x;
             partial[1][(i + j / 2) as usize] += x;
@@ -551,6 +558,48 @@ pub fn cdef_filter_block(
     let dir_s1 = ((dir + 2) & 7) as usize;
     let src_cols = src.cols as usize;
     let dst_cols = dst.cols as usize;
+    // r475 — interior fast path: when the block and its 2-sample tap
+    // reach (`Cdef_Directions` offsets are at most 2) lie inside the
+    // plane, every `CdefAvailable` test is true, so each tap of a
+    // sample row is the contiguous source run at a fixed offset and
+    // the §7.15.3 sums run branch-free across the row (same integer
+    // sums, same min / max — the output is identical to the general
+    // path below, which keeps the per-sample availability test for
+    // the picture-edge blocks). 32 % of a 12 MP still decode was the
+    // general path.
+    if y0 >= 2 && x0 >= 2 && y0 + h + 2 <= plane_h && x0 + w + 2 <= plane_w {
+        let mut taps = [CdefTap::default(); 12];
+        let mut n = 0;
+        for k in 0..2usize {
+            for sign in [-1i32, 1i32] {
+                let (dy, dx) = (CDEF_DIRECTIONS[dir_p][k][0], CDEF_DIRECTIONS[dir_p][k][1]);
+                taps[n] = CdefTap {
+                    offset: (sign * dy) as isize * src_cols as isize + (sign * dx) as isize,
+                    weight: pri_taps[k],
+                    strength: pri_str,
+                    adj: pri_adj.min(31),
+                };
+                n += 1;
+                for d2 in [dir_s0, dir_s1] {
+                    let (dy, dx) = (CDEF_DIRECTIONS[d2][k][0], CDEF_DIRECTIONS[d2][k][1]);
+                    taps[n] = CdefTap {
+                        offset: (sign * dy) as isize * src_cols as isize + (sign * dx) as isize,
+                        weight: sec_taps[k],
+                        strength: sec_str,
+                        adj: sec_adj.min(31),
+                    };
+                    n += 1;
+                }
+            }
+        }
+        let geom = (y0 as usize, x0 as usize, h as usize, src_cols, dst_cols);
+        if w == 8 {
+            cdef_filter_rows::<8>(src.samples, dst.samples, geom, &taps);
+        } else {
+            cdef_filter_rows::<4>(src.samples, dst.samples, geom, &taps);
+        }
+        return;
+    }
     // §7.15.1 is_inside_filter_region (av1-spec p.103 §5.11.52) checks
     // the candidate position against `(0, 0)..(MiRows, MiCols)` in
     // 4×4 units. For the per-plane filter that's equivalent to
@@ -605,6 +654,65 @@ pub fn cdef_filter_block(
 }
 
 /// [`constrain`] with the `dampingAdj` term precomputed by the caller.
+/// r475 — one §7.15.3 tap of the interior fast path: the source
+/// offset of the tap row relative to the centre row, the
+/// `Cdef_Pri_Taps` / `Cdef_Sec_Taps` weight, the strength and the
+/// hoisted `dampingAdj` (clamped to 31 so the shift is total).
+#[derive(Clone, Copy, Default)]
+struct CdefTap {
+    offset: isize,
+    weight: i32,
+    strength: i32,
+    adj: i32,
+}
+
+/// r475 — the §7.15.3 filter over an interior `W × h` block whose
+/// every tap is inside the plane (`CdefAvailable == 1` throughout):
+/// per sample row, each tap is the contiguous source run at
+/// `offset`, and the twelve `constrain` terms, the min / max
+/// envelope and the final `Clip3` run branch-free across the row.
+/// `constrain` with a zero threshold is `Min( Abs( diff ), Max( 0 -
+/// shifted, 0 ) ) = 0`, so a zero-strength tap needs no special
+/// arm — it still widens the envelope, as the spec's `CdefAvailable`
+/// path does. Integer sums in any order are the spec's sums.
+#[inline(always)]
+fn cdef_filter_rows<const W: usize>(
+    src: &[i32],
+    dst: &mut [i32],
+    (y0, x0, h, src_cols, dst_cols): (usize, usize, usize, usize, usize),
+    taps: &[CdefTap; 12],
+) {
+    for i in 0..h {
+        let row0 = (y0 + i) * src_cols + x0;
+        let centre: [i32; W] = src[row0..row0 + W].try_into().expect("W-wide run");
+        let mut sum = [0i32; W];
+        let mut max_v = centre;
+        let mut min_v = centre;
+        for tap in taps {
+            let start = (row0 as isize + tap.offset) as usize;
+            let tap_row: [i32; W] = src[start..start + W].try_into().expect("W-wide run");
+            let (weight, strength, adj) = (tap.weight, tap.strength, tap.adj);
+            for j in 0..W {
+                let p_val = tap_row[j];
+                let diff = p_val - centre[j];
+                let abs_diff = diff.abs();
+                let v = abs_diff.min((strength - (abs_diff >> adj)).max(0));
+                let sgn = diff >> 31;
+                sum[j] += weight * ((v ^ sgn) - sgn);
+                max_v[j] = max_v[j].max(p_val);
+                min_v[j] = min_v[j].min(p_val);
+            }
+        }
+        let drow = (y0 + i) * dst_cols + x0;
+        let out_row = &mut dst[drow..drow + W];
+        for j in 0..W {
+            let s = sum[j];
+            let delta = (8 + s - i32::from(s < 0)) >> 4;
+            out_row[j] = clip3(min_v[j], max_v[j], centre[j] + delta);
+        }
+    }
+}
+
 #[inline]
 fn constrain_adj(diff: i32, threshold: i32, damping_adj: i32) -> i32 {
     if threshold == 0 {

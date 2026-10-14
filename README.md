@@ -1996,6 +1996,7 @@ the previous one and to two black-box reference decoders.
 | Step | Threads | Wall | Peak RSS | Stage split (ms) |
 |---|---|---|---|---|
 | r474 (0.1.20) | 1 | 0.640 s | 320 MiB | parse 0 · tiles 190 · deblock 164 · CDEF 225 · LR 55 · store 1 · output 1 |
+| hot loops: interior CDEF kernel, sliding-window wide filter, stack DCT scratch | 1 | 0.361 s | 320 MiB | tiles 128 · deblock 81 · CDEF 82 · LR 51 |
 
 ## Module layout
 
