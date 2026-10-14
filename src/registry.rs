@@ -236,6 +236,13 @@ impl Decoder for Av1Decoder {
         self.eof = false;
         Ok(())
     }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        // r475 — the worker budget: a multi-tile intra frame walks its
+        // tiles `threads`-wide and the post-filters run by row band,
+        // byte-identical to the serial decode for any budget.
+        self.session.set_threads(ctx.threads.max(1));
+    }
 }
 
 /// Convert a decoded [`SpecFrame`] into an `oxideav-core`

@@ -14248,6 +14248,9 @@ impl PartitionWalker {
         if self.blocks != other.blocks {
             out.push("blocks");
         }
+        if self.lr_origin != other.lr_origin {
+            out.push("lr_origin");
+        }
         if self.curr_frame != other.curr_frame {
             out.push("curr_frame");
         }
@@ -16150,6 +16153,11 @@ pub struct PartitionWalker {
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
+    /// r475 — the frame-level mi origin of a TILE-SIZED walker (the
+    /// tile at the origin of its own frame): §5.11.57 `read_lr`
+    /// indexes the frame's restoration-unit grid at `( r + row, c +
+    /// col )`. `(0, 0)` for a frame-scope walker.
+    lr_origin: (u32, u32),
     /// `CurrFrame[ plane ][ y ][ x ]` (av1-spec §7.12.3 step-3 / §7.11.x
     /// prediction kernels / §7.14 loop filter / §7.15 CDEF / §7.16
     /// upscaling / §7.17 loop restoration). Three per-plane sample
@@ -16922,6 +16930,7 @@ impl PartitionWalker {
             interintra_wedge_indices,
             motion_modes,
             blocks: Vec::new(),
+            lr_origin: (0, 0),
             // §7.12.3 step-3 `CurrFrame[plane]` buffers — allocated
             // lazily on the first per-plane merge call (see
             // [`Self::ensure_curr_frame_plane`]).
@@ -16964,6 +16973,123 @@ impl PartitionWalker {
     /// single-tile decode never needs to call this; multi-tile decodes
     /// (or a re-used walker) call it at each tile's entry to reset the
     /// running subexp references the §5.11.58 `read_lr_unit` reads.
+    /// r475 — declare this walker TILE-SIZED at frame mi origin
+    /// `(mi_row, mi_col)`: §5.11.57 `read_lr` then indexes the
+    /// frame's restoration-unit grid from that origin (the grid
+    /// itself keeps the frame's unit extents, which `LrParams`
+    /// carries). Every other §5.11 process is tile-scoped by the
+    /// spec, so the walk is the frame walk's.
+    pub fn set_lr_origin(&mut self, mi_row: u32, mi_col: u32) {
+        self.lr_origin = (mi_row, mi_col);
+    }
+
+    /// r475 — stitch a tile-sized walker's `CurrFrame[ plane ]` planes
+    /// into this frame-scope walker's planes at frame mi position
+    /// `(dst_row4, dst_col4)` (the planes are allocated at the frame
+    /// extent on first use). Tile boundaries are superblock aligned,
+    /// so the chroma rect origin is exact under any subsampling.
+    pub(crate) fn import_curr_frame_rect_from(
+        &mut self,
+        src: &Self,
+        dst_row4: u32,
+        dst_col4: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) {
+        for plane in 0..3usize {
+            let Some(sp) = src.curr_frame[plane].as_ref() else {
+                continue;
+            };
+            let (ssx, ssy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> ssy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> ssx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+            let Some(dp) = self.curr_frame[plane].as_mut() else {
+                continue;
+            };
+            let y0 = ((dst_row4 * (MI_SIZE as u32)) >> ssy) as usize;
+            let x0 = ((dst_col4 * (MI_SIZE as u32)) >> ssx) as usize;
+            let w = (sp.cols as usize).min((dp.cols as usize).saturating_sub(x0));
+            let h = (sp.rows as usize).min((dp.rows as usize).saturating_sub(y0));
+            let (sc, dc) = (sp.cols as usize, dp.cols as usize);
+            for y in 0..h {
+                dp.samples[(y0 + y) * dc + x0..(y0 + y) * dc + x0 + w]
+                    .copy_from_slice(&sp.samples[y * sc..y * sc + w]);
+            }
+        }
+    }
+
+    /// r475 — import the §5.11.58 restoration units a tile-sized
+    /// walker decoded for the frame mi rect `[ mi_row0, mi_row1 ) ×
+    /// [ mi_col0, mi_col1 )`: the unit ranges the §5.11.57 window
+    /// arithmetic visits over that rect (the union over its
+    /// superblocks — `div_ceil` is monotone, so the union is one
+    /// range per axis).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_lr_units_from(
+        &mut self,
+        src: &Self,
+        mi_row0: u32,
+        mi_row1: u32,
+        mi_col0: u32,
+        mi_col1: u32,
+        params: &LrParams,
+    ) {
+        for plane in 0..params.num_planes.min(3) {
+            if params.frame_restoration_type[plane] == RESTORE_NONE {
+                continue;
+            }
+            let Some(sg) = src.lr_units[plane].as_ref() else {
+                continue;
+            };
+            let sub_x = if plane == 0 { 0 } else { params.subsampling_x };
+            let sub_y = if plane == 0 { 0 } else { params.subsampling_y };
+            let unit_size = params.loop_restoration_size[plane];
+            if unit_size == 0 {
+                continue;
+            }
+            let needs_alloc = match self.lr_units.get(plane).and_then(Option::as_ref) {
+                Some(g) => g.unit_rows != sg.unit_rows || g.unit_cols != sg.unit_cols,
+                None => true,
+            };
+            if needs_alloc {
+                self.lr_units[plane] = Some(LrUnitGrid {
+                    unit_rows: sg.unit_rows,
+                    unit_cols: sg.unit_cols,
+                    units: vec![LrUnit::NONE; (sg.unit_rows as usize) * (sg.unit_cols as usize)],
+                });
+            }
+            let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
+            let row_start = (mi_row0 * mi_size_shift_y).div_ceil(unit_size);
+            let row_end = core::cmp::min(
+                sg.unit_rows,
+                (mi_row1 * mi_size_shift_y).div_ceil(unit_size),
+            );
+            let mi_size_shift_x = (MI_SIZE as u32) >> sub_x;
+            let (numerator, denominator) = if params.use_superres {
+                (
+                    mi_size_shift_x * params.superres_denom,
+                    unit_size * SUPERRES_NUM,
+                )
+            } else {
+                (mi_size_shift_x, unit_size)
+            };
+            let col_start = (mi_col0 * numerator).div_ceil(denominator);
+            let col_end = core::cmp::min(sg.unit_cols, (mi_col1 * numerator).div_ceil(denominator));
+            let Some(dg) = self.lr_units[plane].as_mut() else {
+                continue;
+            };
+            for ur in row_start..row_end {
+                for uc in col_start..col_end {
+                    let idx = (ur as usize) * (sg.unit_cols as usize) + uc as usize;
+                    if let (Some(d), Some(&v)) = (dg.units.get_mut(idx), sg.units.get(idx)) {
+                        *d = v;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn reset_lr_refs(&mut self) {
         self.ref_lr_wiener = [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3];
         self.ref_sgr_xqd = [crate::loop_restoration::SGRPROJ_XQD_MID; 3];
@@ -20587,6 +20713,9 @@ impl PartitionWalker {
                     units,
                 });
             }
+            // r475 — a tile-sized walker addresses the frame's unit
+            // grid from its origin.
+            let (r, c) = (r + self.lr_origin.0, c + self.lr_origin.1);
             let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
             let unit_row_start = (r * mi_size_shift_y).div_ceil(unit_size);
             let unit_row_end =
@@ -20748,6 +20877,151 @@ impl PartitionWalker {
             subsampling_y,
             |ctx| crate::cdef::cdef_frame_in_place(ctx, planes),
         );
+    }
+
+    /// r475 — [`Self::cdef_frame_in_place_from_idx`] `threads`-wide:
+    /// the 64-luma-row bands are filtered in waves of `threads`; a
+    /// wave first copies every band's source window (the band ± 2
+    /// unfiltered rows — §7.15.3 `cdef_get_at` reaches at most 2
+    /// samples, bounded by §5.11.52) and the two rows the next wave's
+    /// first band will need from this wave's last band, then filters
+    /// the bands concurrently, each into its own row window. Byte-
+    /// identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cdef_frame_parallel_from_idx(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        threads: usize,
+    ) {
+        use crate::cdef::{cdef_band_in_place, CdefSrc};
+        use crate::loop_filter::{row_windows_mut, run_jobs, PlaneBuffer};
+        const BAND_MI: u32 = 16;
+        const HALO: usize = 2;
+        let num_planes = num_planes.min(planes.len() as u8) as usize;
+        if num_planes == 0 {
+            return;
+        }
+        let dims: Vec<(usize, usize)> = planes
+            .iter()
+            .map(|p| (p.rows as usize, p.cols as usize))
+            .collect();
+        // Bands: mi rows `[ r0, r1 )`.
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        let mut r = 0u32;
+        while r < self.mi_rows {
+            let r1 = (r + BAND_MI).min(self.mi_rows);
+            bands.push((r, r1));
+            r = r1;
+        }
+        let plane_rows = |plane: usize, r: u32| -> usize {
+            let sub_y = if plane == 0 {
+                0
+            } else {
+                u32::from(subsampling_y)
+            };
+            (((r * MI_SIZE as u32) >> sub_y) as usize).min(dims[plane].0)
+        };
+        // Unfiltered rows `[ by0 - 2, by0 )` of the next wave's first band.
+        let mut carry: Vec<Vec<i32>> = vec![Vec::new(); num_planes];
+        for wave in bands.chunks(threads.max(1)) {
+            // Copy phase: source windows per (band, plane).
+            let mut windows: Vec<Vec<(Vec<i32>, usize)>> = Vec::with_capacity(wave.len());
+            for (k, &(r0, r1)) in wave.iter().enumerate() {
+                let mut per_plane = Vec::with_capacity(num_planes);
+                for (plane, pb) in planes.iter().enumerate().take(num_planes) {
+                    let (rows, cols) = dims[plane];
+                    let (by0, by1) = (plane_rows(plane, r0), plane_rows(plane, r1));
+                    let new0 = by0.saturating_sub(HALO);
+                    let new1 = (by1 + HALO).min(rows);
+                    let mut win: Vec<i32> = Vec::with_capacity((new1 - new0) * cols);
+                    if k == 0 && by0 >= HALO && !carry[plane].is_empty() {
+                        win.extend_from_slice(&carry[plane]);
+                        win.extend_from_slice(&pb.samples[by0 * cols..new1 * cols]);
+                    } else {
+                        win.extend_from_slice(&pb.samples[new0 * cols..new1 * cols]);
+                    }
+                    per_plane.push((win, new0));
+                }
+                windows.push(per_plane);
+            }
+            let &(_, last_r1) = wave.last().expect("non-empty wave");
+            for (plane, pb) in planes.iter().enumerate().take(num_planes) {
+                let cols = dims[plane].1;
+                let by1 = plane_rows(plane, last_r1);
+                let c = &mut carry[plane];
+                c.clear();
+                if by1 >= HALO {
+                    c.extend_from_slice(&pb.samples[(by1 - HALO) * cols..by1 * cols]);
+                }
+            }
+            // Filter phase: disjoint band windows per plane.
+            let mut per_plane_windows: Vec<Vec<&mut [i32]>> = Vec::with_capacity(num_planes);
+            let mut per_plane_row0: Vec<Vec<usize>> = Vec::with_capacity(num_planes);
+            for (plane, pb) in planes.iter_mut().enumerate().take(num_planes) {
+                let cols = dims[plane].1;
+                let ranges: Vec<(usize, usize)> = wave
+                    .iter()
+                    .map(|&(r0, r1)| (plane_rows(plane, r0), plane_rows(plane, r1)))
+                    .collect();
+                per_plane_row0.push(ranges.iter().map(|&(a, _)| a).collect());
+                per_plane_windows.push(row_windows_mut(pb.samples, cols, &ranges));
+            }
+            // Transpose into per-band plane sets.
+            let mut band_sets: Vec<Vec<&mut [i32]>> = (0..wave.len()).map(|_| Vec::new()).collect();
+            for plane_wins in per_plane_windows.into_iter() {
+                for (k, w) in plane_wins.into_iter().enumerate() {
+                    band_sets[k].push(w);
+                }
+            }
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(wave.len());
+            for ((k, &(r0, r1)), (set, srcs_owned)) in wave
+                .iter()
+                .enumerate()
+                .zip(band_sets.into_iter().zip(windows.iter()))
+            {
+                let dims = &dims;
+                let per_plane_row0 = &per_plane_row0;
+                let job = move || {
+                    let mut srcs = [None, None, None];
+                    for (plane, slot) in srcs.iter_mut().enumerate().take(num_planes) {
+                        let (win, row0) = &srcs_owned[plane];
+                        *slot = Some(CdefSrc {
+                            samples: win,
+                            cols: dims[plane].1,
+                            row0: *row0,
+                            plane_rows: dims[plane].0,
+                            plane_cols: dims[plane].1,
+                        });
+                    }
+                    let mut dst_row0 = [0usize; 3];
+                    let mut dsts: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                    for (plane, win) in set.into_iter().enumerate() {
+                        let cols = dims[plane].1;
+                        dst_row0[plane] = per_plane_row0[plane][k];
+                        dsts.push(PlaneBuffer {
+                            rows: (win.len() / cols.max(1)) as u32,
+                            cols: cols as u32,
+                            samples: win,
+                        });
+                    }
+                    self.with_cdef_ctx(
+                        cdef_params,
+                        num_planes as u8,
+                        bit_depth,
+                        subsampling_x,
+                        subsampling_y,
+                        |ctx| cdef_band_in_place(ctx, &srcs, &mut dsts, dst_row0, r0, r1),
+                    );
+                };
+                jobs.push(Box::new(job));
+            }
+            run_jobs(threads, jobs);
+        }
     }
 
     /// The §7.15 frame context over this walker's `cdef_idx[]` /
@@ -20929,7 +21203,150 @@ impl PartitionWalker {
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
-        use crate::loop_filter::{loop_filter_rows, LoopFilterFrameContext};
+        self.with_lf_ctx(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            |ctx| crate::loop_filter::loop_filter_rows(ctx, planes, mi_row_start, mi_row_end),
+        );
+    }
+
+    /// r475 — [`Self::loop_filter_frame_from_grid`] `threads`-wide by
+    /// 64-luma-row bands ([`crate::loop_filter::loop_filter_rows_window`]
+    /// states the independence the split relies on): per plane, pass
+    /// 0 over every band at once, then pass 1 over the even bands
+    /// (each on a window with 7-row skirts) and then the odd ones, so
+    /// the windows of concurrently filtered bands never overlap. Byte-
+    /// identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_filter_frame_parallel_from_grid(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        threads: usize,
+    ) {
+        use crate::loop_filter::{loop_filter_rows_window, row_windows_mut, run_jobs, PlaneBuffer};
+        const BAND_MI: u32 = 16;
+        const SKIRT: usize = 7;
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            if plane > 0 && lf_params.loop_filter_level[(1 + plane) as usize] == 0 {
+                continue;
+            }
+            let sub_y = if plane == 0 {
+                0
+            } else {
+                u32::from(subsampling_y)
+            };
+            let pb = &mut planes[plane as usize];
+            let (rows, cols) = (pb.rows as usize, pb.cols as usize);
+            // Band `k`: mi rows `[16k, 16k + 16)`, plane rows `[by0, by1)`.
+            let mut bands: Vec<(u32, u32, usize, usize)> = Vec::new();
+            let mut r = 0u32;
+            while r < self.mi_rows {
+                let r1 = (r + BAND_MI).min(self.mi_rows);
+                let by0 = (((r * MI_SIZE as u32) >> sub_y) as usize).min(rows);
+                let by1 = (((r1 * MI_SIZE as u32) >> sub_y) as usize).min(rows);
+                if by1 > by0 {
+                    bands.push((r, r1, by0, by1));
+                }
+                r = r1;
+            }
+            let run_phase = |pb: &mut PlaneBuffer<'_>, pass: u8, parity: Option<usize>| {
+                let selected: Vec<(u32, u32, usize, usize)> = bands
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| match parity {
+                        None => true,
+                        Some(p) => k % 2 == p,
+                    })
+                    .map(|(_, b)| *b)
+                    .collect();
+                let ranges: Vec<(usize, usize)> = selected
+                    .iter()
+                    .map(|&(_, _, by0, by1)| {
+                        if pass == 0 {
+                            (by0, by1)
+                        } else {
+                            (by0.saturating_sub(SKIRT), (by1 + SKIRT).min(rows))
+                        }
+                    })
+                    .collect();
+                let windows = row_windows_mut(pb.samples, cols, &ranges);
+                let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> =
+                    Vec::with_capacity(windows.len());
+                for (win, (&(mi0, mi1, _, _), &(w0, w1))) in
+                    windows.into_iter().zip(selected.iter().zip(ranges.iter()))
+                {
+                    let f = move || {
+                        self.with_lf_ctx(
+                            lf_params,
+                            seg_params,
+                            delta_lf_multi,
+                            num_planes,
+                            bit_depth,
+                            subsampling_x,
+                            subsampling_y,
+                            frame_width,
+                            frame_height,
+                            |ctx| {
+                                let mut window = PlaneBuffer {
+                                    rows: (w1 - w0) as u32,
+                                    cols: cols as u32,
+                                    samples: win,
+                                };
+                                loop_filter_rows_window(
+                                    ctx,
+                                    plane,
+                                    pass,
+                                    &mut window,
+                                    w0 as u32,
+                                    mi0,
+                                    mi1,
+                                );
+                            },
+                        );
+                    };
+                    jobs.push(Box::new(f));
+                }
+                run_jobs(threads, jobs);
+            };
+            run_phase(pb, 0, None);
+            run_phase(pb, 1, Some(0));
+            run_phase(pb, 1, Some(1));
+        }
+    }
+
+    /// The §7.14 frame context over this walker's grids, handed to `f`.
+    #[allow(clippy::too_many_arguments)]
+    fn with_lf_ctx(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        f: impl FnOnce(&crate::loop_filter::LoopFilterFrameContext<'_>),
+    ) {
+        use crate::loop_filter::LoopFilterFrameContext;
         let ctx = LoopFilterFrameContext {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
@@ -21007,7 +21424,7 @@ impl PartitionWalker {
             // §7.14.2 line 17065: `MiSizes[ row ][ col ]`.
             mi_size: &|r, c| self.mi_size_at(r as i32, c as i32),
         };
-        loop_filter_rows(&ctx, planes, mi_row_start, mi_row_end);
+        f(&ctx);
     }
 
     /// Reconstruct `LoopfilterTxSizes[ plane ][ subRow ][ subCol ]` from
@@ -21157,6 +21574,91 @@ impl PartitionWalker {
             upscaled_width,
             |ctx| crate::loop_restoration::loop_restoration_frame_in_place(ctx, planes, boundary),
         );
+    }
+
+    /// r475 — [`Self::loop_restore_frame_in_place_from_grid`]
+    /// `threads`-wide: §7.17.6 reads CDEF samples only inside the
+    /// unit's own stripe and pre-CDEF samples only at the stripe's
+    /// skirts (the captured `boundary` rows), and a unit writes only
+    /// its own rectangle — so the stripes of a plane restore
+    /// concurrently, each from its own copy into its own row window.
+    /// Byte-identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_restore_frame_parallel_from_grid(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows],
+        threads: usize,
+    ) {
+        use crate::loop_filter::{row_windows_mut, run_jobs, PlaneBuffer};
+        use crate::loop_restoration::{plane_stripes, restore_stripe_in_place, PlaneStripe};
+        if !lr_params.uses_lr {
+            return;
+        }
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            let Some(bnd) = boundary.get(plane as usize) else {
+                continue;
+            };
+            let mut stripes: Vec<PlaneStripe> = Vec::new();
+            self.with_lr_ctx(
+                lr_params,
+                num_planes,
+                bit_depth,
+                subsampling_x,
+                subsampling_y,
+                mi_rows,
+                mi_cols,
+                frame_height,
+                upscaled_width,
+                |ctx| stripes = plane_stripes(ctx, plane),
+            );
+            if stripes.is_empty() {
+                continue;
+            }
+            let pb = &mut planes[plane as usize];
+            let cols = pb.cols as usize;
+            let ranges: Vec<(usize, usize)> = stripes.iter().map(|s| (s.y0, s.y1)).collect();
+            let windows = row_windows_mut(pb.samples, cols, &ranges);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(windows.len());
+            for (win, stripe) in windows.into_iter().zip(stripes.iter()) {
+                let job = move || {
+                    let mut out = PlaneBuffer {
+                        rows: (stripe.y1 - stripe.y0) as u32,
+                        cols: cols as u32,
+                        samples: win,
+                    };
+                    let mut copy = Vec::new();
+                    self.with_lr_ctx(
+                        lr_params,
+                        num_planes,
+                        bit_depth,
+                        subsampling_x,
+                        subsampling_y,
+                        mi_rows,
+                        mi_cols,
+                        frame_height,
+                        upscaled_width,
+                        |ctx| {
+                            restore_stripe_in_place(
+                                ctx, plane, stripe, bnd, &mut out, stripe.y0, &mut copy,
+                            )
+                        },
+                    );
+                };
+                jobs.push(Box::new(job));
+            }
+            run_jobs(threads, jobs);
+        }
     }
 
     /// The §7.17 frame context over this walker's §5.11.58 unit grid,

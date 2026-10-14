@@ -1998,6 +1998,25 @@ the previous one and to two black-box reference decoders.
 | r474 (0.1.20) | 1 | 0.640 s | 320 MiB | parse 0 · tiles 190 · deblock 164 · CDEF 225 · LR 55 · store 1 · output 1 |
 | hot loops: interior CDEF kernel, sliding-window wide filter, stack DCT scratch | 1 | 0.361 s | 320 MiB | tiles 128 · deblock 81 · CDEF 82 · LR 51 |
 | buffers: in-place CDEF (rolling window) + in-place LR (stripe copy + boundary rows), walker released before output, no output clone, still-header store skip | 1 | 0.344 s | 188 MiB (AVIF `reduced_still_picture_header`: 179 MiB, peak live 156 MiB) | tiles 129 · deblock 83 · CDEF 72 · LR 42 |
+| threads: tile-parallel intra walk + band-parallel deblock / CDEF / LR (tiled AVIF payload, 4 tiles) | 1 | 0.312 s | 181 MiB (peak live 156 MiB) | tiles 143 · deblock 101 · CDEF 49 |
+| | 2 | 0.186 s | peak live 202 MiB | tiles 88 · deblock 52 · CDEF 27 |
+| | 4 | 0.122 s | peak live 236 MiB | tiles 61 · deblock 27 · CDEF 15 |
+| | 8 | 0.097 s | 321 MiB (peak live 270 MiB) | tiles 51 · deblock 16 · CDEF 10 |
+| same, 8-tile IVF still with loop restoration | 1 / 2 / 4 / 8 | 0.328 / 0.187 / 0.119 / 0.092 s | peak live 160 / 204 / 240 / 289 MiB | 8 workers: tiles 41 · deblock 13 · CDEF 13 · LR 5 |
+
+The worker budget is the core `ExecutionContext` the caller grants
+through `set_execution_context` (`SpecDecodeSession::set_threads` on
+the direct API); the bytes equal the serial decode for any budget
+(`tests/decode_threads.rs`), the allocation budget is pinned by
+`tests/decode_alloc_budget.rs`. Where the time goes at one thread
+now: the §5.11 tile walk ~45 % (symbol decoding, inverse transforms,
+intra prediction, reconstruction merge), §7.14 deblocking ~30 %,
+§7.15 CDEF ~16 %, §7.17 restoration ~10 %. Still open: the per-mi
+grids (~45 MiB at 12 MP; `palette_colors` is 35 MiB of them whenever
+palette is enabled) and the `i32` `CurrFrame` (73 MiB; a `u16`
+pipeline would halve it), the per-tile state of the parallel walk
+(one tile-sized walker per worker in flight), and NEON / AVX2
+kernels for CDEF and deblocking.
 
 ## Module layout
 

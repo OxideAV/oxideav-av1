@@ -286,7 +286,7 @@ pub fn decode_frame_spec(
     // The historical intra-only entry: no cross-frame reference state,
     // so inter frames are rejected inside the full driver.
     let mut stages = DecodeStageTimings::default();
-    Ok(decode_frame_spec_full(seq, fh, tile_group_body, None, &mut stages)?.frame)
+    Ok(decode_frame_spec_full(seq, fh, tile_group_body, None, &mut stages, 1)?.frame)
 }
 
 /// Parse one §5.11.1 tile-group OBU body against the frame's
@@ -349,6 +349,7 @@ fn decode_frame_spec_full(
     tile_group_body: &[u8],
     refs: Option<&SpecRefState>,
     stages: &mut DecodeStageTimings,
+    threads: usize,
 ) -> Result<DecodedFrameInternal, Error> {
     let ti = fh
         .tile_info
@@ -357,7 +358,7 @@ fn decode_frame_spec_full(
     let t0 = Instant::now();
     let tiles = parse_whole_frame_tile_group(ti, tile_group_body, false)?;
     stages.parse += t0.elapsed();
-    decode_frame_spec_tiles(seq, fh, &tiles, refs, stages)
+    decode_frame_spec_tiles(seq, fh, &tiles, refs, stages, threads)
 }
 
 /// The frame decode proper, over already-parsed per-tile §8.2
@@ -371,6 +372,7 @@ fn decode_frame_spec_tiles(
     tiles: &[TilePayload],
     refs: Option<&SpecRefState>,
     stages: &mut DecodeStageTimings,
+    threads: usize,
 ) -> Result<DecodedFrameInternal, Error> {
     if fh.show_existing_frame {
         // §7.21 output-existing path is the caller's (no tile group).
@@ -820,7 +822,146 @@ fn decode_frame_spec_tiles(
     // keeps the frame-start state).
     let mut end_cdfs: Option<Box<TileCdfContext>> = None;
     let t_tiles = Instant::now();
+    // r475 — tile-parallel walk. §5.11 scopes every context, every
+    // neighbour availability (`is_inside` is tile-relative), the
+    // intra edges, the delta-q / delta-lf / loop-restoration
+    // reference state and the entropy state to the tile, and tile
+    // boundaries are superblock aligned — so an intra tile decoded on
+    // a TILE-SIZED walker (the tile at the origin of its own frame)
+    // reconstructs the samples and stamps the grids the frame walk
+    // would, bit for bit; only §5.11.57 `read_lr` addresses a
+    // frame-level grid (`set_lr_origin`). The inter arms read the
+    // frame-level motion field / reference planes at frame positions
+    // and intra block copy reads the frame-level `CurrFrame`, so
+    // those frames keep the serial walk. Finished tiles are stitched
+    // into the frame walker as they arrive (`import_rect_from` +
+    // the planes + the restoration units), so at most `threads`
+    // tile-sized states are live beyond the frame's own.
+    let tile_parallel =
+        threads > 1 && tiles.len() > 1 && fh.frame_is_intra && !fh.allow_intrabc && !is_inter_frame;
+    if tile_parallel {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let worker_count = threads.min(tiles.len());
+        let next = AtomicUsize::new(0);
+        let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
+        let decode_one =
+            |tile_num: usize| -> Result<(PartitionWalker, Box<TileCdfContext>), Error> {
+                let tile = &tiles[tile_num];
+                let tile_row = (tile_num as u32) / ti.tile_cols;
+                let tile_col = (tile_num as u32) % ti.tile_cols;
+                let (r0, r1) = (
+                    ti.mi_row_starts[tile_row as usize],
+                    ti.mi_row_starts[tile_row as usize + 1],
+                );
+                let (c0, c1) = (
+                    ti.mi_col_starts[tile_col as usize],
+                    ti.mi_col_starts[tile_col as usize + 1],
+                );
+                let (h4, w4) = (r1 - r0, c1 - c0);
+                let mut local = PartitionWalker::new(
+                    h4,
+                    w4,
+                    TileGeometry {
+                        mi_row_start: 0,
+                        mi_row_end: h4,
+                        mi_col_start: 0,
+                        mi_col_end: w4,
+                    },
+                )
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+                local.set_lr_origin(r0, c0);
+                local.begin_tile(TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: h4,
+                    mi_col_start: 0,
+                    mi_col_end: w4,
+                });
+                local.set_current_q_index(i32::from(qp.base_q_idx));
+                let mut decoder = SymbolDecoder::init_symbol(
+                    &tile.bytes,
+                    tile.bytes.len(),
+                    fh.disable_cdf_update,
+                )?;
+                let mut cdfs = frame_start_cdfs.as_ref().clone();
+                local.decode_tile_syntax_with_lr(
+                    &mut decoder,
+                    &mut cdfs,
+                    &params,
+                    lr_walk_ref,
+                    None,
+                    &quant,
+                    dq.delta_q_present,
+                )?;
+                Ok((local, Box::new(cdfs)))
+            };
+        let mut first_err: Option<Error> = None;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..worker_count {
+                let tx = tx.clone();
+                let next = &next;
+                let decode_one = &decode_one;
+                scope.spawn(move || loop {
+                    let t = next.fetch_add(1, Ordering::SeqCst);
+                    if t >= tiles.len() {
+                        break;
+                    }
+                    let out = decode_one(t);
+                    if tx.send((t, out)).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(tx);
+            for (t, out) in rx {
+                match out {
+                    Ok((local, cdfs)) => {
+                        let tile_row = (t as u32) / ti.tile_cols;
+                        let tile_col = (t as u32) % ti.tile_cols;
+                        let (r0, r1) = (
+                            ti.mi_row_starts[tile_row as usize],
+                            ti.mi_row_starts[tile_row as usize + 1],
+                        );
+                        let (c0, c1) = (
+                            ti.mi_col_starts[tile_col as usize],
+                            ti.mi_col_starts[tile_col as usize + 1],
+                        );
+                        walker.import_rect_from(
+                            &local,
+                            0,
+                            0,
+                            r0,
+                            c0,
+                            r1 - r0,
+                            c1 - c0,
+                            sub_x_u8,
+                            sub_y_u8,
+                        );
+                        walker.import_curr_frame_rect_from(&local, r0, c0, sub_x_u8, sub_y_u8);
+                        if lr.uses_lr {
+                            walker.import_lr_units_from(&local, r0, r1, c0, c1, &lr_walk);
+                        }
+                        if !fh.disable_frame_end_update_cdf && t as u32 == ti.context_update_tile_id
+                        {
+                            end_cdfs = Some(cdfs);
+                        }
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
     for (tile_num, tile) in tiles.iter().enumerate() {
+        if tile_parallel {
+            break;
+        }
         let tile_row = (tile_num as u32) / ti.tile_cols;
         let tile_col = (tile_num as u32) % ti.tile_cols;
         walker.begin_tile(TileGeometry {
@@ -912,18 +1053,34 @@ fn decode_frame_spec_tiles(
                     samples: buf,
                 });
             }
-            walker.loop_filter_frame_from_grid(
-                lf,
-                sp,
-                dlf.delta_lf_multi,
-                cc.num_planes,
-                cc.bit_depth,
-                sub_x as u8,
-                sub_y as u8,
-                fs.frame_width,
-                fs.frame_height,
-                &mut bufs,
-            );
+            if threads > 1 {
+                walker.loop_filter_frame_parallel_from_grid(
+                    lf,
+                    sp,
+                    dlf.delta_lf_multi,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    fs.frame_width,
+                    fs.frame_height,
+                    &mut bufs,
+                    threads,
+                );
+            } else {
+                walker.loop_filter_frame_from_grid(
+                    lf,
+                    sp,
+                    dlf.delta_lf_multi,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    fs.frame_width,
+                    fs.frame_height,
+                    &mut bufs,
+                );
+            }
         }
     }
     // §7.4 steps 2-5: CDEF, then loop restoration. `plane_bufs` holds
@@ -981,31 +1138,60 @@ fn decode_frame_spec_tiles(
             });
         }
         if let (true, Some(cdef)) = (cdef_active, fh.cdef_params.as_ref()) {
-            walker.cdef_frame_in_place_from_idx(
-                cdef,
-                cc.num_planes,
-                cc.bit_depth,
-                sub_x as u8,
-                sub_y as u8,
-                &mut bufs,
-            );
+            if threads > 1 {
+                walker.cdef_frame_parallel_from_idx(
+                    cdef,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    &mut bufs,
+                    threads,
+                );
+            } else {
+                walker.cdef_frame_in_place_from_idx(
+                    cdef,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    &mut bufs,
+                );
+            }
         }
         stages.cdef += t_cdef.elapsed();
         let t_lr = Instant::now();
         if lr.uses_lr {
-            walker.loop_restore_frame_in_place_from_grid(
-                lr,
-                cc.num_planes,
-                cc.bit_depth,
-                sub_x as u8,
-                sub_y as u8,
-                mi_rows,
-                mi_cols,
-                fs.frame_height,
-                fs.upscaled_width,
-                &mut bufs,
-                &boundary,
-            );
+            if threads > 1 {
+                walker.loop_restore_frame_parallel_from_grid(
+                    lr,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    mi_rows,
+                    mi_cols,
+                    fs.frame_height,
+                    fs.upscaled_width,
+                    &mut bufs,
+                    &boundary,
+                    threads,
+                );
+            } else {
+                walker.loop_restore_frame_in_place_from_grid(
+                    lr,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    mi_rows,
+                    mi_cols,
+                    fs.frame_height,
+                    fs.upscaled_width,
+                    &mut bufs,
+                    &boundary,
+                );
+            }
         }
         stages.restoration += t_lr.elapsed();
     } else {
@@ -1662,6 +1848,7 @@ impl SpecDecodeSession {
             &mut self.op_idc,
             self.max_picture_size,
             &mut self.stages,
+            self.threads,
         )?;
         Ok(out)
     }
@@ -1894,6 +2081,7 @@ fn decode_temporal_unit_spec(
     op_idc: &mut u16,
     max_picture_size: u32,
     stages: &mut DecodeStageTimings,
+    threads: usize,
 ) -> Result<(), Error> {
     // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
     // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
@@ -2071,7 +2259,7 @@ fn decode_temporal_unit_spec(
                 if parsed.tg_end + 1 == num_tiles {
                     let pf = pending.take().expect("pending frame checked above");
                     let decoded =
-                        decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs), stages)?;
+                        decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs), stages, threads)?;
                     let frame = reference_frame_update(refs, &pf.fh, decoded)?;
                     if pf.fh.show_frame {
                         out.push(frame);
@@ -2103,7 +2291,7 @@ fn decode_temporal_unit_spec(
                     .ok_or(Error::PartitionWalkOutOfRange)?;
                 let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
                 stages.parse += t_parse.elapsed();
-                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), stages)?;
+                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), stages, threads)?;
                 let frame = reference_frame_update(refs, &fh, decoded)?;
                 if fh.show_frame {
                     out.push(frame);

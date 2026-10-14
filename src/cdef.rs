@@ -287,49 +287,63 @@ pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer
             }
             *held = (new0, new1);
         }
-        let mut r = band_r;
-        while r < band_r1 {
-            let mut c = 0u32;
-            while c < ctx.mi_cols {
-                let base_r = r & CDEF_MASK_4;
-                let base_c = c & CDEF_MASK_4;
-                let idx = (ctx.cdef_idx)(base_r, base_c);
-                // §7.15.1: the copy is the identity in place; `idx < 0`
-                // and the all-skip block leave the samples as they are.
-                if idx >= 0 {
-                    let skip = (ctx.skip)(r, c)
-                        && (r + 1 >= ctx.mi_rows || (ctx.skip)(r + 1, c))
-                        && (c + 1 >= ctx.mi_cols || (ctx.skip)(r, c + 1))
-                        && (r + 1 >= ctx.mi_rows
-                            || c + 1 >= ctx.mi_cols
-                            || (ctx.skip)(r + 1, c + 1));
-                    if !skip {
-                        let mut srcs = [None, None, None];
-                        for ((slot, (window, &(row0, _))), pb) in srcs
-                            .iter_mut()
-                            .zip(windows.iter().zip(win_rows.iter()))
-                            .zip(planes.iter())
-                        {
-                            *slot = Some(CdefSrc {
-                                samples: window,
-                                cols: pb.cols as usize,
-                                row0,
-                                plane_rows: pb.rows as usize,
-                                plane_cols: pb.cols as usize,
-                            });
-                        }
-                        let dir = match srcs[0].as_ref() {
-                            Some(src0) => cdef_direction_src(ctx, src0, r, c),
-                            None => (0, 0),
-                        };
-                        cdef_block_dir_src(ctx, &srcs, planes, num_planes as u8, r, c, idx, dir);
-                    }
-                }
-                c += STEP_4;
-            }
-            r += STEP_4;
+        let mut srcs = [None, None, None];
+        for ((slot, (window, &(row0, _))), pb) in srcs
+            .iter_mut()
+            .zip(windows.iter().zip(win_rows.iter()))
+            .zip(planes.iter())
+        {
+            *slot = Some(CdefSrc {
+                samples: window,
+                cols: pb.cols as usize,
+                row0,
+                plane_rows: pb.rows as usize,
+                plane_cols: pb.cols as usize,
+            });
         }
+        cdef_band_in_place(ctx, &srcs, planes, [0; 3], band_r, band_r1);
         band_r = band_r1;
+    }
+}
+
+/// r475 — the §7.15.1 block loop over the mi rows `[ r0, r1 )` from
+/// source windows (`srcs[ plane ]`, each covering the band ± 2 rows
+/// of the UNFILTERED plane) into `dst_planes` (whole planes, or the
+/// band's own row windows with `dst_row0[ plane ]` their first plane
+/// row). The copy step is the identity in place; `idx < 0` and the
+/// all-skip block leave the samples as they are.
+pub(crate) fn cdef_band_in_place(
+    ctx: &CdefFrameContext<'_>,
+    srcs: &[Option<CdefSrc<'_>>; 3],
+    dst_planes: &mut [PlaneBuffer<'_>],
+    dst_row0: [usize; 3],
+    r0: u32,
+    r1: u32,
+) {
+    let num_planes = ctx.num_planes.min(dst_planes.len() as u8);
+    let mut r = r0;
+    while r < r1.min(ctx.mi_rows) {
+        let mut c = 0u32;
+        while c < ctx.mi_cols {
+            let base_r = r & CDEF_MASK_4;
+            let base_c = c & CDEF_MASK_4;
+            let idx = (ctx.cdef_idx)(base_r, base_c);
+            if idx >= 0 {
+                let skip = (ctx.skip)(r, c)
+                    && (r + 1 >= ctx.mi_rows || (ctx.skip)(r + 1, c))
+                    && (c + 1 >= ctx.mi_cols || (ctx.skip)(r, c + 1))
+                    && (r + 1 >= ctx.mi_rows || c + 1 >= ctx.mi_cols || (ctx.skip)(r + 1, c + 1));
+                if !skip {
+                    let dir = match srcs[0].as_ref() {
+                        Some(src0) => cdef_direction_src(ctx, src0, r, c),
+                        None => (0, 0),
+                    };
+                    cdef_block_dir_src(ctx, srcs, dst_planes, dst_row0, num_planes, r, c, idx, dir);
+                }
+            }
+            c += STEP_4;
+        }
+        r += STEP_4;
     }
 }
 
@@ -421,16 +435,19 @@ pub fn cdef_block_dir(
     for (slot, p) in srcs.iter_mut().zip(src_planes.iter()) {
         *slot = Some(CdefSrc::of(p));
     }
-    cdef_block_dir_src(ctx, &srcs, dst_planes, num_planes, r, c, idx, dir);
+    cdef_block_dir_src(ctx, &srcs, dst_planes, [0; 3], num_planes, r, c, idx, dir);
 }
 
 /// [`cdef_block_dir`] over [`CdefSrc`] views (one per plane; a
-/// missing view leaves that plane untouched).
+/// missing view leaves that plane untouched) into plane buffers
+/// that may be row windows (`dst_row0[ plane ]` = the plane row at
+/// their row 0).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cdef_block_dir_src(
     ctx: &CdefFrameContext<'_>,
     srcs: &[Option<CdefSrc<'_>>; 3],
     dst_planes: &mut [PlaneBuffer<'_>],
+    dst_row0: [usize; 3],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -463,6 +480,7 @@ pub(crate) fn cdef_block_dir_src(
             ctx,
             src,
             dst,
+            dst_row0[0],
             0,
             r,
             c,
@@ -492,6 +510,7 @@ pub(crate) fn cdef_block_dir_src(
                 ctx,
                 src,
                 dst,
+                dst_row0[plane],
                 plane as u8,
                 r,
                 c,
@@ -689,15 +708,20 @@ pub fn cdef_filter_block(
         return;
     };
     let src = CdefSrc::of(src);
-    cdef_filter_block_src(ctx, &src, dst, plane, r, c, pri_str, sec_str, damping, dir);
+    cdef_filter_block_src(
+        ctx, &src, dst, 0, plane, r, c, pri_str, sec_str, damping, dir,
+    );
 }
 
-/// [`cdef_filter_block`] from a [`CdefSrc`] view into one plane.
+/// [`cdef_filter_block`] from a [`CdefSrc`] view into one plane
+/// buffer that may be a row window of the plane (`dst_row0` = the
+/// plane row at `dst.samples[ 0 ]`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cdef_filter_block_src(
     ctx: &CdefFrameContext<'_>,
     src: &CdefSrc<'_>,
     dst: &mut PlaneBuffer<'_>,
+    dst_row0: usize,
     plane: u8,
     r: u32,
     c: u32,
@@ -794,7 +818,7 @@ pub(crate) fn cdef_filter_block_src(
             src_cols,
             dst_cols,
         );
-        let drow0 = y0 as usize * dst_cols;
+        let drow0 = (y0 as usize - dst_row0) * dst_cols;
         let dst_rows = &mut dst.samples[drow0..];
         if w == 8 {
             cdef_filter_rows::<8>(src.samples, dst_rows, geom, &taps);
@@ -851,7 +875,7 @@ pub(crate) fn cdef_filter_block_src(
             // av1-spec p.324 line 17892.
             let delta = (8 + sum - i32::from(sum < 0)) >> 4;
             let out = clip3(min_v, max_v, x + delta);
-            dst.samples[(py as usize) * dst_cols + (px as usize)] = out;
+            dst.samples[(py as usize - dst_row0) * dst_cols + (px as usize)] = out;
         }
     }
 }

@@ -592,14 +592,17 @@ pub fn self_guided_filter(
         cdef: cdef_planes,
         plane,
     };
-    self_guided_filter_src(ctx, &src, lr, plane, geom);
+    self_guided_filter_src(ctx, &src, lr, 0, plane, geom);
 }
 
-/// [`self_guided_filter`] from an [`LrSource`] into one plane.
+/// [`self_guided_filter`] from an [`LrSource`] into one plane buffer
+/// that may be a row window of the plane (`out_row0` = the plane row
+/// at `lr.samples[ 0 ]`).
 pub(crate) fn self_guided_filter_src<S: LrSource>(
     ctx: &LoopRestorationFrameContext<'_>,
     src: &S,
     lr: &mut PlaneBuffer<'_>,
+    out_row0: i32,
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
@@ -643,10 +646,11 @@ pub(crate) fn self_guided_filter_src<S: LrSource>(
                 r1,
                 ctx.bit_depth,
             );
-            if py < 0 || py >= lr_rows || px < 0 || px >= lr_cols {
+            let wy = py - out_row0;
+            if wy < 0 || wy >= lr_rows || px < 0 || px >= lr_cols {
                 continue;
             }
-            lr.samples[(py as usize) * lr_cols_usize + px as usize] = out;
+            lr.samples[(wy as usize) * lr_cols_usize + px as usize] = out;
         }
     }
 }
@@ -913,14 +917,17 @@ pub fn wiener_filter(
         cdef: cdef_planes,
         plane,
     };
-    wiener_filter_src(ctx, &src, lr, plane, geom);
+    wiener_filter_src(ctx, &src, lr, 0, plane, geom);
 }
 
-/// [`wiener_filter`] from an [`LrSource`] into one plane.
+/// [`wiener_filter`] from an [`LrSource`] into one plane buffer that
+/// may be a row window of the plane (`out_row0` = the plane row at
+/// `lr.samples[ 0 ]`).
 pub(crate) fn wiener_filter_src<S: LrSource>(
     ctx: &LoopRestorationFrameContext<'_>,
     src: &S,
     lr: &mut PlaneBuffer<'_>,
+    out_row0: i32,
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
@@ -982,7 +989,7 @@ pub(crate) fn wiener_filter_src<S: LrSource>(
             }
             let v = round2_i32(s, inter_round1);
             let out = clip3(0, max_sample, v);
-            let dst_y = geom.y as i32 + r as i32;
+            let dst_y = geom.y as i32 + r as i32 - out_row0;
             let dst_x = geom.x as i32 + c as i32;
             if dst_y < 0 || dst_y >= lr_rows || dst_x < 0 || dst_x >= lr_cols {
                 continue;
@@ -1214,52 +1221,95 @@ pub(crate) fn loop_restoration_frame_in_place(
     let num_planes = ctx.num_planes.min(planes.len() as u8);
     let mut stripe_copy: Vec<i32> = Vec::new();
     for plane in 0..num_planes {
-        let r_type = ctx.lr_params.frame_restoration_type[plane as usize];
-        if r_type == FrameRestorationType::None {
-            continue;
-        }
         let Some(bnd) = boundary.get(plane as usize) else {
             continue;
         };
-        let rects = stripe_unit_rects(ctx, plane);
         let pb = &mut planes[plane as usize];
-        let cols = pb.cols as usize;
-        let mut i = 0usize;
-        while i < rects.len() {
-            // One stripe = the run of rectangles sharing `stripe_start_y`.
-            let stripe_start = rects[i].stripe_start_y;
-            let mut j = i;
-            while j < rects.len() && rects[j].stripe_start_y == stripe_start {
-                j += 1;
+        for stripe in plane_stripes(ctx, plane) {
+            restore_stripe_in_place(ctx, plane, &stripe, bnd, pb, 0, &mut stripe_copy);
+        }
+    }
+}
+
+/// r475 — one stripe's restoration rectangles (`stripe_unit_rects`
+/// grouped by `stripe_start_y`): the stripe ordinal, its plane rows
+/// `[ y0, y1 )` and the rectangles.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaneStripe {
+    pub stripe: usize,
+    pub y0: usize,
+    pub y1: usize,
+    pub rects: Vec<LrBlockGeometry>,
+}
+
+/// r475 — the stripes of `plane` that carry restoration (empty when
+/// the plane's `FrameRestorationType` is `RESTORE_NONE`).
+pub(crate) fn plane_stripes(ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> Vec<PlaneStripe> {
+    let mut out = Vec::new();
+    if ctx.lr_params.frame_restoration_type[plane as usize] == FrameRestorationType::None {
+        return out;
+    }
+    let rects = stripe_unit_rects(ctx, plane);
+    let mut i = 0usize;
+    while i < rects.len() {
+        let stripe_start = rects[i].stripe_start_y;
+        let mut j = i;
+        while j < rects.len() && rects[j].stripe_start_y == stripe_start {
+            j += 1;
+        }
+        let g = &rects[i];
+        out.push(PlaneStripe {
+            stripe: stripe_index(stripe_start, ctx, plane),
+            y0: g.y as usize,
+            y1: (g.y + g.h) as usize,
+            rects: rects[i..j].to_vec(),
+        });
+        i = j;
+    }
+    out
+}
+
+/// r475 — restore one stripe in place: `out` holds the stripe's
+/// CDEF rows (the whole plane, or the stripe's own row window with
+/// `out_row0` its first plane row); the stripe is copied into
+/// `stripe_copy` first and every unit reads the copy plus the
+/// captured pre-CDEF `boundary` rows.
+pub(crate) fn restore_stripe_in_place(
+    ctx: &LoopRestorationFrameContext<'_>,
+    plane: u8,
+    stripe: &PlaneStripe,
+    boundary: &StripeBoundaryRows,
+    out: &mut PlaneBuffer<'_>,
+    out_row0: usize,
+    stripe_copy: &mut Vec<i32>,
+) {
+    let cols = out.cols as usize;
+    let (y0, y1) = (stripe.y0, stripe.y1);
+    let (w0, w1) = (y0 - out_row0, y1 - out_row0);
+    stripe_copy.clear();
+    stripe_copy.extend_from_slice(&out.samples[w0 * cols..w1 * cols]);
+    let Some(g) = stripe.rects.first() else {
+        return;
+    };
+    let src = StripeSource {
+        cdef: stripe_copy,
+        cdef_row0: y0 as i32,
+        cols,
+        above: boundary.above(stripe.stripe),
+        below: boundary.below(stripe.stripe),
+        plane_end_x: g.plane_end_x,
+        plane_end_y: g.plane_end_y,
+    };
+    for geom in &stripe.rects {
+        let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
+        match r_type {
+            FrameRestorationType::Wiener => {
+                wiener_filter_src(ctx, &src, out, out_row0 as i32, plane, geom);
             }
-            let g = &rects[i];
-            let (y0, y1) = (g.y as usize, (g.y + g.h) as usize);
-            stripe_copy.clear();
-            stripe_copy.extend_from_slice(&pb.samples[y0 * cols..y1 * cols]);
-            // `stripe_start_y = ( 64 s - 8 ) >> subY` ⇒ `s`.
-            let stripe = stripe_index(stripe_start, ctx, plane);
-            let src = StripeSource {
-                cdef: &stripe_copy,
-                cdef_row0: y0 as i32,
-                cols,
-                above: bnd.above(stripe),
-                below: bnd.below(stripe),
-                plane_end_x: g.plane_end_x,
-                plane_end_y: g.plane_end_y,
-            };
-            for geom in &rects[i..j] {
-                let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
-                match r_type {
-                    FrameRestorationType::Wiener => {
-                        wiener_filter_src(ctx, &src, pb, plane, geom);
-                    }
-                    FrameRestorationType::SgrProj => {
-                        self_guided_filter_src(ctx, &src, pb, plane, geom);
-                    }
-                    FrameRestorationType::None | FrameRestorationType::Switchable => {}
-                }
+            FrameRestorationType::SgrProj => {
+                self_guided_filter_src(ctx, &src, out, out_row0 as i32, plane, geom);
             }
-            i = j;
+            FrameRestorationType::None | FrameRestorationType::Switchable => {}
         }
     }
 }

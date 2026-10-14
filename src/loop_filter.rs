@@ -318,6 +318,97 @@ pub fn loop_filter_rows(
     }
 }
 
+/// r475 — one plane, one pass of [`loop_filter_rows`] over the edge
+/// rows `mi_row_start .. mi_row_end`, with the samples addressed
+/// through a row window of the plane (`window_row0` = the plane row
+/// at `window.samples[ 0 ]`). The band-parallel driver's unit of
+/// work: within a pass no two edges of a plane interact — §7.14.3
+/// takes the filter size as the smaller transform size across the
+/// edge, so an edge at `e` of size `S` writes at most `w( S )` rows
+/// each side (`w = 2 / 3 / 6` for `S = 4..6 / 8 / 16`, §7.14.6.3 /
+/// §7.14.6.4) while the next edge lies `T >= S` rows away and reads
+/// `r( S' )` rows back (`r = 2 / 4 / 7`, §7.14.6.2) with `S' <= T`,
+/// and `T > w + r - 1` for every admissible pair — so any order of
+/// the edges of one pass, hence any split into bands, yields the
+/// spec's samples. A pass-1 band needs its 7-row skirts in the
+/// window; a pass-0 band needs none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loop_filter_rows_window(
+    ctx: &LoopFilterFrameContext<'_>,
+    plane: u8,
+    pass: u8,
+    window: &mut PlaneBuffer<'_>,
+    window_row0: u32,
+    mi_row_start: u32,
+    mi_row_end: u32,
+) {
+    if plane > 0 && ctx.loop_filter_level[(1 + plane) as usize] == 0 {
+        return;
+    }
+    let (sub_x, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
+    let row_step: u32 = if plane == 0 { 1 } else { 1 << sub_y };
+    let col_step: u32 = if plane == 0 { 1 } else { 1 << sub_x };
+    let mi_row_end = mi_row_end.min(ctx.mi_rows);
+    let mut row = mi_row_start;
+    while row < mi_row_end {
+        let mut col = 0u32;
+        while col < ctx.mi_cols {
+            loop_filter_edge_in(ctx, window, plane, pass, row, col, window_row0);
+            col += col_step;
+        }
+        row += row_step;
+    }
+}
+
+/// r475 — split a row-major plane into disjoint mutable row windows
+/// `[ start, end )` (sorted, non-overlapping, in plane rows).
+pub(crate) fn row_windows_mut<'a>(
+    samples: &'a mut [i32],
+    cols: usize,
+    ranges: &[(usize, usize)],
+) -> Vec<&'a mut [i32]> {
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut rest = samples;
+    let mut consumed = 0usize;
+    for &(start, end) in ranges {
+        debug_assert!(start >= consumed && end >= start);
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut((start - consumed) * cols);
+        let (win, tail) = tail.split_at_mut((end - start) * cols);
+        out.push(win);
+        rest = tail;
+        consumed = end;
+    }
+    out
+}
+
+/// r475 — run `jobs` on up to `threads` scoped workers (a shared
+/// queue; serial when `threads <= 1`). Each job owns its disjoint
+/// slice of the picture, so the result is the serial result.
+pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    if threads <= 1 || jobs.len() <= 1 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    let queue = std::sync::Mutex::new(jobs);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(queue.lock().map(|q| q.len()).unwrap_or(1)) {
+            let queue = &queue;
+            scope.spawn(move || loop {
+                let job = match queue.lock() {
+                    Ok(mut q) => q.pop(),
+                    Err(_) => None,
+                };
+                match job {
+                    Some(job) => job(),
+                    None => break,
+                }
+            });
+        }
+    });
+}
+
 /// §7.14.2 per-edge driver — av1-spec p.307-310 lines 16994-17126.
 ///
 /// `plane` is `0` (Y), `1` (U), `2` (V). `pass` is `0` for vertical
@@ -331,6 +422,26 @@ pub fn loop_filter_edge(
     pass: u8,
     row: u32,
     col: u32,
+) {
+    let Some(plane_buf) = planes.get_mut(plane as usize) else {
+        return;
+    };
+    loop_filter_edge_in(ctx, plane_buf, plane, pass, row, col, 0);
+}
+
+/// [`loop_filter_edge`] over one plane buffer that may be a row
+/// WINDOW of the plane: `window_row0` is the plane row its row 0
+/// holds (`0` for the whole plane). The §7.14.2 gates run in frame
+/// coordinates; only the sample addressing is shifted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loop_filter_edge_in(
+    ctx: &LoopFilterFrameContext<'_>,
+    plane_buf: &mut PlaneBuffer<'_>,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+    window_row0: u32,
 ) {
     let (sub_x, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
     let (dx, dy) = if pass == 0 {
@@ -422,9 +533,7 @@ pub fn loop_filter_edge(
     if !apply_filter || strength.lvl == 0 {
         return;
     }
-    let Some(plane_buf) = planes.get_mut(plane as usize) else {
-        return;
-    };
+    let y_p = y_p - window_row0 as i32;
     // av1-spec p.309 line 17118-17122: walk i = 0..MI_SIZE-1 along
     // the edge (the boundary spans `MI_SIZE` samples for the 4×4
     // grid).
