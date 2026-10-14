@@ -4,6 +4,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- STILL-IMAGE DECODE BUDGETS — the harness (r475). `examples/decode_bench` decodes an IVF file or a raw temporal unit (the AVIF `av01` item payload) through the direct session and through the registry decoder, printing the wall per §7.4 stage (`SpecDecodeSession::last_stage_timings` → `decoder::DecodeStageTimings`: parse, tiles, deblock, CDEF, superres, restoration, ref store, grain, output), the end-to-end wall, and a 64-bit FNV-1a digest of the output planes (`threads=N` / `repeat=N` / `mode=direct|registry` / `dump=path`). `SpecDecodeSession::set_threads` / `threads` carry the worker budget. Baseline on the 12 MP 8-bit 4:2:0 third-party still: 0.640 s, 320 MiB peak RSS — tiles 190 ms, deblock 164 ms, CDEF 225 ms, loop restoration 55 ms (the README carries the budgets table)
+
 ## [0.1.20](https://github.com/OxideAV/oxideav-av1/compare/v0.1.19...v0.1.20) - 2026-10-01
 
 ### Other

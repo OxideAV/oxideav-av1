@@ -34,7 +34,9 @@ pub mod frame_driver;
 
 pub use frame_driver::{decode_av1_spec, decode_av1_spec_at_operating_point, SpecFrame};
 #[doc(hidden)]
-pub use frame_driver::{decode_frame_spec, SpecDecodeSession, MAX_PICTURE_SIZE};
+pub use frame_driver::{
+    decode_frame_spec, DecodeStageTimings, SpecDecodeSession, MAX_PICTURE_SIZE,
+};
 
 use crate::Error;
 

@@ -1980,6 +1980,23 @@ payload omits the sequence header still decodes (a payload that
 repeats it simply re-caches it). Item payloads with or without a
 leading temporal delimiter decode alike.
 
+#### Still-image decode budgets (r475)
+
+Measured on a 4032×3024 (12 MP) 8-bit 4:2:0 single-frame AV1 stream
+from a third-party encoder (`cpu-used 6`, `cq-level 32`, deblock +
+CDEF + loop restoration on, one tile), release build, Apple M4 Max.
+`examples/decode_bench` prints the wall per §7.4 stage through the
+direct session (`SpecDecodeSession::last_stage_timings`) and the
+end-to-end wall through the registry decoder (the path a HEIF / AVIF
+consumer takes) with a digest of the output planes; peak RSS is
+`/usr/bin/time -l` on the registry path alone (`mode=registry`; the
+harness holds 0.2 MiB of source). Every row decodes byte-identical to
+the previous one and to two black-box reference decoders.
+
+| Step | Threads | Wall | Peak RSS | Stage split (ms) |
+|---|---|---|---|---|
+| r474 (0.1.20) | 1 | 0.640 s | 320 MiB | parse 0 · tiles 190 · deblock 164 · CDEF 225 · LR 55 · store 1 · output 1 |
+
 ## Module layout
 
 `obu`, `sequence_header`, `frame_header`, `tile_info`,
