@@ -17,7 +17,73 @@
 
 use oxideav_av1::decoder::{DecodeStageTimings, SpecDecodeSession};
 use oxideav_core::{CodecParameters, ExecutionContext, Frame, Packet, TimeBase};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Counting allocator: allocation count, live bytes and the peak of
+/// the live bytes (the decoder's own high-water mark, independent of
+/// what the system allocator keeps mapped).
+struct Counting;
+
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+        PEAK.fetch_max(live, Ordering::Relaxed);
+        if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
+            let msg = format!(
+                "ALLOC {} MiB -> live {} MiB\n",
+                layout.size() >> 20,
+                live >> 20
+            );
+            libc_write(msg.as_bytes());
+        }
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let live = LIVE.fetch_sub(layout.size(), Ordering::Relaxed) - layout.size();
+        if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
+            let msg = format!(
+                "FREE {} MiB -> live {} MiB\n",
+                layout.size() >> 20,
+                live >> 20
+            );
+            libc_write(msg.as_bytes());
+        }
+        System.dealloc(ptr, layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        let old = layout.size();
+        if new_size > old {
+            let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+            PEAK.fetch_max(live, Ordering::Relaxed);
+        } else {
+            LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        }
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+fn libc_write(bytes: &[u8]) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(bytes);
+}
+
+fn reset_alloc_stats() {
+    ALLOCS.store(0, Ordering::Relaxed);
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
 
 fn fnv1a(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
@@ -121,7 +187,11 @@ fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&s
     let mut frames = 0usize;
     let mut dims = (0usize, 0usize);
     let mut dumped: Vec<u8> = Vec::new();
+    let mut allocs = 0usize;
+    let mut peak = 0usize;
     for _ in 0..registry_runs {
+        dumped.clear();
+        reset_alloc_stats();
         let t0 = Instant::now();
         let mut dec = oxideav_av1::registry::make_decoder(&params).expect("make_decoder");
         if threads > 1 {
@@ -153,16 +223,35 @@ fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&s
             }
         }
         drop(dec);
-        best = best.min(t0.elapsed().as_secs_f64());
+        let wall = t0.elapsed().as_secs_f64();
+        if wall < best {
+            best = wall;
+            allocs = ALLOCS.load(Ordering::Relaxed);
+            peak = PEAK.load(Ordering::Relaxed);
+        }
         digest = h;
     }
     if let Some(path) = dump {
         std::fs::write(path, &dumped).expect("write dump");
     }
+    let fmt_s = |v: f64| {
+        if v == f64::MAX {
+            "-".to_string()
+        } else {
+            format!("{v:.3} s")
+        }
+    };
     println!(
-        "{input}: {frames} frame(s) {}x{} (plane 0 bytes), threads={threads}, best {:.3} s (direct session {:.3} s), digest {digest:016x}",
-        dims.0, dims.1, best, best_direct
+        "{input}: {frames} frame(s) {}x{} (plane 0 bytes), threads={threads}, best {} (direct session {}), digest {digest:016x}, {allocs} allocations, peak live {:.1} MiB",
+        dims.0,
+        dims.1,
+        fmt_s(best),
+        fmt_s(best_direct),
+        peak as f64 / (1024.0 * 1024.0)
     );
+    if direct_runs == 0 {
+        return;
+    }
     let total = stages.total();
     let row = |name: &str, d: Duration| {
         println!(

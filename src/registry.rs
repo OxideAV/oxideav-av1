@@ -174,7 +174,7 @@ impl Decoder for Av1Decoder {
 
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
         let mut push = |frames: Vec<SpecFrame>| {
-            for frame in &frames {
+            for frame in frames {
                 self.queue
                     .push_back(spec_frame_to_video_frame(frame, packet.pts));
             }
@@ -246,15 +246,17 @@ impl Decoder for Av1Decoder {
 /// row-major bytes — one byte per sample at 8-bit, packed little-endian
 /// `u16` at 10/12-bit — so each plane moves verbatim with its byte
 /// stride (`width` samples × 1 or 2 bytes).
-fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame {
+fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
     let bytes_per_sample: usize = if frame.bit_depth > 8 { 2 } else { 1 };
+    // r475 — the plane bytes MOVE into the framework frame (the
+    // pre-r475 clone was a second copy of every output plane).
     let planes = frame
         .planes
-        .iter()
+        .into_iter()
         .zip(frame.plane_dims.iter())
         .map(|(data, &(w, _h))| VideoPlane {
             stride: (w as usize) * bytes_per_sample,
-            data: data.clone(),
+            data,
         })
         .collect();
     VideoFrame { pts, planes }

@@ -933,165 +933,241 @@ fn decode_frame_spec_tiles(
     // when restoration is active.
     stages.deblock += t_deblock.elapsed();
     let t_cdef = Instant::now();
-    let mut deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
-        Some(plane_bufs.clone())
-    } else {
-        None
-    };
-    if let Some(cdef) = fh.cdef_params.as_ref() {
-        if !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited {
-            // §7.15 filters from the deblocked frame. r453 — when
-            // §7.17 is active the `deblocked` copy above IS that
-            // frame (CDEF only reads its source), so borrow it
-            // instead of cloning a third full-frame buffer.
-            let mut fallback: Option<Vec<Vec<i32>>> = None;
-            let src_owned: &mut Vec<Vec<i32>> = match deblocked {
-                Some(ref mut d) => d,
-                None => fallback.insert(plane_bufs.clone()),
-            };
-            let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
-                src.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
-            }
-            let mut dst: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-                dst.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
-            }
-            walker.cdef_frame_from_idx(
+    let cdef_active = fh.cdef_params.as_ref().is_some_and(|cdef| {
+        !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited
+    });
+    let superres_active = fs.use_superres && fs.upscaled_width > fs.frame_width;
+    if !superres_active {
+        // r475 — the band / stripe path: §7.15 CDEF runs in place over
+        // a rolling window of the unfiltered rows its taps read (the
+        // block ± 2, §7.15.3 `cdef_get_at` bounded by §5.11.52), and
+        // §7.17 restores one stripe at a time from a copy of the
+        // stripe's CDEF rows plus the pre-CDEF rows §7.17.6 reads at
+        // the stripe's 2-row skirts, captured here from the deblocked
+        // frame. No frame-sized copy of `CurrFrame` / `CdefFrame` is
+        // made (the pre-r475 driver held three); every sample is
+        // computed from the same inputs, so the output is identical.
+        // The §7.16 superres arm below keeps the whole-frame path (it
+        // upscales both frames).
+        let boundary: Vec<crate::loop_restoration::StripeBoundaryRows> = if lr.uses_lr {
+            plane_bufs
+                .iter_mut()
+                .zip(plane_dims.iter())
+                .enumerate()
+                .map(|(plane, (buf, &(pw, ph)))| {
+                    let sy = if plane == 0 { 0 } else { sub_y };
+                    let plane_h = (fs.frame_height + sy) >> sy;
+                    let pb = PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    };
+                    crate::loop_restoration::StripeBoundaryRows::capture(
+                        &pb,
+                        plane_h as i32 - 1,
+                        sy as u8,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+            bufs.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
+        }
+        if let (true, Some(cdef)) = (cdef_active, fh.cdef_params.as_ref()) {
+            walker.cdef_frame_in_place_from_idx(
                 cdef,
                 cc.num_planes,
                 cc.bit_depth,
                 sub_x as u8,
                 sub_y as u8,
-                &src,
-                &mut dst,
+                &mut bufs,
             );
         }
-    }
-    stages.cdef += t_cdef.elapsed();
-    // §7.4 steps 3-4 / §7.16: horizontal superres upscaling of BOTH the
-    // CDEF output (`plane_bufs` → UpscaledCdefFrame) and the post-
-    // deblock copy (`deblocked` → UpscaledCurrFrame), ahead of loop
-    // restoration. No-op when `use_superres == 0`.
-    let t_superres = Instant::now();
-    if fs.use_superres && fs.upscaled_width > fs.frame_width {
-        let sr_ctx = crate::superres::SuperresFrameContext {
-            use_superres: true,
-            frame_width: fs.frame_width,
-            upscaled_width: fs.upscaled_width,
-            frame_height: fs.frame_height,
-            mi_cols: fs.mi_cols,
-            num_planes: cc.num_planes,
-            bit_depth: cc.bit_depth,
-            subsampling_x: u8::from(cc.subsampling_x),
-            subsampling_y: u8::from(cc.subsampling_y),
-        };
-        // §7.16 output extents: `upscaledPlaneW x planeH` — exact
-        // (un-padded) per-plane dimensions.
-        let mut new_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
-        for plane in 0..num_planes {
-            let (out_w, out_h) = if plane == 0 {
-                (fs.upscaled_width, fs.frame_height)
-            } else {
-                (
-                    (fs.upscaled_width + sub_x) >> sub_x,
-                    (fs.frame_height + sub_y) >> sub_y,
-                )
-            };
-            new_dims.push((out_w, out_h));
+        stages.cdef += t_cdef.elapsed();
+        let t_lr = Instant::now();
+        if lr.uses_lr {
+            walker.loop_restore_frame_in_place_from_grid(
+                lr,
+                cc.num_planes,
+                cc.bit_depth,
+                sub_x as u8,
+                sub_y as u8,
+                mi_rows,
+                mi_cols,
+                fs.frame_height,
+                fs.upscaled_width,
+                &mut bufs,
+                &boundary,
+            );
         }
-        let upscale_set = |bufs: &mut Vec<Vec<i32>>| -> Result<(), Error> {
-            let mut inputs_owned = std::mem::take(bufs);
-            let mut inputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in inputs_owned.iter_mut().zip(plane_dims.iter()) {
-                inputs.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
-            }
-            let mut outputs_owned: Vec<Vec<i32>> = new_dims
-                .iter()
-                .map(|&(pw, ph)| vec![0i32; (pw as usize) * (ph as usize)])
-                .collect();
-            {
-                let mut outputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-                for (buf, &(pw, ph)) in outputs_owned.iter_mut().zip(new_dims.iter()) {
-                    outputs.push(PlaneBuffer {
+        stages.restoration += t_lr.elapsed();
+    } else {
+        let mut deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
+            Some(plane_bufs.clone())
+        } else {
+            None
+        };
+        if let Some(cdef) = fh.cdef_params.as_ref() {
+            if !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited {
+                // §7.15 filters from the deblocked frame. r453 — when
+                // §7.17 is active the `deblocked` copy above IS that
+                // frame (CDEF only reads its source), so borrow it
+                // instead of cloning a third full-frame buffer.
+                let mut fallback: Option<Vec<Vec<i32>>> = None;
+                let src_owned: &mut Vec<Vec<i32>> = match deblocked {
+                    Some(ref mut d) => d,
+                    None => fallback.insert(plane_bufs.clone()),
+                };
+                let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
+                    src.push(PlaneBuffer {
                         rows: ph,
                         cols: pw,
                         samples: buf,
                     });
                 }
-                crate::superres::upscale_frame(&sr_ctx, &inputs, &mut outputs)
-                    .map_err(|_| Error::PartitionWalkOutOfRange)?;
+                let mut dst: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+                    dst.push(PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    });
+                }
+                walker.cdef_frame_from_idx(
+                    cdef,
+                    cc.num_planes,
+                    cc.bit_depth,
+                    sub_x as u8,
+                    sub_y as u8,
+                    &src,
+                    &mut dst,
+                );
             }
-            *bufs = outputs_owned;
-            Ok(())
-        };
-        upscale_set(&mut plane_bufs)?;
-        if let Some(d) = deblocked.as_mut() {
-            upscale_set(d)?;
         }
-        plane_dims = new_dims;
-    }
+        stages.cdef += t_cdef.elapsed();
+        // §7.4 steps 3-4 / §7.16: horizontal superres upscaling of BOTH the
+        // CDEF output (`plane_bufs` → UpscaledCdefFrame) and the post-
+        // deblock copy (`deblocked` → UpscaledCurrFrame), ahead of loop
+        // restoration. No-op when `use_superres == 0`.
+        let t_superres = Instant::now();
+        if fs.use_superres && fs.upscaled_width > fs.frame_width {
+            let sr_ctx = crate::superres::SuperresFrameContext {
+                use_superres: true,
+                frame_width: fs.frame_width,
+                upscaled_width: fs.upscaled_width,
+                frame_height: fs.frame_height,
+                mi_cols: fs.mi_cols,
+                num_planes: cc.num_planes,
+                bit_depth: cc.bit_depth,
+                subsampling_x: u8::from(cc.subsampling_x),
+                subsampling_y: u8::from(cc.subsampling_y),
+            };
+            // §7.16 output extents: `upscaledPlaneW x planeH` — exact
+            // (un-padded) per-plane dimensions.
+            let mut new_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
+            for plane in 0..num_planes {
+                let (out_w, out_h) = if plane == 0 {
+                    (fs.upscaled_width, fs.frame_height)
+                } else {
+                    (
+                        (fs.upscaled_width + sub_x) >> sub_x,
+                        (fs.frame_height + sub_y) >> sub_y,
+                    )
+                };
+                new_dims.push((out_w, out_h));
+            }
+            let upscale_set = |bufs: &mut Vec<Vec<i32>>| -> Result<(), Error> {
+                let mut inputs_owned = std::mem::take(bufs);
+                let mut inputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                for (buf, &(pw, ph)) in inputs_owned.iter_mut().zip(plane_dims.iter()) {
+                    inputs.push(PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    });
+                }
+                let mut outputs_owned: Vec<Vec<i32>> = new_dims
+                    .iter()
+                    .map(|&(pw, ph)| vec![0i32; (pw as usize) * (ph as usize)])
+                    .collect();
+                {
+                    let mut outputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                    for (buf, &(pw, ph)) in outputs_owned.iter_mut().zip(new_dims.iter()) {
+                        outputs.push(PlaneBuffer {
+                            rows: ph,
+                            cols: pw,
+                            samples: buf,
+                        });
+                    }
+                    crate::superres::upscale_frame(&sr_ctx, &inputs, &mut outputs)
+                        .map_err(|_| Error::PartitionWalkOutOfRange)?;
+                }
+                *bufs = outputs_owned;
+                Ok(())
+            };
+            upscale_set(&mut plane_bufs)?;
+            if let Some(d) = deblocked.as_mut() {
+                upscale_set(d)?;
+            }
+            plane_dims = new_dims;
+        }
 
-    stages.superres += t_superres.elapsed();
-    // §7.4 step 5 / §7.17: loop restoration from (UpscaledCurrFrame,
-    // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
-    // by the tile walk's `read_lr` interleave above.
-    let t_lr = Instant::now();
-    if let Some(mut curr_owned) = deblocked {
-        let mut cdef_owned: Vec<Vec<i32>> = plane_bufs.clone();
-        let mut curr: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-        for (buf, &(pw, ph)) in curr_owned.iter_mut().zip(plane_dims.iter()) {
-            curr.push(PlaneBuffer {
-                rows: ph,
-                cols: pw,
-                samples: buf,
-            });
+        stages.superres += t_superres.elapsed();
+        // §7.4 step 5 / §7.17: loop restoration from (UpscaledCurrFrame,
+        // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
+        // by the tile walk's `read_lr` interleave above.
+        let t_lr = Instant::now();
+        if let Some(mut curr_owned) = deblocked {
+            let mut cdef_owned: Vec<Vec<i32>> = plane_bufs.clone();
+            let mut curr: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in curr_owned.iter_mut().zip(plane_dims.iter()) {
+                curr.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            let mut cdef_bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in cdef_owned.iter_mut().zip(plane_dims.iter()) {
+                cdef_bufs.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            let mut lr_out: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+                lr_out.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            walker.loop_restore_frame_from_grid(
+                lr,
+                cc.num_planes,
+                cc.bit_depth,
+                sub_x as u8,
+                sub_y as u8,
+                mi_rows,
+                mi_cols,
+                fs.frame_height,
+                fs.upscaled_width,
+                &curr,
+                &cdef_bufs,
+                &mut lr_out,
+            );
         }
-        let mut cdef_bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-        for (buf, &(pw, ph)) in cdef_owned.iter_mut().zip(plane_dims.iter()) {
-            cdef_bufs.push(PlaneBuffer {
-                rows: ph,
-                cols: pw,
-                samples: buf,
-            });
-        }
-        let mut lr_out: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-        for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-            lr_out.push(PlaneBuffer {
-                rows: ph,
-                cols: pw,
-                samples: buf,
-            });
-        }
-        walker.loop_restore_frame_from_grid(
-            lr,
-            cc.num_planes,
-            cc.bit_depth,
-            sub_x as u8,
-            sub_y as u8,
-            mi_rows,
-            mi_cols,
-            fs.frame_height,
-            fs.upscaled_width,
-            &curr,
-            &cdef_bufs,
-            &mut lr_out,
-        );
+        stages.restoration += t_lr.elapsed();
     }
-
-    stages.restoration += t_lr.elapsed();
     // ---- §7.18.2 intermediate-output crop to the surfaced extents. ----
     // On the superres path the buffers are already exact; otherwise
     // trim the mi-grid padding down to `UpscaledWidth x FrameHeight`
@@ -1123,84 +1199,6 @@ fn decode_frame_spec_tiles(
         plane_bufs[plane] = buf;
         plane_dims[plane] = (out_w, out_h);
     }
-
-    // ---- §7.20 store payload: pre-grain cropped planes (u16). ----
-    // §7.18.3 film grain applies to the OUTPUT copy only; the §7.20
-    // reference store keeps the grain-free frame (the samples later
-    // frames motion-compensate against).
-    let ref_planes: Vec<Vec<u16>> = plane_bufs
-        .iter()
-        .map(|buf| buf.iter().map(|&v| v.max(0) as u16).collect())
-        .collect();
-    let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
-    stages.ref_store += t_ref.elapsed();
-    let t_grain = Instant::now();
-
-    // ---- §7.18.3 film grain. ----
-    // §5.9.30 `update_grain == 0` predicted path: `load_grain_params(
-    // film_grain_params_ref_idx )` — every field except `grain_seed`
-    // comes from the referenced slot's §7.20-saved state (the
-    // `tempGrainSeed` dance keeps the newly-read seed). A slot with
-    // no saved grain state resolves to `reset_grain_params()`.
-    let effective_grain: Option<crate::uncompressed_header_tail::FilmGrainParams> =
-        match fh.film_grain_params.as_ref() {
-            Some(fg) if fg.apply_grain && fg.predicted => {
-                let slot = fg.film_grain_params_ref_idx as usize;
-                refs.and_then(|st| st.slots.get(slot))
-                    .and_then(|s| s.as_ref())
-                    .and_then(|s| s.grain_params.clone())
-                    .map(|mut g| {
-                        g.grain_seed = fg.grain_seed;
-                        g.apply_grain = true;
-                        g
-                    })
-            }
-            Some(fg) if fg.apply_grain => Some(fg.clone()),
-            _ => None,
-        };
-    if let Some(fg) = effective_grain.as_ref() {
-        if fg.apply_grain {
-            let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-                bufs.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
-            }
-            film_grain_synthesis(
-                fg,
-                cc.bit_depth,
-                cc.num_planes,
-                u8::from(cc.subsampling_x),
-                u8::from(cc.subsampling_y),
-                cc.matrix_coefficients,
-                &mut bufs,
-            );
-        }
-    }
-
-    stages.grain += t_grain.elapsed();
-    let t_out = Instant::now();
-    // ---- Narrow to the output layout: one byte per sample at
-    // 8-bit, packed little-endian `u16` at 10/12-bit (the
-    // `yuv4xxp1{0,2}le` layout), clamped to `(1 << BitDepth) - 1`. ----
-    let max_val: i32 = (1 << cc.bit_depth) - 1;
-    let planes: Vec<Vec<u8>> = plane_bufs
-        .into_iter()
-        .map(|buf| {
-            if cc.bit_depth == 8 {
-                buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
-            } else {
-                let mut out = Vec::with_capacity(buf.len() * 2);
-                for v in buf {
-                    let v = v.clamp(0, max_val) as u16;
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
-                out
-            }
-        })
-        .collect();
 
     // ---- §7.19 motion field motion vector storage. ----
     // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the
@@ -1250,7 +1248,112 @@ fn decode_frame_spec_tiles(
     // spec map is always written: `segment_id = 0` when segmentation
     // is disabled).
     let segment_ids: Vec<i32> = walker.segment_ids().iter().map(|&v| v.max(0)).collect();
-    stages.output += t_out.elapsed();
+    // r475 — nothing below reads the walker: release its per-mi grids
+    // (tens of MB at 12 MP) before the output buffers are built.
+    drop(walker);
+
+    // ---- §7.20 store payload: pre-grain cropped planes (u16). ----
+    // §7.18.3 film grain applies to the OUTPUT copy only; the §7.20
+    // reference store keeps the grain-free frame (the samples later
+    // frames motion-compensate against). r475 — under
+    // `reduced_still_picture_header` the coded video sequence holds
+    // exactly this one frame (§5.5.1: it implies `still_picture`), no
+    // later frame can reference the store, and `show_existing_frame`
+    // is forced off — so the planes are not materialised (36 MiB at
+    // 12 MP 4:2:0); the empty store reads as the never-referenced
+    // placeholder if a non-conformant stream tries.
+    let store_planes = !seq.reduced_still_picture_header;
+    let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
+    let to_u16 = |buf: &[i32]| -> Vec<u16> { buf.iter().map(|&v| v.max(0) as u16).collect() };
+    let max_val: i32 = (1 << cc.bit_depth) - 1;
+    let narrow = |buf: Vec<i32>| -> Vec<u8> {
+        if cc.bit_depth == 8 {
+            buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
+        } else {
+            let mut out = Vec::with_capacity(buf.len() * 2);
+            for v in buf {
+                let v = v.clamp(0, max_val) as u16;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }
+    };
+
+    // ---- §7.18.3 film grain. ----
+    // §5.9.30 `update_grain == 0` predicted path: `load_grain_params(
+    // film_grain_params_ref_idx )` — every field except `grain_seed`
+    // comes from the referenced slot's §7.20-saved state (the
+    // `tempGrainSeed` dance keeps the newly-read seed). A slot with
+    // no saved grain state resolves to `reset_grain_params()`.
+    let effective_grain: Option<crate::uncompressed_header_tail::FilmGrainParams> =
+        match fh.film_grain_params.as_ref() {
+            Some(fg) if fg.apply_grain && fg.predicted => {
+                let slot = fg.film_grain_params_ref_idx as usize;
+                refs.and_then(|st| st.slots.get(slot))
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.grain_params.clone())
+                    .map(|mut g| {
+                        g.grain_seed = fg.grain_seed;
+                        g.apply_grain = true;
+                        g
+                    })
+            }
+            Some(fg) if fg.apply_grain => Some(fg.clone()),
+            _ => None,
+        };
+    let (ref_planes, planes): (Vec<Vec<u16>>, Vec<Vec<u8>>) = match effective_grain.as_ref() {
+        Some(fg) if fg.apply_grain => {
+            // Grain needs every plane at once (chroma scaling reads
+            // luma): store first, synthesise, then narrow.
+            let ref_planes: Vec<Vec<u16>> = if store_planes {
+                plane_bufs.iter().map(|b| to_u16(b)).collect()
+            } else {
+                Vec::new()
+            };
+            stages.ref_store += t_ref.elapsed();
+            let t_grain = Instant::now();
+            let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+                bufs.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            film_grain_synthesis(
+                fg,
+                cc.bit_depth,
+                cc.num_planes,
+                u8::from(cc.subsampling_x),
+                u8::from(cc.subsampling_y),
+                cc.matrix_coefficients,
+                &mut bufs,
+            );
+            stages.grain += t_grain.elapsed();
+            let t_out = Instant::now();
+            let planes: Vec<Vec<u8>> = plane_bufs.into_iter().map(narrow).collect();
+            stages.output += t_out.elapsed();
+            (ref_planes, planes)
+        }
+        _ => {
+            // r475 — no grain: one plane at a time, the `i32` plane
+            // released as soon as its `u16` store copy and output bytes
+            // exist (the peak holds one plane three ways, not all of
+            // them).
+            let t_out = Instant::now();
+            let mut ref_planes: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
+            let mut planes: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
+            for buf in plane_bufs {
+                if store_planes {
+                    ref_planes.push(to_u16(&buf));
+                }
+                planes.push(narrow(buf));
+            }
+            stages.ref_store += t_ref.elapsed();
+            stages.output += t_out.elapsed();
+            (ref_planes, planes)
+        }
+    };
 
     Ok(DecodedFrameInternal {
         frame: SpecFrame {

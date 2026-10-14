@@ -20719,7 +20719,49 @@ impl PartitionWalker {
         src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
         dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::cdef::{cdef_frame, CdefFrameContext};
+        self.with_cdef_ctx(
+            cdef_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            |ctx| crate::cdef::cdef_frame(ctx, src_planes, dst_planes),
+        );
+    }
+
+    /// r475 — [`Self::cdef_frame_from_idx`] in place over the
+    /// deblocked planes ([`crate::cdef::cdef_frame_in_place`]).
+    pub(crate) fn cdef_frame_in_place_from_idx(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+    ) {
+        self.with_cdef_ctx(
+            cdef_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            |ctx| crate::cdef::cdef_frame_in_place(ctx, planes),
+        );
+    }
+
+    /// The §7.15 frame context over this walker's `cdef_idx[]` /
+    /// `Skips[]` grids, handed to `f`.
+    fn with_cdef_ctx(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        f: impl FnOnce(&crate::cdef::CdefFrameContext<'_>),
+    ) {
+        use crate::cdef::CdefFrameContext;
         let ctx = CdefFrameContext {
             mi_rows: self.mi_rows,
             mi_cols: self.mi_cols,
@@ -20742,7 +20784,7 @@ impl PartitionWalker {
             // closure answers the per-cell `Skips[ r ][ c ]`.
             skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
         };
-        cdef_frame(&ctx, src_planes, dst_planes);
+        f(&ctx);
     }
 
     /// r429 — [`Self::cdef_frame_from_idx`] with the §5.11.56
@@ -21064,7 +21106,76 @@ impl PartitionWalker {
         cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
         lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::loop_restoration::{loop_restoration_frame, LoopRestorationFrameContext};
+        self.with_lr_ctx(
+            lr_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            mi_rows,
+            mi_cols,
+            frame_height,
+            upscaled_width,
+            |ctx| {
+                crate::loop_restoration::loop_restoration_frame(
+                    ctx,
+                    curr_planes,
+                    cdef_planes,
+                    lr_planes,
+                )
+            },
+        );
+    }
+
+    /// r475 — [`Self::loop_restore_frame_from_grid`] in place over the
+    /// CDEF output with the captured pre-CDEF stripe-boundary rows
+    /// ([`crate::loop_restoration::loop_restoration_frame_in_place`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_restore_frame_in_place_from_grid(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows],
+    ) {
+        self.with_lr_ctx(
+            lr_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            mi_rows,
+            mi_cols,
+            frame_height,
+            upscaled_width,
+            |ctx| crate::loop_restoration::loop_restoration_frame_in_place(ctx, planes, boundary),
+        );
+    }
+
+    /// The §7.17 frame context over this walker's §5.11.58 unit grid,
+    /// handed to `f`.
+    #[allow(clippy::too_many_arguments)]
+    fn with_lr_ctx(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        f: impl FnOnce(&crate::loop_restoration::LoopRestorationFrameContext<'_>),
+    ) {
+        use crate::loop_restoration::LoopRestorationFrameContext;
         let ctx = LoopRestorationFrameContext {
             mi_rows,
             mi_cols,
@@ -21102,7 +21213,7 @@ impl PartitionWalker {
                 self.lr_unit(plane as usize, unit_row, unit_col).sgr_xqd[i]
             },
         };
-        loop_restoration_frame(&ctx, curr_planes, cdef_planes, lr_planes);
+        f(&ctx);
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
