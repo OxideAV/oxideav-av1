@@ -19557,8 +19557,9 @@ impl PartitionWalker {
             };
             let scratch = &mut self.inter_pred_scratch[r.plane];
             for y in r.y0..r.y0 + r.h {
-                for x in r.x0..r.x0 + r.w {
-                    scratch[y * r.stride + x] = cp.samples[y * r.stride + x] as u16;
+                let row = y * r.stride + r.x0..y * r.stride + r.x0 + r.w;
+                for (d, &s) in scratch[row.clone()].iter_mut().zip(&cp.samples[row]) {
+                    *d = s as u16;
                 }
             }
         }
@@ -19667,8 +19668,9 @@ impl PartitionWalker {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             for y in r.y0..r.y0 + r.h {
-                for x in r.x0..r.x0 + r.w {
-                    cp.samples[y * r.stride + x] = scratch[y * r.stride + x] as i32;
+                let row = y * r.stride + r.x0..y * r.stride + r.x0 + r.w;
+                for (d, &s) in cp.samples[row.clone()].iter_mut().zip(&scratch[row]) {
+                    *d = i32::from(s);
                 }
             }
         }
