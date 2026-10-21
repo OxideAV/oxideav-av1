@@ -34,7 +34,7 @@ pub mod frame_driver;
 
 #[doc(hidden)]
 pub use frame_driver::{
-    DecodeStageTimings, MAX_PICTURE_SIZE, SpecDecodeSession, decode_frame_spec,
+    DecodeStageTimings, MAX_PICTURE_SIZE, PendingSpecFrame, SpecDecodeSession, decode_frame_spec,
 };
 pub use frame_driver::{SpecFrame, decode_av1_spec, decode_av1_spec_at_operating_point};
 

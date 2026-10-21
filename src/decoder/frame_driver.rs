@@ -217,6 +217,116 @@ impl SpecRefState {
     }
 }
 
+/// A shown frame of a temporal unit handed out by
+/// [`SpecDecodeSession::decode_temporal_unit_pipelined`]: either
+/// already decoded, or still decoding on a worker thread.
+///
+/// A frame whose `refresh_frame_flags` is zero is never read by a later
+/// frame — §7.20 stores nothing for it (no samples, no §7.19 motion
+/// field, no CDFs, no saved parameters), and its header parse reads
+/// only the reference state the frames before it left — so it can
+/// decode alongside the frames that follow it. The worker reads an
+/// `Arc` snapshot of that reference state; the bytes equal the serial
+/// decode.
+#[derive(Debug)]
+pub struct PendingSpecFrame(PendingState);
+
+#[derive(Debug)]
+enum PendingState {
+    Done(Result<SpecFrame, Error>),
+    Running(std::thread::JoinHandle<Result<SpecFrame, Error>>),
+}
+
+impl PendingSpecFrame {
+    fn ready(frame: SpecFrame) -> Self {
+        Self(PendingState::Done(Ok(frame)))
+    }
+
+    /// `true` once [`Self::into_frame`] would return without blocking.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match &self.0 {
+            PendingState::Done(_) => true,
+            PendingState::Running(h) => h.is_finished(),
+        }
+    }
+
+    /// Block until the frame is decoded (a worker panic is re-raised
+    /// here, as the serial decode would have raised it).
+    pub fn resolve(&mut self) {
+        if let PendingState::Running(_) = self.0 {
+            let PendingState::Running(h) =
+                std::mem::replace(&mut self.0, PendingState::Done(Err(Error::UnexpectedEnd)))
+            else {
+                unreachable!()
+            };
+            self.0 = PendingState::Done(match h.join() {
+                Ok(r) => r,
+                Err(panic) => std::panic::resume_unwind(panic),
+            });
+        }
+    }
+
+    /// The decoded frame (blocking until it is), or the error its
+    /// decode hit.
+    ///
+    /// ## Errors
+    ///
+    /// Every error the frame's decode can raise.
+    pub fn into_frame(mut self) -> Result<SpecFrame, Error> {
+        self.resolve();
+        match self.0 {
+            PendingState::Done(r) => r,
+            PendingState::Running(_) => unreachable!(),
+        }
+    }
+}
+
+/// Decode one frame whose tiles are all in: on a worker thread when
+/// `defer` is set and nothing after the frame can read it (a shown
+/// frame with `refresh_frame_flags == 0`), serially otherwise
+/// (followed by the §7.20 reference update).
+#[allow(clippy::too_many_arguments)]
+fn decode_or_defer(
+    s: &SequenceHeader,
+    fh: FrameHeader,
+    tiles: Vec<TilePayload>,
+    refs: &mut SpecRefState,
+    out: &mut Vec<PendingSpecFrame>,
+    stages: &mut DecodeStageTimings,
+    threads: usize,
+    defer: bool,
+) -> Result<(), Error> {
+    if defer && threads > 1 && fh.refresh_frame_flags == 0 && fh.show_frame {
+        let job = Arc::new((s.clone(), fh, tiles, refs.clone()));
+        let worker_job = Arc::clone(&job);
+        let spawned = std::thread::Builder::new()
+            .name("av1-frame".into())
+            .spawn(move || {
+                let (seq, fh, tiles, snapshot) = &*worker_job;
+                let mut st = DecodeStageTimings::default();
+                decode_frame_spec_tiles(seq, fh, tiles, Some(snapshot), &mut st, threads)
+                    .map(|d| d.frame)
+            });
+        if let Ok(handle) = spawned {
+            out.push(PendingSpecFrame(PendingState::Running(handle)));
+            return Ok(());
+        }
+        // No thread to be had: decode it here (it stores nothing, so
+        // the snapshot is the live reference state).
+        let (_, fh, tiles, snapshot) = &*job;
+        let decoded = decode_frame_spec_tiles(s, fh, tiles, Some(snapshot), stages, threads)?;
+        out.push(PendingSpecFrame::ready(decoded.frame));
+        return Ok(());
+    }
+    let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), stages, threads)?;
+    let frame = reference_frame_update(refs, &fh, decoded)?;
+    if fh.show_frame {
+        out.push(PendingSpecFrame::ready(frame));
+    }
+    Ok(())
+}
+
 /// One frame decoded by [`decode_frame_spec_full`] — the surfaced
 /// [`SpecFrame`] plus the §7.20 reference-update payload.
 struct DecodedFrameInternal {
@@ -1853,6 +1963,47 @@ impl SpecDecodeSession {
             self.max_picture_size,
             &mut self.stages,
             self.threads,
+            false,
+        )?;
+        out.into_iter().map(PendingSpecFrame::into_frame).collect()
+    }
+
+    /// [`Self::decode_temporal_unit`] that, under a worker budget
+    /// (`threads > 1`), hands each shown frame with
+    /// `refresh_frame_flags == 0` to a worker thread and returns while
+    /// it decodes, so it overlaps the frames that follow it. The
+    /// returned entries are the unit's shown frames in output order;
+    /// [`PendingSpecFrame::into_frame`] waits for one. With a serial
+    /// budget every entry is already decoded. Bytes equal
+    /// [`Self::decode_temporal_unit`] for any budget.
+    ///
+    /// A deferred frame's decode error surfaces from its
+    /// [`PendingSpecFrame::into_frame`], after the session has moved
+    /// on (the frame updates no reference state, so the session is
+    /// unaffected). Its stage timings are not counted in
+    /// [`Self::last_stage_timings`].
+    ///
+    /// ## Errors
+    ///
+    /// The [`Self::decode_temporal_unit`] error surfaces of every
+    /// frame decoded in line.
+    pub fn decode_temporal_unit_pipelined(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Vec<PendingSpecFrame>, Error> {
+        let mut out = Vec::new();
+        self.stages = DecodeStageTimings::default();
+        decode_temporal_unit_spec(
+            payload,
+            &mut self.seq,
+            &mut self.refs,
+            &mut out,
+            self.chosen_op,
+            &mut self.op_idc,
+            self.max_picture_size,
+            &mut self.stages,
+            self.threads,
+            true,
         )?;
         Ok(out)
     }
@@ -2079,12 +2230,13 @@ fn decode_temporal_unit_spec(
     payload: &[u8],
     seq: &mut Option<SequenceHeader>,
     refs: &mut SpecRefState,
-    out: &mut Vec<SpecFrame>,
+    out: &mut Vec<PendingSpecFrame>,
     chosen_op: u8,
     op_idc: &mut u16,
     max_picture_size: u32,
     stages: &mut DecodeStageTimings,
     threads: usize,
+    defer: bool,
 ) -> Result<(), Error> {
     // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
     // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
@@ -2170,7 +2322,9 @@ fn decode_temporal_unit_spec(
                 stages.parse += t_parse.elapsed();
                 check_picture_size(&fh, max_picture_size)?;
                 if fh.show_existing_frame {
-                    out.push(output_existing_frame(refs, &fh, s)?);
+                    out.push(PendingSpecFrame::ready(output_existing_frame(
+                        refs, &fh, s,
+                    )?));
                     // §7.4 / §7.21: a shown KEY frame re-loads the
                     // stored frame state and re-stores it into every
                     // slot (`refresh_frame_flags == allFrames` per the
@@ -2261,12 +2415,7 @@ fn decode_temporal_unit_spec(
                 // `tg_end == NumTiles - 1`.
                 if parsed.tg_end + 1 == num_tiles {
                     let pf = pending.take().expect("pending frame checked above");
-                    let decoded =
-                        decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs), stages, threads)?;
-                    let frame = reference_frame_update(refs, &pf.fh, decoded)?;
-                    if pf.fh.show_frame {
-                        out.push(frame);
-                    }
+                    decode_or_defer(s, pf.fh, pf.tiles, refs, out, stages, threads, defer)?;
                 }
             }
             ObuType::Frame => {
@@ -2294,11 +2443,7 @@ fn decode_temporal_unit_spec(
                     .ok_or(Error::PartitionWalkOutOfRange)?;
                 let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
                 stages.parse += t_parse.elapsed();
-                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), stages, threads)?;
-                let frame = reference_frame_update(refs, &fh, decoded)?;
-                if fh.show_frame {
-                    out.push(frame);
-                }
+                decode_or_defer(s, fh, tiles, refs, out, stages, threads, defer)?;
             }
             _ => return Err(Error::PartitionWalkOutOfRange),
         }

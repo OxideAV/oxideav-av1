@@ -53,7 +53,7 @@ use oxideav_core::{
 };
 
 use crate::codec_config::Av1CodecConfig;
-use crate::decoder::{SpecDecodeSession, SpecFrame};
+use crate::decoder::{PendingSpecFrame, SpecDecodeSession, SpecFrame};
 use crate::encoder::{
     ChromaFormat, DEFAULT_STILL_BASE_Q_IDX, StillOptions, StillSpeed, YuvFrame,
     encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx,
@@ -147,9 +147,10 @@ struct Av1Decoder {
     codec_id: CodecId,
     /// The cross-packet §7.20 session-state stack.
     session: SpecDecodeSession,
-    /// Frames recovered from already-decoded packets, awaiting drain by
-    /// `receive_frame`. Held as `VideoFrame` in output order.
-    queue: std::collections::VecDeque<VideoFrame>,
+    /// Frames recovered from already-sent packets, awaiting drain by
+    /// `receive_frame`, in output order with their packet's pts. Under
+    /// a worker budget a non-reference frame may still be decoding.
+    queue: std::collections::VecDeque<(PendingSpecFrame, Option<i64>)>,
     eof: bool,
 }
 
@@ -173,10 +174,9 @@ impl Decoder for Av1Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
-        let mut push = |frames: Vec<SpecFrame>| {
+        let mut push = |frames: Vec<PendingSpecFrame>| {
             for frame in frames {
-                self.queue
-                    .push_back(spec_frame_to_video_frame(frame, packet.pts));
+                self.queue.push_back((frame, packet.pts));
             }
         };
         if packet.data.len() >= 4 && &packet.data[..4] == IVF_MAGIC {
@@ -192,7 +192,7 @@ impl Decoder for Av1Decoder {
             for record in records {
                 let frames = self
                     .session
-                    .decode_temporal_unit(&record.payload)
+                    .decode_temporal_unit_pipelined(&record.payload)
                     .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
                 push(frames);
             }
@@ -201,24 +201,40 @@ impl Decoder for Av1Decoder {
             // demuxer framing).
             let frames = self
                 .session
-                .decode_temporal_unit(&packet.data)
+                .decode_temporal_unit_pipelined(&packet.data)
                 .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
             push(frames);
+        }
+        // Bound the frames decoding on workers: past the budget, wait
+        // for the oldest before taking more input.
+        let budget = self.session.threads();
+        while self.queue.iter().filter(|(f, _)| !f.is_ready()).count() >= budget.max(2) {
+            if let Some((f, _)) = self.queue.iter_mut().find(|(f, _)| !f.is_ready()) {
+                f.resolve();
+            }
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> CoreResult<CoreFrame> {
-        match self.queue.pop_front() {
-            Some(vf) => Ok(CoreFrame::Video(vf)),
-            None => {
-                if self.eof {
-                    Err(CoreError::Eof)
-                } else {
-                    Err(CoreError::NeedMore)
-                }
-            }
+        // A frame still decoding holds back the queue until the caller
+        // flushes (then it is waited for).
+        let ready = match self.queue.front() {
+            Some((f, _)) => self.eof || f.is_ready(),
+            None => false,
+        };
+        if !ready {
+            return Err(if self.eof && self.queue.is_empty() {
+                CoreError::Eof
+            } else {
+                CoreError::NeedMore
+            });
         }
+        let (frame, pts) = self.queue.pop_front().expect("front checked above");
+        let frame = frame
+            .into_frame()
+            .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+        Ok(CoreFrame::Video(spec_frame_to_video_frame(frame, pts)))
     }
 
     fn flush(&mut self) -> CoreResult<()> {
