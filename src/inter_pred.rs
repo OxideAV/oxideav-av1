@@ -763,9 +763,30 @@ pub fn block_inter_prediction(
     //
     // (av1-spec p.262 lines 14609-14619.)
     let y_base = (start_y >> SCALE_SUBPEL_BITS) - 3;
-    for r in 0..intermediate_height {
+    // Phase 0 of every kernel is { 0, 0, 0, 128, 0, 0, 0, 0 }: only the
+    // centre tap contributes. Without scaling, a whole-sample horizontal
+    // position uses it for every column, and a whole-sample vertical
+    // position reads only intermediate rows 3 ..= h + 2.
+    let phase_of =
+        |p: i32| ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+    let unscaled = 1i32 << SCALE_SUBPEL_BITS;
+    let whole_x = step_x == unscaled && phase_of(start_x) == 0;
+    let rows = if step_y == unscaled && phase_of(start_y) == 0 {
+        3..h + 3
+    } else {
+        0..intermediate_height
+    };
+    for r in rows {
         let ry = clip3_i32(0, last_y, y_base + (r as i32)) as usize;
         let row_base = ry * ref_stride;
+        if whole_x {
+            let x0 = start_x >> SCALE_SUBPEL_BITS;
+            for (c, out) in intermediate[r * w..(r + 1) * w].iter_mut().enumerate() {
+                let rx = clip3_i32(0, last_x, x0 + c as i32) as usize;
+                *out = round2(128 * ref_plane[row_base + rx] as i64, inter_round0) as i32;
+            }
+            continue;
+        }
         for c in 0..w {
             let p: i32 = start_x + step_x * (c as i32);
             // §7.11.3.4 phase index `(p >> 6) & SUBPEL_MASK` —
@@ -819,6 +840,13 @@ pub fn block_inter_prediction(
         // `p_int + t < intermediate_height` for every legal (r, t):
         // `(h-1) * yStep < intermediateHeight - 7` after the `+8` margin.
         let rows = &intermediate[p_int * w..(p_int + 8) * w];
+        if phase == 0 {
+            let centre = &rows[3 * w..4 * w];
+            for (out, &v) in pred[r * w..(r + 1) * w].iter_mut().zip(centre) {
+                *out = round2(128 * v as i64, inter_round1) as i32;
+            }
+            continue;
+        }
         // The intermediate samples are below 2^15 in magnitude (12-bit
         // samples times a kernel of absolute sum 240, shifted by
         // InterRound0), so these sums fit i32 as well.
@@ -7757,6 +7785,100 @@ pub fn motion_field_estimation_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Section 7.11.3.4 evaluated literally: every tap clamped, i64 sums.
+    #[allow(clippy::too_many_arguments)]
+    fn literal_block_inter_prediction(
+        ref_plane: &[u16],
+        stride: usize,
+        pw: i32,
+        ph: i32,
+        x: i32,
+        y: i32,
+        xs: i32,
+        ys: i32,
+        w: usize,
+        h: usize,
+        fx: usize,
+        fy: usize,
+        r0: u32,
+        r1: u32,
+    ) -> Vec<i32> {
+        let ih = ((((h as i64) - 1) * ys as i64 + 1023) >> 10) as usize + 8;
+        let mut inter = vec![0i64; ih * w];
+        for r in 0..ih {
+            let ry = clip3_i32(0, ph - 1, (y >> 10) - 3 + r as i32) as usize;
+            for c in 0..w {
+                let p = x + xs * c as i32;
+                let k = &SUBPEL_FILTERS[fx][((p >> 6) & 15) as usize];
+                let s: i64 = (0..8)
+                    .map(|t| {
+                        k[t] as i64
+                            * ref_plane[ry * stride
+                                + clip3_i32(0, pw - 1, (p >> 10) + t as i32 - 3) as usize]
+                                as i64
+                    })
+                    .sum();
+                inter[r * w + c] = round2(s, r0);
+            }
+        }
+        let mut out = vec![0i32; h * w];
+        for r in 0..h {
+            let p = (y & 1023) + ys * r as i32;
+            let k = &SUBPEL_FILTERS[fy][((p >> 6) & 15) as usize];
+            for c in 0..w {
+                let s: i64 = (0..8)
+                    .map(|t| k[t] as i64 * inter[((p >> 10) as usize + t) * w + c])
+                    .sum();
+                out[r * w + c] = round2(s, r1) as i32;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn block_inter_prediction_matches_the_literal_process() {
+        let (pw, ph) = (48usize, 40usize);
+        for bd in [8u32, 10, 12] {
+            let plane: Vec<u16> = (0..pw * ph)
+                .map(|i| {
+                    (((i as u64).wrapping_mul(2_654_435_761) >> 16) as u16) & ((1 << bd) - 1) as u16
+                })
+                .collect();
+            let r0 = if bd == 12 { 5 } else { 3 };
+            for (xs, ys) in [(1024, 1024), (2048, 1024), (1024, 1536), (1500, 1300)] {
+                for (w, h) in [(4usize, 4usize), (8, 8), (16, 4)] {
+                    for x in [-9000, -1024, 0, 64, 1024 * 5 + 320, 1024 * 40, 1024 * 60] {
+                        for y in [-7000, 0, 512, 1024 * 3, 1024 * 30 + 64, 1024 * 50] {
+                            for (fx, fy) in [(0u8, 0u8), (1, 2), (2, 1)] {
+                                let mut pred = vec![0i32; w * h];
+                                block_inter_prediction(
+                                    0, 0, 0, &plane, pw, pw as u32, ph as u32, x, y, xs, ys, w, h,
+                                    fx, fy, r0, 11, &mut pred,
+                                )
+                                .unwrap();
+                                let hf = if w <= 4 {
+                                    select_interp_filter_small_block(fx)
+                                } else {
+                                    fx
+                                } as usize;
+                                let vf = if h <= 4 {
+                                    select_interp_filter_small_block(fy)
+                                } else {
+                                    fy
+                                } as usize;
+                                let want = literal_block_inter_prediction(
+                                    &plane, pw, pw as i32, ph as i32, x, y, xs, ys, w, h, hf, vf,
+                                    r0, 11,
+                                );
+                                assert_eq!(pred, want, "bd {bd} step ({xs},{ys}) {w}x{h} at ({x},{y}) filters ({fx},{fy})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ---------- §7.11.3.2 rounding_variables ----------
 
