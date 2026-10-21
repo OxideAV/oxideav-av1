@@ -775,10 +775,22 @@ pub fn block_inter_prediction(
             let p_int = p >> SCALE_SUBPEL_BITS;
             let coeffs = &SUBPEL_FILTERS[h_filter][phase];
             let mut s: i64 = 0;
-            for (t, coef) in coeffs.iter().enumerate() {
-                let rx = clip3_i32(0, last_x, p_int + (t as i32) - 3) as usize;
-                let sample = ref_plane[row_base + rx] as i64;
-                s += (*coef as i64) * sample;
+            if p_int >= 3 && p_int + 4 <= last_x {
+                // All eight taps inside the row: no clamping needed. With
+                // samples of at most 12 bits and kernels of absolute sum
+                // at most 256, the sum fits i32.
+                let start = row_base + (p_int - 3) as usize;
+                let mut t32: i32 = 0;
+                for (coef, &sample) in coeffs.iter().zip(&ref_plane[start..start + 8]) {
+                    t32 += (*coef as i32) * sample as i32;
+                }
+                s = t32 as i64;
+            } else {
+                for (t, coef) in coeffs.iter().enumerate() {
+                    let rx = clip3_i32(0, last_x, p_int + (t as i32) - 3) as usize;
+                    let sample = ref_plane[row_base + rx] as i64;
+                    s += (*coef as i64) * sample;
+                }
             }
             intermediate[r * w + c] = round2(s, inter_round0) as i32;
         }
@@ -802,18 +814,19 @@ pub fn block_inter_prediction(
         let phase = ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
         let p_int = (p >> SCALE_SUBPEL_BITS) as usize;
         let coeffs = &SUBPEL_FILTERS[v_filter][phase];
-        for c in 0..w {
-            let mut s: i64 = 0;
+        // The intermediate-height derivation above guarantees
+        // `p_int + t < intermediate_height` for every legal (r, t):
+        // `(h-1) * yStep < intermediateHeight - 7` after the `+8` margin.
+        let rows = &intermediate[p_int * w..(p_int + 8) * w];
+        // The intermediate samples are below 2^15 in magnitude (12-bit
+        // samples times a kernel of absolute sum 240, shifted by
+        // InterRound0), so these sums fit i32 as well.
+        for (c, out) in pred[r * w..(r + 1) * w].iter_mut().enumerate() {
+            let mut s: i32 = 0;
             for (t, coef) in coeffs.iter().enumerate() {
-                let interp_row = p_int + t;
-                // The intermediate-height derivation above guarantees
-                // `p_int + t < intermediate_height` for every legal
-                // (r, t) — `(h-1) * yStep < intermediateHeight - 7`
-                // after applying the `+8` margin from line 14582.
-                let v = intermediate[interp_row * w + c] as i64;
-                s += (*coef as i64) * v;
+                s += *coef * rows[t * w + c];
             }
-            pred[r * w + c] = round2(s, inter_round1) as i32;
+            *out = round2(s as i64, inter_round1) as i32;
         }
     }
 
