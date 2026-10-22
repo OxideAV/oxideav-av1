@@ -92,3 +92,15 @@ name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
+
+# Target 4 — `still` (r479). Attacker-chosen shape / depth / layout /
+# `base_q_idx` / speed / thread budget through the lossy still-picture
+# encoder (`encode_still_yuv`: the §7.14 / §7.15 / §7.17 elections on
+# their row windows, the compact committed trees, the tile-parallel
+# search) and the decode-of-own-output path, asserting the decoder's
+# reconstruction equals the encoder's.
+[[bin]]
+name = "still"
+path = "fuzz_targets/still.rs"
+test = false
+doc = false

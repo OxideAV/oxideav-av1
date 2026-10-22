@@ -252,6 +252,8 @@ pub mod camera_frame;
 pub(crate) mod cdef_elect;
 #[doc(hidden)]
 pub mod coefficients;
+#[doc(hidden)]
+pub(crate) mod committed_tree;
 pub(crate) mod dv_hash;
 #[doc(hidden)]
 pub mod forward_adst;
@@ -293,6 +295,8 @@ pub(crate) mod rate_twin;
 pub mod scalable_gop;
 #[doc(hidden)]
 pub mod sequence_obu;
+#[doc(hidden)]
+pub mod stage_probe;
 /// r460 — the still-picture entry point (AVIF / HEIF `av01` items).
 pub mod still;
 

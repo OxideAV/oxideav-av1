@@ -1117,10 +1117,33 @@ pub(crate) fn apply_lr_plan(
         };
         let recon = &mut recons[plane];
         if plan.header.frame_restoration_type[plane] != FrameRestorationType::None {
-            // Restore into a fresh plane (later rectangles read their
-            // neighbours' PRE-restoration samples), then swap in.
-            let mut restored: Vec<u16> = recon.to_vec();
+            // Later rectangles read their neighbours' PRE-restoration
+            // samples (§7.17 reads `CdefFrame`, writes `LrFrame`), so a
+            // rectangle's output is written back only once every
+            // rectangle that can read its samples has been built.
+            // r479 — a rectangle reaches `LOCAL_MARGIN` samples into
+            // the neighbouring stripes, so one stripe's outputs are
+            // parked until the next stripe is done: two stripes of
+            // `u16` in flight instead of a frame-sized copy (23 MiB at
+            // 12 MP).
+            type Rect = (usize, usize, usize, usize, Vec<u16>);
+            let flush = |rects: &mut Vec<Rect>, recon: &mut [u16]| {
+                for (x, y, w, h, buf) in rects.drain(..) {
+                    for i in 0..h {
+                        recon[(y + i) * pw + x..(y + i) * pw + x + w]
+                            .copy_from_slice(&buf[i * w..(i + 1) * w]);
+                    }
+                }
+            };
+            let mut parked: Vec<Rect> = Vec::new();
+            let mut current: Vec<Rect> = Vec::new();
+            let mut stripe: Option<i32> = None;
             for g in stripe_unit_rects(&geom_ctx, plane as u8) {
+                if stripe != Some(g.stripe_start_y) {
+                    flush(&mut parked, recon);
+                    parked = std::mem::take(&mut current);
+                    stripe = Some(g.stripe_start_y);
+                }
                 let unit = find(plane, g.unit_row, g.unit_col);
                 if unit.restoration_type == RESTORE_NONE {
                     continue;
@@ -1128,15 +1151,19 @@ pub(crate) fn apply_lr_plan(
                 let mut lr = LocalRect::build(&g, currs[plane], recon, pw, ph);
                 eval_rect(&mut lr, &unit, plane, bit_depth, &mut out, srcs[plane], pw);
                 let m = LOCAL_MARGIN;
-                for i in 0..g.h as usize {
-                    let orow = &out[(m + i) * lr.cols + m..(m + i) * lr.cols + m + g.w as usize];
-                    let drow = &mut restored[(lr.abs_y + i) * pw + lr.abs_x..][..g.w as usize];
-                    for (d, o) in drow.iter_mut().zip(orow) {
-                        *d = (*o).max(0) as u16;
-                    }
+                let (w, h) = (g.w as usize, g.h as usize);
+                let mut buf: Vec<u16> = Vec::with_capacity(w * h);
+                for i in 0..h {
+                    buf.extend(
+                        out[(m + i) * lr.cols + m..(m + i) * lr.cols + m + w]
+                            .iter()
+                            .map(|&o| o.max(0) as u16),
+                    );
                 }
+                current.push((lr.abs_x, lr.abs_y, w, h, buf));
             }
-            recon.copy_from_slice(&restored);
+            flush(&mut parked, recon);
+            flush(&mut current, recon);
         }
         // r460 — the SSD is measured over the CODED extent only (the
         // election's per-unit rects never reach into the mi-grid

@@ -758,7 +758,7 @@ pub(crate) fn encode_key_frame_yuv_seg_carry_tiles(
 pub(crate) struct TileSearchOut {
     pub payload: Vec<u8>,
     pub cdfs: Box<TileCdfContext>,
-    pub trees: Vec<crate::encoder::partition_tree::SyntaxNode>,
+    pub trees: Vec<crate::encoder::committed_tree::CommittedTree>,
     pub sbs: Vec<(u32, u32)>,
 }
 
@@ -1702,6 +1702,7 @@ fn encode_key_frame_yuv_core(
     // Shape / depth / sample-range gate (multiples of 8, [8, MAX] per
     // axis, planes consistent with the format).
     input.validate()?;
+    crate::encoder::stage_probe::stage("enter");
     let bit_depth = input.bit_depth;
     let (ssx, ssy) = input.format.subsampling();
     let mono = input.format == ChromaFormat::Monochrome;
@@ -2035,12 +2036,39 @@ fn encode_key_frame_yuv_core(
         inter: None,
     };
 
+    // r479 — the threaded tile-local walk (see `tile_local` below)
+    // never touches the frame-scope reconstruction or syntax mirror
+    // during the search: each thread works on tile-sized objects and
+    // the results are stitched afterwards. Both frame-scope objects
+    // are therefore materialised AFTER the search on that path (73 MiB
+    // at 12 MP that would otherwise sit idle under the per-tile
+    // state).
+    let threaded_local = extras
+        .search
+        .threads
+        .max(1)
+        .min((ti.tile_cols * ti.tile_rows) as usize)
+        > 1
+        && !fh.allow_intrabc
+        && exact_mask.is_none();
     // Running reconstruction — tracks the decoder's `CurrFrame`
     // sample-for-sample (see module docs).
     let mut recon = ReconState {
-        y: vec![0u16; width * height],
-        u: vec![0u16; chroma_w * chroma_h],
-        v: vec![0u16; chroma_w * chroma_h],
+        y: if threaded_local {
+            Vec::new()
+        } else {
+            vec![0u16; width * height]
+        },
+        u: if threaded_local {
+            Vec::new()
+        } else {
+            vec![0u16; chroma_w * chroma_h]
+        },
+        v: if threaded_local {
+            Vec::new()
+        } else {
+            vec![0u16; chroma_w * chroma_h]
+        },
         width,
         height,
         chroma_w,
@@ -2102,23 +2130,31 @@ fn encode_key_frame_yuv_core(
         "tile plan must cover every superblock exactly once"
     );
 
-    let mut state = PartitionSyntaxWriter::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
-    .ok_or(Error::PartitionWalkOutOfRange)?;
+    let frame_state = || {
+        PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)
+    };
+    let mut state_opt: Option<PartitionSyntaxWriter> = if threaded_local {
+        None
+    } else {
+        Some(frame_state()?)
+    };
 
     // r429 — the committed trees are retained: the per-unit CDEF
     // election re-emits the tile with §5.11.56 strength ids stamped.
     // r431: tile-scan order, with the superblock origin of each tree
     // kept alongside (the CDEF unit grid is frame-raster indexed).
-    let mut trees: Vec<crate::encoder::partition_tree::SyntaxNode> = Vec::new();
+    // r479 — compact form (see [`crate::encoder::committed_tree`]).
+    let mut trees: Vec<crate::encoder::committed_tree::CommittedTree> = Vec::new();
     let mut tree_sb: Vec<(u32, u32)> = Vec::new();
     let mut tile_payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
     // The §8.4 frame-end donation: tile `context_update_tile_id`'s
@@ -2148,7 +2184,7 @@ fn encode_key_frame_yuv_core(
                     rc: &mut ReconState,
                     st: &mut PartitionSyntaxWriter|
      -> Result<TileSearchOut, Error> {
-        let mut out_trees: Vec<crate::encoder::partition_tree::SyntaxNode> = Vec::new();
+        let mut out_trees: Vec<crate::encoder::committed_tree::CommittedTree> = Vec::new();
         let mut out_sbs: Vec<(u32, u32)> = Vec::new();
         if !st.begin_tile(geo) {
             return Err(Error::PartitionWalkOutOfRange);
@@ -2243,7 +2279,7 @@ fn encode_key_frame_yuv_core(
                     }
                 }
             }
-            out_trees.push(tree);
+            out_trees.push(crate::encoder::committed_tree::CommittedTree::pack(&tree));
             out_sbs.push((sb_r + abs.0, sb_c + abs.1));
         }
         Ok(TileSearchOut {
@@ -2254,9 +2290,13 @@ fn encode_key_frame_yuv_core(
         })
     };
     let threads = extras.search.threads.max(1).min(num_tiles as usize);
+    crate::encoder::stage_probe::stage("search");
     if threads <= 1 {
+        let state = state_opt
+            .as_mut()
+            .expect("the sequential walk owns the frame-scope mirror");
         for (geo, origins) in tile_plan.iter() {
-            let out = run_tile(*geo, origins, (0, 0), input, &mut recon, &mut state)?;
+            let out = run_tile(*geo, origins, (0, 0), input, &mut recon, state)?;
             tile_payloads.push(out.payload);
             all_cdfs.push(out.cdfs);
             trees.extend(out.trees);
@@ -2277,13 +2317,14 @@ fn encode_key_frame_yuv_core(
         // arm indexes the frame-level hash and the frame-level
         // reconstruction, so it keeps the frame-scope clone.
         let tile_local = !recon.allow_intrabc && exact_mask.is_none();
+        debug_assert_eq!(tile_local, threaded_local);
         let next = core::sync::atomic::AtomicUsize::new(0);
         type TileRun = (usize, TileSearchOut, ReconState, PartitionSyntaxWriter);
         let results: Vec<Result<TileRun, Error>> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads);
             for _ in 0..threads {
                 let recon_ref = &recon;
-                let state_ref = &state;
+                let state_ref = state_opt.as_ref();
                 let plan_ref = &tile_plan;
                 let next_ref = &next;
                 let run = &run_tile;
@@ -2304,7 +2345,9 @@ fn encode_key_frame_yuv_core(
                             );
                         } else {
                             let mut rc = recon_ref.clone();
-                            let mut st = state_ref.clone();
+                            let mut st = state_ref
+                                .expect("the frame-scope walk owns the frame-scope mirror")
+                                .clone();
                             outs.push(
                                 run(*geo, origins, (0, 0), input, &mut rc, &mut st)
                                     .map(|o| (t, o, rc, st)),
@@ -2326,6 +2369,17 @@ fn encode_key_frame_yuv_core(
             let (t, o, rc, st) = r?;
             per_tile[t] = Some((o, rc, st));
         }
+        // r479 — materialise the frame-scope objects the tiles are
+        // stitched into (see `threaded_local`).
+        if recon.y.is_empty() {
+            recon.y = vec![0u16; width * height];
+            recon.u = vec![0u16; chroma_w * chroma_h];
+            recon.v = vec![0u16; chroma_w * chroma_h];
+        }
+        let state = match state_opt.as_mut() {
+            Some(s) => s,
+            None => state_opt.insert(frame_state()?),
+        };
         for (t, slot) in per_tile.into_iter().enumerate() {
             let (o, rc, st) = slot.expect("every tile searched");
             let geo = tile_plan[t].0;
@@ -2382,6 +2436,8 @@ fn encode_key_frame_yuv_core(
         }
     }
 
+    let mut state = state_opt.expect("the frame-scope mirror exists after the search");
+
     // §5.11.1 assembled tile-group body length — what the exact-bytes
     // elections below price (for a single tile this IS the tile
     // payload, byte for byte; multi-tile adds the flag byte + the
@@ -2402,6 +2458,7 @@ fn encode_key_frame_yuv_core(
         ))
     };
     let mut tile_group_body = assemble(&tile_payloads)?;
+    crate::encoder::stage_probe::stage("deblock");
 
     // r431 — replay the committed trees under `emit_params` (plus the
     // optional §5.11.57 `write_lr` interleave) across the tile plan:
@@ -2419,10 +2476,18 @@ fn encode_key_frame_yuv_core(
         Vec<Box<TileCdfContext>>,
         PartitionSyntaxWriter,
     );
-    let emit_tiles = |trees: &[crate::encoder::partition_tree::SyntaxNode],
+    // r479 — the previous frame-scope mirror is handed in and dropped
+    // before the replay's fresh one is built (37 MiB at 12 MP): the
+    // replayed mirror carries the same grids (the trees are the same)
+    // and stands in for it whether or not the arm is adopted — only
+    // the §5.11.56 `cdef_idx` stamps and the §5.11.57 unit grids
+    // differ, and neither is read after an arm settles.
+    let emit_tiles = |trees: &[crate::encoder::committed_tree::CommittedTree],
                       emit_params: &SyntaxFrameParams,
-                      lr_plan: Option<&crate::encoder::lr_elect::LrPlan>|
+                      lr_plan: Option<&crate::encoder::lr_elect::LrPlan>,
+                      previous: PartitionSyntaxWriter|
      -> Result<EmitOut, Error> {
+        drop(previous);
         let mut re_state = PartitionSyntaxWriter::new(
             mi_rows,
             mi_cols,
@@ -2459,11 +2524,12 @@ fn encode_key_frame_yuv_core(
                         &plan.units,
                     )?;
                 }
+                let tree = trees[tree_idx].expand();
                 write_partition_tree_syntax(
                     &mut re_writer,
                     &mut re_cdfs,
                     &mut re_state,
-                    &trees[tree_idx],
+                    &tree,
                     sb_r,
                     sb_c,
                     BLOCK_64X64,
@@ -2511,32 +2577,40 @@ fn encode_key_frame_yuv_core(
         && exact_mask.is_none()
         && alt_q.is_empty()
     {
-        if let Some(e) =
-            crate::encoder::lf_elect::elect_loop_filter(&crate::encoder::lf_elect::LfElectInput {
-                mirror: state.mirror(),
-                input,
-                recon_y: &recon.y,
-                recon_u: &recon.u,
-                recon_v: &recon.v,
-                width,
-                height,
-                chroma_w,
-                chroma_h,
-                frame_width: coded_w,
-                frame_height: coded_h,
-                bit_depth,
-                subsampling_x: ssx,
-                subsampling_y: ssy,
-                num_planes,
-                effort: extras.search.lf_effort,
-            })
-        {
-            recon.y = e.y;
-            recon.u = e.u;
-            recon.v = e.v;
-            fh.loop_filter_params = Some(e.params);
+        let lf_input = crate::encoder::lf_elect::LfElectInput {
+            mirror: state.mirror(),
+            input,
+            recon_y: &recon.y,
+            recon_u: &recon.u,
+            recon_v: &recon.v,
+            width,
+            height,
+            chroma_w,
+            chroma_h,
+            frame_width: coded_w,
+            frame_height: coded_h,
+            bit_depth,
+            subsampling_x: ssx,
+            subsampling_y: ssy,
+            num_planes,
+            effort: extras.search.lf_effort,
+        };
+        let lf_geometry = lf_input.geometry();
+        if let Some(params) = crate::encoder::lf_elect::elect_loop_filter(&lf_input) {
+            // r479 — applied in place through the rolling window (no
+            // frame-sized copies).
+            crate::encoder::lf_elect::apply_loop_filter(
+                state.mirror(),
+                &params,
+                &lf_geometry,
+                &mut recon.y,
+                &mut recon.u,
+                &mut recon.v,
+            );
+            fh.loop_filter_params = Some(params);
         }
     }
+    crate::encoder::stage_probe::stage("cdef");
     let lr_armed =
         lr && base_q_idx > 0 && seq.enable_restoration && !fh.allow_intrabc && exact_mask.is_none();
     // r464 — on a flat-width frame only the stripe-boundary rows of
@@ -2601,7 +2675,9 @@ fn encode_key_frame_yuv_core(
                     let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
                     tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
                 }
-                let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &cdef_params_w, None)?;
+                let (re_payloads, re_cdfs, re_state) =
+                    emit_tiles(&trees, &cdef_params_w, None, state)?;
+                state = re_state;
                 let re_body = assemble(&re_payloads)?;
                 // Exact-bytes settlement: per-unit vs the fallback arm
                 // (frame-level when it beats unfiltered, else the
@@ -2626,7 +2702,6 @@ fn encode_key_frame_yuv_core(
                     tile_payloads = re_payloads;
                     tile_group_body = re_body;
                     all_cdfs = re_cdfs;
-                    state = re_state;
                     committed_cdef_bits = u32::from(plan.params.cdef_bits);
                     // The re-emitted mirror's §5.11.56 grid must equal
                     // the plan (the decoder will derive ITS grid from
@@ -2681,6 +2756,7 @@ fn encode_key_frame_yuv_core(
         }
     }
 
+    crate::encoder::stage_probe::stage("restoration");
     // r444 — §7.4 steps 3-4 / §7.16 on the superres arm: upscale the
     // post-CDEF reconstruction (and the pre-CDEF snapshot §7.17
     // reads across stripe boundaries) to the upscaled extent through
@@ -2811,7 +2887,6 @@ fn encode_key_frame_yuv_core(
             Vec<Vec<u8>>,
             Vec<u8>,
             Vec<Box<TileCdfContext>>,
-            PartitionSyntaxWriter,
             u64,
         );
         let mut best_lr: Option<LrCand> = None;
@@ -2857,7 +2932,9 @@ fn encode_key_frame_yuv_core(
             };
             let mut lr_params_w = params.clone();
             lr_params_w.cdef_bits = committed_cdef_bits;
-            let (re_payloads, re_cdfs, re_state) = emit_tiles(&trees, &lr_params_w, Some(&plan))?;
+            let (re_payloads, re_cdfs, re_state) =
+                emit_tiles(&trees, &lr_params_w, Some(&plan), state)?;
+            state = re_state;
             let re_body = assemble(&re_payloads)?;
             let on_score = plan.d * 256
                 + lambda * 8 * 256 * ((lr_header_len(&plan.header) + re_body.len()) as u64);
@@ -2872,15 +2949,14 @@ fn encode_key_frame_yuv_core(
                     plan.header.frame_restoration_type
                 );
             }
-            if on_score < off_score && best_lr.as_ref().map_or(true, |b| on_score < b.5) {
-                best_lr = Some((plan, re_payloads, re_body, re_cdfs, re_state, on_score));
+            if on_score < off_score && best_lr.as_ref().map_or(true, |b| on_score < b.4) {
+                best_lr = Some((plan, re_payloads, re_body, re_cdfs, on_score));
             }
         }
-        if let Some((plan, re_payloads, re_body, re_cdfs, re_state, _)) = best_lr {
+        if let Some((plan, re_payloads, re_body, re_cdfs, _)) = best_lr {
             tile_payloads = re_payloads;
             tile_group_body = re_body;
             all_cdfs = re_cdfs;
-            state = re_state;
             let applied_d = crate::encoder::lr_elect::apply_lr_plan(
                 &plan,
                 lr_src,
@@ -2914,6 +2990,7 @@ fn encode_key_frame_yuv_core(
             fh.lr_params = Some(plan.header);
         }
     }
+    crate::encoder::stage_probe::stage("assemble");
 
     // §5.11.1 tile-group body — already assembled from the winning
     // per-tile payloads (`tile_group_body`); stamp the REALIZED
@@ -3044,6 +3121,7 @@ fn encode_key_frame_yuv_core(
     } else {
         (all_cdfs.swap_remove(ctx_update_id as usize), Vec::new())
     };
+    crate::encoder::stage_probe::stage("done");
     let carry = crate::encoder::inter_frame::RefSlotCarry {
         cdfs,
         segment_ids: state.mirror().segment_ids().to_vec(),

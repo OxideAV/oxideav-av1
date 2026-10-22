@@ -657,6 +657,13 @@ impl TuQuant {
         &self.nz
     }
 
+    /// r479 — build from the sparse form (`len` coefficients, `nz` the
+    /// non-zero `(raster index, value)` pairs in ascending index
+    /// order).
+    pub(crate) fn from_sparse(len: u32, nz: Vec<(u16, i32)>) -> Self {
+        Self { len, nz }
+    }
+
     /// The dense `Quant[]` array.
     #[must_use]
     pub fn dense(&self) -> Vec<i32> {
@@ -677,14 +684,20 @@ impl From<Vec<i32>> for TuQuant {
 impl From<&[i32]> for TuQuant {
     fn from(v: &[i32]) -> Self {
         debug_assert!(v.len() <= u16::MAX as usize + 1);
-        Self {
-            len: v.len() as u32,
-            nz: v
-                .iter()
+        // r479 — exact capacity: the committed trees of a 12 MP
+        // picture hold ~3 M non-zero coefficients, and a `collect`
+        // from a filter grows by doubling (up to twice the bytes).
+        let count = v.iter().filter(|&&q| q != 0).count();
+        let mut nz = Vec::with_capacity(count);
+        nz.extend(
+            v.iter()
                 .enumerate()
                 .filter(|(_, &q)| q != 0)
-                .map(|(i, &q)| (i as u16, q))
-                .collect(),
+                .map(|(i, &q)| (i as u16, q)),
+        );
+        Self {
+            len: v.len() as u32,
+            nz,
         }
     }
 }
@@ -3134,15 +3147,26 @@ fn write_block_syntax_inter_frame(
             // §8.3.2 `comp_group_idx` / `compound_idx` neighbour ctx
             // from the mirror's grids (identity 0 / 1 when
             // unavailable — the bit_silent defaults).
+            // r479 — the grids are materialised by the first inter
+            // stamp; before that every cell reads its pre-fill.
+            let cg = |cell: usize| {
+                state
+                    .mirror
+                    .comp_group_idxs()
+                    .get(cell)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let ci = |cell: usize| state.mirror.compound_idxs().get(cell).copied().unwrap_or(1);
             if avail_u {
                 let cell = (((mi_row - 1) * state.mi_cols) + mi_col) as usize;
-                tail.above_comp_group_idx = state.mirror.comp_group_idxs()[cell];
-                tail.above_compound_idx = state.mirror.compound_idxs()[cell];
+                tail.above_comp_group_idx = cg(cell);
+                tail.above_compound_idx = ci(cell);
             }
             if avail_l {
                 let cell = ((mi_row * state.mi_cols) + mi_col - 1) as usize;
-                tail.left_comp_group_idx = state.mirror.comp_group_idxs()[cell];
-                tail.left_compound_idx = state.mirror.compound_idxs()[cell];
+                tail.left_comp_group_idx = cg(cell);
+                tail.left_compound_idx = ci(cell);
             }
         }
         tail.interp_filter = if ip.interpolation_filter != SWITCHABLE {
@@ -3191,15 +3215,22 @@ fn write_block_syntax_inter_frame(
                 read_from_bitstream: read,
             }
         };
+        // r479 — `InterpFilters[]` is materialised by the first inter
+        // stamp; before that every cell reads `EIGHTTAP`.
+        let filters = |cell: usize| {
+            let f = state.mirror.interp_filters();
+            [
+                f.get(cell).copied().unwrap_or(EIGHTTAP),
+                f.get(cell + 1).copied().unwrap_or(EIGHTTAP),
+            ]
+        };
         if avail_u {
             let cell = (((mi_row - 1) * state.mi_cols + mi_col) as usize) * 2;
-            let f = state.mirror.interp_filters();
-            tail.above_interp_filters = [f[cell], f[cell + 1]];
+            tail.above_interp_filters = filters(cell);
         }
         if avail_l {
             let cell = ((mi_row * state.mi_cols + mi_col - 1) as usize) * 2;
-            let f = state.mirror.interp_filters();
-            tail.left_interp_filters = [f[cell], f[cell + 1]];
+            tail.left_interp_filters = filters(cell);
         }
         let committed_filters = tail.interp_filter.interp_filter;
 

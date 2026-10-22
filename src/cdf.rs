@@ -13982,6 +13982,16 @@ impl PartitionWalker {
         if !src.palette_colors.is_empty() {
             self.ensure_palette_colors();
         }
+        // r479 — the lazily-materialised grids: a source that carries
+        // them is copied (materialising the destination); a source
+        // without them lands its pre-fill value on a destination that
+        // has them, and nothing otherwise.
+        if src.inter_grids_present() {
+            self.ensure_inter_grids();
+        }
+        if !src.delta_lfs.is_empty() {
+            self.ensure_delta_lfs();
+        }
         for rr in 0..h4 {
             let sbase = ((src_row + rr) * src.mi_cols + src_col) as usize;
             let dbase = ((dst_row + rr) * self.mi_cols + dst_col) as usize;
@@ -13992,10 +14002,19 @@ impl PartitionWalker {
                         .copy_from_slice(&src.$field[sbase * $mult..(sbase + n) * $mult]);
                 };
             }
+            macro_rules! copy_lazy {
+                ($field:ident, $mult:expr, $default:expr) => {
+                    if !src.$field.is_empty() {
+                        copy_cells!($field, $mult);
+                    } else if !self.$field.is_empty() {
+                        self.$field[dbase * $mult..(dbase + n) * $mult].fill($default);
+                    }
+                };
+            }
             copy_cells!(mi_sizes, 1);
             copy_cells!(skips, 1);
             copy_cells!(skip_modes, 1);
-            copy_cells!(delta_lfs, FRAME_LF_COUNT);
+            copy_lazy!(delta_lfs, FRAME_LF_COUNT, 0);
             copy_cells!(cdef_idx, 1);
             copy_cells!(is_inters, 1);
             copy_cells!(segment_ids, 1);
@@ -14005,23 +14024,23 @@ impl PartitionWalker {
             copy_cells!(inter_tx_sizes, 1);
             copy_cells!(tx_types, 1);
             copy_cells!(ref_frames, 2);
-            copy_cells!(mvs, 4);
-            copy_cells!(comp_group_idxs, 1);
-            copy_cells!(compound_idxs, 1);
-            copy_cells!(interp_filters, 2);
-            copy_cells!(compound_types, 1);
-            copy_cells!(compound_wedge_indices, 1);
-            copy_cells!(compound_wedge_signs, 1);
-            copy_cells!(compound_mask_types, 1);
-            copy_cells!(interintra_modes, 1);
-            copy_cells!(wedge_interintras, 1);
-            copy_cells!(interintra_wedge_indices, 1);
-            copy_cells!(motion_modes, 1);
+            copy_lazy!(mvs, 4, 0);
+            copy_lazy!(comp_group_idxs, 1, 0);
+            copy_lazy!(compound_idxs, 1, 1);
+            copy_lazy!(interp_filters, 2, EIGHTTAP);
+            copy_lazy!(compound_types, 1, crate::inter_pred::COMPOUND_AVERAGE);
+            copy_lazy!(compound_wedge_indices, 1, 0);
+            copy_lazy!(compound_wedge_signs, 1, 0);
+            copy_lazy!(compound_mask_types, 1, 0);
+            copy_lazy!(interintra_modes, 1, 0);
+            copy_lazy!(wedge_interintras, 1, 0);
+            copy_lazy!(interintra_wedge_indices, 1, 0);
+            copy_lazy!(motion_modes, 1, MOTION_MODE_SIMPLE);
             if !src.local_warp_params.is_empty() {
                 self.ensure_local_warp_params();
                 copy_cells!(local_warp_params, 6);
             }
-            copy_cells!(local_warp_valid, 1);
+            copy_lazy!(local_warp_valid, 1, 0);
             for plane in 0..3usize {
                 let (sp, dp) = (plane * sa + sbase, plane * da + dbase);
                 self.palette_sizes[dp..dp + n].copy_from_slice(&src.palette_sizes[sp..sp + n]);
@@ -14110,6 +14129,16 @@ impl PartitionWalker {
                 short.is_empty() && long.iter().all(|&v| v == 0)
             }
         };
+        // r479 — the inter grids and `DeltaLFs[]` likewise: an empty
+        // grid equals one holding its pre-fill value everywhere.
+        fn lazy_eq<T: PartialEq + Copy>(a: &[T], b: &[T], default: T) -> bool {
+            if a.len() == b.len() {
+                a == b
+            } else {
+                let (short, long) = if a.is_empty() { (a, b) } else { (b, a) };
+                short.is_empty() && long.iter().all(|&v| v == default)
+            }
+        }
         if self.mi_rows != other.mi_rows {
             out.push("mi_rows");
         }
@@ -14134,7 +14163,7 @@ impl PartitionWalker {
         if !pal_eq_i32(&self.local_warp_params, &other.local_warp_params) {
             out.push("local_warp_params");
         }
-        if self.local_warp_valid != other.local_warp_valid {
+        if !lazy_eq(&self.local_warp_valid, &other.local_warp_valid, 0) {
             out.push("local_warp_valid");
         }
         if self.mi_sizes != other.mi_sizes {
@@ -14155,7 +14184,7 @@ impl PartitionWalker {
         if self.current_delta_lf != other.current_delta_lf {
             out.push("current_delta_lf");
         }
-        if self.delta_lfs != other.delta_lfs {
+        if !lazy_eq(&self.delta_lfs, &other.delta_lfs, 0) {
             out.push("delta_lfs");
         }
         if self.cdef_idx != other.cdef_idx {
@@ -14209,40 +14238,52 @@ impl PartitionWalker {
         if !pal_eq(&self.palette_colors, &other.palette_colors) {
             out.push("palette_colors");
         }
-        if self.mvs != other.mvs {
+        if !lazy_eq(&self.mvs, &other.mvs, 0) {
             out.push("mvs");
         }
-        if self.comp_group_idxs != other.comp_group_idxs {
+        if !lazy_eq(&self.comp_group_idxs, &other.comp_group_idxs, 0) {
             out.push("comp_group_idxs");
         }
-        if self.compound_idxs != other.compound_idxs {
+        if !lazy_eq(&self.compound_idxs, &other.compound_idxs, 1) {
             out.push("compound_idxs");
         }
-        if self.interp_filters != other.interp_filters {
+        if !lazy_eq(&self.interp_filters, &other.interp_filters, EIGHTTAP) {
             out.push("interp_filters");
         }
-        if self.compound_types != other.compound_types {
+        if !lazy_eq(
+            &self.compound_types,
+            &other.compound_types,
+            crate::inter_pred::COMPOUND_AVERAGE,
+        ) {
             out.push("compound_types");
         }
-        if self.compound_wedge_indices != other.compound_wedge_indices {
+        if !lazy_eq(
+            &self.compound_wedge_indices,
+            &other.compound_wedge_indices,
+            0,
+        ) {
             out.push("compound_wedge_indices");
         }
-        if self.compound_wedge_signs != other.compound_wedge_signs {
+        if !lazy_eq(&self.compound_wedge_signs, &other.compound_wedge_signs, 0) {
             out.push("compound_wedge_signs");
         }
-        if self.compound_mask_types != other.compound_mask_types {
+        if !lazy_eq(&self.compound_mask_types, &other.compound_mask_types, 0) {
             out.push("compound_mask_types");
         }
-        if self.interintra_modes != other.interintra_modes {
+        if !lazy_eq(&self.interintra_modes, &other.interintra_modes, 0) {
             out.push("interintra_modes");
         }
-        if self.wedge_interintras != other.wedge_interintras {
+        if !lazy_eq(&self.wedge_interintras, &other.wedge_interintras, 0) {
             out.push("wedge_interintras");
         }
-        if self.interintra_wedge_indices != other.interintra_wedge_indices {
+        if !lazy_eq(
+            &self.interintra_wedge_indices,
+            &other.interintra_wedge_indices,
+            0,
+        ) {
             out.push("interintra_wedge_indices");
         }
-        if self.motion_modes != other.motion_modes {
+        if !lazy_eq(&self.motion_modes, &other.motion_modes, MOTION_MODE_SIMPLE) {
             out.push("motion_modes");
         }
         if self.blocks != other.blocks {
@@ -16778,10 +16819,15 @@ impl PartitionWalker {
         // == 0` ⇒ return) ensures the pre-fill value is unobservable
         // on the conformant path until `assign_mv` (next-arc) writes
         // it.
-        let area4 = area.checked_mul(4)?;
-        let mut mvs: Vec<i16> = Vec::new();
-        mvs.try_reserve_exact(area4).ok()?;
-        mvs.resize(area4, 0);
+        // r479 — `Mvs[]`, `InterpFilters[]`, the §5.11.27 / §5.11.28 /
+        // §5.11.29 side-data grids, `DeltaLFs[]` and `LocalValid[]`
+        // are materialised lazily (see [`Self::ensure_inter_grids`] /
+        // [`Self::ensure_delta_lfs`]): only an inter or intra-block-
+        // copy leaf stamps them, so an intra frame's walker never
+        // carries their 21 bytes per mi (15 MiB at 12 MP — the
+        // encoder keeps up to four walkers alive per picture). Every
+        // reader treats the empty grid as the pre-fill value.
+        let mvs: Vec<i16> = Vec::new();
         // §5.11.29 / §8.3.2: pre-fill `CompGroupIdxs[r][c]` with `0`,
         // the §5.11.29 default `comp_group_idx = 0` initialiser (also
         // the natural identity for an unavailable neighbour — the
@@ -16789,17 +16835,13 @@ impl PartitionWalker {
         // the `!AboveSingle` / `!LeftSingle` arms which fire on
         // compound-coded neighbours, never on intra / single-pred or
         // unavailable cells).
-        let mut comp_group_idxs: Vec<u8> = Vec::new();
-        comp_group_idxs.try_reserve_exact(area).ok()?;
-        comp_group_idxs.resize(area, 0);
+        let comp_group_idxs: Vec<u8> = Vec::new();
         // §5.11.29 / §8.3.2: pre-fill `CompoundIdxs[r][c]` with `1`,
         // the §5.11.29 default `compound_idx = 1` initialiser. The
         // §8.3.2 `compound_idx` ctx body only consults this grid on
         // the `!AboveSingle` / `!LeftSingle` arms (same identity
         // story as `CompGroupIdxs` above).
-        let mut compound_idxs: Vec<u8> = Vec::new();
-        compound_idxs.try_reserve_exact(area).ok()?;
-        compound_idxs.resize(area, 1);
+        let compound_idxs: Vec<u8> = Vec::new();
         // §5.11.29 / §5.11.28 / §5.11.27 inter side-data grids — the
         // already-resolved decode outputs the §5.11.33 frame walk
         // dispatches compound / inter-intra / warped leaves from. Each
@@ -16808,36 +16850,18 @@ impl PartitionWalker {
         // pre-fill values are the §5.11.29 / §5.11.28 / §5.11.27
         // short-circuit defaults (never read on a single-ref / intra
         // cell). See the field docs for the per-grid semantics.
-        let mut compound_types: Vec<u8> = Vec::new();
-        compound_types.try_reserve_exact(area).ok()?;
-        compound_types.resize(area, crate::inter_pred::COMPOUND_AVERAGE);
-        let mut compound_wedge_indices: Vec<u8> = Vec::new();
-        compound_wedge_indices.try_reserve_exact(area).ok()?;
-        compound_wedge_indices.resize(area, 0);
-        let mut compound_wedge_signs: Vec<u8> = Vec::new();
-        compound_wedge_signs.try_reserve_exact(area).ok()?;
-        compound_wedge_signs.resize(area, 0);
-        let mut compound_mask_types: Vec<u8> = Vec::new();
-        compound_mask_types.try_reserve_exact(area).ok()?;
-        compound_mask_types.resize(area, 0);
-        let mut interintra_modes: Vec<u8> = Vec::new();
-        interintra_modes.try_reserve_exact(area).ok()?;
-        interintra_modes.resize(area, 0);
-        let mut wedge_interintras: Vec<u8> = Vec::new();
-        wedge_interintras.try_reserve_exact(area).ok()?;
-        wedge_interintras.resize(area, 0);
-        let mut interintra_wedge_indices: Vec<u8> = Vec::new();
-        interintra_wedge_indices.try_reserve_exact(area).ok()?;
-        interintra_wedge_indices.resize(area, 0);
-        let mut motion_modes: Vec<u8> = Vec::new();
-        motion_modes.try_reserve_exact(area).ok()?;
-        motion_modes.resize(area, MOTION_MODE_SIMPLE);
+        let compound_types: Vec<u8> = Vec::new();
+        let compound_wedge_indices: Vec<u8> = Vec::new();
+        let compound_wedge_signs: Vec<u8> = Vec::new();
+        let compound_mask_types: Vec<u8> = Vec::new();
+        let interintra_modes: Vec<u8> = Vec::new();
+        let wedge_interintras: Vec<u8> = Vec::new();
+        let interintra_wedge_indices: Vec<u8> = Vec::new();
+        let motion_modes: Vec<u8> = Vec::new();
         // §5.11.5 `DeltaLFs[ r ][ c ][ i ]` per-mi snapshot grid —
         // `area * FRAME_LF_COUNT` slots, pre-filled `0` (the §5.9.18
         // zero default). Stamped per block via `stamp_delta_lfs`.
-        let mut delta_lfs: Vec<i8> = Vec::new();
-        delta_lfs.try_reserve_exact(area * FRAME_LF_COUNT).ok()?;
-        delta_lfs.resize(area * FRAME_LF_COUNT, 0);
+        let delta_lfs: Vec<i8> = Vec::new();
         // §5.11.x / §8.3.2: pre-fill `InterpFilters[r][c][0..2]` with
         // `EIGHTTAP = 0`, the spec's `interp_filter[ dir ] = EIGHTTAP`
         // fallback (set when `needs_interp_filter() == 0`). The §8.3.2
@@ -16847,9 +16871,7 @@ impl PartitionWalker {
         // `aboveType = 3` / `leftType = 3` sentinel and never read the
         // grid value, so the pre-fill is unobserved on the conformant
         // path for the first inter block.
-        let mut interp_filters: Vec<u8> = Vec::new();
-        interp_filters.try_reserve_exact(area2).ok()?;
-        interp_filters.resize(area2, EIGHTTAP);
+        let interp_filters: Vec<u8> = Vec::new();
         // §6.10.3 `BlockDecoded[ plane ][ y ][ x ]` — a constant-size
         // superblock-local grid (`3 * BD_STRIDE * BD_STRIDE`). The
         // fresh-walker fill is `0`; the §5.11.3
@@ -16884,12 +16906,7 @@ impl PartitionWalker {
             // MB of zeros per walker at 12 MP that an intra frame
             // never reads.
             local_warp_params: Vec::new(),
-            local_warp_valid: {
-                let mut v: Vec<u8> = Vec::new();
-                v.try_reserve_exact(area).ok()?;
-                v.resize(area, 0);
-                v
-            },
+            local_warp_valid: Vec::new(),
             mi_sizes,
             skips,
             skip_modes,
@@ -19289,6 +19306,8 @@ impl PartitionWalker {
         if plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        // r479 — the grid snapshot below copies every inter grid.
+        self.ensure_inter_grids();
 
         let mi_rows = self.mi_rows;
         let mi_cols = self.mi_cols;
@@ -19989,6 +20008,13 @@ impl PartitionWalker {
         // §5.11.13 clamps every accumulator slot to ±MAX_LOOP_FILTER
         // (±63) before it lands here, so the i8 narrowing is lossless.
         let acc: [i8; FRAME_LF_COUNT] = core::array::from_fn(|i| self.current_delta_lf[i] as i8);
+        // r479 — stamping the zero default into a never-materialised
+        // grid is the identity (the §5.9.18 default every reader
+        // assumes for the empty grid).
+        if self.delta_lfs.is_empty() && acc == [0; FRAME_LF_COUNT] {
+            return;
+        }
+        self.ensure_delta_lfs();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -20018,7 +20044,12 @@ impl PartitionWalker {
         if r >= self.mi_rows || c >= self.mi_cols {
             return 0;
         }
-        i32::from(self.delta_lfs[((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx])
+        i32::from(
+            self.delta_lfs
+                .get(((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx)
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     /// View of the §5.11.5 `DeltaLFs[]` grid after the walk —
@@ -21331,6 +21362,57 @@ impl PartitionWalker {
         }
     }
 
+    /// r479 — one plane, one pass of §7.14 over the edge rows
+    /// `mi_row_start .. mi_row_end`, the samples addressed through a
+    /// row window of the plane (`window_row0` = the plane row at
+    /// `window.samples[ 0 ]`; see
+    /// [`crate::loop_filter::loop_filter_rows_window`] for the reach
+    /// the window must cover). The encoder's deblocking election
+    /// runs its trials and its final filter through this on band
+    /// windows instead of frame-sized `i32` copies.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_filter_pass_window_from_grid(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        plane: u8,
+        pass: u8,
+        window: &mut crate::loop_filter::PlaneBuffer<'_>,
+        window_row0: u32,
+        mi_row_start: u32,
+        mi_row_end: u32,
+    ) {
+        self.with_lf_ctx(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            |ctx| {
+                crate::loop_filter::loop_filter_rows_window(
+                    ctx,
+                    plane,
+                    pass,
+                    window,
+                    window_row0,
+                    mi_row_start,
+                    mi_row_end,
+                );
+            },
+        );
+    }
+
     /// The §7.14 frame context over this walker's grids, handed to `f`.
     #[allow(clippy::too_many_arguments)]
     fn with_lf_ctx(
@@ -22028,6 +22110,49 @@ impl PartitionWalker {
         }
     }
 
+    /// r479 — whether the lazily-materialised inter grids (see
+    /// [`Self::ensure_inter_grids`]) exist.
+    #[inline]
+    fn inter_grids_present(&self) -> bool {
+        !self.mvs.is_empty()
+    }
+
+    /// r479 — materialise the grids only inter / intra-block-copy
+    /// leaves stamp, at their construction pre-fill values: `Mvs[] =
+    /// 0`, `InterpFilters[] = EIGHTTAP`, `MotionModes[] = SIMPLE`,
+    /// `CompGroupIdxs[] = 0`, `CompoundIdxs[] = 1`, `CompoundTypes[]
+    /// = COMPOUND_AVERAGE`, the wedge / mask / inter-intra grids `0`,
+    /// `LocalValid[] = 0`. Idempotent.
+    pub(crate) fn ensure_inter_grids(&mut self) {
+        if self.inter_grids_present() {
+            return;
+        }
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        self.mvs.resize(area * 4, 0);
+        self.interp_filters.resize(area * 2, EIGHTTAP);
+        self.motion_modes.resize(area, MOTION_MODE_SIMPLE);
+        self.comp_group_idxs.resize(area, 0);
+        self.compound_idxs.resize(area, 1);
+        self.compound_types
+            .resize(area, crate::inter_pred::COMPOUND_AVERAGE);
+        self.compound_wedge_indices.resize(area, 0);
+        self.compound_wedge_signs.resize(area, 0);
+        self.compound_mask_types.resize(area, 0);
+        self.interintra_modes.resize(area, 0);
+        self.wedge_interintras.resize(area, 0);
+        self.interintra_wedge_indices.resize(area, 0);
+        self.local_warp_valid.resize(area, 0);
+    }
+
+    /// r479 — materialise the §5.11.5 `DeltaLFs[]` grid (all zero,
+    /// the §5.9.18 default). Idempotent.
+    fn ensure_delta_lfs(&mut self) {
+        if self.delta_lfs.is_empty() {
+            let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+            self.delta_lfs.resize(area * FRAME_LF_COUNT, 0);
+        }
+    }
+
     fn ensure_palette_colors(&mut self) {
         if self.palette_colors.is_empty() {
             let area = (self.mi_rows as usize) * (self.mi_cols as usize);
@@ -22116,6 +22241,9 @@ impl PartitionWalker {
         let bw4 = NUM_4X4_BLOCKS_WIDE[s.sub_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[s.sub_size] as u32;
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        if s.is_inter != 0 {
+            self.ensure_inter_grids();
+        }
         for dr in 0..bh4 {
             let rr = s.mi_row + dr;
             if rr >= self.mi_rows {
@@ -22323,16 +22451,28 @@ impl PartitionWalker {
                 snap.is_inters.push(self.is_inters[cell]);
                 snap.tx_sizes.push(self.tx_sizes[cell]);
                 snap.inter_tx_sizes.push(self.inter_tx_sizes[cell]);
-                snap.motion_modes.push(self.motion_modes[cell]);
                 snap.ref_frames
                     .extend_from_slice(&self.ref_frames[cell * 2..cell * 2 + 2]);
-                snap.interp_filters
-                    .extend_from_slice(&self.interp_filters[cell * 2..cell * 2 + 2]);
-                snap.mvs
-                    .extend_from_slice(&self.mvs[cell * 4..cell * 4 + 4]);
-                snap.delta_lfs.extend_from_slice(
-                    &self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT],
-                );
+                if self.inter_grids_present() {
+                    snap.motion_modes.push(self.motion_modes[cell]);
+                    snap.interp_filters
+                        .extend_from_slice(&self.interp_filters[cell * 2..cell * 2 + 2]);
+                    snap.mvs
+                        .extend_from_slice(&self.mvs[cell * 4..cell * 4 + 4]);
+                } else {
+                    // r479 — lazily-materialised grids never touched:
+                    // snapshot the pre-fill values.
+                    snap.motion_modes.push(MOTION_MODE_SIMPLE);
+                    snap.interp_filters.extend_from_slice(&[EIGHTTAP; 2]);
+                    snap.mvs.extend_from_slice(&[0i16; 4]);
+                }
+                if self.delta_lfs.is_empty() {
+                    snap.delta_lfs.extend_from_slice(&[0i8; FRAME_LF_COUNT]);
+                } else {
+                    snap.delta_lfs.extend_from_slice(
+                        &self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT],
+                    );
+                }
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     snap.palette_sizes.push(self.palette_sizes[pcell]);
@@ -22348,19 +22488,32 @@ impl PartitionWalker {
                         );
                     }
                 }
-                snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
-                snap.compound_idxs.push(self.compound_idxs[cell]);
-                snap.compound_types.push(self.compound_types[cell]);
-                snap.compound_wedge_indices
-                    .push(self.compound_wedge_indices[cell]);
-                snap.compound_wedge_signs
-                    .push(self.compound_wedge_signs[cell]);
-                snap.compound_mask_types
-                    .push(self.compound_mask_types[cell]);
-                snap.interintra_modes.push(self.interintra_modes[cell]);
-                snap.wedge_interintras.push(self.wedge_interintras[cell]);
-                snap.interintra_wedge_indices
-                    .push(self.interintra_wedge_indices[cell]);
+                if self.inter_grids_present() {
+                    snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
+                    snap.compound_idxs.push(self.compound_idxs[cell]);
+                    snap.compound_types.push(self.compound_types[cell]);
+                    snap.compound_wedge_indices
+                        .push(self.compound_wedge_indices[cell]);
+                    snap.compound_wedge_signs
+                        .push(self.compound_wedge_signs[cell]);
+                    snap.compound_mask_types
+                        .push(self.compound_mask_types[cell]);
+                    snap.interintra_modes.push(self.interintra_modes[cell]);
+                    snap.wedge_interintras.push(self.wedge_interintras[cell]);
+                    snap.interintra_wedge_indices
+                        .push(self.interintra_wedge_indices[cell]);
+                } else {
+                    snap.comp_group_idxs.push(0);
+                    snap.compound_idxs.push(1);
+                    snap.compound_types
+                        .push(crate::inter_pred::COMPOUND_AVERAGE);
+                    snap.compound_wedge_indices.push(0);
+                    snap.compound_wedge_signs.push(0);
+                    snap.compound_mask_types.push(0);
+                    snap.interintra_modes.push(0);
+                    snap.wedge_interintras.push(0);
+                    snap.interintra_wedge_indices.push(0);
+                }
             }
         }
         snap
@@ -22372,6 +22525,31 @@ impl PartitionWalker {
     /// outside the rect is touched.
     pub(crate) fn restore_encoder_stamp_rect(&mut self, snap: &EncoderStampSnapshot) {
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        // r479 — writing the pre-fill values into a never-materialised
+        // grid is the identity: skip the allocation on the intra path.
+        let inter = self.inter_grids_present()
+            || snap.mvs.iter().any(|&v| v != 0)
+            || snap.interp_filters.iter().any(|&v| v != EIGHTTAP)
+            || snap.motion_modes.iter().any(|&v| v != MOTION_MODE_SIMPLE)
+            || snap.comp_group_idxs.iter().any(|&v| v != 0)
+            || snap.compound_idxs.iter().any(|&v| v != 1)
+            || snap
+                .compound_types
+                .iter()
+                .any(|&v| v != crate::inter_pred::COMPOUND_AVERAGE)
+            || snap.compound_wedge_indices.iter().any(|&v| v != 0)
+            || snap.compound_wedge_signs.iter().any(|&v| v != 0)
+            || snap.compound_mask_types.iter().any(|&v| v != 0)
+            || snap.interintra_modes.iter().any(|&v| v != 0)
+            || snap.wedge_interintras.iter().any(|&v| v != 0)
+            || snap.interintra_wedge_indices.iter().any(|&v| v != 0);
+        if inter {
+            self.ensure_inter_grids();
+        }
+        let dlf = !self.delta_lfs.is_empty() || snap.delta_lfs.iter().any(|&v| v != 0);
+        if dlf {
+            self.ensure_delta_lfs();
+        }
         let mut i = 0usize;
         for dr in 0..snap.rows {
             for dc in 0..snap.cols {
@@ -22384,14 +22562,20 @@ impl PartitionWalker {
                 self.is_inters[cell] = snap.is_inters[i];
                 self.tx_sizes[cell] = snap.tx_sizes[i];
                 self.inter_tx_sizes[cell] = snap.inter_tx_sizes[i];
-                self.motion_modes[cell] = snap.motion_modes[i];
                 self.ref_frames[cell * 2..cell * 2 + 2]
                     .copy_from_slice(&snap.ref_frames[i * 2..i * 2 + 2]);
-                self.interp_filters[cell * 2..cell * 2 + 2]
-                    .copy_from_slice(&snap.interp_filters[i * 2..i * 2 + 2]);
-                self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&snap.mvs[i * 4..i * 4 + 4]);
-                self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT]
-                    .copy_from_slice(&snap.delta_lfs[i * FRAME_LF_COUNT..(i + 1) * FRAME_LF_COUNT]);
+                if inter {
+                    self.motion_modes[cell] = snap.motion_modes[i];
+                    self.interp_filters[cell * 2..cell * 2 + 2]
+                        .copy_from_slice(&snap.interp_filters[i * 2..i * 2 + 2]);
+                    self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&snap.mvs[i * 4..i * 4 + 4]);
+                }
+                if dlf {
+                    self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT]
+                        .copy_from_slice(
+                            &snap.delta_lfs[i * FRAME_LF_COUNT..(i + 1) * FRAME_LF_COUNT],
+                        );
+                }
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     self.palette_sizes[pcell] = snap.palette_sizes[i * 3 + plane];
@@ -22405,15 +22589,17 @@ impl PartitionWalker {
                             .copy_from_slice(src);
                     }
                 }
-                self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
-                self.compound_idxs[cell] = snap.compound_idxs[i];
-                self.compound_types[cell] = snap.compound_types[i];
-                self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
-                self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
-                self.compound_mask_types[cell] = snap.compound_mask_types[i];
-                self.interintra_modes[cell] = snap.interintra_modes[i];
-                self.wedge_interintras[cell] = snap.wedge_interintras[i];
-                self.interintra_wedge_indices[cell] = snap.interintra_wedge_indices[i];
+                if inter {
+                    self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
+                    self.compound_idxs[cell] = snap.compound_idxs[i];
+                    self.compound_types[cell] = snap.compound_types[i];
+                    self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
+                    self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
+                    self.compound_mask_types[cell] = snap.compound_mask_types[i];
+                    self.interintra_modes[cell] = snap.interintra_modes[i];
+                    self.wedge_interintras[cell] = snap.wedge_interintras[i];
+                    self.interintra_wedge_indices[cell] = snap.interintra_wedge_indices[i];
+                }
                 i += 1;
             }
         }
@@ -27268,6 +27454,7 @@ impl PartitionWalker {
         // ordering is `mvs[ref][row][col]`; cast i32 → i16 (the
         // §6.10.27 conformance bound `Abs( Mv[ i ][ comp ] ) < ( 1 <<
         // 14 )` keeps the value in i16 range).
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -27455,6 +27642,7 @@ impl PartitionWalker {
         // (`skip_mode == 1` or `!isCompound`) still stamps the pre-set
         // defaults (`0` / `1`) — matching the §5.11.29 line-1 / line-2
         // imperatives.
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -27500,6 +27688,7 @@ impl PartitionWalker {
         // path (the §5.11.x short-circuit arms set both slots, with the
         // `!enable_dual_filter` mirror already applied inside
         // [`Self::read_interpolation_filter`]).
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -27535,6 +27724,7 @@ impl PartitionWalker {
         let ii_mode = interintra.interintra_mode.unwrap_or(0);
         let ii_wedge = interintra.wedge_interintra.unwrap_or(0);
         let ii_wedge_index = interintra.wedge_index.unwrap_or(0);
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -27952,8 +28142,8 @@ impl PartitionWalker {
         let bh = block_height(sub_size) as i32;
         let threshold = core::cmp::max(bw, bh).clamp(16, 112);
         let nb_cell = (cand_row as u32 * self.mi_cols + cand_col as u32) as usize;
-        let nb_mv_row = self.mvs[(nb_cell * 2) * 2] as i32;
-        let nb_mv_col = self.mvs[(nb_cell * 2) * 2 + 1] as i32;
+        let nb_mv_row = i32::from(self.mvs.get((nb_cell * 2) * 2).copied().unwrap_or(0));
+        let nb_mv_col = i32::from(self.mvs.get((nb_cell * 2) * 2 + 1).copied().unwrap_or(0));
         let mv_diff_row = (nb_mv_row - mv[0][0]).unsigned_abs() as i64;
         let mv_diff_col = (nb_mv_col - mv[0][1]).unsigned_abs() as i64;
         let valid = mv_diff_row + mv_diff_col <= threshold as i64;
@@ -28397,13 +28587,13 @@ impl PartitionWalker {
             // the `0` identity (the §5.11.29 pre-fill value).
             let above_cg = if avail_u && mi_row > 0 {
                 let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                self.comp_group_idxs[cell]
+                self.comp_group_idxs.get(cell).copied().unwrap_or(0)
             } else {
                 0
             };
             let left_cg = if avail_l && mi_col > 0 {
                 let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                self.comp_group_idxs[cell]
+                self.comp_group_idxs.get(cell).copied().unwrap_or(0)
             } else {
                 0
             };
@@ -28441,13 +28631,13 @@ impl PartitionWalker {
                 // av1-spec p.384.
                 let above_ci = if avail_u && mi_row > 0 {
                     let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                    self.compound_idxs[cell]
+                    self.compound_idxs.get(cell).copied().unwrap_or(1)
                 } else {
                     1
                 };
                 let left_ci = if avail_l && mi_col > 0 {
                     let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                    self.compound_idxs[cell]
+                    self.compound_idxs.get(cell).copied().unwrap_or(1)
                 } else {
                     1
                 };
@@ -28706,7 +28896,10 @@ impl PartitionWalker {
                 let n1 = self.ref_frame_at(row, col, 1) as i32;
                 if n0 == ref_frame[0] || n1 == ref_frame[0] {
                     let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                    self.interp_filters[cell * 2 + dir] as usize
+                    self.interp_filters
+                        .get(cell * 2 + dir)
+                        .copied()
+                        .unwrap_or(EIGHTTAP) as usize
                 } else {
                     INTERP_FILTER_NONE
                 }
@@ -28720,7 +28913,10 @@ impl PartitionWalker {
                 let n1 = self.ref_frame_at(row, col, 1) as i32;
                 if n0 == ref_frame[0] || n1 == ref_frame[0] {
                     let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                    self.interp_filters[cell * 2 + dir] as usize
+                    self.interp_filters
+                        .get(cell * 2 + dir)
+                        .copied()
+                        .unwrap_or(EIGHTTAP) as usize
                 } else {
                     INTERP_FILTER_NONE
                 }
@@ -31454,6 +31650,7 @@ impl PartitionWalker {
             // §5.11.5 `if ( !use_intrabc )` gate). Subsequent
             // intra-block-copy blocks' §7.10.2 neighbour scans read
             // these cells.
+            self.ensure_inter_grids();
             for dr in 0..bh4 {
                 let rr = mi_row_b + dr;
                 if rr >= self.mi_rows {
@@ -32181,6 +32378,7 @@ impl PartitionWalker {
                 );
                 let origin = (mi_row * self.mi_cols + mi_col) as usize;
                 self.ensure_local_warp_params();
+                self.ensure_inter_grids();
                 self.local_warp_params[origin * 6..origin * 6 + 6]
                     .copy_from_slice(&lw.local_warp_params);
                 self.local_warp_valid[origin] = u8::from(lw.local_valid);
@@ -34820,7 +35018,10 @@ impl PartitionWalker {
             return 0;
         }
         let cell = (r * self.mi_cols + c) as usize;
-        self.mvs[(cell * 2 + list) * 2 + comp]
+        self.mvs
+            .get((cell * 2 + list) * 2 + comp)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Test-only setter to seed a synthetic inter-block neighbour for
@@ -34852,6 +35053,7 @@ impl PartitionWalker {
         debug_assert!(mi_size < BLOCK_SIZES);
         let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size] as u32;
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
