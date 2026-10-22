@@ -1917,6 +1917,144 @@ set is three frame-sized `i32` in-loop buffers plus the mirror
 (`PlaneBuffer<i32>` kernels — a `u16` pipeline is the next step
 towards the 120 MiB target).
 
+#### Still-picture memory (r479) — the resident set is a window, not the picture
+
+Measured with `examples/encode_bench` (a counting allocator samples
+its live bytes, its high-water mark since the previous boundary and
+the process RSS at every boundary the encoder's stage probe fires —
+`encoder::stage_probe`, doc-hidden; `--trace N` prints every
+allocation of at least `N` MiB with its stage, `--sample N` buckets
+every `N`-th allocation by call site) on the same 4032 × 3024 device
+sample the AVIF crate measures (`docs/image/heif/device-samples/
+iphone_13_pro_max.HEIC` decoded by a black-box tool to 8-bit 4:2:0,
+10-bit 4:2:0 and 8-bit 4:4:4), `base_q_idx = 102` (`quality = 60`),
+`Fast`, one item; `/usr/bin/time -l` peak RSS around a process that
+holds the raw bytes plus the `u16` frame (52 MiB at 8-bit 4:2:0 —
+the two copies the AVIF registry bench holds too) and nothing else.
+The 0.1.21 encoder measured 448 / 563 / 573 MiB at 1 / 4 / 8 workers
+here, which reconciles the two earlier figures: the AVIF crate's
+465 / 553 / 607 MiB (r478, `quality = 60`, 0.1.21) and the r464 table
+above (378 / 474 / 489 MiB at `base_q_idx = 128` on 0.1.19 — the
+quantiser moves the committed trees, and 0.1.21 at `q = 128` measures
+431 MiB on one worker).
+
+**Where the bytes were** (0.1.21, 8-bit 4:2:0, peak of the live
+allocation during each stage; the harness's 52 MiB included):
+
+| Stage | 1 worker | 4 workers | 8 workers | Owner |
+|---|---|---|---|---|
+| frame state | 126 | 126 | 126 | `u16` reconstruction 36 MiB + the syntax mirror (`PartitionWalker`, 53 bytes per mi) 37 MiB — allocated before the search on every path |
+| tile search | 230 | 343 | 343 | per worker: the source cropped to the tile, a tile reconstruction, a tile mirror, the rate twin's clone of it (one picture's worth of each across the workers) + the committed trees (47 MiB: boxed `SyntaxBlock`s + 8 bytes per non-zero coefficient, over-capacity vectors) |
+| §7.14 deblock election | 268 | 268 | 268 | a frame-sized `i32` copy of the luma plane (46 MiB) + a `u16` result (23 MiB) per trial, eight trials |
+| §7.15 CDEF election + apply | 268 | 268 | 268 | the replay's second frame-scope mirror (37 MiB) + every unit's filtered rectangles held as `i32` (70 MiB) before the first write-back |
+| §7.17 restoration election + apply | 249 | 242 | 239 | the replay's mirror again + a frame-sized `u16` copy of each plane under restoration |
+
+**What moved** (every change byte-identical: eleven configurations
+pinned against 0.1.21 — 8-bit 4:2:0 at 1 / 4 / 8 workers `Fast` and
+1 / 8 `Balanced`, 10-bit 4:2:0 and 8-bit 4:4:4 at 1 / 4 / 8):
+
+* The §7.14 election runs its trials and its final filter on ROW
+  WINDOWS (`lf_elect`): the sampled probe keeps the r464 semantics
+  (both passes over the band's edges, the rows around the band
+  unfiltered, `i32` for one band plus 16-row skirts); the exact
+  frame process is a rolling window — pass 0 (vertical edges) is
+  applied to rows as they enter, pass 1 (horizontal edges) band by
+  band in §7.14.1 order, and a row leaves once no later edge reaches
+  it (an edge at row `e` reads `e - 7 ..= e + 6` and writes
+  `e - 6 ..= e + 5`, §7.14.6.2 / §7.14.6.4). Applied in place.
+* The §7.15 apply writes a superblock row back once the next row's
+  windows are built (§7.15 reads unfiltered samples up to 8 luma rows
+  past a unit); the §7.17 apply parks one stripe's outputs (a
+  rectangle reaches `LOCAL_MARGIN = 4` rows into the neighbouring
+  stripes).
+* The committed trees ride a compact form (`encoder::committed_tree`):
+  a pre-order shape string, a 32-byte record per leaf, one arena of
+  transform-unit headers and one of `(raster index, value)` pairs at
+  4 bytes each (values outside `i16` escape to a side table), a full
+  `SyntaxBlock` only for palette / intra-block-copy / inter /
+  variable-transform / delta-lf leaves; the CDEF and restoration
+  re-emissions expand one superblock at a time. 47 → 16 MiB.
+* `PartitionWalker` materialises `Mvs[]`, `InterpFilters[]`, the
+  §5.11.27-29 side-data grids, `DeltaLFs[]` and `LocalValid[]` lazily
+  — only an inter or intra-block-copy leaf stamps them, every reader
+  treats the empty grid as its pre-fill, and the encoder's snapshot /
+  restore / tile-import paths skip them while they are absent. 53 →
+  32 bytes per mi on an intra walker; the encoder keeps up to four
+  alive (frame, tile, twin, replay), the decoder one.
+* The threaded tile-local walk builds the frame-scope reconstruction
+  and mirror AFTER the search (they are only stitched into); each
+  re-emission receives the previous mirror by value and drops it
+  before building its own.
+* The search reads the source through `SourceView` (window-local
+  coordinates over the frame's planes) and copies each superblock's
+  samples into contiguous per-worker scratch (`SbSource`, 12 KiB)
+  before its RD search — no per-tile crop, and no 8 KiB-stride reads
+  from eight workers (that alone cost the threaded walk 10 %).
+
+**After** (same harness; the rows the AVIF crate's table carries, re-
+measured on 0.1.21 and on this round, interleaved on the same machine
+under the same load; wall = best of two):
+
+| Layout | Workers | Wall 0.1.21 → r479 | Peak live r479 (search / deblock / CDEF / LR stage) | Peak RSS 0.1.21 → r479 | Bytes |
+|---|---|---|---|---|---|
+| 8-bit 4:2:0 | 1 | 7.71 → 7.42 s | 153 (153 / 127 / 129 / 151) | 448 → 221 MiB | 1 953 597 |
+| 8-bit 4:2:0 | 4 | 3.02 → 2.96 s | 180 (180 / 129 / 141 / 144) | 563 → 247 MiB | 1 964 984 |
+| 8-bit 4:2:0 | 8 | 3.02 → 3.00 s | 181 (181 / 130 / 141 / 151) | 573 → 259 MiB | 1 982 434 |
+| 8-bit 4:2:0 `Balanced` | 1 | 19.0 → 17.8 s | 151 | 462 → 237 MiB | 1 804 505 |
+| 8-bit 4:2:0 `Balanced` | 8 | 6.2 → 6.0 s | 179 | 574 → 270 MiB | 1 820 873 |
+| 10-bit 4:2:0 | 1 | 7.61 → 7.21 s | 170 | 440 → 229 MiB | 1 986 994 |
+| 10-bit 4:2:0 | 4 | 3.07 → 3.02 s | 198 | — → 264 MiB | 1 998 342 |
+| 10-bit 4:2:0 | 8 | 2.73 → 2.70 s | 198 | 601 → 276 MiB | 2 015 980 |
+| 8-bit 4:4:4 | 1 | 11.15 → 10.88 s | 249 | 666 → 309 MiB | 2 186 191 |
+| 8-bit 4:4:4 | 4 | 4.11 → 4.11 s | 304 | — → 382 MiB | 2 200 731 |
+| 8-bit 4:4:4 | 8 | 3.82 → 3.78 s | 304 | 895 → 388 MiB | 2 222 521 |
+
+(The harness holds 70 MiB of the 10-bit rows and 105 MiB of the 4:4:4
+rows. This machine was shared with other builds during the round, so
+the 4-worker and 8-worker walls do not reach the r464 table's idle-
+machine figures; the before / after pairs ran back to back.)
+
+**What stays, and why.** The resident set at 8 workers on 8-bit 4:2:0
+is now 52 (harness) + 36 (frame `u16` reconstruction) + 23 (frame
+mirror) + 36 (eight tile reconstructions) + 23 + 23 (eight tile
+mirrors and their rate twins) + 16 (trees) MiB during the search:
+
+* The frame-scope reconstruction has to exist in full before the
+  §7.4 in-loop chain: §7.14 reads reconstructed samples across tile
+  boundaries, §7.15 reads deblocked samples 8 rows past a unit, §7.17
+  reads CDEF output across unit boundaries and pre-CDEF samples at
+  stripe skirts — each stage consumes the previous stage's complete
+  output, so the planes cannot be windowed below one frame without
+  changing the order the samples are produced in (the elections then
+  measure different distortions).
+* The committed trees must be retained until the last re-emission:
+  the §8.2 arithmetic coder's state is continuous across a tile, so
+  stamping the §5.11.56 `cdef_idx` literals or interleaving the
+  §5.11.57 `write_lr` symbols means re-running the writer from the
+  tile's first symbol.
+* A worker's tile reconstruction and mirror are the tile's §5.11
+  state; eight tiles in flight on eight workers are one picture's
+  worth of each by construction. The rate twin needs its own mirror
+  because it commits and restores trial subtrees.
+* Samples are `u16` at every bit depth (`ReconState`, the recon the
+  API returns, the mirrors' plane views): an 8-bit storage path for
+  8-bit layouts would take 18 MiB off the frame reconstruction and 18
+  off the tile reconstructions at 8 workers — the next step, left
+  for a round that can touch every sample access in the search.
+* On this platform freed memory stays in the allocator's zones
+  (medium-size chunks are retained per thread and only reused by
+  same-sized requests), so peak RSS runs 40–80 MiB above the peak
+  live allocation; the gap is the eight workers' freed tile state
+  plus the per-unit scratch of the threaded elections.
+
+For the AVIF crate: a single 12 MP item now costs 259 MiB at 8
+workers against its 512-pixel grid's 162 MiB (+2.8 % bytes), and a
+1024-pixel 4 × 3 grid's 299 MiB — the `auto` threshold could rise from
+1 MP to the point where the single item and the grid meet (about
+4 MP at 8 workers: the single item's resident set is ~95 MiB plus the
+per-worker tile state, the grid's is per tile), and the 1024-pixel
+grid is no longer cheaper than the single item.
+
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5
 mi grid internally (the decoder reconstructs every mi block in full,
