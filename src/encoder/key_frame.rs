@@ -926,10 +926,99 @@ pub(crate) struct SourceView<'a> {
     v: &'a [u16],
     stride_y: usize,
     stride_c: usize,
-    x0: usize,
-    y0: usize,
-    cx0: usize,
-    cy0: usize,
+    /// Added to window-local coordinates (negative for a superblock
+    /// scratch whose origin lies inside the window).
+    x0: isize,
+    y0: isize,
+    cx0: isize,
+    cy0: isize,
+}
+
+/// r479 — one superblock's source samples in contiguous scratch
+/// (luma 64 wide, chroma at its subsampled width), refilled per
+/// superblock by the tile walk: the search then reads 8 KiB rows
+/// instead of striding across a 12 MP frame from eight workers at
+/// once (that stride cost the threaded walk 10 % against the r464
+/// per-tile crop; the scratch beats both).
+pub(crate) struct SbSource {
+    y: Vec<u16>,
+    u: Vec<u16>,
+    v: Vec<u16>,
+    cw: usize,
+    ch: usize,
+    ssx: usize,
+    ssy: usize,
+    num_planes: u8,
+}
+
+impl SbSource {
+    const SB: usize = 64;
+
+    pub(crate) fn new(ssx: u8, ssy: u8, num_planes: u8) -> Self {
+        let (cw, ch) = (Self::SB >> ssx, Self::SB >> ssy);
+        Self {
+            y: vec![0; Self::SB * Self::SB],
+            u: vec![0; cw * ch],
+            v: vec![0; cw * ch],
+            cw,
+            ch,
+            ssx: usize::from(ssx),
+            ssy: usize::from(ssy),
+            num_planes,
+        }
+    }
+
+    /// Copy the superblock at mi `(sb_r, sb_c)` of the window `src`
+    /// (`width × height` luma, `chroma_w × chroma_h` chroma extents)
+    /// and return a view onto the scratch in the window's coordinates.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fill<'a>(
+        &'a mut self,
+        src: &SourceView<'_>,
+        sb_r: u32,
+        sb_c: u32,
+        width: usize,
+        height: usize,
+        chroma_w: usize,
+        chroma_h: usize,
+    ) -> SourceView<'a> {
+        let (y0, x0) = ((sb_r as usize) * 4, (sb_c as usize) * 4);
+        let w = Self::SB.min(width.saturating_sub(x0));
+        let h = Self::SB.min(height.saturating_sub(y0));
+        for r in 0..h {
+            self.y[r * Self::SB..r * Self::SB + w].copy_from_slice(src.luma_row(y0 + r, x0, w));
+        }
+        let (cy0, cx0) = (y0 >> self.ssy, x0 >> self.ssx);
+        if self.num_planes > 1 {
+            let cw = self.cw.min(chroma_w.saturating_sub(cx0));
+            let ch = self.ch.min(chroma_h.saturating_sub(cy0));
+            for r in 0..ch {
+                self.u[r * self.cw..r * self.cw + cw].copy_from_slice(src.chroma_row(
+                    1,
+                    cy0 + r,
+                    cx0,
+                    cw,
+                ));
+                self.v[r * self.cw..r * self.cw + cw].copy_from_slice(src.chroma_row(
+                    2,
+                    cy0 + r,
+                    cx0,
+                    cw,
+                ));
+            }
+        }
+        SourceView {
+            y: &self.y,
+            u: &self.u,
+            v: &self.v,
+            stride_y: Self::SB,
+            stride_c: self.cw,
+            x0: -(x0 as isize),
+            y0: -(y0 as isize),
+            cx0: -(cx0 as isize),
+            cy0: -(cy0 as isize),
+        }
+    }
 }
 
 /// r479 — one plane of a [`SourceView`] for the residual helpers:
@@ -938,8 +1027,8 @@ pub(crate) struct SourceView<'a> {
 pub(crate) struct SrcPlane<'a> {
     plane: &'a [u16],
     stride: usize,
-    r0: usize,
-    c0: usize,
+    r0: isize,
+    c0: isize,
 }
 
 impl<'a> SrcPlane<'a> {
@@ -955,7 +1044,7 @@ impl<'a> SrcPlane<'a> {
 
     #[inline]
     pub(crate) fn at(&self, r: usize, c: usize) -> u16 {
-        self.plane[(self.r0 + r) * self.stride + self.c0 + c]
+        self.plane[((r as isize + self.r0) * self.stride as isize + c as isize + self.c0) as usize]
     }
 }
 
@@ -979,23 +1068,33 @@ impl<'a> SourceView<'a> {
     /// origin at `(cx0, cy0)` in the frame's planes.
     pub(crate) fn window(f: &'a YuvFrame, x0: usize, y0: usize, cx0: usize, cy0: usize) -> Self {
         Self {
-            x0,
-            y0,
-            cx0,
-            cy0,
+            x0: x0 as isize,
+            y0: y0 as isize,
+            cx0: cx0 as isize,
+            cy0: cy0 as isize,
             ..Self::whole(f)
         }
     }
 
     #[inline]
+    fn luma_index(&self, r: usize, c: usize) -> usize {
+        ((r as isize + self.y0) * self.stride_y as isize + c as isize + self.x0) as usize
+    }
+
+    #[inline]
+    fn chroma_index(&self, r: usize, c: usize) -> usize {
+        ((r as isize + self.cy0) * self.stride_c as isize + c as isize + self.cx0) as usize
+    }
+
+    #[inline]
     pub(crate) fn luma(&self, r: usize, c: usize) -> u16 {
-        self.y[(self.y0 + r) * self.stride_y + self.x0 + c]
+        self.y[self.luma_index(r, c)]
     }
 
     /// `n` luma samples from window-local `(r, c0)`.
     #[inline]
     pub(crate) fn luma_row(&self, r: usize, c0: usize, n: usize) -> &'a [u16] {
-        let b = (self.y0 + r) * self.stride_y + self.x0 + c0;
+        let b = self.luma_index(r, c0);
         &self.y[b..b + n]
     }
 
@@ -1003,7 +1102,15 @@ impl<'a> SourceView<'a> {
     #[inline]
     pub(crate) fn chroma(&self, plane: usize, r: usize, c: usize) -> u16 {
         let p = if plane == 1 { self.u } else { self.v };
-        p[(self.cy0 + r) * self.stride_c + self.cx0 + c]
+        p[self.chroma_index(r, c)]
+    }
+
+    /// `n` chroma samples of `plane` from window-local `(r, c0)`.
+    #[inline]
+    pub(crate) fn chroma_row(&self, plane: usize, r: usize, c0: usize, n: usize) -> &'a [u16] {
+        let p = if plane == 1 { self.u } else { self.v };
+        let b = self.chroma_index(r, c0);
+        &p[b..b + n]
     }
 
     pub(crate) fn luma_src(&self) -> SrcPlane<'a> {
@@ -2302,8 +2409,20 @@ fn encode_key_frame_yuv_core(
         // pre-r464 per-superblock `snapshot` cloned the whole-frame
         // mirror (~40 MB at 12 MP) 3000 times per picture.
         let mut twin = RateTwin::snapshot(&tile_cdfs, st, &writer);
+        // r479 — the superblock's source in contiguous scratch (see
+        // [`SbSource`]).
+        let mut sb_src = SbSource::new(rc.subsampling_x, rc.subsampling_y, rc.num_planes);
         for &(sb_r, sb_c) in origins {
             rc.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
+            let sb_view = sb_src.fill(
+                input,
+                sb_r,
+                sb_c,
+                rc.width,
+                rc.height,
+                rc.chroma_w,
+                rc.chroma_h,
+            );
             // r431 — §5.11.13 `CurrentQIndex` walk (the KEY twin of
             // the inter r428 arm): apply the plan step BEFORE the
             // superblock's search so every trial quantises (and the
@@ -2338,7 +2457,7 @@ fn encode_key_frame_yuv_core(
                 sb_r,
                 sb_c,
                 BLOCK_64X64,
-                input,
+                &sb_view,
                 rc,
                 &mut twin,
                 &params,
@@ -5666,8 +5785,8 @@ fn intrabc_best_dv(
         let (hash, uniform) = crate::encoder::dv_hash::hash_block_direct(
             input.y,
             input.stride_y,
-            input.y0 + row0,
-            input.x0 + col0,
+            (row0 as isize + input.y0) as usize,
+            (col0 as isize + input.x0) as usize,
             n,
         );
         if !uniform {

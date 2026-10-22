@@ -106,7 +106,11 @@ static GLOBAL: Counting = Counting;
 /// the previous boundary, process RSS MiB at the boundary)` the probe
 /// collects. Each label names the stage that STARTS at the boundary,
 /// so a row's peak column is the previous row's stage.
-static SAMPLES: Mutex<Vec<(&'static str, f64, f64, f64)>> = Mutex::new(Vec::new());
+type Sample = (&'static str, f64, f64, f64, f64);
+static SAMPLES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
+/// Wall-clock origin of the current run (seconds since the harness
+/// started, captured at each boundary).
+static RUN_T0: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The process's resident set in MiB (`ps`; `-1` when unavailable).
 fn rss_mib() -> f64 {
@@ -327,30 +331,41 @@ fn main() {
         let live = LIVE.load(Ordering::Relaxed);
         let peak = PEAK.swap(live, Ordering::Relaxed);
         let rss = rss_mib();
-        SAMPLES
+        let t = RUN_T0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((label, mib(live), mib(peak), rss));
+            .map_or(0.0, |t0| t0.elapsed().as_secs_f64());
+        SAMPLES.lock().unwrap_or_else(|e| e.into_inner()).push((
+            label,
+            mib(live),
+            mib(peak),
+            rss,
+            t,
+        ));
         *STAGE.lock().unwrap_or_else(|e| e.into_inner()) = label;
     })));
 
     let mut best = f64::MAX;
-    let mut report: Vec<(&'static str, f64, f64, f64)> = Vec::new();
+    let mut report: Vec<Sample> = Vec::new();
     let mut peak = 0usize;
     let mut allocs = 0usize;
     let mut result = None;
     for _ in 0..a.repeat.max(1) {
+        // The previous run's result would otherwise sit under this
+        // run's peak.
+        drop(result.take());
         SAMPLES.lock().unwrap_or_else(|e| e.into_inner()).clear();
         ALLOCS.store(0, Ordering::Relaxed);
         PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
         *STAGE.lock().unwrap_or_else(|e| e.into_inner()) = "pre-enter";
         let t0 = Instant::now();
+        *RUN_T0.lock().unwrap_or_else(|e| e.into_inner()) = Some(t0);
         let still = encode_still_yuv(&frame, &opts).expect("still encodes");
         let wall = t0.elapsed().as_secs_f64();
         let live = LIVE.load(Ordering::Relaxed);
         let p = PEAK.swap(live, Ordering::Relaxed);
         let mut s = SAMPLES.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        s.push(("return", mib(live), mib(p), rss_mib()));
+        s.push(("return", mib(live), mib(p), rss_mib(), wall));
         *STAGE.lock().unwrap_or_else(|e| e.into_inner()) = "harness";
         let run_peak = s.iter().map(|x| x.2).fold(0.0, f64::max);
         if wall < best {
@@ -390,11 +405,11 @@ fn main() {
         mib(peak) - mib(held)
     );
     println!(
-        "  {:<12} {:>12} {:>14} {:>10}   (peak = during the stage above)",
-        "stage starts", "live MiB", "peak MiB", "RSS MiB"
+        "  {:<12} {:>12} {:>14} {:>10} {:>9}   (peak = during the stage above)",
+        "stage starts", "live MiB", "peak MiB", "RSS MiB", "at s"
     );
-    for (label, live, p, rss) in &report {
-        println!("  {label:<12} {live:>12.1} {p:>14.1} {rss:>10.1}");
+    for (label, live, p, rss, t) in &report {
+        println!("  {label:<12} {live:>12.1} {p:>14.1} {rss:>10.1} {t:>9.3}");
     }
     if let Some(path) = a.out {
         std::fs::write(path, &still.temporal_unit_bytes).expect("write --out");
