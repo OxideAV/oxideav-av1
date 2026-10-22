@@ -913,14 +913,126 @@ impl SearchLimits {
     }
 }
 
+/// r479 — a read-only window onto the source planes: the search reads
+/// the source through it with window-local coordinates, so a tile
+/// walk on tile-sized state reads the frame's planes in place (the
+/// r464 walk cropped the source per tile — one more copy of the
+/// picture at 12 MP). Chroma offsets follow the §5.11.5 origin
+/// derivation at the window origin (superblock-aligned).
+#[derive(Clone, Copy)]
+pub(crate) struct SourceView<'a> {
+    y: &'a [u16],
+    u: &'a [u16],
+    v: &'a [u16],
+    stride_y: usize,
+    stride_c: usize,
+    x0: usize,
+    y0: usize,
+    cx0: usize,
+    cy0: usize,
+}
+
+/// r479 — one plane of a [`SourceView`] for the residual helpers:
+/// `at(r, c)` reads the window-local sample.
+#[derive(Clone, Copy)]
+pub(crate) struct SrcPlane<'a> {
+    plane: &'a [u16],
+    stride: usize,
+    r0: usize,
+    c0: usize,
+}
+
+impl<'a> SrcPlane<'a> {
+    /// A whole plane of `stride` samples per row.
+    pub(crate) fn whole(plane: &'a [u16], stride: usize) -> Self {
+        Self {
+            plane,
+            stride,
+            r0: 0,
+            c0: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn at(&self, r: usize, c: usize) -> u16 {
+        self.plane[(self.r0 + r) * self.stride + self.c0 + c]
+    }
+}
+
+impl<'a> SourceView<'a> {
+    /// The whole frame.
+    pub(crate) fn whole(f: &'a YuvFrame) -> Self {
+        Self {
+            y: &f.y,
+            u: &f.u,
+            v: &f.v,
+            stride_y: f.width as usize,
+            stride_c: f.chroma_width() as usize,
+            x0: 0,
+            y0: 0,
+            cx0: 0,
+            cy0: 0,
+        }
+    }
+
+    /// The window with its luma origin at `(x0, y0)` and its chroma
+    /// origin at `(cx0, cy0)` in the frame's planes.
+    pub(crate) fn window(f: &'a YuvFrame, x0: usize, y0: usize, cx0: usize, cy0: usize) -> Self {
+        Self {
+            x0,
+            y0,
+            cx0,
+            cy0,
+            ..Self::whole(f)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn luma(&self, r: usize, c: usize) -> u16 {
+        self.y[(self.y0 + r) * self.stride_y + self.x0 + c]
+    }
+
+    /// `n` luma samples from window-local `(r, c0)`.
+    #[inline]
+    pub(crate) fn luma_row(&self, r: usize, c0: usize, n: usize) -> &'a [u16] {
+        let b = (self.y0 + r) * self.stride_y + self.x0 + c0;
+        &self.y[b..b + n]
+    }
+
+    /// Chroma sample of `plane` (1 = U, 2 = V) at window-local `(r, c)`.
+    #[inline]
+    pub(crate) fn chroma(&self, plane: usize, r: usize, c: usize) -> u16 {
+        let p = if plane == 1 { self.u } else { self.v };
+        p[(self.cy0 + r) * self.stride_c + self.cx0 + c]
+    }
+
+    pub(crate) fn luma_src(&self) -> SrcPlane<'a> {
+        SrcPlane {
+            plane: self.y,
+            stride: self.stride_y,
+            r0: self.y0,
+            c0: self.x0,
+        }
+    }
+
+    pub(crate) fn chroma_src(&self, plane: usize) -> SrcPlane<'a> {
+        SrcPlane {
+            plane: if plane == 1 { self.u } else { self.v },
+            stride: self.stride_c,
+            r0: self.cy0,
+            c0: self.cx0,
+        }
+    }
+}
+
 /// r464 — [`tile_local_state`]'s result: the local geometry, the local
-/// superblock origins, the tile origin in frame mi units, the cropped
-/// source, the tile reconstruction and the tile syntax driver.
-type TileLocalState = (
+/// superblock origins, the tile origin in frame mi units, the source
+/// window, the tile reconstruction and the tile syntax driver.
+type TileLocalState<'a> = (
     TileGeometry,
     Vec<(u32, u32)>,
     (u32, u32),
-    YuvFrame,
+    SourceView<'a>,
     ReconState,
     PartitionSyntaxWriter,
 );
@@ -932,12 +1044,12 @@ type TileLocalState = (
 /// [`PartitionSyntaxWriter`], with the tile at the origin. Returns the
 /// local geometry, the local superblock origins, the tile origin in
 /// frame mi units, and the three objects.
-fn tile_local_state(
-    input: &YuvFrame,
+fn tile_local_state<'a>(
+    input: &'a YuvFrame,
     frame: &ReconState,
     geo: TileGeometry,
     origins: &[(u32, u32)],
-) -> TileLocalState {
+) -> TileLocalState<'a> {
     let (ssx, ssy) = (frame.subsampling_x, frame.subsampling_y);
     let mi_rows = geo.mi_row_end - geo.mi_row_start;
     let mi_cols = geo.mi_col_end - geo.mi_col_start;
@@ -956,22 +1068,7 @@ fn tile_local_state(
     } else {
         (0, 0)
     };
-    let crop = |src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize| -> Vec<u16> {
-        let mut out = Vec::with_capacity(w * h);
-        for y in 0..h {
-            out.extend_from_slice(&src[(y0 + y) * stride + x0..(y0 + y) * stride + x0 + w]);
-        }
-        out
-    };
-    let lin = YuvFrame {
-        width: width as u32,
-        height: height as u32,
-        bit_depth: input.bit_depth,
-        format: input.format,
-        y: crop(&input.y, frame.width, col0, row0, width, height),
-        u: crop(&input.u, frame.chroma_w, ccol0, crow0, chroma_w, chroma_h),
-        v: crop(&input.v, frame.chroma_w, ccol0, crow0, chroma_w, chroma_h),
-    };
+    let lin = SourceView::window(input, col0, row0, ccol0, crow0);
     let lgeo = TileGeometry {
         mi_row_start: 0,
         mi_row_end: mi_rows,
@@ -2180,7 +2277,7 @@ fn encode_key_frame_yuv_core(
     let run_tile = |geo: TileGeometry,
                     origins: &[(u32, u32)],
                     abs: (u32, u32),
-                    input: &YuvFrame,
+                    input: &SourceView<'_>,
                     rc: &mut ReconState,
                     st: &mut PartitionSyntaxWriter|
      -> Result<TileSearchOut, Error> {
@@ -2295,8 +2392,9 @@ fn encode_key_frame_yuv_core(
         let state = state_opt
             .as_mut()
             .expect("the sequential walk owns the frame-scope mirror");
+        let whole = SourceView::whole(input);
         for (geo, origins) in tile_plan.iter() {
-            let out = run_tile(*geo, origins, (0, 0), input, &mut recon, state)?;
+            let out = run_tile(*geo, origins, (0, 0), &whole, &mut recon, state)?;
             tile_payloads.push(out.payload);
             all_cdfs.push(out.cdfs);
             trees.extend(out.trees);
@@ -2349,8 +2447,15 @@ fn encode_key_frame_yuv_core(
                                 .expect("the frame-scope walk owns the frame-scope mirror")
                                 .clone();
                             outs.push(
-                                run(*geo, origins, (0, 0), input, &mut rc, &mut st)
-                                    .map(|o| (t, o, rc, st)),
+                                run(
+                                    *geo,
+                                    origins,
+                                    (0, 0),
+                                    &SourceView::whole(input),
+                                    &mut rc,
+                                    &mut st,
+                                )
+                                .map(|o| (t, o, rc, st)),
                             );
                         }
                     }
@@ -3918,7 +4023,7 @@ pub(crate) fn step3_flips(tx_type: usize) -> (bool, bool) {
 /// row-major otherwise), zero-padded to `Tx_Width * Tx_Height`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx(
-    input_plane: &[u16],
+    src: SrcPlane<'_>,
     recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
@@ -3933,7 +4038,7 @@ pub(crate) fn residual_tx(
     let w = TX_WIDTH[tx_sz];
     let h = TX_HEIGHT[tx_sz];
     residual_tx_avail(
-        input_plane,
+        src,
         recon_plane,
         pw,
         row0,
@@ -3959,7 +4064,7 @@ pub(crate) fn residual_tx(
 /// the exact pre-r425 path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_avail(
-    input_plane: &[u16],
+    src: SrcPlane<'_>,
     recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
@@ -3981,7 +4086,7 @@ pub(crate) fn residual_tx_avail(
     for i in 0..ah {
         for j in 0..aw {
             residual[i * w + j] =
-                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
+                i64::from(src.at(row0 + i, col0 + j)) - i64::from(pred[i * w + j]);
         }
     }
     let coeffs = if lossless {
@@ -4041,7 +4146,7 @@ pub(crate) fn residual_tx_avail(
 /// residual is zero. Fully-on-screen TUs pass the full TU extent.
 #[allow(clippy::too_many_arguments)]
 fn residual_tx_search_luma_avail(
-    input_plane: &[u16],
+    src: SrcPlane<'_>,
     recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
@@ -4065,7 +4170,7 @@ fn residual_tx_search_luma_avail(
     for i in 0..ah {
         for j in 0..aw {
             residual[i * w + j] =
-                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
+                i64::from(src.at(row0 + i, col0 + j)) - i64::from(pred[i * w + j]);
         }
     }
     let set = intra_tx_type_set(
@@ -4113,7 +4218,7 @@ fn residual_tx_search_luma_avail(
         for i in 0..ah {
             for j in 0..aw {
                 let rec = (i64::from(pred[i * w + j]) + res_back[src_idx(i, j)]).clamp(0, max_val);
-                let diff = i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - rec;
+                let diff = i64::from(src.at(row0 + i, col0 + j)) - rec;
                 d += (diff * diff) as u64;
             }
         }
@@ -4195,7 +4300,7 @@ fn angle_delta_candidates(mode: usize, n: usize) -> core::ops::RangeInclusive<i3
 /// the block's first luma TU will observe.
 fn pick_y_mode(
     recon: &ReconState,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     row0: usize,
     col0: usize,
     bw: usize,
@@ -4225,8 +4330,7 @@ fn pick_y_mode(
         let mut ssd = 0u64;
         for i in 0..ah {
             for j in 0..aw {
-                let d = i64::from(input.y[(row0 + i) * recon.width + (col0 + j)])
-                    - i64::from(pred[i * bw + j]);
+                let d = i64::from(input.luma(row0 + i, col0 + j)) - i64::from(pred[i * bw + j]);
                 ssd += (d * d) as u64;
             }
         }
@@ -4313,7 +4417,7 @@ fn pick_y_mode(
 #[allow(clippy::too_many_arguments)]
 fn pick_uv_mode(
     recon: &ReconState,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     crow0: usize,
     ccol0: usize,
     cbw: usize,
@@ -4330,7 +4434,6 @@ fn pick_uv_mode(
     // plus the luma mode at its delta, and the CfL seed ± 1 per axis.
     luma_hint: (u8, i8),
 ) -> (u8, i8, Option<(i8, i8)>) {
-    let pw = recon.chroma_w;
     let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cbw, cbh);
     let (ctile_x0, ctile_y0) = recon.bd.tile_origin_px(1);
     let (above_u, left_u, ha_u, hl_u) = build_tu_neighbours(
@@ -4371,9 +4474,10 @@ fn pick_uv_mode(
         let mut ssd = 0u64;
         for i in 0..cah {
             for j in 0..caw {
-                let idx = (crow0 + i) * pw + (ccol0 + j);
-                let du = i64::from(input.u[idx]) - i64::from(pred_u[i * cbw + j]);
-                let dv = i64::from(input.v[idx]) - i64::from(pred_v[i * cbw + j]);
+                let du = i64::from(input.chroma(1, crow0 + i, ccol0 + j))
+                    - i64::from(pred_u[i * cbw + j]);
+                let dv = i64::from(input.chroma(2, crow0 + i, ccol0 + j))
+                    - i64::from(pred_v[i * cbw + j]);
                 ssd += (du * du + dv * dv) as u64;
             }
         }
@@ -4498,13 +4602,14 @@ fn pick_uv_mode(
             recon.subsampling_x,
             recon.subsampling_y,
         );
-        let seed = |plane_in: &[u16], dc: &[u16]| -> i8 {
+        let seed = |plane_in: usize, dc: &[u16]| -> i8 {
             let mut num = 0i128;
             let mut den = 0i128;
             for i in 0..cah {
                 for j in 0..caw {
                     let k = i * cbw + j;
-                    let r = i64::from(plane_in[(crow0 + i) * pw + (ccol0 + j)]) - i64::from(dc[k]);
+                    let r =
+                        i64::from(input.chroma(plane_in, crow0 + i, ccol0 + j)) - i64::from(dc[k]);
                     num += i128::from(r) * i128::from(ac[k]);
                     den += i128::from(ac[k]) * i128::from(ac[k]);
                 }
@@ -4515,7 +4620,7 @@ fn pick_uv_mode(
             let a = (64 * num + den.signum() * den / 2) / den;
             a.clamp(-16, 16) as i8
         };
-        let (su, sv) = (seed(&input.u, &dc_pred_u), seed(&input.v, &dc_pred_v));
+        let (su, sv) = (seed(1, &dc_pred_u), seed(2, &dc_pred_v));
         let around =
             |a: i8| -> [i8; 3] { [a.saturating_sub(1).max(-16), a, a.saturating_add(1).min(16)] };
         let mut cands: Vec<(i8, i8)> = Vec::with_capacity(9);
@@ -4629,7 +4734,7 @@ pub(crate) fn encode_leaf_sq(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     // r421 — `Some((twin, params))` prices the leaf-level elections
     // (tx-depth ladder, §5.11.46 palette combos, §5.11.7 intra-bc)
@@ -4652,7 +4757,7 @@ pub(crate) fn encode_leaf_sq_seg(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
     segment_override: Option<u8>,
@@ -4899,7 +5004,7 @@ pub(crate) struct PaletteCandY {
 /// are a follow-up arc).
 #[cfg(test)]
 fn palette_candidate_y(
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -4919,7 +5024,7 @@ fn palette_candidate_y(
 /// palette-predicted §5.11.39 residual chain) settles the `k` choice
 /// the `SSE + λ·entry-cost` proxy used to make alone.
 fn palette_candidates_y(
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -4954,7 +5059,7 @@ fn palette_candidates_y(
     let mut hist = [0u32; 256];
     let mut distinct = 0usize;
     for i in 0..os_h {
-        let row = &input.y[(row0 + i) * recon.width + col0..][..os_w];
+        let row = input.luma_row(row0 + i, col0, os_w);
         for &v in row {
             if hist[v as usize] == 0 {
                 distinct += 1;
@@ -5003,7 +5108,7 @@ fn palette_candidates_y(
             }
             let mut map = vec![0u8; bw * bh];
             for i in 0..os_h {
-                let row = &input.y[(row0 + i) * recon.width + col0..][..os_w];
+                let row = input.luma_row(row0 + i, col0, os_w);
                 for (j, &v) in row.iter().enumerate() {
                     map[i * bw + j] = lut[v as usize];
                 }
@@ -5142,7 +5247,7 @@ pub(crate) struct PaletteCandUv {
 /// subsampled block — §5.11.49 codes ONE shared `ColorMapUV` for both
 /// chroma planes.
 fn palette_candidates_uv(
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -5178,8 +5283,10 @@ fn palette_candidates_uv(
         std::collections::BTreeMap::new();
     for i in 0..os_ch {
         for j in 0..os_cw {
-            let off = (crow0 + i) * cw + (ccol0 + j);
-            let p = (input.u[off], input.v[off]);
+            let p = (
+                input.chroma(1, crow0 + i, ccol0 + j),
+                input.chroma(2, crow0 + i, ccol0 + j),
+            );
             *weights.entry(p).or_insert(0) += 1;
             if weights.len() > kmeans_distinct_bound(os_cw * os_ch).max(PALETTE_COLORS) {
                 return Vec::new();
@@ -5213,8 +5320,10 @@ fn palette_candidates_uv(
             let mut map = vec![0u8; cbw * cbh];
             for i in 0..os_ch {
                 for j in 0..os_cw {
-                    let off = (crow0 + i) * cw + (ccol0 + j);
-                    let p = (i64::from(input.u[off]), i64::from(input.v[off]));
+                    let p = (
+                        i64::from(input.chroma(1, crow0 + i, ccol0 + j)),
+                        i64::from(input.chroma(2, crow0 + i, ccol0 + j)),
+                    );
                     // Nearest pair (exact arm: the pair itself).
                     let mut bi = 0usize;
                     let mut bd = i64::MAX;
@@ -5534,7 +5643,7 @@ const INTRABC_GATE_CELL_FRACTION: usize = 64;
 /// of the block extent, leftward / upward / diagonal). Returns `None`
 /// when no candidate passes §6.10.24 validity.
 fn intrabc_best_dv(
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &ReconState,
     mi_r: u32,
     mi_c: u32,
@@ -5554,8 +5663,13 @@ fn intrabc_best_dv(
     // skip the probe: DC / palette arms already code them at
     // near-zero cost.
     if let Some(tier) = crate::encoder::dv_hash::dv_hash_size_idx(n) {
-        let (hash, uniform) =
-            crate::encoder::dv_hash::hash_block_direct(&input.y, recon.width, row0, col0, n);
+        let (hash, uniform) = crate::encoder::dv_hash::hash_block_direct(
+            input.y,
+            input.stride_y,
+            input.y0 + row0,
+            input.x0 + col0,
+            n,
+        );
         if !uniform {
             cands.extend(recon.dv_hash.candidates(hash, tier, row0, col0));
         }
@@ -5580,7 +5694,7 @@ fn intrabc_best_dv(
         let mut ssd = 0u64;
         for i in 0..n {
             for j in 0..n {
-                let d = i64::from(input.y[(row0 + i) * recon.width + col0 + j])
+                let d = i64::from(input.luma(row0 + i, col0 + j))
                     - i64::from(recon.y[(sr + i) * recon.width + sc + j]);
                 ssd += (d * d) as u64;
             }
@@ -5606,7 +5720,7 @@ fn encode_intrabc_leaf(
     mi_c: u32,
     b_size: usize,
     dv: (i32, i32),
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     // r424 — running per-TU twin fork threading (the intrabc arm
     // prices the §5.11.48 INTER-set candidates exactly like an inter
@@ -5666,7 +5780,7 @@ fn encode_intrabc_leaf(
             let (q, tt) = if lossless {
                 (
                     residual_tx(
-                        &input.y,
+                        input.luma_src(),
                         &mut recon.y,
                         width,
                         tr,
@@ -5682,7 +5796,7 @@ fn encode_intrabc_leaf(
                 )
             } else {
                 crate::encoder::inter_frame::residual_tx_search_luma_inter(
-                    &input.y,
+                    input.luma_src(),
                     &mut recon.y,
                     width,
                     tr,
@@ -5766,7 +5880,7 @@ fn encode_intrabc_leaf(
                     &mut recon.v
                 };
                 let q = residual_tx(
-                    if plane == 1 { &input.u } else { &input.v },
+                    input.chroma_src(plane),
                     plane_buf,
                     cw,
                     tr,
@@ -5826,7 +5940,7 @@ pub(crate) fn encode_leaf_with_tx(
     mi_c: u32,
     b_size: usize,
     luma_tx: usize,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     palette_y: Option<&PaletteCandY>,
     palette_uv: Option<&PaletteCandUv>,
@@ -5939,7 +6053,7 @@ pub(crate) fn encode_leaf_with_tx(
             let (q, tt) = if lossless {
                 (
                     residual_tx_avail(
-                        &input.y,
+                        input.luma_src(),
                         &mut recon.y,
                         width,
                         tr,
@@ -5961,7 +6075,7 @@ pub(crate) fn encode_leaf_with_tx(
                 // over the §5.11.48 intra set for this TX size (r424:
                 // exact chain pricing through the running fork).
                 residual_tx_search_luma_avail(
-                    &input.y,
+                    input.luma_src(),
                     &mut recon.y,
                     width,
                     tr,
@@ -6137,7 +6251,7 @@ pub(crate) fn encode_leaf_with_tx(
                         &mut recon.v
                     };
                     let q = residual_tx_avail(
-                        if plane == 1 { &input.u } else { &input.v },
+                        input.chroma_src(plane),
                         plane_buf,
                         cw,
                         tr,
@@ -6328,7 +6442,7 @@ pub(crate) fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &Regi
 /// reconstruction against the input over one square node's region.
 pub(crate) fn region_distortion(
     recon: &ReconState,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     r: u32,
     c: u32,
     n4: usize,
@@ -6340,7 +6454,7 @@ pub(crate) fn region_distortion(
 /// lower bound of the split arm at the 8×8 level).
 pub(crate) fn region_distortion_luma(
     recon: &ReconState,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     r: u32,
     c: u32,
     n4: usize,
@@ -6351,7 +6465,10 @@ pub(crate) fn region_distortion_luma(
     let mut d = 0u64;
     for i in 0..h {
         let base = (row0 + i) * recon.width + col0;
-        for (a, b) in recon.y[base..base + w].iter().zip(&input.y[base..base + w]) {
+        for (a, b) in recon.y[base..base + w]
+            .iter()
+            .zip(input.luma_row(row0 + i, col0, w))
+        {
             let diff = i64::from(*a) - i64::from(*b);
             d += (diff * diff) as u64;
         }
@@ -6362,7 +6479,7 @@ pub(crate) fn region_distortion_luma(
 /// r412 — rectangular twin of [`region_distortion`].
 pub(crate) fn region_distortion_wh(
     recon: &ReconState,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     r: u32,
     c: u32,
     w4: usize,
@@ -6385,15 +6502,15 @@ pub(crate) fn region_distortion_wh(
     for i in 0..h {
         for j in 0..w {
             let idx = (row0 + i) * recon.width + (col0 + j);
-            let d = i64::from(recon.y[idx]) - i64::from(input.y[idx]);
+            let d = i64::from(recon.y[idx]) - i64::from(input.luma(row0 + i, col0 + j));
             ssd += (d * d) as u64;
         }
     }
     for i in 0..ch {
         for j in 0..cw {
             let idx = (crow0 + i) * recon.chroma_w + (ccol0 + j);
-            let du = i64::from(recon.u[idx]) - i64::from(input.u[idx]);
-            let dv = i64::from(recon.v[idx]) - i64::from(input.v[idx]);
+            let du = i64::from(recon.u[idx]) - i64::from(input.chroma(1, crow0 + i, ccol0 + j));
+            let dv = i64::from(recon.v[idx]) - i64::from(input.chroma(2, crow0 + i, ccol0 + j));
             ssd += (du * du + dv * dv) as u64;
         }
     }
@@ -6524,7 +6641,7 @@ fn encode_key_leaf(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
     seg: Option<&KeySegDemand<'_>>,
@@ -6592,7 +6709,7 @@ fn build_search_tree(
     r: u32,
     c: u32,
     b_size: usize,
-    input: &YuvFrame,
+    input: &SourceView<'_>,
     recon: &mut ReconState,
     twin: &mut RateTwin,
     params: &SyntaxFrameParams,
@@ -7097,7 +7214,7 @@ mod tests {
                 sb_r,
                 sb_c,
                 BLOCK_64X64,
-                &input,
+                &SourceView::whole(&input),
                 &mut recon,
                 &mut twin,
                 &params,
@@ -7212,7 +7329,7 @@ mod tests {
                 0,
                 0,
                 BLOCK_64X64,
-                &input,
+                &SourceView::whole(&input),
                 &mut recon,
                 &mut twin,
                 &params,
@@ -7329,7 +7446,7 @@ mod tests {
             0,
             0,
             BLOCK_64X64,
-            &input,
+            &SourceView::whole(&input),
             &mut recon,
             &mut twin,
             &params,
@@ -7442,7 +7559,7 @@ mod tests {
                     sb_r,
                     sb_c,
                     BLOCK_64X64,
-                    &input,
+                    &SourceView::whole(&input),
                     &mut recon,
                     &mut twin,
                     &params,
@@ -7604,7 +7721,7 @@ mod tests {
                     sb_r,
                     sb_c,
                     BLOCK_64X64,
-                    &input,
+                    &SourceView::whole(&input),
                     &mut recon,
                     &mut twin,
                     &params,
@@ -7701,7 +7818,7 @@ mod tests {
                 0,
                 0,
                 BLOCK_64X64,
-                &input,
+                &SourceView::whole(&input),
                 &mut recon,
                 &mut twin,
                 &params,
@@ -7800,7 +7917,7 @@ mod tests {
                     sb_r,
                     sb_c,
                     BLOCK_64X64,
-                    &input,
+                    &SourceView::whole(&input),
                     &mut recon,
                     &mut twin,
                     &params,
@@ -7904,7 +8021,7 @@ mod tests {
                 sb_r,
                 sb_c,
                 BLOCK_64X64,
-                input,
+                &SourceView::whole(input),
                 &mut recon,
                 &mut twin,
                 &params,
@@ -8257,7 +8374,7 @@ mod tests {
                 sb_r,
                 sb_c,
                 BLOCK_64X64,
-                &input,
+                &SourceView::whole(&input),
                 &mut recon,
                 &mut twin,
                 &params,
@@ -8410,7 +8527,7 @@ mod tests {
             0,
             0,
             BLOCK_64X64,
-            &input,
+            &SourceView::whole(&input),
             &mut recon,
             &mut twin,
             &params,
@@ -8576,7 +8693,7 @@ mod tests {
             dv_hash: Default::default(),
         };
         assert!(
-            palette_candidate_y(&flat, &recon, 0, 0, BLOCK_64X64).is_none(),
+            palette_candidate_y(&SourceView::whole(&flat), &recon, 0, 0, BLOCK_64X64).is_none(),
             "1 distinct colour: no palette candidate"
         );
         let mut many = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
@@ -8584,7 +8701,7 @@ mod tests {
             *p = (i % 251) as u16;
         }
         assert!(
-            palette_candidate_y(&many, &recon, 0, 0, BLOCK_64X64).is_none(),
+            palette_candidate_y(&SourceView::whole(&many), &recon, 0, 0, BLOCK_64X64).is_none(),
             "> PALETTE_COLORS distinct colours: no candidate (r418 scope)"
         );
         let two = {
@@ -8594,10 +8711,11 @@ mod tests {
             }
             f
         };
-        let cand = palette_candidate_y(&two, &recon, 0, 0, BLOCK_64X64).expect("2-colour block");
+        let cand = palette_candidate_y(&SourceView::whole(&two), &recon, 0, 0, BLOCK_64X64)
+            .expect("2-colour block");
         assert_eq!(cand.colors, vec![10, 200]);
         assert_eq!(cand.map.len(), 64 * 64);
         // BLOCK_4X4 is under the §5.11.46 outer gate.
-        assert!(palette_candidate_y(&two, &recon, 0, 0, BLOCK_4X4).is_none());
+        assert!(palette_candidate_y(&SourceView::whole(&two), &recon, 0, 0, BLOCK_4X4).is_none());
     }
 }

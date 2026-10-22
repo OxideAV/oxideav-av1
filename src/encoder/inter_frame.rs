@@ -6634,7 +6634,14 @@ fn encode_inter_leaf_base(
             None => Ok(p_leaf_rate(blk) * 256),
         }
     };
-    let d_normal = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_normal = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let score_normal = score256(d_normal, lambda, rate_of(&leaf)?);
     let after_normal = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
 
@@ -6711,7 +6718,14 @@ fn encode_inter_leaf_base(
         // §5.11.27 line 1: skip-mode forces SIMPLE with no bits.
         motion_mode: MOTION_MODE_SIMPLE,
     });
-    let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_sm = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let score_sm = score256(d_sm, lambda, rate_of(&sm_leaf)?);
     // On a lossless-segment leaf a skip-mode block (which can never
     // code a residual) is only admissible when its bare prediction is
@@ -6869,7 +6883,14 @@ fn seg_extras_trials(
             None => Ok(p_leaf_rate(blk) * 256),
         }
     };
-    let d_now = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_now = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let mut score_best = score256(d_now, lambda, rate_of(&best)?);
 
     // Arm 1 — SEG_LVL_REF_FRAME re-labelling (no pixel change).
@@ -7018,7 +7039,14 @@ fn seg_extras_trials(
                     &seg_qp,
                     pricing,
                 )?;
-                let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+                let d = region_distortion_wh(
+                    recon,
+                    &crate::encoder::key_frame::SourceView::whole(input),
+                    mi_r,
+                    mi_c,
+                    bw4,
+                    bh4,
+                );
                 let sc = score256(d, lambda, rate_of(&cand)?);
                 if inner.as_ref().map(|(_, _, s0)| sc < *s0).unwrap_or(true) {
                     inner = Some((cand, save_region_wh(recon, mi_r, mi_c, bw4, bh4), sc));
@@ -7029,7 +7057,14 @@ fn seg_extras_trials(
             restore_region(recon, mi_r, mi_c, &after_cand);
             cand
         };
-        let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            mi_r,
+            mi_c,
+            bw4,
+            bh4,
+        );
         let sc = score256(d, lambda, rate_of(&trial)?);
         if sc < score_best {
             score_best = sc;
@@ -7960,7 +7995,14 @@ fn encode_inter_leaf_modes(
             &seg_qp,
             pricing,
         )?;
-        let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            sw4,
+            sh4,
+        );
         // r421 — exact twin bits (the §5.11.17 depth symbols are part
         // of the block syntax, so no depth surcharge) or the pre-r421
         // proxy, one scale per call.
@@ -8008,7 +8050,14 @@ fn encode_inter_leaf_modes(
                 &ll_qp,
                 pricing,
             )?;
-            let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
+            let d = region_distortion_wh(
+                recon,
+                &crate::encoder::key_frame::SourceView::whole(input),
+                sr,
+                sc,
+                sw4,
+                sh4,
+            );
             let rate256 = match pricing {
                 Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
                 None => p_leaf_rate(&leaf) * 256,
@@ -8073,7 +8122,7 @@ fn transform_tree_tu_order(
 /// heuristic and the `RateModel::Heuristic` baseline).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_search_luma_inter(
-    input_plane: &[u16],
+    src: crate::encoder::key_frame::SrcPlane<'_>,
     recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
@@ -8096,7 +8145,7 @@ pub(crate) fn residual_tx_search_luma_inter(
     for i in 0..h {
         for j in 0..w {
             residual[i * w + j] =
-                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
+                i64::from(src.at(row0 + i, col0 + j)) - i64::from(pred[i * w + j]);
         }
     }
     let set = inter_tx_type_set(
@@ -8136,7 +8185,7 @@ pub(crate) fn residual_tx_search_luma_inter(
             for j in 0..w {
                 let xx = if flip_lr { w - 1 - j } else { j };
                 let rec = (i64::from(pred[yy * w + xx]) + res_back[i * w + j]).clamp(0, max_val);
-                let diff = i64::from(input_plane[(row0 + yy) * pw + (col0 + xx)]) - rec;
+                let diff = i64::from(src.at(row0 + yy, col0 + xx)) - rec;
                 d += (diff * diff) as u64;
             }
         }
@@ -8323,7 +8372,7 @@ fn encode_inter_leaf_residual(
         let (q, tt) = if lossless {
             (
                 residual_tx(
-                    &input.y,
+                    crate::encoder::key_frame::SrcPlane::whole(&input.y, width),
                     &mut recon.y,
                     width,
                     tr,
@@ -8342,7 +8391,7 @@ fn encode_inter_leaf_residual(
             // the §5.11.48 INTER set for this TX size (r424: exact
             // chain pricing through the running fork when priced).
             residual_tx_search_luma_inter(
-                &input.y,
+                crate::encoder::key_frame::SrcPlane::whole(&input.y, width),
                 &mut recon.y,
                 width,
                 tr,
@@ -8444,7 +8493,10 @@ fn encode_inter_leaf_residual(
                     &mut recon.v
                 };
                 let q = residual_tx(
-                    if plane == 1 { &input.u } else { &input.v },
+                    crate::encoder::key_frame::SrcPlane::whole(
+                        if plane == 1 { &input.u } else { &input.v },
+                        cw,
+                    ),
                     plane_buf,
                     cw,
                     tr,
@@ -8624,7 +8676,14 @@ fn encode_intra_candidate(
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
     if !ictx.demands_exact(r, c, b_size) {
-        let mut leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+        let mut leaf = encode_leaf_sq(
+            r,
+            c,
+            b_size,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            recon,
+            pricing,
+        )?;
         // r413 — a skip intra leaf inherits the §5.11.20 `pred`
         // (bit-silent); a coded intra leaf keeps segment 0 (its
         // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
@@ -8657,7 +8716,7 @@ fn encode_intra_candidate(
         r,
         c,
         b_size,
-        input,
+        &crate::encoder::key_frame::SourceView::whole(input),
         recon,
         pricing,
         Some(ll_seg),
@@ -8735,7 +8794,14 @@ fn build_p_search_tree(
             b_size,
             ictx.seg_lossless(inter_leaf.segment_id),
         );
-        let d_inter = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let d_inter = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            2,
+            2,
+        );
         let h_rate_inter = p_leaf_rate(&inter_leaf);
         let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
         let mut twin_inter = twin.clone();
@@ -8767,7 +8833,14 @@ fn build_p_search_tree(
             b_size,
             ictx.seg_lossless(intra_leaf.segment_id),
         );
-        let d_intra = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let d_intra = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            2,
+            2,
+        );
         let h_rate_intra = p_leaf_rate(&intra_leaf);
         let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
         let mut twin_intra = twin.clone();
@@ -8881,7 +8954,13 @@ fn build_p_search_tree(
         b_size,
         ictx.seg_lossless(inter_leaf.segment_id),
     );
-    let d_inter = region_distortion(recon, input, r, c, n4 as usize);
+    let d_inter = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_inter = p_leaf_rate(&inter_leaf);
     let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
     let mut twin_inter = twin.clone();
@@ -8918,7 +8997,13 @@ fn build_p_search_tree(
     // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` on a committed intra
     // region, exactly as the decoder will.
     ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
-    let d_intra = region_distortion(recon, input, r, c, n4 as usize);
+    let d_intra = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_intra = p_leaf_rate(&intra_leaf);
     let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
     let mut twin_intra = twin.clone();
@@ -9056,7 +9141,13 @@ fn build_p_search_tree(
             cost_shape += twin_shape.commit_block(&blk, rr, cc, sz, params)?;
             blocks.push(blk);
         }
-        let d = region_distortion(recon, input, r, c, n4 as usize);
+        let d = region_distortion(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            r,
+            c,
+            n4 as usize,
+        );
         let bx = |b: SyntaxBlock| Box::new(b);
         let node = match part {
             PARTITION_HORZ | PARTITION_VERT => {
@@ -9181,7 +9272,13 @@ fn build_p_search_tree(
     )?;
     cost_split += c0 + c1 + c2 + c3;
     let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
-    let d_split = region_distortion(recon, input, r, c, n4 as usize);
+    let d_split = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_split = children.iter().map(|ch| p_tree_rate(ch)).sum::<u64>() + 4;
     let score_split = score_of(d_split, cost_split, h_rate_split);
 
