@@ -778,11 +778,12 @@ pub fn block_inter_prediction(
             if p_int >= 3 && p_int + 4 <= last_x {
                 // All eight taps inside the row: no clamping needed. With
                 // samples of at most 12 bits and kernels of absolute sum
-                // at most 256, the sum fits i32.
+                // at most 240 (`SUBPEL_FILTERS`, every phase of every
+                // row), the sum is below 2^20 and fits i32.
                 let start = row_base + (p_int - 3) as usize;
                 let mut t32: i32 = 0;
                 for (coef, &sample) in coeffs.iter().zip(&ref_plane[start..start + 8]) {
-                    t32 += (*coef as i32) * sample as i32;
+                    t32 += *coef * i32::from(sample);
                 }
                 s = t32 as i64;
             } else {

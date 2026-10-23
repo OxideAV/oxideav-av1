@@ -7,6 +7,7 @@ All notable changes to `oxideav-av1` are recorded here.
 ### Changed
 
 - edition 2024, MSRV 1.95.
+- `block_inter_prediction` (§7.11.3.4): an interior horizontal position (all eight taps inside the row) reads the row slice without the per-tap `Clip3`, the vertical pass walks the eight intermediate rows as one slice, and both passes sum in `i32` (samples are at most 12 bits and a `SUBPEL_FILTERS` row's absolute sum is at most 240, so the horizontal sum is below 2^20, the intermediate below 2^15 and the vertical sum below 2^23). Output unchanged; 1080p SVT-AV1 single-thread decode ~20 % faster (#27, ropoctl).
 
 ### Other
 
