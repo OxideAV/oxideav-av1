@@ -9,6 +9,7 @@ All notable changes to `oxideav-av1` are recorded here.
 - edition 2024, MSRV 1.95.
 - `block_inter_prediction` (§7.11.3.4): an interior horizontal position (all eight taps inside the row) reads the row slice without the per-tap `Clip3`, the vertical pass walks the eight intermediate rows as one slice, and both passes sum in `i32` (samples are at most 12 bits and a `SUBPEL_FILTERS` row's absolute sum is at most 240, so the horizontal sum is below 2^20, the intermediate below 2^15 and the vertical sum below 2^23). Output unchanged; 1080p SVT-AV1 single-thread decode ~20 % faster (#27, ropoctl).
 - `block_inter_prediction`: phase 0 of every `SUBPEL_FILTERS` row is `{ 0, 0, 0, 128, 0, 0, 0, 0 }`, so an unscaled whole-sample horizontal position computes `Round2( 128 * sample, InterRound0 )` per column, an unscaled whole-sample vertical position builds only the `h` intermediate rows the vertical pass reads, and a phase-0 output row takes the centre intermediate row. `inter_pred::tests::block_inter_prediction_matches_the_literal_process` pins the function against a literal §7.11.3.4 evaluation (every tap clamped, `i64` sums) at 8 / 10 / 12 bits, unscaled and scaled steps, positions off every edge, 4×4 / 8×8 / 16×4 blocks and several filter pairs (#28, ropoctl).
+- `predict_inter_leaf_from_walk`: the `i32` ↔ `u16` mirror of an inter leaf's rectangle into and out of the prediction scratch planes copies row slices (zipped) instead of indexing every sample through `y * stride + x` with a bounds check each; same samples, same order (#30, ropoctl).
 
 ### Other
 
