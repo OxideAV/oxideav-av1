@@ -205,14 +205,7 @@ impl Decoder for Av1Decoder {
                 .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
             push(frames);
         }
-        // Bound the frames decoding on workers: past the budget, wait
-        // for the oldest before taking more input.
-        let budget = self.session.threads();
-        while self.queue.iter().filter(|(f, _)| !f.is_ready()).count() >= budget.max(2) {
-            if let Some((f, _)) = self.queue.iter_mut().find(|(f, _)| !f.is_ready()) {
-                f.resolve();
-            }
-        }
+        // The session bounds the frames in flight on its workers.
         Ok(())
     }
 

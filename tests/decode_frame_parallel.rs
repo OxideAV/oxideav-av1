@@ -2,7 +2,9 @@
 //! one temporal unit per packet decodes BYTE-IDENTICAL through the
 //! registry decoder for every `ExecutionContext` budget, and through
 //! `SpecDecodeSession::decode_temporal_unit_pipelined` with the pending
-//! frames collected only after the whole stream was submitted.
+//! frames collected only after the whole stream was submitted. Under a
+//! budget the reference frames decode on workers too, each waiting only
+//! for the slots it reads.
 
 use oxideav_av1::decoder::{SpecDecodeSession, decode_av1_spec};
 use oxideav_av1::encoder::{Yuv420Frame, encode_pyramid_gop_yuv420_with_q};
@@ -28,7 +30,13 @@ fn moving(w: u32, h: u32, t: usize) -> Yuv420Frame {
 }
 
 fn gop() -> (Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>) {
-    let frames: Vec<Yuv420Frame> = (0..5).map(|t| moving(72, 40, t)).collect();
+    gop_of(5)
+}
+
+/// A KEY frame plus `n - 1` B-pyramid frames: hidden ALT / MID
+/// references, shown leaves and `show_existing_frame` units.
+fn gop_of(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>) {
+    let frames: Vec<Yuv420Frame> = (0..n).map(|t| moving(72, 40, t)).collect();
     let enc = encode_pyramid_gop_yuv420_with_q(&frames, 90).expect("pyramid encode");
     let reference: Vec<Vec<Vec<u8>>> = decode_av1_spec(&enc.ivf_bytes)
         .expect("spec decode")
@@ -78,6 +86,31 @@ fn pipelined_session_frames_resolve_after_the_stream() {
     let (units, reference) = gop();
     let mut s = SpecDecodeSession::new();
     s.set_threads(4);
+    let mut pending = Vec::new();
+    for tu in &units {
+        pending.extend(s.decode_temporal_unit_pipelined(tu).expect("submit"));
+    }
+    let frames: Vec<Vec<Vec<u8>>> = pending
+        .into_iter()
+        .map(|p| p.into_frame().expect("deferred decode").planes)
+        .collect();
+    assert_eq!(frames, reference);
+}
+
+#[test]
+fn deep_pyramid_reference_frames_decode_identically_for_every_worker_budget() {
+    // A full 16-frame mini-GOP: four layers of hidden references, each
+    // read by frames decoded on other workers.
+    let (units, reference) = gop_of(17);
+    for threads in [1usize, 2, 3, 4, 8, 16] {
+        let out = decode_registry(&units, threads);
+        assert_eq!(out.len(), reference.len(), "{threads} workers: frame count");
+        for (i, (a, b)) in out.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(a, b, "{threads} workers: display frame {i}");
+        }
+    }
+    let mut s = SpecDecodeSession::new();
+    s.set_threads(8);
     let mut pending = Vec::new();
     for tu in &units {
         pending.extend(s.decode_temporal_unit_pipelined(tu).expect("submit"));

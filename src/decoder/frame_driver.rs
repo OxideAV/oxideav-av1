@@ -56,7 +56,7 @@ use crate::uncompressed_header_tail::{
     ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP, SegmentationParams,
 };
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// r475 — wall time per §7.4 decode stage of the LAST temporal unit
@@ -163,21 +163,12 @@ struct SpecRefSlot {
     /// §7.20 `RefFrameType[ i ]` — `FrameIsIntra` of the stored frame
     /// (the §7.9.2 projection skips KEY / INTRA_ONLY sources).
     frame_is_intra: bool,
-    /// §7.20 `RefFrameType[ i ] == KEY_FRAME` — the §7.21 trigger.
-    frame_type_is_key: bool,
     /// §7.20 `RefBitDepth[ i ]` — the stored frame's `BitDepth`.
     bit_depth: u8,
     /// §7.20 `save_cdfs( i )` — the frame-end CDF state (§8.4
     /// `frame_end_update_cdf`), loaded back by §8.3.1 `load_cdfs()`
     /// when a later frame names this slot as its primary reference.
     cdfs: Box<TileCdfContext>,
-    /// §7.20 `SavedGmParams[ i ]` — this frame's `gm_params`.
-    gm_params: [[i32; 6]; 8],
-    /// §7.20 `save_loop_filter_params( i )` — the §5.9.11 running
-    /// delta state at the end of this frame's header parse.
-    lf_ref_deltas: [i8; 8],
-    /// Mode-delta half of `save_loop_filter_params( i )`.
-    lf_mode_deltas: [i8; 2],
     /// §7.20 `SavedSegmentIds[ i ]` — the decoded frame's
     /// `SegmentIds[ row ][ col ]` grid (row-major, one `i32` per mi
     /// cell), loaded back by `load_previous_segment_ids()` as the
@@ -193,9 +184,9 @@ struct SpecRefSlot {
     grain_params: Option<crate::uncompressed_header_tail::FilmGrainParams>,
 }
 
-/// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
-/// inter `uncompressed_header()` parse consumes plus the §7.20
-/// per-slot pixel/grid stores.
+/// The §7.20 store as one frame's decode reads it: the §5.9.2
+/// `RefInfo` arrays as they stood when the frame's header was parsed,
+/// plus the decoded payload of every slot the frame reads.
 #[derive(Debug, Clone)]
 struct SpecRefState {
     info: RefInfo,
@@ -208,11 +199,219 @@ struct SpecRefState {
     slots: [Option<Arc<SpecRefSlot>>; NUM_REF_FRAMES as usize],
 }
 
-impl SpecRefState {
+/// One §7.20 slot payload that may still be decoding on a worker
+/// thread: set exactly once, by the frame that stores it.
+#[derive(Debug)]
+struct SlotCell {
+    payload: Mutex<Option<Result<Arc<SpecRefSlot>, Error>>>,
+    ready: Condvar,
+}
+
+impl SlotCell {
+    fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            payload: Mutex::new(None),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn done(payload: Arc<SpecRefSlot>) -> Arc<Self> {
+        Arc::new(Self {
+            payload: Mutex::new(Some(Ok(payload))),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Store the payload (or the error the storing frame hit); only the
+    /// first call counts.
+    fn fulfil(&self, r: Result<Arc<SpecRefSlot>, Error>) {
+        let mut g = self.payload.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(r);
+            self.ready.notify_all();
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.payload
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Block until the storing frame has decoded.
+    fn wait(&self) -> Result<Arc<SpecRefSlot>, Error> {
+        let mut g = self.payload.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(r) = g.as_ref() {
+                return r.clone();
+            }
+            g = self.ready.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
+/// inter `uncompressed_header()` parse consumes, updated in decode
+/// order as each frame header is parsed, plus the §7.20 per-slot
+/// pixel/grid stores, each of which may still be decoding.
+///
+/// Everything a later frame HEADER reads from a slot (§5.9.2 order
+/// hints and frame sizes, §7.20 `SavedGmParams`, the loop-filter and
+/// segmentation parameters) is derived from the storing frame's own
+/// header, so the header parse never waits for a decode.
+#[derive(Debug, Clone)]
+struct SessionRefs {
+    info: RefInfo,
+    slots: [Option<Arc<SlotCell>>; NUM_REF_FRAMES as usize],
+}
+
+impl SessionRefs {
     fn new() -> Self {
         Self {
             info: RefInfo::default(),
             slots: Default::default(),
+        }
+    }
+
+    /// The slots in `mask` (bit `i` = slot `i`), waited for, with the
+    /// current `RefInfo`.
+    fn resolve(&self, mask: u8) -> Result<SpecRefState, Error> {
+        let mut slots: [Option<Arc<SpecRefSlot>>; NUM_REF_FRAMES as usize] = Default::default();
+        for (i, (dst, cell)) in slots.iter_mut().zip(self.slots.iter()).enumerate() {
+            if let (true, Some(cell)) = ((mask >> i) & 1 != 0, cell) {
+                *dst = Some(cell.wait()?);
+            }
+        }
+        Ok(SpecRefState {
+            info: self.info.clone(),
+            slots,
+        })
+    }
+}
+
+/// The §7.20 slots a frame's decode reads: the seven `ref_frame_idx[]`
+/// entries of an inter frame (the §7.11.3 prediction sources, the §7.9
+/// projection sources, and through `primary_ref_frame` the §8.3.1
+/// `load_cdfs` and `load_previous_segment_ids` source) and the §5.9.30
+/// `film_grain_params_ref_idx` of a predicted grain set.
+fn slots_read(fh: &FrameHeader) -> u8 {
+    let mut mask = 0u8;
+    if let Some(ir) = fh.inter_refs.as_ref() {
+        for &idx in &ir.ref_frame_idx {
+            if idx < NUM_REF_FRAMES {
+                mask |= 1 << idx;
+            }
+        }
+    }
+    let grain_source = fh.film_grain_params.as_ref().filter(|fg| {
+        fg.apply_grain && fg.predicted && fg.film_grain_params_ref_idx < NUM_REF_FRAMES
+    });
+    if let Some(fg) = grain_source {
+        mask |= 1 << fg.film_grain_params_ref_idx;
+    }
+    mask
+}
+
+/// A counter with a ceiling: [`Gate::enter`] waits while `limit`
+/// holders are inside.
+#[derive(Debug, Default)]
+struct Gate {
+    inside: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl Gate {
+    fn enter(&self, limit: usize) {
+        let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= limit.max(1) {
+            n = self.changed.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+    }
+
+    fn leave(&self) {
+        let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        self.changed.notify_all();
+    }
+}
+
+/// How many frames a pipelined session lets past their header parse
+/// before the oldest finishes, per worker: frames waiting on their
+/// references hold no worker, so the window runs ahead of the budget
+/// to find frames that can decode now (a hierarchical group's next
+/// branch, the next group's anchor).
+const FRAME_WINDOW_PER_WORKER: usize = 4;
+
+/// The worker threads of a pipelined session. At most
+/// `FRAME_WINDOW_PER_WORKER * threads` frames are in flight, and at
+/// most `threads` of them decode at once (a frame takes its turn once
+/// its references are decoded). The handles of frames nobody waits on
+/// (hidden frames) are kept to re-raise a worker panic.
+#[derive(Debug, Default)]
+struct FrameJobs {
+    window: Arc<Gate>,
+    running: Arc<Gate>,
+    hidden: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Leaves the window (and the running set, once entered) when a job
+/// ends, normally or by unwinding, and fails the job's slot if it never
+/// stored one, so a frame waiting on it cannot hang.
+struct JobGuard {
+    window: Arc<Gate>,
+    running: Option<Arc<Gate>>,
+    cell: Option<Arc<SlotCell>>,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if let Some(cell) = self.cell.take() {
+            cell.fulfil(Err(Error::PartitionWalkOutOfRange));
+        }
+        if let Some(running) = self.running.take() {
+            running.leave();
+        }
+        self.window.leave();
+    }
+}
+
+impl FrameJobs {
+    /// Wait for room in the window, re-raising the panic of any
+    /// finished hidden frame.
+    fn admit(&mut self, threads: usize) -> JobGuard {
+        let mut i = 0;
+        while i < self.hidden.len() {
+            if self.hidden[i].is_finished() {
+                if let Err(panic) = self.hidden.swap_remove(i).join() {
+                    std::panic::resume_unwind(panic);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        self.window.enter(FRAME_WINDOW_PER_WORKER * threads);
+        JobGuard {
+            window: Arc::clone(&self.window),
+            running: None,
+            cell: None,
+        }
+    }
+}
+
+impl JobGuard {
+    /// Take a worker turn (waits while `threads` frames decode).
+    fn run(&mut self, gate: &Arc<Gate>, threads: usize) {
+        gate.enter(threads);
+        self.running = Some(Arc::clone(gate));
+    }
+}
+
+impl Drop for FrameJobs {
+    fn drop(&mut self) {
+        for h in self.hidden.drain(..) {
+            let _ = h.join();
         }
     }
 }
@@ -221,13 +420,14 @@ impl SpecRefState {
 /// [`SpecDecodeSession::decode_temporal_unit_pipelined`]: either
 /// already decoded, or still decoding on a worker thread.
 ///
-/// A frame whose `refresh_frame_flags` is zero is never read by a later
-/// frame — §7.20 stores nothing for it (no samples, no §7.19 motion
-/// field, no CDFs, no saved parameters), and its header parse reads
-/// only the reference state the frames before it left — so it can
-/// decode alongside the frames that follow it. The worker reads an
-/// `Arc` snapshot of that reference state; the bytes equal the serial
-/// decode.
+/// Under a worker budget every frame decodes on a worker as soon as its
+/// tiles are in. Its header parse has already updated the session's
+/// §5.9.2 reference info (everything a later header reads is derived
+/// from the header), and the worker waits for the §7.20 payloads of
+/// exactly the slots the frame reads — so the frames of a hierarchical
+/// group that do not depend on one another decode at the same time.
+/// Every frame is decoded from the same inputs as the serial decode, so
+/// the bytes are identical.
 #[derive(Debug)]
 pub struct PendingSpecFrame(PendingState);
 
@@ -235,6 +435,8 @@ pub struct PendingSpecFrame(PendingState);
 enum PendingState {
     Done(Result<SpecFrame, Error>),
     Running(std::thread::JoinHandle<Result<SpecFrame, Error>>),
+    /// A §7.21 `show_existing_frame` output of a slot still decoding.
+    Existing(Arc<SlotCell>, Box<SequenceHeader>),
 }
 
 impl PendingSpecFrame {
@@ -248,23 +450,24 @@ impl PendingSpecFrame {
         match &self.0 {
             PendingState::Done(_) => true,
             PendingState::Running(h) => h.is_finished(),
+            PendingState::Existing(cell, _) => cell.is_ready(),
         }
     }
 
     /// Block until the frame is decoded (a worker panic is re-raised
     /// here, as the serial decode would have raised it).
     pub fn resolve(&mut self) {
-        if let PendingState::Running(_) = self.0 {
-            let PendingState::Running(h) =
-                std::mem::replace(&mut self.0, PendingState::Done(Err(Error::UnexpectedEnd)))
-            else {
-                unreachable!()
-            };
-            self.0 = PendingState::Done(match h.join() {
+        let state = std::mem::replace(&mut self.0, PendingState::Done(Err(Error::UnexpectedEnd)));
+        self.0 = PendingState::Done(match state {
+            PendingState::Done(r) => r,
+            PendingState::Running(h) => match h.join() {
                 Ok(r) => r,
                 Err(panic) => std::panic::resume_unwind(panic),
-            });
-        }
+            },
+            PendingState::Existing(cell, seq) => cell
+                .wait()
+                .and_then(|slot| output_existing_frame(&slot, &seq)),
+        });
     }
 
     /// The decoded frame (blocking until it is), or the error its
@@ -277,49 +480,91 @@ impl PendingSpecFrame {
         self.resolve();
         match self.0 {
             PendingState::Done(r) => r,
-            PendingState::Running(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 }
 
-/// Decode one frame whose tiles are all in: on a worker thread when
-/// `defer` is set and nothing after the frame can read it (a shown
-/// frame with `refresh_frame_flags == 0`), serially otherwise
-/// (followed by the §7.20 reference update).
+/// Decode one frame whose tiles are all in: on a worker thread when the
+/// session is pipelined (`jobs`) under a worker budget, in line
+/// otherwise; either way followed by the §7.20 reference update.
 #[allow(clippy::too_many_arguments)]
 fn decode_or_defer(
     s: &SequenceHeader,
     fh: FrameHeader,
     tiles: Vec<TilePayload>,
-    refs: &mut SpecRefState,
+    refs: &mut SessionRefs,
     out: &mut Vec<PendingSpecFrame>,
     stages: &mut DecodeStageTimings,
     threads: usize,
-    defer: bool,
+    jobs: Option<&mut FrameJobs>,
 ) -> Result<(), Error> {
-    if defer && threads > 1 && fh.refresh_frame_flags == 0 && fh.show_frame {
-        let job = Arc::new((s.clone(), fh, tiles, refs.clone()));
-        let worker_job = Arc::clone(&job);
-        let spawned = std::thread::Builder::new()
-            .name("av1-frame".into())
-            .spawn(move || {
-                let (seq, fh, tiles, snapshot) = &*worker_job;
-                let mut st = DecodeStageTimings::default();
-                decode_frame_spec_tiles(seq, fh, tiles, Some(snapshot), &mut st, threads)
-                    .map(|d| d.frame)
-            });
-        if let Ok(handle) = spawned {
-            out.push(PendingSpecFrame(PendingState::Running(handle)));
-            return Ok(());
+    let mask = slots_read(&fh);
+    if let Some(jobs) = jobs.filter(|_| threads > 1) {
+        let mut guard = jobs.admit(threads);
+        // What the frame reads, as it stands before the frame's own
+        // reference update.
+        let mut reads = SessionRefs {
+            info: refs.info.clone(),
+            slots: Default::default(),
+        };
+        for (i, (dst, src)) in reads.slots.iter_mut().zip(refs.slots.iter()).enumerate() {
+            if (mask >> i) & 1 != 0 {
+                dst.clone_from(src);
+            }
         }
-        // No thread to be had: decode it here (it stores nothing, so
-        // the snapshot is the live reference state).
-        let (_, fh, tiles, snapshot) = &*job;
-        let decoded = decode_frame_spec_tiles(s, fh, tiles, Some(snapshot), stages, threads)?;
-        out.push(PendingSpecFrame::ready(decoded.frame));
+        let cell = (fh.refresh_frame_flags != 0).then(SlotCell::pending);
+        if let Some(cell) = &cell {
+            store_header_info(refs, &fh, cell)?;
+        }
+        guard.cell = cell.clone();
+        let shown = fh.show_frame;
+        let seq = s.clone();
+        let running = Arc::clone(&jobs.running);
+        let job = move || -> Result<SpecFrame, Error> {
+            let mut guard = guard;
+            let result = reads.resolve(mask).and_then(|snapshot| {
+                guard.run(&running, threads);
+                let mut st = DecodeStageTimings::default();
+                decode_frame_spec_tiles(&seq, &fh, &tiles, Some(&snapshot), &mut st, threads)
+            });
+            let frame = match result {
+                Ok(decoded) => {
+                    let (frame, payload) = split_decoded(&fh, decoded);
+                    if let Some(cell) = &guard.cell {
+                        cell.fulfil(Ok(payload));
+                    }
+                    Ok(frame)
+                }
+                Err(e) => {
+                    if let Some(cell) = &guard.cell {
+                        cell.fulfil(Err(e));
+                    }
+                    Err(e)
+                }
+            };
+            drop(guard);
+            frame
+        };
+        let builder = std::thread::Builder::new().name("av1-frame".into());
+        if shown {
+            let handle = builder
+                .spawn(job)
+                .map_err(|_| Error::PartitionWalkOutOfRange)?;
+            out.push(PendingSpecFrame(PendingState::Running(handle)));
+        } else {
+            let handle = builder
+                .spawn(move || {
+                    let _ = job();
+                })
+                .map_err(|_| Error::PartitionWalkOutOfRange)?;
+            jobs.hidden.push(handle);
+        }
         return Ok(());
     }
-    let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), stages, threads)?;
+    let snapshot = refs.resolve(mask)?;
+    let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(&snapshot), stages, threads)?;
+    drop(snapshot);
     let frame = reference_frame_update(refs, &fh, decoded)?;
     if fh.show_frame {
         out.push(PendingSpecFrame::ready(frame));
@@ -1801,7 +2046,9 @@ pub fn decode_av1_spec_at_operating_point(
 #[derive(Debug)]
 pub struct SpecDecodeSession {
     seq: Option<SequenceHeader>,
-    refs: SpecRefState,
+    refs: SessionRefs,
+    /// The frames decoding on worker threads (pipelined decode).
+    jobs: FrameJobs,
     /// r430 — the operating point selected by external means (the
     /// §6.7.5 `choose_operating_point()` return value). Defaults to
     /// `0` — the earliest (preferred) entry of the sequence header's
@@ -1834,7 +2081,8 @@ impl SpecDecodeSession {
     pub fn new() -> Self {
         Self {
             seq: None,
-            refs: SpecRefState::new(),
+            refs: SessionRefs::new(),
+            jobs: FrameJobs::default(),
             chosen_op: 0,
             op_idc: 0,
             max_picture_size: MAX_PICTURE_SIZE,
@@ -1963,7 +2211,7 @@ impl SpecDecodeSession {
             self.max_picture_size,
             &mut self.stages,
             self.threads,
-            false,
+            None,
         )?;
         out.into_iter().map(PendingSpecFrame::into_frame).collect()
     }
@@ -2003,7 +2251,7 @@ impl SpecDecodeSession {
             self.max_picture_size,
             &mut self.stages,
             self.threads,
-            true,
+            Some(&mut self.jobs),
         )?;
         Ok(out)
     }
@@ -2022,7 +2270,7 @@ impl SpecDecodeSession {
     /// must start a new coded video sequence (a KEY frame), which
     /// rebuilds every slot before anything can reference it.
     pub fn reset_references(&mut self) {
-        self.refs = SpecRefState::new();
+        self.refs = SessionRefs::new();
     }
 }
 
@@ -2030,32 +2278,32 @@ impl SpecDecodeSession {
 /// into every slot `refresh_frame_flags` selects, updating the
 /// §5.9.2 `RefInfo` arrays in lockstep.
 fn reference_frame_update(
-    refs: &mut SpecRefState,
+    refs: &mut SessionRefs,
     fh: &FrameHeader,
     decoded: DecodedFrameInternal,
 ) -> Result<SpecFrame, Error> {
     if fh.refresh_frame_flags == 0 {
         return Ok(decoded.frame);
     }
+    let (frame, payload) = split_decoded(fh, decoded);
+    store_header_info(refs, fh, &SlotCell::done(payload))?;
+    Ok(frame)
+}
+
+/// The header half of §7.20 `reference_frame_update()`: the §5.9.2
+/// `RefInfo` entries of every slot `refresh_frame_flags` selects, all
+/// derived from the frame header, and `cell` (the frame's payload,
+/// possibly still decoding) as the slots' store.
+fn store_header_info(
+    refs: &mut SessionRefs,
+    fh: &FrameHeader,
+    cell: &Arc<SlotCell>,
+) -> Result<(), Error> {
     let fs = fh
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    // §7.20 per-slot payload: pixels + §7.19 motion-field grids +
-    // `SavedOrderHints` + `save_cdfs` + `SavedGmParams` +
-    // `save_loop_filter_params`.
-    let mut gm_params = crate::uncompressed_header_tail::prev_gm_params_default();
-    if let Some(g) = fh.global_motion_params.as_ref() {
-        gm_params = g.gm_params;
-    }
-    let (lf_ref_deltas, lf_mode_deltas) = fh
-        .loop_filter_params
-        .as_ref()
-        .map(|lf| (lf.loop_filter_ref_deltas, lf.loop_filter_mode_deltas))
-        .unwrap_or((
-            crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
-            [0i8; 2],
-        ));
+    let (gm_params, lf_ref_deltas, lf_mode_deltas) = saved_header_params(fh);
     // §7.20 `save_segmentation_params( i )` — the current frame's
     // FeatureEnabled / FeatureData (post-§5.9.14, including the
     // `segmentation_update_data == 0` loaded values).
@@ -2070,9 +2318,52 @@ fn reference_frame_update(
             [[0i16; crate::uncompressed_header_tail::SEG_LVL_MAX];
                 crate::uncompressed_header_tail::MAX_SEGMENTS],
         ));
-    // r453 — the payload MOVES out of the decode result (the surfaced
-    // output frame is a separate buffer) and is Arc-shared across the
-    // selected slots.
+    let is_key = matches!(fh.frame_type, crate::frame_header::FrameType::Key);
+    for i in 0..NUM_REF_FRAMES as usize {
+        if (fh.refresh_frame_flags >> i) & 1 != 0 {
+            refs.info.valid[i] = true;
+            refs.info.order_hint[i] = fh.order_hint;
+            refs.info.frame_id[i] = fh.current_frame_id;
+            refs.info.upscaled_width[i] = fs.upscaled_width;
+            refs.info.frame_height[i] = fs.frame_height;
+            refs.info.render_width[i] = fs.render_width;
+            refs.info.render_height[i] = fs.render_height;
+            refs.info.frame_type_is_key[i] = is_key;
+            refs.info.saved_gm_params[i] = gm_params;
+            refs.info.saved_lf_ref_deltas[i] = lf_ref_deltas;
+            refs.info.saved_lf_mode_deltas[i] = lf_mode_deltas;
+            refs.info.saved_seg_feature_active[i] = seg_active;
+            refs.info.saved_seg_feature_data[i] = seg_data;
+            refs.slots[i] = Some(Arc::clone(cell));
+        }
+    }
+    Ok(())
+}
+
+/// §7.20 `SavedGmParams` + `save_loop_filter_params` from the header.
+fn saved_header_params(fh: &FrameHeader) -> ([[i32; 6]; 8], [i8; 8], [i8; 2]) {
+    let mut gm_params = crate::uncompressed_header_tail::prev_gm_params_default();
+    if let Some(g) = fh.global_motion_params.as_ref() {
+        gm_params = g.gm_params;
+    }
+    let (lf_ref_deltas, lf_mode_deltas) = fh
+        .loop_filter_params
+        .as_ref()
+        .map(|lf| (lf.loop_filter_ref_deltas, lf.loop_filter_mode_deltas))
+        .unwrap_or((
+            crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
+            [0i8; 2],
+        ));
+    (gm_params, lf_ref_deltas, lf_mode_deltas)
+}
+
+/// Split a decoded frame into the surfaced output and the §7.20 slot
+/// payload: pixels + §7.19 motion-field grids + `SavedOrderHints` +
+/// `save_cdfs` + `SavedSegmentIds` + the grain state (the header-derived
+/// saved parameters live in `RefInfo`). r453 —
+/// the payload MOVES out of the decode result (the surfaced output
+/// frame is a separate buffer).
+fn split_decoded(fh: &FrameHeader, decoded: DecodedFrameInternal) -> (SpecFrame, Arc<SpecRefSlot>) {
     let DecodedFrameInternal {
         frame,
         ref_planes,
@@ -2095,34 +2386,12 @@ fn reference_frame_update(
         mi_rows,
         mi_cols,
         frame_is_intra: fh.frame_is_intra,
-        frame_type_is_key: matches!(fh.frame_type, crate::frame_header::FrameType::Key),
         bit_depth: frame.bit_depth,
         cdfs: end_cdfs,
-        gm_params,
-        lf_ref_deltas,
-        lf_mode_deltas,
         segment_ids,
         grain_params,
     });
-    for i in 0..NUM_REF_FRAMES as usize {
-        if (fh.refresh_frame_flags >> i) & 1 != 0 {
-            refs.info.valid[i] = true;
-            refs.info.order_hint[i] = fh.order_hint;
-            refs.info.frame_id[i] = fh.current_frame_id;
-            refs.info.upscaled_width[i] = fs.upscaled_width;
-            refs.info.frame_height[i] = fs.frame_height;
-            refs.info.render_width[i] = fs.render_width;
-            refs.info.render_height[i] = fs.render_height;
-            refs.info.frame_type_is_key[i] = payload.frame_type_is_key;
-            refs.info.saved_gm_params[i] = payload.gm_params;
-            refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
-            refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
-            refs.info.saved_seg_feature_active[i] = seg_active;
-            refs.info.saved_seg_feature_data[i] = seg_data;
-            refs.slots[i] = Some(Arc::clone(&payload));
-        }
-    }
-    Ok(frame)
+    (frame, payload)
 }
 
 /// §7.21-adjacent `show_existing_frame` output: surface the stored
@@ -2131,20 +2400,7 @@ fn reference_frame_update(
 /// runs `load_grain_params( frame_to_show_map_idx )` when
 /// `film_grain_params_present == 1`; the stored planes themselves stay
 /// grain-free).
-fn output_existing_frame(
-    refs: &SpecRefState,
-    fh: &FrameHeader,
-    seq: &SequenceHeader,
-) -> Result<SpecFrame, Error> {
-    let idx = fh
-        .frame_to_show_map_idx
-        .ok_or(Error::PartitionWalkOutOfRange)? as usize;
-    if idx >= NUM_REF_FRAMES as usize {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    let slot = refs.slots[idx]
-        .as_ref()
-        .ok_or(Error::PartitionWalkOutOfRange)?;
+fn output_existing_frame(slot: &SpecRefSlot, seq: &SequenceHeader) -> Result<SpecFrame, Error> {
     // §7.18.3 on the OUTPUT copy only.
     let mut grain_bufs: Option<Vec<Vec<i32>>> = None;
     if seq.film_grain_params_present
@@ -2229,14 +2485,14 @@ fn output_existing_frame(
 fn decode_temporal_unit_spec(
     payload: &[u8],
     seq: &mut Option<SequenceHeader>,
-    refs: &mut SpecRefState,
+    refs: &mut SessionRefs,
     out: &mut Vec<PendingSpecFrame>,
     chosen_op: u8,
     op_idc: &mut u16,
     max_picture_size: u32,
     stages: &mut DecodeStageTimings,
     threads: usize,
-    defer: bool,
+    mut jobs: Option<&mut FrameJobs>,
 ) -> Result<(), Error> {
     // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
     // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
@@ -2322,9 +2578,27 @@ fn decode_temporal_unit_spec(
                 stages.parse += t_parse.elapsed();
                 check_picture_size(&fh, max_picture_size)?;
                 if fh.show_existing_frame {
-                    out.push(PendingSpecFrame::ready(output_existing_frame(
-                        refs, &fh, s,
-                    )?));
+                    let idx = fh
+                        .frame_to_show_map_idx
+                        .ok_or(Error::PartitionWalkOutOfRange)?
+                        as usize;
+                    let cell = refs
+                        .slots
+                        .get(idx)
+                        .cloned()
+                        .flatten()
+                        .ok_or(Error::PartitionWalkOutOfRange)?;
+                    if jobs.is_some() && threads > 1 {
+                        out.push(PendingSpecFrame(PendingState::Existing(
+                            Arc::clone(&cell),
+                            Box::new(s.clone()),
+                        )));
+                    } else {
+                        out.push(PendingSpecFrame::ready(output_existing_frame(
+                            &*cell.wait()?,
+                            s,
+                        )?));
+                    }
                     // §7.4 / §7.21: a shown KEY frame re-loads the
                     // stored frame state and re-stores it into every
                     // slot (`refresh_frame_flags == allFrames` per the
@@ -2332,43 +2606,27 @@ fn decode_temporal_unit_spec(
                     // clone IS the §7.21 load followed by the §7.20
                     // store — pixels, §7.19 grids, `SavedOrderHints`,
                     // CDFs, gm params and loop-filter deltas all ride
-                    // the payload.
+                    // the payload (and its `RefInfo` entries).
                     if fh.refresh_frame_flags != 0 {
-                        let idx = fh
-                            .frame_to_show_map_idx
-                            .ok_or(Error::PartitionWalkOutOfRange)?
-                            as usize;
-                        let payload = refs.slots[idx]
-                            .as_ref()
-                            .cloned()
-                            .ok_or(Error::PartitionWalkOutOfRange)?;
-                        let loaded_order_hint = refs.info.order_hint[idx];
-                        let loaded_frame_id = refs.info.frame_id[idx];
-                        let loaded_uw = refs.info.upscaled_width[idx];
-                        let loaded_fh = refs.info.frame_height[idx];
-                        let loaded_rw = refs.info.render_width[idx];
-                        let loaded_rh = refs.info.render_height[idx];
+                        let info = refs.info.clone();
                         for i in 0..NUM_REF_FRAMES as usize {
                             if (fh.refresh_frame_flags >> i) & 1 != 0 {
                                 refs.info.valid[i] = true;
-                                refs.info.order_hint[i] = loaded_order_hint;
-                                refs.info.frame_id[i] = loaded_frame_id;
-                                refs.info.upscaled_width[i] = loaded_uw;
-                                refs.info.frame_height[i] = loaded_fh;
-                                refs.info.render_width[i] = loaded_rw;
-                                refs.info.render_height[i] = loaded_rh;
-                                refs.info.frame_type_is_key[i] = payload.frame_type_is_key;
-                                refs.info.saved_gm_params[i] = payload.gm_params;
-                                refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
-                                refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
-                                // §7.21 load + §7.20 re-store: the
-                                // segmentation params ride the RefInfo
-                                // copy from the loaded slot.
+                                refs.info.order_hint[i] = info.order_hint[idx];
+                                refs.info.frame_id[i] = info.frame_id[idx];
+                                refs.info.upscaled_width[i] = info.upscaled_width[idx];
+                                refs.info.frame_height[i] = info.frame_height[idx];
+                                refs.info.render_width[i] = info.render_width[idx];
+                                refs.info.render_height[i] = info.render_height[idx];
+                                refs.info.frame_type_is_key[i] = info.frame_type_is_key[idx];
+                                refs.info.saved_gm_params[i] = info.saved_gm_params[idx];
+                                refs.info.saved_lf_ref_deltas[i] = info.saved_lf_ref_deltas[idx];
+                                refs.info.saved_lf_mode_deltas[i] = info.saved_lf_mode_deltas[idx];
                                 refs.info.saved_seg_feature_active[i] =
-                                    refs.info.saved_seg_feature_active[idx];
+                                    info.saved_seg_feature_active[idx];
                                 refs.info.saved_seg_feature_data[i] =
-                                    refs.info.saved_seg_feature_data[idx];
-                                refs.slots[i] = Some(payload.clone());
+                                    info.saved_seg_feature_data[idx];
+                                refs.slots[i] = Some(Arc::clone(&cell));
                             }
                         }
                     }
@@ -2415,7 +2673,16 @@ fn decode_temporal_unit_spec(
                 // `tg_end == NumTiles - 1`.
                 if parsed.tg_end + 1 == num_tiles {
                     let pf = pending.take().expect("pending frame checked above");
-                    decode_or_defer(s, pf.fh, pf.tiles, refs, out, stages, threads, defer)?;
+                    decode_or_defer(
+                        s,
+                        pf.fh,
+                        pf.tiles,
+                        refs,
+                        out,
+                        stages,
+                        threads,
+                        jobs.as_deref_mut(),
+                    )?;
                 }
             }
             ObuType::Frame => {
@@ -2443,7 +2710,16 @@ fn decode_temporal_unit_spec(
                     .ok_or(Error::PartitionWalkOutOfRange)?;
                 let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
                 stages.parse += t_parse.elapsed();
-                decode_or_defer(s, fh, tiles, refs, out, stages, threads, defer)?;
+                decode_or_defer(
+                    s,
+                    fh,
+                    tiles,
+                    refs,
+                    out,
+                    stages,
+                    threads,
+                    jobs.as_deref_mut(),
+                )?;
             }
             _ => return Err(Error::PartitionWalkOutOfRange),
         }
