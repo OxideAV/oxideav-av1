@@ -254,7 +254,7 @@ pub fn write_obu(out: &mut Vec<u8>, header: &ObuHeader, payload: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obu::{parse_obu, ObuIter};
+    use crate::obu::{ObuIter, parse_obu};
 
     #[test]
     fn temporal_delimiter_byte_exact() {

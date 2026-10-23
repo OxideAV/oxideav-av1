@@ -31,7 +31,7 @@
 //!   * §7.5 — Temporal unit decoding process; TD-prefix invariant.
 
 use crate::encoder::frame_obu::write_frame_header_obu;
-use crate::encoder::obu::{build_temporal_unit, write_obu_with_size, ObuFrame, ObuHeader};
+use crate::encoder::obu::{ObuFrame, ObuHeader, build_temporal_unit, write_obu_with_size};
 use crate::encoder::sequence_obu::write_sequence_header_obu;
 use crate::frame_header::FrameHeader;
 use crate::obu::ObuType;

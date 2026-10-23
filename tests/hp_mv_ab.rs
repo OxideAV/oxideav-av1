@@ -18,7 +18,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, EncodedGop, GopTuning, TunedGop, Yuv420Frame,
+    EncodedGop, GopTuning, TunedGop, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned,
 };
 
 // ---------------------------------------------------------------------

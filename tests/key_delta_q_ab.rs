@@ -21,9 +21,9 @@
 //!
 //! Spec: docs/video/av1/av1-spec.txt §5.9.17, §5.11.13, §7.12.2.
 
-use oxideav_av1::decoder::{decode_av1_spec, SpecFrame};
-use oxideav_av1::encoder::encode_key_frame_yuv420_with_q_dq;
+use oxideav_av1::decoder::{SpecFrame, decode_av1_spec};
 use oxideav_av1::encoder::Yuv420Frame;
+use oxideav_av1::encoder::encode_key_frame_yuv420_with_q_dq;
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;

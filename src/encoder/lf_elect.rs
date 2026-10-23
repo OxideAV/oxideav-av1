@@ -41,8 +41,8 @@ use crate::cdf::PartitionWalker;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::loop_filter::PlaneBuffer;
 use crate::uncompressed_header_tail::{
-    LoopFilterParams, SegmentationParams, LOOP_FILTER_MODE_DELTAS_DEFAULT,
-    LOOP_FILTER_REF_DELTAS_DEFAULT,
+    LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT, LoopFilterParams,
+    SegmentationParams,
 };
 
 /// Inputs to [`elect_loop_filter`].

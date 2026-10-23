@@ -30,13 +30,13 @@
 //! has no display-rate / decode-rate / bit-rate constraint to meet),
 //! `31` (maximum parameters) beyond level 6.3.
 
+use crate::Error;
 use crate::codec_config::Av1CodecConfig;
-use crate::encoder::key_frame::{encode_key_frame_yuv_full, EncodedKeyFrameYuv, KeyExtras};
+use crate::encoder::key_frame::{EncodedKeyFrameYuv, KeyExtras, encode_key_frame_yuv_full};
 use crate::encoder::rate_twin::RateModel;
 use crate::encoder::yuv_frame::{Yuv420Frame, YuvFrame};
 use crate::frame_header::FrameHeader;
-use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
-use crate::Error;
+use crate::sequence_header::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, SequenceHeader};
 
 /// Search-effort presets for [`StillOptions::speed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

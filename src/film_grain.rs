@@ -138,11 +138,7 @@ impl RandomRegister {
 /// 1))) >> n`, with the `n == 0` short-circuit to `x`.
 #[inline]
 fn round2(x: i32, n: u32) -> i32 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1 << (n - 1))) >> n
-    }
+    if n == 0 { x } else { (x + (1 << (n - 1))) >> n }
 }
 
 /// `Clip3(a, b, x)` per av1-spec "Conventions" p.26 — clamp `x` to

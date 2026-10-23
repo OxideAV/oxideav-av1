@@ -101,37 +101,36 @@
 //! [`crate::cdf::PartitionWalker::decode_partition`]: crate::cdf::PartitionWalker::decode_partition
 //! [`crate::cdf::PartitionWalker::decode_block`]: crate::cdf::PartitionWalker
 
+use crate::Error;
 use crate::cdf::{
-    block_height, block_width, cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size,
-    get_plane_residual_size, get_tx_size, inter_tx_type_set, intra_mode_ctx, intra_tx_type_set,
-    is_inter_ctx, palette_tokens_args, partition_ctx, partition_subsize, segment_id_ctx,
-    size_group, skip_ctx, skip_mode_ctx, tx_size_sqr_index, EncoderBlockSyntaxStamp,
-    FrameInterOrderHints, InterIntraReadout, InterpolationFilterReadout, MotionFieldMvs,
-    PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
-    BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
-    GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
-    MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
-    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEWMV,
-    MODE_NEW_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS,
-    PARTITION_HORZ, PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE,
-    PARTITION_SPLIT, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+    BLOCK_4X4, BLOCK_8X8, BLOCK_64X64, BLOCK_INVALID, BLOCK_SIZES, DC_PRED, DCT_DCT, EIGHTTAP,
+    EncoderBlockSyntaxStamp, FRAME_LF_COUNT, FrameInterOrderHints, GM_TYPE_IDENTITY,
+    GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, InterIntraReadout, InterpolationFilterReadout,
+    MAX_SEGMENTS, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2,
+    MI_WIDTH_LOG2, MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_NEAREST_NEARESTMV, MODE_NEARESTMV,
+    MODE_NEARMV, MODE_NEW_NEWMV, MODE_NEWMV, MOTION_MODE_SIMPLE, MotionFieldMvs,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_HORZ, PARTITION_HORZ_4,
+    PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT,
+    PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B, PalettePlane, PartitionWalker,
     SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT,
-    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
-    WARPEDMODEL_PREC_BITS,
+    TX_SIZE_SQR_UP, TX_SIZES_ALL, TX_WIDTH, TileCdfContext, TileGeometry, UV_CFL_PRED, V_ADST,
+    V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS, block_height, block_width, cfl_allowed_for_uv_mode,
+    compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size, inter_tx_type_set,
+    intra_mode_ctx, intra_tx_type_set, is_inter_ctx, palette_tokens_args, partition_ctx,
+    partition_subsize, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx, tx_size_sqr_index,
 };
 use crate::encoder::block_mode_info::{
-    assign_mv_pred_mv, write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex,
-    write_inter_block_mode_info, write_inter_frame_mode_info_prefix,
-    write_intra_block_mode_info_with_palette, write_intra_frame_else_arm,
-    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
-    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_y_mode,
-    InterBlockModeInfoTail, InterFrameDeltaSiteInputs, IntrabcArmInputs,
+    InterBlockModeInfoTail, InterFrameDeltaSiteInputs, IntrabcArmInputs, assign_mv_pred_mv,
+    write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_inter_block_mode_info,
+    write_inter_frame_mode_info_prefix, write_intra_block_mode_info_with_palette,
+    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_intra_frame_y_mode,
+    write_intra_segment_id, write_intra_uv_mode, write_palette_tokens_plane, write_skip,
+    write_y_mode,
 };
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::transform_tree::write_block_tx_size;
-use crate::Error;
 
 /// Per-plane §5.11.39 `coefficients()` input the driver hands to
 /// [`write_coefficients`] at a leaf.
@@ -692,7 +691,7 @@ impl From<&[i32]> for TuQuant {
         nz.extend(
             v.iter()
                 .enumerate()
-                .filter(|(_, &q)| q != 0)
+                .filter(|&(_, &q)| q != 0)
                 .map(|(i, &q)| (i as u16, q)),
         );
         Self {
@@ -1619,11 +1618,7 @@ impl PartitionSyntaxWriter {
         // arms intentionally return `prev_u`; see the decode twin).
         #[allow(clippy::if_same_then_else)]
         let pred: i32 = if prev_u == -1 {
-            if prev_l == -1 {
-                0
-            } else {
-                prev_l
-            }
+            if prev_l == -1 { 0 } else { prev_l }
         } else if prev_l == -1 {
             prev_u
         } else if prev_ul == prev_u {
@@ -4480,10 +4475,10 @@ fn write_transform_tree(
 mod tests {
     use super::*;
     use crate::cdf::{
-        get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, CoefficientsReadout,
-        PartitionWalker, TileGeometry as G, BLOCK_16X16, BLOCK_16X32, BLOCK_32X16, BLOCK_32X32,
-        BLOCK_64X64, BLOCK_8X8, DC_PRED, MAX_SEGMENTS, TX_16X16, TX_4X4, TX_8X8, TX_CLASS_2D,
-        V_PRED,
+        BLOCK_8X8, BLOCK_16X16, BLOCK_16X32, BLOCK_32X16, BLOCK_32X32, BLOCK_64X64,
+        CoefficientsReadout, DC_PRED, MAX_SEGMENTS, PartitionWalker, TX_4X4, TX_8X8, TX_16X16,
+        TX_CLASS_2D, TileGeometry as G, V_PRED, get_br_ctx, get_coeff_base_ctx,
+        get_coeff_base_eob_ctx,
     };
     use crate::scan::get_default_scan;
     use crate::symbol_decoder::SymbolDecoder;
@@ -5181,8 +5176,8 @@ mod tests {
 
     use crate::cdf::PALETTE_COLORS;
     use crate::encoder::partition_tree::{
-        write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
-        SyntaxNode, SyntaxPalette,
+        PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxNode, SyntaxPalette,
+        write_partition_tree_syntax,
     };
 
     /// Encode `node`, append `sentinel`, decode through

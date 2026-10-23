@@ -332,7 +332,7 @@ fn all_corpus_fixtures_round_trip_sequence_header() {
 fn collect_mismatches(name: &str, sh: &oxideav_av1::SequenceHeader, e: &Expected) -> Vec<String> {
     let mut m: Vec<String> = Vec::new();
     macro_rules! check {
-        ($field:ident, $actual:expr) => {
+        ($field:ident, $actual:expr_2021) => {
             if e.$field != $actual {
                 m.push(format!(
                     "{}: {} expected {:?} got {:?}",

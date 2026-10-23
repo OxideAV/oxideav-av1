@@ -12,7 +12,7 @@
 //! the round and pinned via `fixture_conformance.rs`.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q, Yuv420Frame};
+use oxideav_av1::encoder::{Yuv420Frame, encode_gop_yuv420_with_q};
 
 /// Deterministic textured frame with per-frame translation `(sy, sx)`
 /// — consecutive frames are shifted copies plus a mild luma ramp, so

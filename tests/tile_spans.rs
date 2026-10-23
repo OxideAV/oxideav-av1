@@ -19,7 +19,7 @@
 //! Spec: docs/video/av1/av1-spec.txt §5.11.1, §5.10, §6.10.1.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning, Yuv420Frame};
+use oxideav_av1::encoder::{GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_tuned};
 use oxideav_av1::obu::{ObuIter, ObuType};
 
 fn moving_frame(w: u32, h: u32, t: usize) -> Yuv420Frame {

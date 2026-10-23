@@ -64,47 +64,47 @@
 //! syntax), §7.10.2 (MV prediction), §7.11.3 (inter prediction),
 //! §7.20 (reference frame update).
 
+use crate::Error;
 use crate::cdf::{
-    get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
-    QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
-    EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
-    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
-    MODE_NEWMV, MODE_NEW_NEWMV, MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE,
-    SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
+    BLOCK_4X4, BLOCK_8X8, BLOCK_64X64, DCT_DCT, EIGHTTAP, FindMvStackResult, GM_TYPE_IDENTITY,
+    MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_NEAR_NEARMV,
+    MODE_NEAREST_NEARESTMV, MODE_NEARESTMV, MODE_NEARMV, MODE_NEW_NEWMV, MODE_NEWMV,
+    MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_VERT, PartitionWalker, QuantizerParams,
+    SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH, TileCdfContext,
+    TileGeometry, get_tx_size, inter_tx_type_set, tx_size_sqr_index,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
-use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
+use crate::encoder::ivf::{FOURCC_AV01, IvfWriter};
 use crate::encoder::key_frame::{
-    encode_leaf_sq, lambda_for, leaf_rate, region_distortion, region_distortion_wh, residual_tx,
-    restore_region, save_region, save_region_wh, tu_bd_stamp, BlockDecodedMirror, ReconState,
-    RegionSnapshot,
+    BlockDecodedMirror, ReconState, RegionSnapshot, encode_leaf_sq, lambda_for, leaf_rate,
+    region_distortion, region_distortion_wh, residual_tx, restore_region, save_region,
+    save_region_wh, tu_bd_stamp,
 };
-use crate::encoder::obu::{build_temporal_unit, ObuFrame};
+use crate::encoder::obu::{ObuFrame, build_temporal_unit};
 use crate::encoder::partition_tree::{
-    write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
-    SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree,
+    PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxInterBlock,
+    SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree, write_partition_tree_syntax,
 };
-use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
+use crate::encoder::rate_twin::{RateModel, RateTwin, TuCtx, TuFork, score256};
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
+use crate::encoder::tile_group_obu::{TileGroupObu, TilePayload, write_tile_group_obu};
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::encoder::yuv_frame::{
-    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
+    Yuv420Frame, build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins,
 };
 use crate::frame_header::{
-    FrameHeader, FrameType, InterFrameRefs, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
+    ALL_FRAMES_PUB, FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE,
 };
 use crate::inter_pred::{
-    reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
+    InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry, reconstruct_inter_leaf_at,
 };
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::uncompressed_header_tail::{
-    FilmGrainParams, InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
+    FilmGrainParams, InterpolationFilter, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME, TxMode,
 };
 use crate::uncompressed_header_tail::{GOLDEN_FRAME, LAST_FRAME};
-use crate::Error;
 
 /// One frame's reconstructed planes (row-major; U/V at
 /// `(width/2) × (height/2)`).
@@ -1848,13 +1848,13 @@ fn encode_gop_yuv_core_fg(
         let p_index = (k + 1) as u32;
         // r447 — the §5.9.2 SWITCH-frame cadence (see
         // [`GopTuning::s_frame_period`]).
-        let is_s = tuning.s_frame_period > 0 && p_index % tuning.s_frame_period == 0;
+        let is_s = tuning.s_frame_period > 0 && p_index.is_multiple_of(tuning.s_frame_period);
         // r450 — the CODED error-resilient cadence (see
         // [`GopTuning::error_resilient_period`]); an S-frame position
         // keeps the SWITCH shape (the flag is inferred there).
         let is_er = !is_s
             && tuning.error_resilient_period > 0
-            && p_index % tuning.error_resilient_period == 0;
+            && p_index.is_multiple_of(tuning.error_resilient_period);
         let prev = recon.last().expect("at least the KEY recon");
         // GOLDEN's slot holds frame `max(floor, p_index - 2)` (the
         // rotation refresher, unless the floor frame overwrote every
@@ -2571,7 +2571,7 @@ pub(crate) fn segmentation_params_for_plan(
     extras: &SegExtras,
 ) -> crate::uncompressed_header_tail::SegmentationParams {
     use crate::uncompressed_header_tail::{
-        SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+        SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SegmentationParams,
     };
     let mut sp = SegmentationParams::disabled();
     sp.enabled = true;
@@ -3394,7 +3394,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     ip.use_ref_frame_mvs =
         seq.enable_order_hint && seq.enable_ref_frame_mvs && !fh.error_resilient_mode;
     if ip.use_ref_frame_mvs {
-        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
         let ref_frame_idx = cfg.ref_frame_idx;
         let mut order_hints = [0i32; 8];
         order_hints.copy_from_slice(&ip.order_hints.order_hints_by_ref);
@@ -3784,12 +3784,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     // delta on the wire), so the decoder's running index
                     // never moves — mirror that for the next superblock's
                     // step.
-                    if plan.is_some() {
-                        if let SyntaxNode::Leaf(b) = &tree {
-                            if b.skip == 1 {
-                                recon.qp.current_q_index = prev_q;
-                            }
-                        }
+                    if plan.is_some()
+                        && let SyntaxNode::Leaf(b) = &tree
+                        && b.skip == 1
+                    {
+                        recon.qp.current_q_index = prev_q;
                     }
                     trees.push(tree);
                 }
@@ -4378,35 +4377,34 @@ pub(crate) fn encode_inter_frame_generic_gm(
             .and_then(|(_, c)| *c)
     };
     let mut donor_elected: Option<u32> = None;
-    if cfg.elect_donor {
-        if let Some(pc) = donor_src {
-            if pc.donor_cdfs.len() > 1 {
-                // Replay under the ELECTED params (hp updated
-                // `params.inter` in place; the temporal-seg arm
-                // swapped the tile without touching `params`, so
-                // mirror its flag here — same doctrine as the CDEF
-                // re-emission below).
-                let mut d_params = params.clone();
-                if let Some(ip) = d_params.inter.as_mut() {
-                    ip.segmentation_temporal_update = seg_temporal_elected;
-                }
-                for (tid, cand) in pc.donor_cdfs.iter().enumerate().skip(1) {
-                    let cand_start = || -> Box<TileCdfContext> {
-                        let mut loaded = cand.clone();
-                        loaded.zero_counts();
-                        loaded
-                    };
-                    let (cand_payloads, cand_all, cand_state) =
-                        emit_tiles(&trees, &d_params, &cand_start, None)?;
-                    let cand_body = assemble(&cand_payloads)?;
-                    if cand_body.len() < tile_bytes.len() {
-                        donor_elected = Some(tid as u32);
-                        tile_payloads = cand_payloads;
-                        tile_bytes = cand_body;
-                        all_cdfs = cand_all;
-                        state = cand_state;
-                    }
-                }
+    if cfg.elect_donor
+        && let Some(pc) = donor_src
+        && pc.donor_cdfs.len() > 1
+    {
+        // Replay under the ELECTED params (hp updated
+        // `params.inter` in place; the temporal-seg arm
+        // swapped the tile without touching `params`, so
+        // mirror its flag here — same doctrine as the CDEF
+        // re-emission below).
+        let mut d_params = params.clone();
+        if let Some(ip) = d_params.inter.as_mut() {
+            ip.segmentation_temporal_update = seg_temporal_elected;
+        }
+        for (tid, cand) in pc.donor_cdfs.iter().enumerate().skip(1) {
+            let cand_start = || -> Box<TileCdfContext> {
+                let mut loaded = cand.clone();
+                loaded.zero_counts();
+                loaded
+            };
+            let (cand_payloads, cand_all, cand_state) =
+                emit_tiles(&trees, &d_params, &cand_start, None)?;
+            let cand_body = assemble(&cand_payloads)?;
+            if cand_body.len() < tile_bytes.len() {
+                donor_elected = Some(tid as u32);
+                tile_payloads = cand_payloads;
+                tile_bytes = cand_body;
+                all_cdfs = cand_all;
+                state = cand_state;
             }
         }
     }
@@ -4491,8 +4489,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     let mut committed_cdef_bits: u32 = 0;
     let mut cdef_elected = false;
-    if cfg.cdef && !lossless && seq.enable_cdef && cfg.exact_mask.is_none() && !cfg.auto_lossless {
-        if let Some(election) =
+    if cfg.cdef
+        && !lossless
+        && seq.enable_cdef
+        && cfg.exact_mask.is_none()
+        && !cfg.auto_lossless
+        && let Some(election) =
             crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
                 mirror: state.mirror(),
                 input,
@@ -4512,115 +4514,114 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 fast: None,
                 threads: 1,
             })
-        {
-            let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
-            let cdef_header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
-                let mut fh_c = fh.clone();
-                fh_c.cdef_params = Some(*cdef_params);
-                let mut bw = crate::encoder::bitwriter::BitWriter::new();
-                crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
-                    &mut bw,
-                    &fh_c,
-                    seq,
-                    prev_gm_for_header.as_ref(),
-                );
-                bw.byte_align();
-                bw.finish().len()
-            };
-            let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
-            if election.best.params.cdef_bits > 0 {
-                let plan = &election.best;
-                let elected_ord = fh.primary_ref_frame;
-                // The elected params: hp updated `params.inter` in
-                // place; the temporal-seg arm swapped the tile without
-                // touching `params`, so mirror its flag here.
-                let mut re_params = params.clone();
-                if let Some(ip) = re_params.inter.as_mut() {
-                    ip.segmentation_temporal_update = seg_temporal_elected;
-                }
-                re_params.cdef_bits = u32::from(plan.params.cdef_bits);
-                // r431 — `plan.unit_idx` is frame-raster per 64×64
-                // unit; the trees ride tile-scan order — map through
-                // each tree's superblock origin.
-                let sb_cols_frame = mi_cols.div_ceil(16);
-                for (tree, &(sb_r, sb_c)) in trees.iter_mut().zip(flat_sb.iter()) {
-                    let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
-                    tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
-                }
-                let (re_payloads, re_cdfs, re_state) =
-                    emit_tiles(&trees, &re_params, &|| start_cdfs_for(elected_ord), None)?;
-                let re_body = assemble(&re_payloads)?;
-                // Exact-bytes settlement: per-unit vs the fallback arm
-                // (frame-level when it beats unfiltered, else the
-                // unfiltered default header) on the SAME `D + λ·R`
-                // scale the leaf ladders use.
-                let unit_score = plan.d * 256
-                    + lambda * 8 * 256 * ((cdef_header_len(&plan.params) + re_body.len()) as u64);
-                let (fb_d, fb_hdr) = match &election.frame_level {
-                    Some(p) => (p.d, cdef_header_len(&p.params)),
-                    None => (
-                        election.base_d,
-                        cdef_header_len(
-                            fh.cdef_params
-                                .as_ref()
-                                .expect("lossy inter header carries cdef params"),
-                        ),
+    {
+        let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
+        let cdef_header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
+            let mut fh_c = fh.clone();
+            fh_c.cdef_params = Some(*cdef_params);
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                &fh_c,
+                seq,
+                prev_gm_for_header.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
+        if election.best.params.cdef_bits > 0 {
+            let plan = &election.best;
+            let elected_ord = fh.primary_ref_frame;
+            // The elected params: hp updated `params.inter` in
+            // place; the temporal-seg arm swapped the tile without
+            // touching `params`, so mirror its flag here.
+            let mut re_params = params.clone();
+            if let Some(ip) = re_params.inter.as_mut() {
+                ip.segmentation_temporal_update = seg_temporal_elected;
+            }
+            re_params.cdef_bits = u32::from(plan.params.cdef_bits);
+            // r431 — `plan.unit_idx` is frame-raster per 64×64
+            // unit; the trees ride tile-scan order — map through
+            // each tree's superblock origin.
+            let sb_cols_frame = mi_cols.div_ceil(16);
+            for (tree, &(sb_r, sb_c)) in trees.iter_mut().zip(flat_sb.iter()) {
+                let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
+                tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
+            }
+            let (re_payloads, re_cdfs, re_state) =
+                emit_tiles(&trees, &re_params, &|| start_cdfs_for(elected_ord), None)?;
+            let re_body = assemble(&re_payloads)?;
+            // Exact-bytes settlement: per-unit vs the fallback arm
+            // (frame-level when it beats unfiltered, else the
+            // unfiltered default header) on the SAME `D + λ·R`
+            // scale the leaf ladders use.
+            let unit_score = plan.d * 256
+                + lambda * 8 * 256 * ((cdef_header_len(&plan.params) + re_body.len()) as u64);
+            let (fb_d, fb_hdr) = match &election.frame_level {
+                Some(p) => (p.d, cdef_header_len(&p.params)),
+                None => (
+                    election.base_d,
+                    cdef_header_len(
+                        fh.cdef_params
+                            .as_ref()
+                            .expect("lossy inter header carries cdef params"),
                     ),
-                };
-                let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
-                if unit_score < fb_score {
-                    tile_payloads = re_payloads;
-                    tile_bytes = re_body;
-                    all_cdfs = re_cdfs;
-                    state = re_state;
-                    committed_cdef_bits = u32::from(plan.params.cdef_bits);
-                    debug_assert!(
-                        {
-                            let grid = state.mirror().cdef_idx();
-                            let sb_cols_dbg = mi_cols.div_ceil(16);
-                            plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
-                                let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
-                                grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
-                            })
-                        },
-                        "re-emitted cdef_idx grid diverged from the elected plan"
-                    );
-                    adopted = Some(election.best);
-                } else {
-                    // The per-unit arm lost the settlement: the
-                    // original tile stands. Re-stamp the trees to id
-                    // 0 — a later re-emission (the LR election)
-                    // replays them at `cdef_bits = 0`, whose §5.11.56
-                    // range check rejects any stamped id > 0.
-                    for tree in trees.iter_mut() {
-                        tree.stamp_cdef_idx(0);
-                    }
-                    adopted = election.frame_level;
-                }
-            } else {
-                adopted = Some(election.best);
-            }
-            if let Some(plan) = adopted {
-                crate::encoder::cdef_elect::apply_cdef_plan(
-                    state.mirror(),
-                    &plan,
-                    input,
-                    &mut recon.y,
-                    &mut recon.u,
-                    &mut recon.v,
-                    width,
-                    height,
-                    chroma_w,
-                    chroma_h,
-                    bit_depth,
-                    ssx,
-                    ssy,
-                    num_planes,
-                    1,
+                ),
+            };
+            let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
+            if unit_score < fb_score {
+                tile_payloads = re_payloads;
+                tile_bytes = re_body;
+                all_cdfs = re_cdfs;
+                state = re_state;
+                committed_cdef_bits = u32::from(plan.params.cdef_bits);
+                debug_assert!(
+                    {
+                        let grid = state.mirror().cdef_idx();
+                        let sb_cols_dbg = mi_cols.div_ceil(16);
+                        plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
+                            let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
+                            grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
+                        })
+                    },
+                    "re-emitted cdef_idx grid diverged from the elected plan"
                 );
-                fh.cdef_params = Some(plan.params);
-                cdef_elected = true;
+                adopted = Some(election.best);
+            } else {
+                // The per-unit arm lost the settlement: the
+                // original tile stands. Re-stamp the trees to id
+                // 0 — a later re-emission (the LR election)
+                // replays them at `cdef_bits = 0`, whose §5.11.56
+                // range check rejects any stamped id > 0.
+                for tree in trees.iter_mut() {
+                    tree.stamp_cdef_idx(0);
+                }
+                adopted = election.frame_level;
             }
+        } else {
+            adopted = Some(election.best);
+        }
+        if let Some(plan) = adopted {
+            crate::encoder::cdef_elect::apply_cdef_plan(
+                state.mirror(),
+                &plan,
+                input,
+                &mut recon.y,
+                &mut recon.u,
+                &mut recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                ssx,
+                ssy,
+                num_planes,
+                1,
+            );
+            fh.cdef_params = Some(plan.params);
+            cdef_elected = true;
         }
     }
 
@@ -4770,7 +4771,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             let off = *off_score.get_or_insert(
                 plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64),
             );
-            if on_score < off && best_lr.as_ref().map_or(true, |b| on_score < b.5) {
+            if on_score < off && best_lr.as_ref().is_none_or(|b| on_score < b.5) {
                 best_lr = Some((plan, re_payloads, re_body, re_cdfs, re_state, on_score));
             }
         }
@@ -5652,11 +5653,7 @@ impl PSearchCtx {
         let prev_l = if avail_l { at(r, c - 1) } else { -1 };
         #[allow(clippy::if_same_then_else)]
         let pred: i32 = if prev_u == -1 {
-            if prev_l == -1 {
-                0
-            } else {
-                prev_l
-            }
+            if prev_l == -1 { 0 } else { prev_l }
         } else if prev_l == -1 {
             prev_u
         } else if prev_ul == prev_u {
@@ -7254,7 +7251,7 @@ fn encode_inter_leaf_modes(
                 let rate = 5 + ref_bias + u64::from(idx) + diff_bits(mv_new, pred);
                 let exact = price_mode([rf, -1], MODE_NEWMV, [mv_new, [0, 0]], idx, &stack)?;
                 let key = exact.unwrap_or(rate);
-                if best.map_or(true, |(k, _, _, _)| key < k) {
+                if best.is_none_or(|(k, _, _, _)| key < k) {
                     best = Some((key, idx, rate, exact));
                 }
             }
@@ -7368,7 +7365,7 @@ fn encode_inter_leaf_modes(
                     + diff_bits(pair_mv[1], pred1);
                 let exact = price_mode(crf, MODE_NEW_NEWMV, pair_mv, idx, &stack)?;
                 let key = exact.unwrap_or(rate);
-                if best.map_or(true, |(k, _, _, _)| key < k) {
+                if best.is_none_or(|(k, _, _, _)| key < k) {
                     best = Some((key, idx, rate, exact));
                 }
             }
@@ -7426,13 +7423,13 @@ fn encode_inter_leaf_modes(
             Some(b) => score256(ssd, lambda, b),
             None => ssd + lambda * cand.rate,
         };
-        if best.map_or(true, |(s, _)| score < s) {
+        if best.is_none_or(|(s, _)| score < s) {
             best = Some((score, ci));
         }
-        if cand.ref_frame[1] > 0 && best_compound.map_or(true, |(s, _)| score < s) {
+        if cand.ref_frame[1] > 0 && best_compound.is_none_or(|(s, _)| score < s) {
             best_compound = Some((score, ci));
         }
-        if cand.ref_frame[1] < 0 && best_single.map_or(true, |(s, _)| score < s) {
+        if cand.ref_frame[1] < 0 && best_single.is_none_or(|(s, _)| score < s) {
             best_single = Some((score, ci));
         }
     }
@@ -7445,93 +7442,41 @@ fn encode_inter_leaf_modes(
     // blend and scored `D + λ·(rate + side-data bits)` against the
     // running best (which keeps COMPOUND_AVERAGE when the masks lose).
     let mut comp = CompoundSel::AVERAGE;
-    if ictx.ip.enable_masked_compound {
-        if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
-                let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
-            if crate::cdf::wedge_bits(b_size) > 0 {
-                for wi in 0..16u8 {
-                    for ws in 0..=1u8 {
-                        trials.push((
-                            CompoundSel {
-                                ctype: crate::inter_pred::COMPOUND_WEDGE,
-                                wedge_index: wi,
-                                wedge_sign: ws,
-                                mask_type: 0,
-                            },
-                            /* comp_group_idx + wedge_index S() + sign L(1) */ 6,
-                        ));
-                    }
-                }
-            }
-            for mt in 0..=1u8 {
-                trials.push((
-                    CompoundSel {
-                        ctype: crate::inter_pred::COMPOUND_DIFFWTD,
-                        wedge_index: 0,
-                        wedge_sign: 0,
-                        mask_type: mt,
-                    },
-                    /* comp_group_idx (+ compound_type S()) + mask L(1) */ 3,
-                ));
-            }
-            for (sel, extra) in trials {
-                ictx.predict_leaf(
-                    mi_r,
-                    mi_c,
-                    b_size,
-                    c_ref,
-                    c_mode,
-                    c_mv,
-                    EIGHTTAP,
-                    sel,
-                    None,
-                    MotionSel::Simple,
-                )?;
-                let mut ssd = 0u64;
-                for i in 0..bh {
-                    for j in 0..bw {
-                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
-                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
-                        ssd += (d * d) as u64;
-                    }
-                }
-                // r422 — twin scale: the exact mode-prefix bits plus
-                // the side-symbol proxy promoted to 1/256 units.
-                let score = match c_bits256 {
-                    Some(b) => score256(ssd, lambda, b + extra * 256),
-                    None => ssd + lambda * (c_rate + extra),
-                };
-                if score < best_score {
-                    best_score = score;
-                    best_ci = cci;
-                    comp = sel;
+    if ictx.ip.enable_masked_compound
+        && let Some((_, cci)) = best_compound
+    {
+        let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
+            let c = &cands[cci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
+        if crate::cdf::wedge_bits(b_size) > 0 {
+            for wi in 0..16u8 {
+                for ws in 0..=1u8 {
+                    trials.push((
+                        CompoundSel {
+                            ctype: crate::inter_pred::COMPOUND_WEDGE,
+                            wedge_index: wi,
+                            wedge_sign: ws,
+                            mask_type: 0,
+                        },
+                        /* comp_group_idx + wedge_index S() + sign L(1) */ 6,
+                    ));
                 }
             }
         }
-    }
-
-    // r416 — §5.11.29 jnt-comp trial on the best compound candidate:
-    // the COMPOUND_DISTANCE leaf (`comp_group_idx = 0`,
-    // `compound_idx = 0`) predicted through the decoder's own
-    // §7.11.3.15 distance-weighted blend. Rate-neutral against the
-    // coded AVERAGE arm (both code the same two §5.11.29 symbols), so
-    // luma distortion alone decides; ties keep the running best.
-    if ictx.ip.enable_jnt_comp {
-        if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
-                let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let sel = CompoundSel {
-                ctype: crate::inter_pred::COMPOUND_DISTANCE,
-                wedge_index: 0,
-                wedge_sign: 0,
-                mask_type: 0,
-            };
+        for mt in 0..=1u8 {
+            trials.push((
+                CompoundSel {
+                    ctype: crate::inter_pred::COMPOUND_DIFFWTD,
+                    wedge_index: 0,
+                    wedge_sign: 0,
+                    mask_type: mt,
+                },
+                /* comp_group_idx (+ compound_type S()) + mask L(1) */ 3,
+            ));
+        }
+        for (sel, extra) in trials {
             ictx.predict_leaf(
                 mi_r,
                 mi_c,
@@ -7552,15 +7497,67 @@ fn encode_inter_leaf_modes(
                     ssd += (d * d) as u64;
                 }
             }
+            // r422 — twin scale: the exact mode-prefix bits plus
+            // the side-symbol proxy promoted to 1/256 units.
             let score = match c_bits256 {
-                Some(b) => score256(ssd, lambda, b),
-                None => ssd + lambda * c_rate,
+                Some(b) => score256(ssd, lambda, b + extra * 256),
+                None => ssd + lambda * (c_rate + extra),
             };
             if score < best_score {
                 best_score = score;
                 best_ci = cci;
                 comp = sel;
             }
+        }
+    }
+
+    // r416 — §5.11.29 jnt-comp trial on the best compound candidate:
+    // the COMPOUND_DISTANCE leaf (`comp_group_idx = 0`,
+    // `compound_idx = 0`) predicted through the decoder's own
+    // §7.11.3.15 distance-weighted blend. Rate-neutral against the
+    // coded AVERAGE arm (both code the same two §5.11.29 symbols), so
+    // luma distortion alone decides; ties keep the running best.
+    if ictx.ip.enable_jnt_comp
+        && let Some((_, cci)) = best_compound
+    {
+        let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
+            let c = &cands[cci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let sel = CompoundSel {
+            ctype: crate::inter_pred::COMPOUND_DISTANCE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
+        };
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            c_ref,
+            c_mode,
+            c_mv,
+            EIGHTTAP,
+            sel,
+            None,
+            MotionSel::Simple,
+        )?;
+        let mut ssd = 0u64;
+        for i in 0..bh {
+            for j in 0..bw {
+                let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                    - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        let score = match c_bits256 {
+            Some(b) => score256(ssd, lambda, b),
+            None => ssd + lambda * c_rate,
+        };
+        if score < best_score {
+            best_score = score;
+            best_ci = cci;
+            comp = sel;
         }
     }
 
@@ -7576,28 +7573,64 @@ fn encode_inter_leaf_modes(
     let mut ii_sel: Option<(u8, Option<u8>)> = None;
     if ictx.ip.enable_interintra_compound
         && (crate::cdf::BLOCK_8X8..=crate::cdf::BLOCK_32X32).contains(&b_size)
+        && let Some((_, sci)) = best_single
     {
-        if let Some((_, sci)) = best_single {
-            let (s_ref, s_mode, s_mv, s_rate, s_bits256) = {
-                let c = &cands[sci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
-                let mut ssd = 0u64;
-                for i in 0..bh {
-                    for j in 0..bw {
-                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
-                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
-                        ssd += (d * d) as u64;
-                    }
+        let (s_ref, s_mode, s_mv, s_rate, s_bits256) = {
+            let c = &cands[sci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
+            let mut ssd = 0u64;
+            for i in 0..bh {
+                for j in 0..bw {
+                    let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                        - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                    ssd += (d * d) as u64;
                 }
-                ssd
+            }
+            ssd
+        };
+        // Stage 1 — the four smooth-mask II modes
+        // (`interintra` S() + `interintra_mode` S() +
+        // `wedge_interintra` S() ≈ 4 rate-proxy bits).
+        let mut stage: Option<(u64, u8)> = None;
+        for m in 0..crate::cdf::INTERINTRA_MODES as u8 {
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                s_ref,
+                s_mode,
+                s_mv,
+                EIGHTTAP,
+                CompoundSel::AVERAGE,
+                Some(InterIntraTrial {
+                    mode: m,
+                    wedge: None,
+                    neigh: &*recon,
+                }),
+                MotionSel::Simple,
+            )?;
+            let ssd = leaf_ssd(ictx);
+            if stage.is_none_or(|(s, _)| ssd < s) {
+                stage = Some((ssd, m));
+            }
+            let score = match s_bits256 {
+                Some(b) => score256(ssd, lambda, b + 4 * 256),
+                None => ssd + lambda * (s_rate + 4),
             };
-            // Stage 1 — the four smooth-mask II modes
-            // (`interintra` S() + `interintra_mode` S() +
-            // `wedge_interintra` S() ≈ 4 rate-proxy bits).
-            let mut stage: Option<(u64, u8)> = None;
-            for m in 0..crate::cdf::INTERINTRA_MODES as u8 {
+            if score < best_score {
+                best_score = score;
+                best_ci = sci;
+                comp = CompoundSel::AVERAGE;
+                ii_sel = Some((m, None));
+            }
+        }
+        // Stage 2 — the 16 wedge masks at the stage-1 distortion
+        // winner (+ `wedge_index` S() ≈ 4 more bits).
+        if crate::cdf::wedge_bits(b_size) > 0 {
+            let (_, base_mode) = stage.expect("stage 1 ran");
+            for wi in 0..16u8 {
                 ictx.predict_leaf(
                     mi_r,
                     mi_c,
@@ -7608,58 +7641,21 @@ fn encode_inter_leaf_modes(
                     EIGHTTAP,
                     CompoundSel::AVERAGE,
                     Some(InterIntraTrial {
-                        mode: m,
-                        wedge: None,
+                        mode: base_mode,
+                        wedge: Some(wi),
                         neigh: &*recon,
                     }),
                     MotionSel::Simple,
                 )?;
-                let ssd = leaf_ssd(ictx);
-                if stage.map_or(true, |(s, _)| ssd < s) {
-                    stage = Some((ssd, m));
-                }
                 let score = match s_bits256 {
-                    Some(b) => score256(ssd, lambda, b + 4 * 256),
-                    None => ssd + lambda * (s_rate + 4),
+                    Some(b) => score256(leaf_ssd(ictx), lambda, b + 8 * 256),
+                    None => leaf_ssd(ictx) + lambda * (s_rate + 8),
                 };
                 if score < best_score {
                     best_score = score;
                     best_ci = sci;
                     comp = CompoundSel::AVERAGE;
-                    ii_sel = Some((m, None));
-                }
-            }
-            // Stage 2 — the 16 wedge masks at the stage-1 distortion
-            // winner (+ `wedge_index` S() ≈ 4 more bits).
-            if crate::cdf::wedge_bits(b_size) > 0 {
-                let (_, base_mode) = stage.expect("stage 1 ran");
-                for wi in 0..16u8 {
-                    ictx.predict_leaf(
-                        mi_r,
-                        mi_c,
-                        b_size,
-                        s_ref,
-                        s_mode,
-                        s_mv,
-                        EIGHTTAP,
-                        CompoundSel::AVERAGE,
-                        Some(InterIntraTrial {
-                            mode: base_mode,
-                            wedge: Some(wi),
-                            neigh: &*recon,
-                        }),
-                        MotionSel::Simple,
-                    )?;
-                    let score = match s_bits256 {
-                        Some(b) => score256(leaf_ssd(ictx), lambda, b + 8 * 256),
-                        None => leaf_ssd(ictx) + lambda * (s_rate + 8),
-                    };
-                    if score < best_score {
-                        best_score = score;
-                        best_ci = sci;
-                        comp = CompoundSel::AVERAGE;
-                        ii_sel = Some((base_mode, Some(wi)));
-                    }
+                    ii_sel = Some((base_mode, Some(wi)));
                 }
             }
         }
@@ -7857,37 +7853,36 @@ fn encode_inter_leaf_modes(
         if ictx.ip.allow_warped_motion
             && !ictx.ip.force_integer_mv
             && !ictx.ip.is_scaled_per_ref[(ref_frame[0] - 1) as usize]
+            && let Some(params) = ictx.warp_fit(mi_r, mi_c, b_size, ref_frame[0], mv)
         {
-            if let Some(params) = ictx.warp_fit(mi_r, mi_c, b_size, ref_frame[0], mv) {
-                ictx.predict_leaf(
-                    mi_r,
-                    mi_c,
-                    b_size,
-                    ref_frame,
-                    y_mode,
-                    mv,
-                    EIGHTTAP,
-                    comp,
-                    None,
-                    MotionSel::Warp(params),
-                )?;
-                let score = score256(
-                    leaf_luma_ssd(ictx),
-                    lambda,
-                    mm_bits(MOTION_MODE_WARPED_CAUSAL)?,
-                );
-                if score < best_score {
-                    motion = MotionSel::Warp(params);
-                    // `needs_interp_filter( ) == 0` on LOCALWARP —
-                    // the committed pair is the reader's bit-silent
-                    // derivation: EIGHTTAP on the SWITCHABLE arm, the
-                    // frame filter otherwise.
-                    filter = if ictx.ip.interpolation_filter != SWITCHABLE {
-                        ictx.ip.interpolation_filter
-                    } else {
-                        EIGHTTAP
-                    };
-                }
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                ref_frame,
+                y_mode,
+                mv,
+                EIGHTTAP,
+                comp,
+                None,
+                MotionSel::Warp(params),
+            )?;
+            let score = score256(
+                leaf_luma_ssd(ictx),
+                lambda,
+                mm_bits(MOTION_MODE_WARPED_CAUSAL)?,
+            );
+            if score < best_score {
+                motion = MotionSel::Warp(params);
+                // `needs_interp_filter( ) == 0` on LOCALWARP —
+                // the committed pair is the reader's bit-silent
+                // derivation: EIGHTTAP on the SWITCHABLE arm, the
+                // frame filter otherwise.
+                filter = if ictx.ip.interpolation_filter != SWITCHABLE {
+                    ictx.ip.interpolation_filter
+                } else {
+                    EIGHTTAP
+                };
             }
         }
     }
@@ -8027,51 +8022,52 @@ fn encode_inter_leaf_modes(
     // `D + λ·R` scale (twin bits when priced). The lossless arm wins
     // exactly when the ladder's distortion outprices the WHT chain's
     // rate premium.
-    if ictx.auto_lossless && ictx.synthetic_leaf(input, mi_r, mi_c, b_size) {
-        if let Some(ll_seg) = ictx.lossless_seg {
-            let ll_qp = ictx.seg_qp(&recon.qp, ll_seg);
-            let leaf = encode_inter_leaf_residual(
-                mi_r,
-                mi_c,
-                b_size,
-                input,
-                recon,
-                ictx,
-                ref_frame,
-                y_mode,
-                mv,
-                ref_mv_idx,
-                filter,
-                comp,
-                ii_sel,
-                motion.ordinal(),
-                0,
-                ll_seg,
-                &ll_qp,
-                pricing,
-            )?;
-            let d = region_distortion_wh(
-                recon,
-                &crate::encoder::key_frame::SourceView::whole(input),
-                sr,
-                sc,
-                sw4,
-                sh4,
-            );
-            let rate256 = match pricing {
-                Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
-                None => p_leaf_rate(&leaf) * 256,
-            };
-            let score = score256(d, lambda, rate256);
-            let improves = match best.as_ref() {
-                Some((_, _, s)) => score < *s,
-                None => true,
-            };
-            if improves {
-                best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
-            }
-            restore_region(recon, sr, sc, &before);
+    if ictx.auto_lossless
+        && ictx.synthetic_leaf(input, mi_r, mi_c, b_size)
+        && let Some(ll_seg) = ictx.lossless_seg
+    {
+        let ll_qp = ictx.seg_qp(&recon.qp, ll_seg);
+        let leaf = encode_inter_leaf_residual(
+            mi_r,
+            mi_c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            filter,
+            comp,
+            ii_sel,
+            motion.ordinal(),
+            0,
+            ll_seg,
+            &ll_qp,
+            pricing,
+        )?;
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            sw4,
+            sh4,
+        );
+        let rate256 = match pricing {
+            Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
+            None => p_leaf_rate(&leaf) * 256,
+        };
+        let score = score256(d, lambda, rate256);
+        let improves = match best.as_ref() {
+            Some((_, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
         }
+        restore_region(recon, sr, sc, &before);
     }
     let (leaf, after, _) = best.expect("at least depth 0");
     restore_region(recon, sr, sc, &after);
@@ -8132,7 +8128,7 @@ pub(crate) fn residual_tx_search_luma_inter(
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
 ) -> Result<(Vec<i32>, u8), Error> {
-    use crate::cdf::{dequantize_step1, is_tx_type_in_set, tx_size_sqr_index, TX_SIZE_SQR_UP};
+    use crate::cdf::{TX_SIZE_SQR_UP, dequantize_step1, is_tx_type_in_set, tx_size_sqr_index};
     use crate::encoder::forward_quantize::forward_quantize;
     use crate::encoder::forward_transform_2d::forward_transform_2d;
     use crate::encoder::key_frame::repack_compact;
@@ -10328,7 +10324,7 @@ mod tests {
         // Frame k: top 64x32 band shifts by (0, 2k); bottom-left
         // 32x32 by (2k, 0); bottom-right 32x32 by (2k, 2k) — the
         // HORZ_B geometry at BLOCK_64X64.
-        let gen = |k: usize| -> YuvFrame {
+        let r#gen = |k: usize| -> YuvFrame {
             let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
             let tex = |i: usize, j: usize| ((i * 7 + j * 13 + (i / 8) * (j / 8)) % 256) as u16;
             for i in 0..64usize {
@@ -10351,7 +10347,7 @@ mod tests {
             }
             f
         };
-        let frames: Vec<YuvFrame> = (0..3).map(gen).collect();
+        let frames: Vec<YuvFrame> = (0..3).map(r#gen).collect();
         let base_q_idx = 60u8;
         let pre = encode_gop_yuv_with_q(&frames[..1], base_q_idx).unwrap();
         let key_recon = GopFrameReconYuv {
@@ -10517,7 +10513,7 @@ mod tests {
             "P1 must store §7.19 motion-field candidates on moving content"
         );
 
-        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
         let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
         let intra = SavedMotionField::intra(mi_rows, mi_cols);
         for (i, s) in slots.iter_mut().enumerate() {
@@ -11802,9 +11798,9 @@ mod tests {
     /// BLOCK_4X4 leaves, and four-strip (HORZ_4 / VERT_4) nodes.
     fn count_sub8(node: &SyntaxNode, b_size: usize, n_sub8: &mut u32, n_4x4: &mut u32) {
         use crate::cdf::{
-            block_height, block_width, partition_subsize, BLOCK_4X4, PARTITION_HORZ,
-            PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_SPLIT, PARTITION_VERT,
-            PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+            BLOCK_4X4, PARTITION_HORZ, PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B,
+            PARTITION_SPLIT, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+            block_height, block_width, partition_subsize,
         };
         let leaf_hit = |sz: usize, n_sub8: &mut u32, n_4x4: &mut u32| {
             if block_width(sz) < 8 || block_height(sz) < 8 {

@@ -32,8 +32,8 @@
 //! frame_unit (and a frame_unit must not contain frame headers for
 //! more than one frame)" (Annex B.3).
 
-use crate::obu::{parse_leb128, parse_obu, ObuType};
 use crate::Error;
+use crate::obu::{ObuType, parse_leb128, parse_obu};
 
 /// Encode one `leb128()` value per §4.10.5 (minimal length).
 fn write_leb128(out: &mut Vec<u8>, mut value: u64) {

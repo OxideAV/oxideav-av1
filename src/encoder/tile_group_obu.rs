@@ -49,8 +49,8 @@
 //!
 //! [`SymbolWriter`]: crate::encoder::symbol_writer::SymbolWriter
 
-use crate::encoder::bitwriter::BitWriter;
 use crate::Error;
+use crate::encoder::bitwriter::BitWriter;
 
 /// One tile's entropy-coded payload as it appears inside the §5.11.1
 /// `tile_group_obu` body. `bytes` is the full output of a
@@ -469,7 +469,7 @@ pub struct ParsedTileGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::obu::{write_obu_with_size, ObuHeader};
+    use crate::encoder::obu::{ObuHeader, write_obu_with_size};
     use crate::encoder::symbol_writer::SymbolWriter;
     use crate::obu::ObuType;
 

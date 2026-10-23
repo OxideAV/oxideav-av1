@@ -26,8 +26,8 @@
 //!     `tileWidthSb * tileHeightSb < maxTileAreaSb`,
 //!     `context_update_tile_id < TileCols * TileRows`).
 
-use crate::bitreader::BitReader;
 use crate::Error;
+use crate::bitreader::BitReader;
 
 // ---------------------------------------------------------------------
 // §3 constants

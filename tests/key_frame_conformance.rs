@@ -17,8 +17,8 @@
 //!     `Frame::Spec` (the encoder-mirror path must never claim these
 //!     conformant streams).
 
-use oxideav_av1::decoder::{decode_av1_spec, Frame};
-use oxideav_av1::encoder::{encode_key_frame_yuv420_with_q, Yuv420Frame, KEY_FRAME_MAX_DIM};
+use oxideav_av1::decoder::{Frame, decode_av1_spec};
+use oxideav_av1::encoder::{KEY_FRAME_MAX_DIM, Yuv420Frame, encode_key_frame_yuv420_with_q};
 
 /// Deterministic textured input (distinct per-plane gradients).
 fn gradient(w: u32, h: u32, seed: u32) -> Yuv420Frame {

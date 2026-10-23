@@ -39,13 +39,13 @@
 
 use core::cell::RefCell;
 
-use crate::cdf::{TileCdfContext, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE};
+use crate::Error;
+use crate::cdf::{NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, TileCdfContext};
 use crate::encoder::partition_tree::{
-    write_block_syntax, write_partition_symbol, write_partition_tree_syntax, PartitionSyntaxWriter,
-    SyntaxBlock, SyntaxFrameParams, SyntaxNode, WriterScopeSnapshot,
+    PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxNode, WriterScopeSnapshot,
+    write_block_syntax, write_partition_symbol, write_partition_tree_syntax,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::Error;
 
 /// r421 — rate-model selector for the RD ladders, kept so the sweep
 /// harnesses can measure twin-priced vs heuristic-priced elections on

@@ -7,8 +7,8 @@
 //! produced. Inert (one relaxed atomic load per boundary) when no
 //! probe is registered; never on the per-block path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type Probe = Box<dyn Fn(&'static str) + Send + Sync + 'static>;
 
@@ -30,9 +30,9 @@ pub(crate) fn stage(label: &'static str) {
     if !ARMED.load(Ordering::Acquire) {
         return;
     }
-    if let Ok(g) = PROBE.read() {
-        if let Some(p) = g.as_ref() {
-            p(label);
-        }
+    if let Ok(g) = PROBE.read()
+        && let Some(p) = g.as_ref()
+    {
+        p(label);
     }
 }

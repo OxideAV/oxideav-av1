@@ -1442,33 +1442,21 @@ fn clip3(a: i32, b: i32, x: i32) -> i32 {
 /// `(subX, subY)` for `plane` per av1-spec p.328 lines 18138-18142.
 #[inline]
 fn subsampling_for_plane(plane: u8, sub_x: u8, sub_y: u8) -> (u8, u8) {
-    if plane == 0 {
-        (0, 0)
-    } else {
-        (sub_x, sub_y)
-    }
+    if plane == 0 { (0, 0) } else { (sub_x, sub_y) }
 }
 
 /// §7.11.3.2 `InterRound0` for `isCompound = 0` per av1-spec p.259
 /// lines 14423 / 14427 — `3` for `BitDepth ∈ {8, 10}`, `5` for `12`.
 #[inline]
 fn inter_round0(bit_depth: u8) -> u32 {
-    if bit_depth == 12 {
-        5
-    } else {
-        3
-    }
+    if bit_depth == 12 { 5 } else { 3 }
 }
 
 /// §7.11.3.2 `InterRound1` for `isCompound = 0` per av1-spec p.259
 /// lines 14425 / 14429 — `11` for `BitDepth ∈ {8, 10}`, `9` for `12`.
 #[inline]
 fn inter_round1(bit_depth: u8) -> u32 {
-    if bit_depth == 12 {
-        9
-    } else {
-        11
-    }
+    if bit_depth == 12 { 9 } else { 11 }
 }
 
 // =====================================================================

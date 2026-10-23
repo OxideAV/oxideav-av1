@@ -23,7 +23,7 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_tile_layout, encode_key_frame_yuv420_with_q_tile_layout, Yuv420Frame,
+    Yuv420Frame, encode_gop_yuv420_with_q_tile_layout, encode_key_frame_yuv420_with_q_tile_layout,
 };
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};

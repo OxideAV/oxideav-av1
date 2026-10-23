@@ -23,8 +23,8 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, encode_key_frame_yuv420_with_q, EncodedGop,
-    GopTuning, Yuv420Frame,
+    EncodedGop, GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned,
+    encode_key_frame_yuv420_with_q,
 };
 
 // ---------------------------------------------------------------------
@@ -254,7 +254,7 @@ fn lr_beats_baseline_on_detail_content() {
 /// through the spec driver.
 #[test]
 fn lr_elects_and_round_trips_at_10bit() {
-    use oxideav_av1::encoder::{encode_key_frame_yuv_with_q, ChromaFormat, YuvFrame};
+    use oxideav_av1::encoder::{ChromaFormat, YuvFrame, encode_key_frame_yuv_with_q};
     let (w, h) = (512u32, 256u32);
     let mut input = YuvFrame::filled(w, h, 10, ChromaFormat::Yuv420, 0);
     let (wu, hu) = (w as usize, h as usize);

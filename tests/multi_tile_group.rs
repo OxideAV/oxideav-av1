@@ -30,17 +30,17 @@
 //! Spec: docs/video/av1/av1-spec.txt §5.9.1, §5.10, §5.11.1, §6.8.1,
 //! §6.10.1, §7.5.
 
+use oxideav_av1::Error;
 use oxideav_av1::decoder::Frame;
-use oxideav_av1::encoder::ivf::{build_file_header, build_frame_header, IvfReader};
-use oxideav_av1::encoder::obu::{write_obu_with_size, ObuHeader};
+use oxideav_av1::encoder::ivf::{IvfReader, build_file_header, build_frame_header};
+use oxideav_av1::encoder::obu::{ObuHeader, write_obu_with_size};
 use oxideav_av1::encoder::tile_group_obu::{
-    parse_tile_group_obu_body, write_tile_group_obu, TileGroupObu, TilePayload,
+    TileGroupObu, TilePayload, parse_tile_group_obu_body, write_tile_group_obu,
 };
-use oxideav_av1::encoder::{encode_key_frame_yuv420_with_q_tiles, Yuv420Frame};
+use oxideav_av1::encoder::{Yuv420Frame, encode_key_frame_yuv420_with_q_tiles};
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
-use oxideav_av1::Error;
 
 // ---------------------------------------------------------------------
 // Content.
@@ -95,7 +95,7 @@ fn split_frame_obu(
     // zeros, so only the one bit differs (or a whole 0x80 byte when
     // the header already ended byte-aligned).
     let mut fh_payload = payload[..header_bytes].to_vec();
-    if bits % 8 == 0 {
+    if bits.is_multiple_of(8) {
         fh_payload.push(0x80);
     } else {
         fh_payload[bits / 8] |= 0x80u8 >> (bits % 8);
@@ -628,7 +628,7 @@ fn key_native_split_groups_decode_pixel_exact() {
 /// frame decodes pixel-exact to the encoder reconstruction.
 #[test]
 fn gop_native_split_groups_decode_pixel_exact() {
-    use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning};
+    use oxideav_av1::encoder::{GopTuning, encode_gop_yuv420_with_q_seg_tuned};
     let frames: Vec<Yuv420Frame> = (0..3).map(|t| noise(192, 128, 100 + t)).collect();
     let tuning = GopTuning {
         tiles: (1, 1),
@@ -677,7 +677,7 @@ fn gop_native_split_groups_decode_pixel_exact() {
 /// no-op on the tiled GOP stream.
 #[test]
 fn gop_tile_groups_1_is_byte_identical() {
-    use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning};
+    use oxideav_av1::encoder::{GopTuning, encode_gop_yuv420_with_q_seg_tuned};
     let frames: Vec<Yuv420Frame> = (0..3).map(|t| noise(192, 128, 200 + t)).collect();
     let a = encode_gop_yuv420_with_q_seg_tuned(
         &frames,

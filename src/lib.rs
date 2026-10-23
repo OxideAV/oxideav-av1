@@ -1577,109 +1577,108 @@ pub mod uncompressed_header_tail;
 
 #[doc(hidden)]
 pub use cdf::{
-    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx,
-    compound_mode_ctx, compute_tx_type, find_tx_size, get_br_ctx, get_coeff_base_ctx,
-    get_coeff_base_eob_ctx, get_palette_color_context, get_segment_id, get_tx_class,
-    inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
+    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_4X4, BLOCK_4X8, BLOCK_4X16,
+    BLOCK_8X4, BLOCK_8X8, BLOCK_8X16, BLOCK_8X32, BLOCK_16X4, BLOCK_16X8, BLOCK_16X16, BLOCK_16X32,
+    BLOCK_16X64, BLOCK_32X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_64X16, BLOCK_64X32,
+    BLOCK_64X64, BLOCK_64X128, BLOCK_128X64, BLOCK_128X128, BLOCK_INVALID, BLOCK_SIZE_GROUPS,
+    BLOCK_SIZES, BR_CDF_SIZE, BWD_REFS, CFL_ALPHA_CONTEXTS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS,
+    CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE,
+    COEFF_CDF_Q_CTXS, COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS,
+    COMP_REF_TYPE_CONTEXTS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP,
+    COMPOUND_MODES, COMPOUND_TYPES, DC_SIGN_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
+    DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
+    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
+    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF,
+    DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
+    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_32_CDF,
+    DEFAULT_EOB_PT_64_CDF, DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_512_CDF,
+    DEFAULT_EOB_PT_1024_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
+    DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
+    DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTERP_FILTER_CDF,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF,
+    DEFAULT_INTRABC_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF,
+    DEFAULT_MV_CLASS_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF,
+    DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF, DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_5_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_5_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_6_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_6_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_7_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_7_Y_COLOR_CDF, DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF,
+    DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF, DEFAULT_PALETTE_UV_MODE_CDF, DEFAULT_PALETTE_UV_SIZE_CDF,
+    DEFAULT_PALETTE_Y_MODE_CDF, DEFAULT_PALETTE_Y_SIZE_CDF, DEFAULT_PARTITION_W8_CDF,
+    DEFAULT_PARTITION_W16_CDF, DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF,
+    DEFAULT_PARTITION_W128_CDF, DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF,
+    DEFAULT_SEGMENT_ID_PREDICTED_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
+    DEFAULT_SKIP_MODE_CDF, DEFAULT_TX_8X8_CDF, DEFAULT_TX_16X16_CDF, DEFAULT_TX_32X32_CDF,
+    DEFAULT_TX_64X64_CDF, DEFAULT_TXB_SKIP_CDF, DEFAULT_TXFM_SPLIT_CDF, DEFAULT_UNI_COMP_REF_CDF,
+    DEFAULT_UV_MODE_CFL_ALLOWED_CDF, DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF, DEFAULT_WEDGE_INDEX_CDF,
+    DEFAULT_WEDGE_INTER_INTRA_CDF, DEFAULT_Y_MODE_CDF, DEFAULT_ZERO_MV_CDF, DELTA_LF_SMALL,
+    DELTA_Q_SMALL, DIRECTIONAL_MODES, DRL_MODE_CONTEXTS, DecodedBlock, DecodedBlockRecord,
+    DecodedInterBlockModeInfo, DecodedInterFrameModeInfo, DecodedPaletteMap, EOB_COEF_CONTEXTS,
+    EXT_PARTITION_TYPES, FILTER_INTRA_MODE_TO_INTRA_DIR, FLIPADST_ADST, FLIPADST_DCT,
+    FLIPADST_FLIPADST, FRAME_LF_COUNT, FWD_REFS, FindMvStackResult, FrameInterOrderHints, H_ADST,
+    H_DCT, H_FLIPADST, IDTX, INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTERINTRA_MODES,
+    INTERP_FILTER_CONTEXTS, INTERP_FILTER_NONE, INTERP_FILTERS, INTRA_FILTER_MODES,
+    INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_MODES, INTRA_TX_TYPE_SET1_SIZES,
+    INTRA_TX_TYPE_SET2_SIZES, INTRABC_DELAY_PIXELS, IS_INTER_CONTEXTS, InterFrameContext,
+    InterWalkPixels, IntraFrameModeInfoPrefix, LEVEL_CONTEXTS, MAG_REF_OFFSET_WITH_TX_CLASS,
+    MAX_ANGLE_DELTA, MAX_TX_DEPTH, MAX_TX_DEPTH_TABLE, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH,
+    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES,
+    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS, PALETTE_COLORS,
+    PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
+    PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, PARTITION_HORZ, PARTITION_HORZ_4,
+    PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_SUBSIZE,
+    PARTITION_TYPES_TOTAL, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+    PLANE_TYPES, PaletteColorContext, PalettePlane, PaletteTokensArgs, PartitionWalker,
+    REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
+    SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_2D, SIG_COEF_CONTEXTS_EOB, SIG_REF_DIFF_OFFSET,
+    SIG_REF_DIFF_OFFSET_NUM, SINGLE_REFS, SIZE_GROUP, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
+    SPLIT_TX_SIZE, TX_4X4, TX_4X8, TX_4X16, TX_8X4, TX_8X8, TX_8X16, TX_8X32, TX_16X4, TX_16X8,
+    TX_16X16, TX_16X32, TX_16X64, TX_32X8, TX_32X16, TX_32X32, TX_32X64, TX_64X16, TX_64X32,
+    TX_64X64, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY,
+    TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3, TX_SET_INTRA_1, TX_SET_INTRA_2,
+    TX_SET_TYPES_INTER, TX_SET_TYPES_INTRA, TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_SIZES,
+    TX_SIZES_ALL, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_TYPES, TX_TYPES_INTRA_SET1,
+    TX_TYPES_INTRA_SET2, TX_TYPES_SET2, TX_TYPES_SET3, TX_WIDTH, TX_WIDTH_LOG2, TXB_SKIP_CONTEXTS,
+    TXFM_PARTITION_CONTEXTS, TileCdfContext, TileDecodeParams, TileGeometry, UNIDIR_COMP_REFS,
+    UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED, V_ADST, V_DCT, V_FLIPADST, V_PRED,
+    WEDGE_TYPES, ZERO_MV_CONTEXTS, block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx,
+    coeff_cdf_q_ctx, compound_mode_ctx, compute_tx_type, find_tx_size, get_br_ctx,
+    get_coeff_base_ctx, get_coeff_base_eob_ctx, get_palette_color_context, get_segment_id,
+    get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
     intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mi_height_log2, mi_width_log2, mv_ctx,
     neg_deinterleave, num_4x4_blocks_high, num_4x4_blocks_wide,
     palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_args,
     palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
     partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
-    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlock,
-    DecodedBlockRecord, DecodedInterBlockModeInfo, DecodedInterFrameModeInfo, DecodedPaletteMap,
-    FindMvStackResult, FrameInterOrderHints, InterFrameContext, InterWalkPixels,
-    IntraFrameModeInfoPrefix, PaletteColorContext, PalettePlane, PaletteTokensArgs,
-    PartitionWalker, TileCdfContext, TileDecodeParams, TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST,
-    ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4,
-    BLOCK_16X64, BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16,
-    BLOCK_4X4, BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16,
-    BLOCK_8X32, BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE,
-    BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE,
-    COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS,
-    COMPOUND_IDX_CONTEXTS, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP,
-    COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS,
-    COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS,
-    DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
-    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
-    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
-    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
-    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
-    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF,
-    DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF,
-    DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
-    DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF,
-    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
-    DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
-    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
-    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
-    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
-    DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_5_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_5_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_6_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_6_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_7_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_7_Y_COLOR_CDF,
-    DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF,
-    DEFAULT_PALETTE_UV_MODE_CDF, DEFAULT_PALETTE_UV_SIZE_CDF, DEFAULT_PALETTE_Y_MODE_CDF,
-    DEFAULT_PALETTE_Y_SIZE_CDF, DEFAULT_PARTITION_W128_CDF, DEFAULT_PARTITION_W16_CDF,
-    DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF, DEFAULT_PARTITION_W8_CDF,
-    DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SEGMENT_ID_PREDICTED_CDF,
-    DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF, DEFAULT_SKIP_MODE_CDF, DEFAULT_TXB_SKIP_CDF,
-    DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF, DEFAULT_TX_32X32_CDF, DEFAULT_TX_64X64_CDF,
-    DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF, DEFAULT_UV_MODE_CFL_ALLOWED_CDF,
-    DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF, DEFAULT_WEDGE_INDEX_CDF, DEFAULT_WEDGE_INTER_INTRA_CDF,
-    DEFAULT_Y_MODE_CDF, DEFAULT_ZERO_MV_CDF, DELTA_LF_SMALL, DELTA_Q_SMALL, DIRECTIONAL_MODES,
-    DRL_MODE_CONTEXTS, EOB_COEF_CONTEXTS, EXT_PARTITION_TYPES, FILTER_INTRA_MODE_TO_INTRA_DIR,
-    FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, FRAME_LF_COUNT, FWD_REFS, H_ADST, H_DCT,
-    H_FLIPADST, IDTX, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_NONE,
-    INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRABC_DELAY_PIXELS, INTRA_FILTER_MODES,
-    INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_TX_TYPE_SET1_SIZES,
-    INTRA_TX_TYPE_SET2_SIZES, IS_INTER_CONTEXTS, LEVEL_CONTEXTS, MAG_REF_OFFSET_WITH_TX_CLASS,
-    MAX_ANGLE_DELTA, MAX_TX_DEPTH, MAX_TX_DEPTH_TABLE, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH,
-    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES,
-    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS,
-    PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
-    PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
-    PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, PARTITION_HORZ, PARTITION_HORZ_4,
-    PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_SUBSIZE,
-    PARTITION_TYPES_TOTAL, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
-    PLANE_TYPES, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
-    SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_2D, SIG_COEF_CONTEXTS_EOB, SIG_REF_DIFF_OFFSET,
-    SIG_REF_DIFF_OFFSET_NUM, SINGLE_REFS, SIZE_GROUP, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
-    SPLIT_TX_SIZE, TXB_SKIP_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_16X16, TX_16X32, TX_16X4,
-    TX_16X64, TX_16X8, TX_32X16, TX_32X32, TX_32X64, TX_32X8, TX_4X16, TX_4X4, TX_4X8, TX_64X16,
-    TX_64X32, TX_64X64, TX_8X16, TX_8X32, TX_8X4, TX_8X8, TX_CLASS_2D, TX_CLASS_HORIZ,
-    TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY, TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3,
-    TX_SET_INTRA_1, TX_SET_INTRA_2, TX_SET_TYPES_INTER, TX_SET_TYPES_INTRA, TX_SIZES, TX_SIZES_ALL,
-    TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_TYPES, TX_TYPES_INTRA_SET1, TX_TYPES_INTRA_SET2,
-    TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_WIDTH,
-    TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
-    V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
+    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx,
 };
 #[doc(hidden)]
 pub use cdf::{
     GM_TYPE_AFFINE, GM_TYPE_IDENTITY, GM_TYPE_ROTZOOM, GM_TYPE_TRANSLATION, MAX_REF_MV_STACK_SIZE,
-    MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV,
-    MODE_NEAREST_NEWMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
-    MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_BORDER, REF_CAT_LEVEL,
+    MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEAREST_NEARESTMV,
+    MODE_NEAREST_NEWMV, MODE_NEARESTMV, MODE_NEARMV, MODE_NEW_NEARESTMV, MODE_NEW_NEARMV,
+    MODE_NEW_NEWMV, MODE_NEWMV, MV_BORDER, REF_CAT_LEVEL,
 };
 // r205: §7.9 motion-field-estimation helpers + the §7.10.2.5 /
 // §7.10.2.6 temporal-scan grid + §3 constants.
 #[doc(hidden)]
 pub use cdf::{
-    get_block_position, get_mv_projection, MotionFieldMvs, DIV_MULT, MAX_OFFSET_HEIGHT,
-    MAX_OFFSET_WIDTH, MFMV_INVALID, MFMV_STACK_SIZE, MV_IN_USE_BITS,
+    DIV_MULT, MAX_OFFSET_HEIGHT, MAX_OFFSET_WIDTH, MFMV_INVALID, MFMV_STACK_SIZE, MV_IN_USE_BITS,
+    MotionFieldMvs, get_block_position, get_mv_projection,
 };
 // r178: §5.11.x `read_interpolation_filter` named ordinals + readout
 // aggregate, plus the §5.11.28 / §5.11.29 readout aggregates exposed
 // alongside (each `DecodedInterBlockModeInfo` field references them).
 #[doc(hidden)]
 pub use cdf::{
-    CompoundTypeReadout, InterIntraReadout, InterpolationFilterReadout, BILINEAR, EIGHTTAP,
-    EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, SWITCHABLE,
+    BILINEAR, CompoundTypeReadout, EIGHTTAP, EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, InterIntraReadout,
+    InterpolationFilterReadout, SWITCHABLE,
 };
 // r179: §5.11.39 `coeffs` per-TU readout aggregate ([`cdf::CoefficientsReadout`])
 // surfaced through [`cdf::PartitionWalker::coefficients`].
@@ -1693,8 +1692,8 @@ pub use cdf::CoefficientsReadout;
 // `get_plane_residual_size` / `SUBSAMPLED_SIZE` helpers.
 #[doc(hidden)]
 pub use cdf::{
-    get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
-    COMPUTE_PRED_MODE_INTER, SUBSAMPLED_SIZE,
+    COMPUTE_PRED_MODE_INTER, ComputePredictionReadout, PlanePredictionTask, SUBSAMPLED_SIZE,
+    get_plane_residual_size, predict_intra_dc_pred,
 };
 // r186: §7.11.2.4 step-10 V_PRED + step-11 H_PRED sample-generation
 // leaves admitted to the dispatcher alongside DC_PRED; plus the
@@ -1704,7 +1703,7 @@ pub use cdf::{
 // helpers that read `CurrFrame[plane]` and feed the leaves.
 #[doc(hidden)]
 pub use cdf::{
-    derive_above_row, derive_left_col, predict_intra_h_pred, predict_intra_v_pred, DC_PRED, H_PRED,
+    DC_PRED, H_PRED, derive_above_row, derive_left_col, predict_intra_h_pred, predict_intra_v_pred,
 };
 // r330: §7.11.4 palette prediction process — the per-transform-block
 // sample-generation leaf that consumes the §5.11.49 `ColorMap{Y,UV}`
@@ -1724,10 +1723,10 @@ pub use cdf::predict_palette;
 // weight tables verbatim from av1-spec p.508.
 #[doc(hidden)]
 pub use cdf::{
-    derive_above_left, predict_intra_paeth_pred, predict_intra_smooth_h_pred,
-    predict_intra_smooth_pred, predict_intra_smooth_v_pred, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED,
-    SMOOTH_V_PRED, SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32, SM_WEIGHTS_TX_4X4,
-    SM_WEIGHTS_TX_64X64, SM_WEIGHTS_TX_8X8,
+    PAETH_PRED, SM_WEIGHTS_TX_4X4, SM_WEIGHTS_TX_8X8, SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32,
+    SM_WEIGHTS_TX_64X64, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, derive_above_left,
+    predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
+    predict_intra_smooth_v_pred,
 };
 // r188: §7.11.2.4 six non-degenerate directional D-mode sample-
 // generation leaves (`predict_intra_directional` keyed by `pAngle`;
@@ -1747,17 +1746,17 @@ pub use cdf::{
 // `D135_PRED` / `D113_PRED` / `D157_PRED` / `D203_PRED` / `D67_PRED`).
 #[doc(hidden)]
 pub use cdf::{
+    ANGLE_STEP, D45_PRED, D67_PRED, D113_PRED, D135_PRED, D157_PRED, D203_PRED,
+    DR_INTRA_DERIVATIVE, INTRA_EDGE_KERNEL, INTRA_EDGE_KERNELS, INTRA_EDGE_TAPS, MODE_TO_ANGLE,
     filter_corner, intra_edge_filter, intra_edge_filter_strength_selection, intra_edge_upsample,
-    intra_edge_upsample_selection, predict_intra_d_mode, predict_intra_directional, ANGLE_STEP,
-    D113_PRED, D135_PRED, D157_PRED, D203_PRED, D45_PRED, D67_PRED, DR_INTRA_DERIVATIVE,
-    INTRA_EDGE_KERNEL, INTRA_EDGE_KERNELS, INTRA_EDGE_TAPS, MODE_TO_ANGLE,
+    intra_edge_upsample_selection, predict_intra_d_mode, predict_intra_directional,
 };
 // r181: §5.11.34 `residual()` outer-dispatch readout
 // ([`cdf::ResidualReadout`] + [`cdf::ResidualTuTask`]) surfaced
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37
 // per-plane transform-size lookup [`cdf::get_tx_size`].
 #[doc(hidden)]
-pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
+pub use cdf::{ResidualReadout, ResidualTuTask, get_tx_size};
 // r183: §7.12.2 dequantization-function tables + helpers + §7.12.3
 // step-1 dequantization loop ([`cdf::dequantize_step1`]) + §5.11.47
 // `transform_type` per-TU S() reader ([`cdf::PartitionWalker::transform_type`])
@@ -1770,10 +1769,10 @@ pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
 // the dispatcher needs.
 #[doc(hidden)]
 pub use cdf::{
-    ac_q, dc_q, dequant_denom, dequantize_step1, get_ac_quant, get_dc_quant, get_qindex,
-    QuantizerParams, ResidualContext, TransformTypeReadout, AC_QLOOKUP, DC_QLOOKUP,
-    TX_TYPE_INTER_INV_SET1, TX_TYPE_INTER_INV_SET2, TX_TYPE_INTER_INV_SET3, TX_TYPE_INTRA_INV_SET1,
-    TX_TYPE_INTRA_INV_SET2,
+    AC_QLOOKUP, DC_QLOOKUP, QuantizerParams, ResidualContext, TX_TYPE_INTER_INV_SET1,
+    TX_TYPE_INTER_INV_SET2, TX_TYPE_INTER_INV_SET3, TX_TYPE_INTRA_INV_SET1, TX_TYPE_INTRA_INV_SET2,
+    TransformTypeReadout, ac_q, dc_q, dequant_denom, dequantize_step1, get_ac_quant, get_dc_quant,
+    get_qindex,
 };
 // r182: §7.13 inverse transform (av1-spec p.295-307) — the
 // `inverse_transform_2d` 2D dispatcher consumes the §7.12.3 step-1
@@ -1787,37 +1786,37 @@ pub use cdf::{
 pub use codec_config::Av1CodecConfig;
 #[doc(hidden)]
 pub use frame_header::{
-    parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
-    InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
-    SUPERRES_DENOM_MIN, SUPERRES_NUM,
+    FrameHeader, FrameSize, FrameType, InterFrameRefs, NUM_REF_FRAMES, PRIMARY_REF_NONE, RefInfo,
+    SUPERRES_DENOM_BITS, SUPERRES_DENOM_MIN, SUPERRES_NUM, parse_frame_header,
+    parse_frame_header_with_refs,
 };
 #[doc(hidden)]
-pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
+pub use obu::{ObuDescriptor, ObuIter, ObuType, parse_leb128, parse_obu};
 #[doc(hidden)]
 pub use sequence_header::{
-    parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
-    SequenceHeader, TimingInfo,
+    ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint, SequenceHeader,
+    TimingInfo, parse_sequence_header,
 };
 #[doc(hidden)]
 pub use superres::{
-    upscale_frame, upscale_plane, upscale_sample, SuperresError, SuperresFrameContext,
     FILTER_BITS as SUPERRES_TAP_FILTER_BITS, SUPERRES_EXTRA_BITS, SUPERRES_FILTER_BITS,
     SUPERRES_FILTER_OFFSET, SUPERRES_FILTER_SHIFTS, SUPERRES_FILTER_TAPS, SUPERRES_SCALE_BITS,
-    SUPERRES_SCALE_MASK, UPSCALE_FILTER,
+    SUPERRES_SCALE_MASK, SuperresError, SuperresFrameContext, UPSCALE_FILTER, upscale_frame,
+    upscale_plane, upscale_sample,
 };
 #[doc(hidden)]
 pub use symbol_decoder::SymbolDecoder;
 #[doc(hidden)]
 pub use tile_info::{
-    parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
+    MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH, TileInfo, parse_tile_info,
 };
 #[doc(hidden)]
 pub use transform::{
-    brev, butterfly_b, butterfly_h, clip3, cos128, inverse_adst, inverse_adst16, inverse_adst4,
-    inverse_adst8, inverse_adst_input_permute, inverse_adst_output_permute, inverse_dct,
-    inverse_dct_permute, inverse_identity, inverse_identity16, inverse_identity32,
-    inverse_identity4, inverse_identity8, inverse_transform_2d, inverse_wht4, round2, sin128,
-    COS128_LOOKUP, SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9, TRANSFORM_ROW_SHIFT,
+    COS128_LOOKUP, SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9, TRANSFORM_ROW_SHIFT, brev,
+    butterfly_b, butterfly_h, clip3, cos128, inverse_adst, inverse_adst_input_permute,
+    inverse_adst_output_permute, inverse_adst4, inverse_adst8, inverse_adst16, inverse_dct,
+    inverse_dct_permute, inverse_identity, inverse_identity4, inverse_identity8,
+    inverse_identity16, inverse_identity32, inverse_transform_2d, inverse_wht4, round2, sin128,
 };
 // r189: §7.11.3 Inter prediction process (av1-spec p.257-265) —
 // translational single-reference MC kernel. Three sample-generation
@@ -1860,74 +1859,73 @@ pub use transform::{
 // are now driver-side complete.
 #[doc(hidden)]
 pub use cdef::{
-    cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
-    CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
+    CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, CdefFrameContext, DIV_TABLE,
+    cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain,
 };
 #[doc(hidden)]
 pub use film_grain::{
+    GrainArrays, LUMA_GRAIN_H, LUMA_GRAIN_W, MC_IDENTITY, RandomRegister, ScalingLut,
     add_noise_synthesis, film_grain_synthesis, generate_grain, scale_lut, scaling_lookup_init,
-    GrainArrays, RandomRegister, ScalingLut, LUMA_GRAIN_H, LUMA_GRAIN_W, MC_IDENTITY,
 };
 #[doc(hidden)]
 pub use inter_pred::{
+    COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE,
+    CompoundParams, DIV_LUT, DIV_LUT_BITS, DIV_LUT_NUM, DIV_LUT_PREC_BITS, DistanceWeights,
+    Divisor, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP, FILTER_BITS as INTER_FILTER_BITS,
+    GridObmcContext, GridWarpContext, II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED,
+    II_WEIGHTS_1D, InterIntraLeaf, InterIntraModeInfo, InterIntraWedgeModeInfo, InterModeInfo,
+    InterModeInfoGrid, LEAST_SQUARES_SAMPLES_MAX as INTER_LEAST_SQUARES_SAMPLES_MAX, LS_MV_MAX,
+    LocalWarp, MASK_MASTER_SIZE, MAX_FRAME_DISTANCE, MAX_SB_SIZE, MvScale, ObmcNeighbour,
+    ObmcParams, PlaneReconContext, PlaneRefSpec, PredictInterRef, QUANT_DIST_LOOKUP,
+    QUANT_DIST_WEIGHT, REF_SCALE_SHIFT, RefFrameStoreEntry, RoundingVars, SCALE_SUBPEL_BITS,
+    SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, ShearParams, USE_WARP_GLOBAL, USE_WARP_LOCAL,
+    WARP_PARAM_REDUCE_BITS, WARP_WARPEDMODEL_PREC_BITS, WARPED_FILTERS, WARPEDDIFF_PREC_BITS,
+    WARPEDMODEL_NONDIAGAFFINE_CLAMP, WARPEDMODEL_TRANS_CLAMP, WARPEDPIXEL_PREC_SHIFTS, WEDGE_BITS,
+    WEDGE_CODEBOOK, WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN,
+    WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE27, WEDGE_OBLIQUE63,
+    WEDGE_OBLIQUE117, WEDGE_OBLIQUE153, WEDGE_VERTICAL, WarpDriverParams, WarpSampleCand,
     block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
     mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling, predict_inter,
     reconstruct_inter_block, reconstruct_inter_block_interintra, reconstruct_inter_block_obmc,
     reconstruct_inter_block_warp, reconstruct_inter_frame, reconstruct_inter_intra_block,
     reconstruct_inter_intra_from_dispatch, resolve_divisor, rounding_variables,
-    select_interp_filter_small_block, setup_shear, warp_estimation, wedge_mask, CompoundParams,
-    DistanceWeights, Divisor, GridObmcContext, GridWarpContext, InterIntraLeaf, InterIntraModeInfo,
-    InterIntraWedgeModeInfo, InterModeInfo, InterModeInfoGrid, LocalWarp, MvScale, ObmcNeighbour,
-    ObmcParams, PlaneReconContext, PlaneRefSpec, PredictInterRef, RefFrameStoreEntry, RoundingVars,
-    ShearParams, WarpDriverParams, WarpSampleCand, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
-    COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE, DIV_LUT, DIV_LUT_BITS, DIV_LUT_NUM,
-    DIV_LUT_PREC_BITS, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP, FILTER_BITS as INTER_FILTER_BITS,
-    II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED, II_WEIGHTS_1D,
-    LEAST_SQUARES_SAMPLES_MAX as INTER_LEAST_SQUARES_SAMPLES_MAX, LS_MV_MAX, MASK_MASTER_SIZE,
-    MAX_FRAME_DISTANCE, MAX_SB_SIZE, QUANT_DIST_LOOKUP, QUANT_DIST_WEIGHT, REF_SCALE_SHIFT,
-    SCALE_SUBPEL_BITS, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, USE_WARP_GLOBAL, USE_WARP_LOCAL,
-    WARPEDDIFF_PREC_BITS, WARPEDMODEL_NONDIAGAFFINE_CLAMP, WARPEDMODEL_TRANS_CLAMP,
-    WARPEDPIXEL_PREC_SHIFTS, WARPED_FILTERS, WARP_PARAM_REDUCE_BITS, WARP_WARPEDMODEL_PREC_BITS,
-    WEDGE_BITS, WEDGE_CODEBOOK, WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN,
-    WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153,
-    WEDGE_OBLIQUE27, WEDGE_OBLIQUE63, WEDGE_VERTICAL,
+    select_interp_filter_small_block, setup_shear, warp_estimation, wedge_mask,
 };
 #[doc(hidden)]
 pub use loop_filter::{
+    FilterMaskOutput, FilterStrength, LoopFilterFrameContext, PlaneBuffer,
     adaptive_filter_strength, adaptive_filter_strength_selection, filter_mask, filter_size,
     loop_filter_edge, loop_filter_frame, narrow_filter, sample_filtering, wide_filter,
-    FilterMaskOutput, FilterStrength, LoopFilterFrameContext, PlaneBuffer,
 };
 #[doc(hidden)]
 pub use loop_restoration::{
-    count_units_in_frame, derive_block_geometry, get_source_sample, loop_restoration_frame,
-    loop_restore_block, self_guided_filter, wiener_coefficients, wiener_filter,
-    LoopRestorationFrameContext, LrBlockGeometry, FILTER_BITS as LR_FILTER_BITS,
+    FILTER_BITS as LR_FILTER_BITS, LoopRestorationFrameContext, LrBlockGeometry, SGR_PARAMS,
     SGRPROJ_MTABLE_BITS, SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K,
     SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS, SGRPROJ_XQD_MAX, SGRPROJ_XQD_MID,
-    SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MID,
-    WIENER_TAPS_MIN,
+    SGRPROJ_XQD_MIN, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MID,
+    WIENER_TAPS_MIN, count_units_in_frame, derive_block_geometry, get_source_sample,
+    loop_restoration_frame, loop_restore_block, self_guided_filter, wiener_coefficients,
+    wiener_filter,
 };
 #[doc(hidden)]
 pub use uncompressed_header_tail::{
-    parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
-    parse_global_motion_params, parse_interpolation_filter, parse_loop_filter_params,
-    parse_lr_params, parse_quantization_params, parse_segmentation_params, parse_tx_mode,
-    prev_gm_params_default, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext,
-    FilmGrainParams, FrameRestorationType, GlobalMotionParams, InterpolationFilter,
-    LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, TxMode, WarpModelType,
-    ALTREF2_FRAME, ALTREF_FRAME, BIDIR_COMP_REFERENCE, BWDREF_FRAME, CDEF_MAX_STRENGTHS,
-    COMPOUND_REFERENCE, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
-    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, GOLDEN_FRAME, INTRA_FRAME,
-    LAST2_FRAME, LAST3_FRAME, LAST_FRAME, LOOP_FILTER_MODE_DELTAS_DEFAULT,
-    LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_AR_COEFFS_UV, MAX_AR_COEFFS_Y, MAX_LOOP_FILTER,
-    MAX_NUM_CHROMA_POINTS, MAX_NUM_Y_POINTS, MAX_SEGMENTS, REFS_PER_FRAME,
-    RESTORATION_TILESIZE_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
-    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H,
-    SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
-    SEG_LVL_SKIP, SINGLE_REFERENCE, TOTAL_REFS_PER_FRAME, TX_MODES, UNIDIR_COMP_REFERENCE,
-    WARPEDMODEL_PREC_BITS,
+    ALTREF_FRAME, ALTREF2_FRAME, BIDIR_COMP_REFERENCE, BWDREF_FRAME, CDEF_MAX_STRENGTHS,
+    COMPOUND_REFERENCE, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext, FilmGrainParams,
+    FrameRestorationType, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
+    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, GOLDEN_FRAME,
+    GlobalMotionParams, INTRA_FRAME, InterpolationFilter, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
+    LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT, LoopFilterParams, LrParams,
+    MAX_AR_COEFFS_UV, MAX_AR_COEFFS_Y, MAX_LOOP_FILTER, MAX_NUM_CHROMA_POINTS, MAX_NUM_Y_POINTS,
+    MAX_SEGMENTS, QuantizationParams, REFS_PER_FRAME, RESTORATION_TILESIZE_MAX, SEG_LVL_ALT_LF_U,
+    SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H, SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV,
+    SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEGMENTATION_FEATURE_BITS,
+    SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED, SINGLE_REFERENCE, SegmentationParams,
+    TOTAL_REFS_PER_FRAME, TX_MODES, TxMode, UNIDIR_COMP_REFERENCE, WARPEDMODEL_PREC_BITS,
+    WarpModelType, parse_cdef_params, parse_delta_lf_params, parse_delta_q_params,
+    parse_film_grain_params, parse_global_motion_params, parse_interpolation_filter,
+    parse_loop_filter_params, parse_lr_params, parse_quantization_params,
+    parse_segmentation_params, parse_tx_mode, prev_gm_params_default,
 };
 
 /// Crate-local error type.
@@ -2498,7 +2496,10 @@ impl core::fmt::Display for Error {
                 "oxideav-av1: leb128 encoding used more than 8 bytes (§4.10.5)"
             ),
             Self::SizeOverflow => {
-                write!(f, "oxideav-av1: obu_size did not fit in usize on this target")
+                write!(
+                    f,
+                    "oxideav-av1: obu_size did not fit in usize on this target"
+                )
             }
             Self::ReservedProfile(p) => write!(
                 f,
@@ -2735,7 +2736,7 @@ pub fn decode_av1_at_operating_point(
 /// * Internal partition-tree / coefficient writer overflow — same
 ///   `Error` variants the driver surfaces.
 pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
-    use crate::encoder::{encode_key_frame_yuv420, Yuv420Frame};
+    use crate::encoder::{Yuv420Frame, encode_key_frame_yuv420};
     let chroma_w = width.div_ceil(2) as usize;
     let chroma_h = height.div_ceil(2) as usize;
     let y_size = (width as usize) * (height as usize);

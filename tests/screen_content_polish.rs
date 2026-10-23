@@ -6,7 +6,7 @@
 //! env-gated fixture-generation twin for the pinned corpus stream.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_key_frame_yuv420_with_q, Yuv420Frame};
+use oxideav_av1::encoder::{Yuv420Frame, encode_key_frame_yuv420_with_q};
 
 /// 4-colour dither luma over a 2×2-cell chroma checker with a WIDE U
 /// spread and a TIGHT V spread — UV-palette territory whose V entry

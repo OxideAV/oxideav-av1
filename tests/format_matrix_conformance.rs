@@ -14,7 +14,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv_with_q, encode_key_frame_yuv_with_q, ChromaFormat, YuvFrame,
+    ChromaFormat, YuvFrame, encode_gop_yuv_with_q, encode_key_frame_yuv_with_q,
 };
 
 /// All twelve §6.4.1-admissible (depth, format) pairings.
@@ -208,7 +208,7 @@ fn key_monochrome_round_trips_all_depths() {
 /// routes through the same core).
 #[test]
 fn key_8bit_420_general_entry_matches_legacy_bytes() {
-    use oxideav_av1::encoder::{encode_key_frame_yuv420_with_q, Yuv420Frame};
+    use oxideav_av1::encoder::{Yuv420Frame, encode_key_frame_yuv420_with_q};
     let (w, h) = (96u32, 80u32);
     let mut legacy = Yuv420Frame::filled(w, h, 128);
     for (i, p) in legacy.y.iter_mut().enumerate() {
@@ -411,7 +411,7 @@ fn pyramid_round_trips_at_new_pairings() {
 /// driver byte-exact against the encoder reconstruction.
 #[test]
 fn segmented_gop_round_trips_above_8bit() {
-    use oxideav_av1::encoder::{encode_gop_yuv_seg_extras_tuned, GopTuning};
+    use oxideav_av1::encoder::{GopTuning, encode_gop_yuv_seg_extras_tuned};
     for &(bd, fmt) in &[
         (10u8, ChromaFormat::Yuv420),
         (12u8, ChromaFormat::Yuv420),

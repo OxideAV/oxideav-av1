@@ -378,11 +378,19 @@ mod tests {
         b.reduced_delta_q_index = seed as i32 - 7;
         b.angle_delta_y = (seed % 7) as i8 - 3;
         b.angle_delta_uv = 3 - (seed % 7) as i8;
-        b.cfl_alpha_u = if seed % 2 == 0 { Some(-5) } else { None };
-        b.cfl_alpha_v = if seed % 3 == 0 { Some(12) } else { None };
+        b.cfl_alpha_u = if seed.is_multiple_of(2) {
+            Some(-5)
+        } else {
+            None
+        };
+        b.cfl_alpha_v = if seed.is_multiple_of(3) {
+            Some(12)
+        } else {
+            None
+        };
         b.use_filter_intra = (seed % 2) as u8;
         b.filter_intra_mode = (seed % 2 == 1).then_some((seed % 5) as u8);
-        b.tx_size = (seed % 4 != 0).then_some((seed % 19) as u8);
+        b.tx_size = (!seed.is_multiple_of(4)).then_some((seed % 19) as u8);
         b.residual_tx_type = vec![(seed % 16) as u8; (seed % 3) as usize];
         let mut dense = vec![0i32; len];
         for &(i, q) in nz {

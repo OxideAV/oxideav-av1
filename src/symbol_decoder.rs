@@ -26,8 +26,8 @@
 //! `exit_symbol` advance the *same* bit-position indicator the rest of
 //! the OBU walk uses.
 
-use crate::bitreader::BitReader;
 use crate::Error;
+use crate::bitreader::BitReader;
 
 /// `EC_PROB_SHIFT` — number of bits to reduce CDF precision during
 /// arithmetic coding (§3, symbol-table constant; value 6).
@@ -44,11 +44,7 @@ const EC_MIN_PROB: u32 = 4;
 /// renormalisation step only invokes it on a `SymbolRange` that is at
 /// least `1 << 8`, and the §8.3 rate calculation on `N >= 1`).
 fn floor_log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// `inverse_recenter(r, v)` per §5.9.29. Shared by the
@@ -672,7 +668,7 @@ mod tests {
         let mut cdf: [u16; 3] = [16384, 32768, 31];
         update_cdf(&mut cdf, 0, 2);
         assert_eq!(cdf[2], 32); // 31 < 32 ⇒ +1.
-                                // Already at 32: stays 32.
+        // Already at 32: stays 32.
         let mut cdf2: [u16; 3] = [16384, 32768, 32];
         update_cdf(&mut cdf2, 0, 2);
         assert_eq!(cdf2[2], 32);

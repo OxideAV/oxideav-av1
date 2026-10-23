@@ -29,8 +29,8 @@ use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::key_frame::{
     encode_key_frame_yuv420_with_q_sr, encode_key_frame_yuv420_with_q_sr_forced,
 };
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_extras_tuned, GopTuning, Yuv420Frame};
-use oxideav_av1::frame_header::{parse_frame_header, SUPERRES_NUM};
+use oxideav_av1::encoder::{GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned};
+use oxideav_av1::frame_header::{SUPERRES_NUM, parse_frame_header};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -466,7 +466,7 @@ fn segmented_gop_with_superres_key_decodes_bit_exact() {
 /// reconstruction and every display frame decodes bit-exact.
 #[test]
 fn pyramid_gop_with_superres_key_decodes_bit_exact() {
-    use oxideav_av1::encoder::{encode_pyramid_gop_yuv420_with_q_tuned, PyramidTuning};
+    use oxideav_av1::encoder::{PyramidTuning, encode_pyramid_gop_yuv420_with_q_tuned};
     let frames: Vec<Yuv420Frame> = (0..6).map(|t| smooth_frame(128, 96, t)).collect();
     let enc = encode_pyramid_gop_yuv420_with_q_tuned(&frames, 180, PyramidTuning::default())
         .expect("pyramid encode");
@@ -519,7 +519,7 @@ fn temporal_ladder_with_superres_key_decodes_bit_exact() {
         .temporal_ids
         .iter()
         .enumerate()
-        .filter(|(_, &tid)| tid <= 1)
+        .filter(|&(_, &tid)| tid <= 1)
         .map(|(i, _)| i)
         .collect();
     assert_eq!(reduced.len(), keep.len(), "op-1 frame count");
@@ -632,10 +632,10 @@ fn sr_ab_measurement_matrix() {
     type ContentGen = fn(u32, u32, usize) -> Yuv420Frame;
     let contents: [(&str, ContentGen); 2] = [("smooth", smooth_frame), ("detail", detail_frame)];
     let geoms = [(96u32, 96u32), (128, 96), (192, 128)];
-    for (name, gen) in contents {
+    for (name, r#gen) in contents {
         for &(w, h) in &geoms {
             for q in [60u8, 100, 140, 180, 220] {
-                let f = gen(w, h, 0);
+                let f = r#gen(w, h, 0);
                 let off = encode_key_frame_yuv420_with_q_sr(&f, q, false).expect("off");
                 let off_psnr = psnr(&off.recon_y, &f.y);
                 let mut line = format!(

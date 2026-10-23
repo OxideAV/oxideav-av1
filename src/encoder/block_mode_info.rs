@@ -47,32 +47,31 @@
 //! [`size_group`]: crate::cdf::size_group
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
+use crate::Error;
 use crate::cdf::{
-    block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_group_idx_ctx,
-    comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx, compound_mode_ctx, count_refs,
-    get_palette_color_context, interintra_ctx, interp_filter_ctx, is_directional,
-    is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave, palette_color_ctx,
-    palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits, CompoundTypeReadout,
-    FindMvStackResult, InterIntraReadout, InterpolationFilterReadout, PalettePlane,
-    PartitionWalker, TileCdfContext, BILINEAR, BLOCK_128X128, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8,
-    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
-    COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_MODES,
-    COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE, COMP_INTER_CONTEXTS, DC_PRED,
-    DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP, FRAME_LF_COUNT,
-    GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
-    INTRABC_DELAY_PIXELS, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MI_SIZE, MODE_GLOBALMV,
-    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
-    MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES, MOTION_MODE_OBMC,
-    MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
-    MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
-    NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
-    PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
-    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, SWITCHABLE, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
+    BILINEAR, BLOCK_8X8, BLOCK_32X32, BLOCK_64X64, BLOCK_128X128, BLOCK_SIZE_GROUPS, BLOCK_SIZES,
+    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE, COMP_INTER_CONTEXTS, COMPOUND_AVERAGE,
+    COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_MODE_CONTEXTS, COMPOUND_MODES,
+    COMPOUND_TYPES, COMPOUND_WEDGE, CompoundTypeReadout, DC_PRED, DELTA_LF_SMALL, DELTA_Q_SMALL,
+    DRL_MODE_CONTEXTS, EIGHTTAP, FRAME_LF_COUNT, FindMvStackResult, GM_TYPE_TRANSLATION,
+    INTERINTRA_MODES, INTERP_FILTER_NONE, INTERP_FILTERS, INTRA_FILTER_MODES, INTRA_MODE_CONTEXTS,
+    INTRA_MODES, INTRABC_DELAY_PIXELS, IS_INTER_CONTEXTS, InterIntraReadout,
+    InterpolationFilterReadout, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MI_SIZE,
+    MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEAREST_NEARESTMV,
+    MODE_NEARESTMV, MODE_NEARMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MODE_NEWMV, MOTION_MODE_OBMC,
+    MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL, MOTION_MODES, MV_CLASS_0, MV_CLASSES, MV_COMPS,
+    MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ,
+    MV_JOINT_ZERO, NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, PalettePlane, PartitionWalker, REF_MV_CONTEXTS,
+    SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
+    SWITCHABLE, TileCdfContext, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    WEDGE_TYPES, ZERO_MV_CONTEXTS, block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx,
+    cfl_alpha_v_ctx, comp_group_idx_ctx, comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx,
+    compound_mode_ctx, count_refs, get_palette_color_context, interintra_ctx, interp_filter_ctx,
+    is_directional, is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave,
+    palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::Error;
 
 /// `read_skip()` inverse per §5.11.11 (av1-spec p.67).
 ///
@@ -3417,10 +3416,10 @@ pub fn write_palette_mode_info_with_entries(
     if (y_mode as usize) >= INTRA_MODES {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if let Some(uv) = uv_mode {
-        if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
+    if let Some(uv) = uv_mode
+        && (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED
+    {
+        return Err(Error::PartitionWalkOutOfRange);
     }
     if has_palette_y > 1 || has_palette_uv > 1 {
         return Err(Error::PartitionWalkOutOfRange);
@@ -6645,10 +6644,10 @@ pub fn write_interintra_mode(
     if (wedge_ii == 1) != readout.wedge_index.is_some() {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if let Some(wi) = readout.wedge_index {
-        if (wi as usize) >= WEDGE_TYPES {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
+    if let Some(wi) = readout.wedge_index
+        && (wi as usize) >= WEDGE_TYPES
+    {
+        return Err(Error::PartitionWalkOutOfRange);
     }
 
     let row = cdfs
@@ -7307,10 +7306,10 @@ fn floor_log2(mut x: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::cdf::{
-        cfl_allowed_for_uv_mode, comp_mode_ctx, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
-        skip_mode_ctx, PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4,
-        BLOCK_8X8, DC_PRED, MODE_GLOBAL_GLOBALMV, MODE_NEAREST_NEWMV, MODE_NEAR_NEARMV,
-        MODE_NEAR_NEWMV, MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, V_PRED,
+        BLOCK_4X4, BLOCK_4X8, BLOCK_8X4, BLOCK_8X8, BLOCK_16X16, DC_PRED, MODE_GLOBAL_GLOBALMV,
+        MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEAREST_NEWMV, MODE_NEW_NEARESTMV, MODE_NEW_NEARMV,
+        PartitionWalker, TileGeometry, V_PRED, cfl_allowed_for_uv_mode, comp_mode_ctx,
+        intra_mode_ctx, is_inter_ctx, size_group, skip_ctx, skip_mode_ctx,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -8892,11 +8891,7 @@ mod tests {
     /// pattern in the `write_skip_seg_short_circuit` /
     /// `write_segment_id_skip_short_circuit` tests.
     fn pad_no_symbol(bytes: Vec<u8>) -> Vec<u8> {
-        if bytes.is_empty() {
-            vec![0u8]
-        } else {
-            bytes
-        }
+        if bytes.is_empty() { vec![0u8] } else { bytes }
     }
 
     /// Arm 1: `!segmentation_enabled` — no bits written, no bits read,
@@ -14831,30 +14826,18 @@ mod tests {
             let ref0 = if comp_ref == 0 {
                 let p1_ctx = ref_count_ctx(cnt(1), cnt(2));
                 let p1 = dec.read_symbol(cdfs.comp_ref_cdf(p1_ctx, 1)).unwrap();
-                if p1 != 0 {
-                    2
-                } else {
-                    1
-                }
+                if p1 != 0 { 2 } else { 1 }
             } else {
                 let p2_ctx = ref_count_ctx(cnt(3), cnt(4));
                 let p2 = dec.read_symbol(cdfs.comp_ref_cdf(p2_ctx, 2)).unwrap();
-                if p2 != 0 {
-                    4
-                } else {
-                    3
-                }
+                if p2 != 0 { 4 } else { 3 }
             };
             let bw_ctx = ref_count_ctx(cnt(5) + cnt(6), cnt(7));
             let bwdref = dec.read_symbol(cdfs.comp_bwd_ref_cdf(bw_ctx, 0)).unwrap();
             let ref1 = if bwdref == 0 {
                 let p1_ctx = ref_count_ctx(cnt(5), cnt(6));
                 let p1 = dec.read_symbol(cdfs.comp_bwd_ref_cdf(p1_ctx, 1)).unwrap();
-                if p1 != 0 {
-                    6
-                } else {
-                    5
-                }
+                if p1 != 0 { 6 } else { 5 }
             } else {
                 7
             };
@@ -17634,11 +17617,7 @@ mod tests {
                     let single_ref_p6 = dec
                         .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 5))
                         .unwrap() as u8;
-                    if single_ref_p6 != 0 {
-                        6
-                    } else {
-                        5
-                    }
+                    if single_ref_p6 != 0 { 6 } else { 5 }
                 } else {
                     7
                 }
@@ -17650,20 +17629,12 @@ mod tests {
                     let single_ref_p5 = dec
                         .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 4))
                         .unwrap() as u8;
-                    if single_ref_p5 != 0 {
-                        4
-                    } else {
-                        3
-                    }
+                    if single_ref_p5 != 0 { 4 } else { 3 }
                 } else {
                     let single_ref_p4 = dec
                         .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 3))
                         .unwrap() as u8;
-                    if single_ref_p4 != 0 {
-                        2
-                    } else {
-                        1
-                    }
+                    if single_ref_p4 != 0 { 2 } else { 1 }
                 }
             };
             [r0, -1]
@@ -17865,7 +17836,7 @@ mod tests {
     #[test]
     fn write_inter_block_mode_info_single_nearmv_round_trip() {
         let stack = mk_mv_stack(4); // deep enough for the has_nearmv loop.
-                                    // NEARMV @ RefMvIdx 2 ⇒ PredMv = ref_stack_mv[2][0].
+        // NEARMV @ RefMvIdx 2 ⇒ PredMv = ref_stack_mv[2][0].
         let pred = assign_mv_pred_mv(&stack, MODE_NEARMV, 0, 2).unwrap();
         let mv = [pred, [0, 0]]; // Mv inherits PredMv (no NEWMV read).
         let ref_frame = [2i32, -1]; // LAST2_FRAME, single.
@@ -19542,64 +19513,74 @@ mod tests {
         // Non-SWITCHABLE with a slot off the frame-header value.
         assert!(run(forced(EIGHTTAP), 0, crate::cdf::EIGHTTAP_SHARP, false).is_err());
         // Non-SWITCHABLE with a stray read flag.
-        assert!(run(
-            InterpolationFilterReadout {
-                interp_filter: [EIGHTTAP, EIGHTTAP],
-                read_from_bitstream: [true, false],
-            },
-            0,
-            EIGHTTAP,
-            false,
-        )
-        .is_err());
+        assert!(
+            run(
+                InterpolationFilterReadout {
+                    interp_filter: [EIGHTTAP, EIGHTTAP],
+                    read_from_bitstream: [true, false],
+                },
+                0,
+                EIGHTTAP,
+                false,
+            )
+            .is_err()
+        );
         // SWITCHABLE + !needs (skip_mode) but a non-EIGHTTAP slot.
         assert!(run(forced(crate::cdf::EIGHTTAP_SMOOTH), 1, SWITCHABLE, false).is_err());
         // SWITCHABLE + !needs with a stray read flag.
-        assert!(run(
-            InterpolationFilterReadout {
-                interp_filter: [EIGHTTAP, EIGHTTAP],
-                read_from_bitstream: [true, false],
-            },
-            1,
-            SWITCHABLE,
-            false,
-        )
-        .is_err());
+        assert!(
+            run(
+                InterpolationFilterReadout {
+                    interp_filter: [EIGHTTAP, EIGHTTAP],
+                    read_from_bitstream: [true, false],
+                },
+                1,
+                SWITCHABLE,
+                false,
+            )
+            .is_err()
+        );
         // SWITCHABLE + needs but the read flag is clear.
         assert!(run(forced(crate::cdf::EIGHTTAP_SMOOTH), 0, SWITCHABLE, false).is_err());
         // BILINEAR is not codeable through the 3-way S().
-        assert!(run(
-            InterpolationFilterReadout {
-                interp_filter: [BILINEAR, BILINEAR],
-                read_from_bitstream: [true, false],
-            },
-            0,
-            SWITCHABLE,
-            false,
-        )
-        .is_err());
+        assert!(
+            run(
+                InterpolationFilterReadout {
+                    interp_filter: [BILINEAR, BILINEAR],
+                    read_from_bitstream: [true, false],
+                },
+                0,
+                SWITCHABLE,
+                false,
+            )
+            .is_err()
+        );
         // !enable_dual_filter mirror violation (slot 1 differs).
-        assert!(run(
-            InterpolationFilterReadout {
-                interp_filter: [EIGHTTAP, crate::cdf::EIGHTTAP_SMOOTH],
-                read_from_bitstream: [true, false],
-            },
-            0,
-            SWITCHABLE,
-            false,
-        )
-        .is_err());
+        assert!(
+            run(
+                InterpolationFilterReadout {
+                    interp_filter: [EIGHTTAP, crate::cdf::EIGHTTAP_SMOOTH],
+                    read_from_bitstream: [true, false],
+                },
+                0,
+                SWITCHABLE,
+                false,
+            )
+            .is_err()
+        );
         // !enable_dual_filter with a stray slot-1 read flag.
-        assert!(run(
-            InterpolationFilterReadout {
-                interp_filter: [EIGHTTAP, EIGHTTAP],
-                read_from_bitstream: [true, true],
-            },
-            0,
-            SWITCHABLE,
-            false,
-        )
-        .is_err());
+        assert!(
+            run(
+                InterpolationFilterReadout {
+                    interp_filter: [EIGHTTAP, EIGHTTAP],
+                    read_from_bitstream: [true, true],
+                },
+                0,
+                SWITCHABLE,
+                false,
+            )
+            .is_err()
+        );
         // interpolation_filter out of the §6.8.9 range.
         assert!(run(forced(EIGHTTAP), 0, SWITCHABLE + 1, false).is_err());
     }

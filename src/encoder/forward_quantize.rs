@@ -69,8 +69,8 @@
 //! the decoder reads.
 
 use crate::cdf::{
-    dequant_denom, get_ac_quant, get_dc_quant, QuantizerParams, IDTX, TX_HEIGHT, TX_SIZES_ALL,
-    TX_WIDTH,
+    IDTX, QuantizerParams, TX_HEIGHT, TX_SIZES_ALL, TX_WIDTH, dequant_denom, get_ac_quant,
+    get_dc_quant,
 };
 use crate::qmatrix;
 
@@ -260,7 +260,7 @@ pub fn forward_quantize_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdf::{dequantize_step1, DCT_DCT, TX_16X8, TX_4X4, TX_4X8, TX_8X16, TX_8X4, TX_8X8};
+    use crate::cdf::{DCT_DCT, TX_4X4, TX_4X8, TX_8X4, TX_8X8, TX_8X16, TX_16X8, dequantize_step1};
 
     /// At `q_index = 0` the DC + AC quantizers both equal `4` (the
     /// first cell of `Dc_Qlookup[0]` and `Ac_Qlookup[0]`), `dqDenom =

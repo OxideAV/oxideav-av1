@@ -13,8 +13,8 @@
 //! the round and pinned via `fixture_conformance.rs` corpus entries.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q, EncodedGop, Yuv420Frame};
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, FrameType, RefInfo};
+use oxideav_av1::encoder::{EncodedGop, Yuv420Frame, encode_gop_yuv420_with_q};
+use oxideav_av1::frame_header::{FrameType, RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::uncompressed_header_tail::WarpModelType;
 use oxideav_av1::{ObuIter, ObuType};
 

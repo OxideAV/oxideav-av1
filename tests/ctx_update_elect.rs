@@ -27,8 +27,8 @@
 //! §8.4.
 
 use oxideav_av1::decoder::Frame;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning, Yuv420Frame};
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, RefInfo};
+use oxideav_av1::encoder::{GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_tuned};
+use oxideav_av1::frame_header::{RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -286,7 +286,7 @@ use oxideav_av1::encoder::encode_temporal_layered_gop_yuv420_with_q_tiles;
 // r439 — the §6.8.14 election on the B-PYRAMID driver.
 // ---------------------------------------------------------------------
 
-use oxideav_av1::encoder::{encode_pyramid_gop_yuv420_with_q_tuned, PyramidTuning};
+use oxideav_av1::encoder::{PyramidTuning, encode_pyramid_gop_yuv420_with_q_tuned};
 
 /// Coded (non-`show_existing_frame`) frame headers' wire
 /// `context_update_tile_id`s across a stream, in decode order.
@@ -391,9 +391,11 @@ fn pyramid_ctx_update_election_fires_and_decodes_bit_exact() {
     )
     .expect("pyramid baseline encode");
     assert!(off.ctx_donor_elections.is_empty());
-    assert!(wire_ctx_ids_tus(&off.gop.temporal_units, 128, 64)
-        .iter()
-        .all(|&id| id == 0));
+    assert!(
+        wire_ctx_ids_tus(&off.gop.temporal_units, 128, 64)
+            .iter()
+            .all(|&id| id == 0)
+    );
 }
 
 /// The ADAPTIVE mini-GOP driver rides the same session mechanics —
@@ -405,7 +407,7 @@ fn pyramid_ctx_update_election_fires_and_decodes_bit_exact() {
 /// must decode display-order bit-exact.
 #[test]
 fn adaptive_ctx_update_election_survives_trial_cloning() {
-    use oxideav_av1::encoder::{encode_adaptive_gop_yuv420_with_q_tuned, AdaptiveTuning};
+    use oxideav_av1::encoder::{AdaptiveTuning, encode_adaptive_gop_yuv420_with_q_tuned};
     let n = 9usize;
     let frames: Vec<Yuv420Frame> = (0..n)
         .map(|t| {
@@ -531,7 +533,7 @@ fn ladder_ctx_update_election_survives_every_operating_point() {
             .temporal_ids
             .iter()
             .enumerate()
-            .filter(|(_, &tid)| tid <= 2 - k)
+            .filter(|&(_, &tid)| tid <= 2 - k)
             .map(|(i, _)| i)
             .collect();
         assert_eq!(out.len(), keep.len(), "op {k} shown frames");

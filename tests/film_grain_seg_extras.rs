@@ -12,9 +12,9 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, GopTuning, SegExtras, TunedGop, Yuv420Frame,
+    GopTuning, SegExtras, TunedGop, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned,
 };
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, FrameHeader, RefInfo};
+use oxideav_av1::frame_header::{FrameHeader, RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 

@@ -40,7 +40,7 @@
 //! engineering; every candidate is evaluated through the real §7.15
 //! kernels.
 
-use crate::cdef::{cdef_block_dir, cdef_direction, CdefFrameContext};
+use crate::cdef::{CdefFrameContext, cdef_block_dir, cdef_direction};
 use crate::cdf::PartitionWalker;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::loop_filter::PlaneBuffer;
@@ -383,10 +383,10 @@ impl<'a> UnitEngine<'a> {
     /// step chosen so the subsample keeps at least ~16 units (4 on
     /// small pictures) — one in 16 at 12 MP.
     fn subsample_step(&self) -> usize {
-        if let Some((step, _)) = self.inp.fast {
-            if step > 0 {
-                return usize::from(step);
-            }
+        if let Some((step, _)) = self.inp.fast
+            && step > 0
+        {
+            return usize::from(step);
         }
         let n = self.sb_rows * self.sb_cols;
         if n >= 256 {

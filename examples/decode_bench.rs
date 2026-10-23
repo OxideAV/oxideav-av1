@@ -32,43 +32,49 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
-            let msg = format!(
-                "ALLOC {} MiB -> live {} MiB\n",
-                layout.size() >> 20,
-                live >> 20
-            );
-            libc_write(msg.as_bytes());
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
+                let msg = format!(
+                    "ALLOC {} MiB -> live {} MiB\n",
+                    layout.size() >> 20,
+                    live >> 20
+                );
+                libc_write(msg.as_bytes());
+            }
+            System.alloc(layout)
         }
-        System.alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let live = LIVE.fetch_sub(layout.size(), Ordering::Relaxed) - layout.size();
-        if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
-            let msg = format!(
-                "FREE {} MiB -> live {} MiB\n",
-                layout.size() >> 20,
-                live >> 20
-            );
-            libc_write(msg.as_bytes());
+        unsafe {
+            let live = LIVE.fetch_sub(layout.size(), Ordering::Relaxed) - layout.size();
+            if layout.size() >= (1 << 21) && std::env::var_os("TRACE_ALLOC").is_some() {
+                let msg = format!(
+                    "FREE {} MiB -> live {} MiB\n",
+                    layout.size() >> 20,
+                    live >> 20
+                );
+                libc_write(msg.as_bytes());
+            }
+            System.dealloc(ptr, layout)
         }
-        System.dealloc(ptr, layout)
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let old = layout.size();
-        if new_size > old {
-            let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        } else {
-            LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let old = layout.size();
+            if new_size > old {
+                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            } else {
+                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+            }
+            System.realloc(ptr, layout, new_size)
         }
-        System.realloc(ptr, layout, new_size)
     }
 }
 

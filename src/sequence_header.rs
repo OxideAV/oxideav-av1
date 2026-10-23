@@ -34,8 +34,8 @@
 //! a future round (frame header, byte-aligned tile groups) can act on
 //! the difference.
 
-use crate::bitreader::BitReader;
 use crate::Error;
+use crate::bitreader::BitReader;
 
 // ---------------------------------------------------------------------
 // §3 constants
@@ -453,18 +453,10 @@ fn parse_color_config(br: &mut BitReader<'_>, seq_profile: u8) -> Result<ColorCo
     let mut twelve_bit = false;
     let bit_depth = if seq_profile == 2 && high_bitdepth {
         twelve_bit = br.f(1)? == 1;
-        if twelve_bit {
-            12
-        } else {
-            10
-        }
+        if twelve_bit { 12 } else { 10 }
     } else {
         // §5.5.2: seq_profile <= 2 — guaranteed by parse_sequence_header.
-        if high_bitdepth {
-            10
-        } else {
-            8
-        }
+        if high_bitdepth { 10 } else { 8 }
     };
     let mono_chrome = if seq_profile == 1 {
         false

@@ -183,7 +183,7 @@ pub fn parse_obu(bytes: &[u8]) -> Result<(ObuDescriptor<'_>, usize), Error> {
         cursor += 1;
         let temporal = (ext >> 5) & 0x7; // f(3)
         let spatial = (ext >> 3) & 0x3; // f(2)
-                                        // extension_header_reserved_3bits is ignored per §6.2.3.
+        // extension_header_reserved_3bits is ignored per §6.2.3.
         (temporal, spatial)
     } else {
         // §6.2.3: when not present, temporal_id and spatial_id are

@@ -55,8 +55,8 @@ use oxideav_core::{
 use crate::codec_config::Av1CodecConfig;
 use crate::decoder::{SpecDecodeSession, SpecFrame};
 use crate::encoder::{
-    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
-    StillOptions, StillSpeed, YuvFrame, DEFAULT_STILL_BASE_Q_IDX,
+    ChromaFormat, DEFAULT_STILL_BASE_Q_IDX, StillOptions, StillSpeed, YuvFrame,
+    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx,
 };
 use oxideav_core::ExecutionContext;
 
@@ -396,7 +396,7 @@ impl Av1EncoderOptions {
                 _ => {
                     return Err(CoreError::invalid(format!(
                         "oxideav-av1: unknown option {k:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -407,7 +407,7 @@ impl Av1EncoderOptions {
                 return Err(CoreError::invalid(
                     "oxideav-av1: color_primaries / transfer_characteristics / \
                      matrix_coefficients must be given together",
-                ))
+                ));
             }
         }
         if let Some(q) = quality {
@@ -591,7 +591,9 @@ impl Av1Encoder {
                     out.extend(row.iter().map(|&b| u16::from(b)));
                 } else {
                     out.extend(
-                        row.chunks_exact(2)
+                        row.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]])),
                     );
                 }
@@ -960,7 +962,7 @@ mod tests {
     /// same pixels.
     #[test]
     fn av1c_extradata_config_obus_seed_the_sequence_header() {
-        use crate::encoder::{encode_still_yuv420, StillOptions, Yuv420Frame};
+        use crate::encoder::{StillOptions, Yuv420Frame, encode_still_yuv420};
         use crate::obu::{ObuIter, ObuType};
         let mut frame = Yuv420Frame::filled(32, 16, 60);
         for (i, s) in frame.y.iter_mut().enumerate() {

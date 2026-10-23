@@ -57,14 +57,15 @@
 //! Spec provenance: `docs/video/av1/av1-spec.txt` §5.3.3, §5.5.1,
 //! §6.7.5, §7.5.
 
+use crate::Error;
 use crate::encoder::inter_frame::{
-    encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv, GopFrameReconYuv,
-    InterFrameConfig, RefSlotCarry, SavedMotionField,
+    EncodedGop, EncodedGopYuv, GopFrameReconYuv, InterFrameConfig, RefSlotCarry, SavedMotionField,
+    encode_inter_frame_generic, narrow_gop_8bit,
 };
-use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
+use crate::encoder::ivf::{FOURCC_AV01, IvfWriter};
 use crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles;
 use crate::encoder::obu::{
-    build_temporal_unit, write_obu_with_size, ObuExtensionHeader, ObuHeader,
+    ObuExtensionHeader, ObuHeader, build_temporal_unit, write_obu_with_size,
 };
 use crate::encoder::pyramid_gop::validate_gop_input;
 use crate::encoder::rate_twin::RateModel;
@@ -73,7 +74,6 @@ use crate::encoder::yuv_frame::{Yuv420Frame, YuvFrame};
 use crate::frame_header::PRIMARY_REF_NONE;
 use crate::obu::{ObuIter, ObuType};
 use crate::sequence_header::OperatingPoint;
-use crate::Error;
 use std::rc::Rc;
 
 /// [`EncodedGopYuv`] plus the per-display-frame `temporal_id` ladder
@@ -792,10 +792,10 @@ fn encode_spatial_layered_core(
                     ..Default::default()
                 },
             )?;
-            if let Some(fs) = pre.fh.frame_size.as_ref() {
-                if fs.use_superres {
-                    layer_sr[s] = Some((fs.upscaled_width, fs.superres_denom));
-                }
+            if let Some(fs) = pre.fh.frame_size.as_ref()
+                && fs.use_superres
+            {
+                layer_sr[s] = Some((fs.upscaled_width, fs.superres_denom));
             }
         }
     }
@@ -1141,10 +1141,10 @@ fn encode_spatial_layered_core(
                     ctx_update_span: None,
                 });
                 for slot in carry_store.iter_mut() {
-                    if let Some(c) = slot {
-                        if Rc::ptr_eq(c, &last_carry) {
-                            *slot = Some(fixed.clone());
-                        }
+                    if let Some(c) = slot
+                        && Rc::ptr_eq(c, &last_carry)
+                    {
+                        *slot = Some(fixed.clone());
                     }
                 }
             }

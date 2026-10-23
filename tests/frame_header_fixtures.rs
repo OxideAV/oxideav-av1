@@ -30,8 +30,8 @@
 //! only.
 
 use oxideav_av1::{
-    parse_frame_header, parse_sequence_header, FrameRestorationType, FrameType, TxMode,
-    SUPERRES_NUM,
+    FrameRestorationType, FrameType, SUPERRES_NUM, TxMode, parse_frame_header,
+    parse_sequence_header,
 };
 
 #[derive(Debug)]
@@ -210,11 +210,7 @@ struct FilmGrainExpected {
 /// value, so the integration test maps the raw expectation through this
 /// to compare against [`oxideav_av1::CdefParams`].
 fn cdef_sec_adjust(raw: u8) -> u8 {
-    if raw == 3 {
-        4
-    } else {
-        raw
-    }
+    if raw == 3 { 4 } else { raw }
 }
 
 struct Fixture {
@@ -1435,7 +1431,7 @@ const IFTP_INTER_FRAME_PAYLOAD: &[u8] = &[
 /// `docs/video/av1/fixtures/i-frame-then-p-64x64/trace.txt`.
 #[test]
 fn parses_iftp_inter_frame_header() {
-    use oxideav_av1::{parse_frame_header_with_refs, InterpolationFilter, RefInfo};
+    use oxideav_av1::{InterpolationFilter, RefInfo, parse_frame_header_with_refs};
 
     let seq = parse_sequence_header(IFTP_SEQ_PAYLOAD).expect("i-frame-then-p seq header parses");
     // The inter frame is keyed off a session ref state, but this
@@ -1535,7 +1531,7 @@ fn parses_iftp_inter_frame_header() {
 /// zeroed hints / dimensions, mirroring the §5.9.2 post-KEY-frame reset.
 #[test]
 fn ref_info_default_is_all_invalid() {
-    use oxideav_av1::{RefInfo, NUM_REF_FRAMES};
+    use oxideav_av1::{NUM_REF_FRAMES, RefInfo};
     let ri = RefInfo::default();
     assert_eq!(ri.valid.len(), NUM_REF_FRAMES as usize);
     assert!(ri.valid.iter().all(|&v| !v));

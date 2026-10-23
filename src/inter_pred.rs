@@ -2231,12 +2231,13 @@ pub fn predict_inter(
     // `local_valid` from the §7.11.3.8 fit without re-checking
     // §7.11.3.6 doesn't sneak past the spec's two-step validity.
     let mut effective_local_valid: bool = warp.is_some_and(|w| w.local_valid);
-    if let Some(wp) = warp {
-        if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL && wp.local_valid {
-            match setup_shear(wp.local_warp_params) {
-                Some(s) if s.warp_valid => {}
-                _ => effective_local_valid = false,
-            }
+    if let Some(wp) = warp
+        && motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL
+        && wp.local_valid
+    {
+        match setup_shear(wp.local_warp_params) {
+            Some(s) if s.warp_valid => {}
+            _ => effective_local_valid = false,
         }
     }
 
@@ -6895,10 +6896,10 @@ pub fn reconstruct_inter_frame(
     // §7.11.3.9 OBMC-context slice guards (only when the OBMC arm is
     // enabled). The per-cell slices index within `cells`. A short slice
     // is a caller bug.
-    if let Some(oc) = grid.obmc.as_ref() {
-        if oc.motion_modes.len() < cells || oc.avail_u.len() < cells || oc.avail_l.len() < cells {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
+    if let Some(oc) = grid.obmc.as_ref()
+        && (oc.motion_modes.len() < cells || oc.avail_u.len() < cells || oc.avail_l.len() < cells)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
     // §5.11.5 leaf-origin detection: a leaf's `MiSize` is stamped over
@@ -7370,22 +7371,21 @@ pub(crate) fn reconstruct_inter_leaf_at(
     // no `someUseIntra` sub-block split (OBMC blocks are >= 8×8 luma
     // by the §5.11.27 `use_obmc` eligibility, so the §5.11.33 chroma
     // intra-neighbour split does not arise for them).
-    if leaf_warp.is_none() {
-        if let Some(oc) = grid.obmc.as_ref() {
-            if oc.motion_modes[origin] == crate::cdf::MOTION_MODE_OBMC {
-                obmc_dispatch_leaf(
-                    grid,
-                    oc,
-                    ref_frame_idx,
-                    planes,
-                    mi_row,
-                    mi_col,
-                    mi_size,
-                    ref_frame0,
-                )?;
-                return Ok(());
-            }
-        }
+    if leaf_warp.is_none()
+        && let Some(oc) = grid.obmc.as_ref()
+        && oc.motion_modes[origin] == crate::cdf::MOTION_MODE_OBMC
+    {
+        obmc_dispatch_leaf(
+            grid,
+            oc,
+            ref_frame_idx,
+            planes,
+            mi_row,
+            mi_col,
+            mi_size,
+            ref_frame0,
+        )?;
+        return Ok(());
     }
 
     for ctx in planes.iter_mut() {
@@ -8108,36 +8108,48 @@ mod tests {
         let refp = vec![0u16; 64];
         let mut pred = vec![0i32; 16];
         // plane > 2
-        assert!(block_inter_prediction(
-            3, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                3, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
+            )
+            .is_err()
+        );
         // subsampling_x > 1
-        assert!(block_inter_prediction(
-            0, 2, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                0, 2, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
+            )
+            .is_err()
+        );
         // ref_width == 0
-        assert!(block_inter_prediction(
-            0, 0, 0, &refp, 8, 0, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                0, 0, 0, &refp, 8, 0, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut pred
+            )
+            .is_err()
+        );
         // step_x == 0
-        assert!(block_inter_prediction(
-            0, 0, 0, &refp, 8, 8, 8, 0, 0, 0, 1024, 4, 4, 0, 0, 3, 11, &mut pred
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                0, 0, 0, &refp, 8, 8, 8, 0, 0, 0, 1024, 4, 4, 0, 0, 3, 11, &mut pred
+            )
+            .is_err()
+        );
         // interp_filter_x out of range
-        assert!(block_inter_prediction(
-            0, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 6, 0, 3, 11, &mut pred
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                0, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 6, 0, 3, 11, &mut pred
+            )
+            .is_err()
+        );
         // pred too small
         let mut tiny = vec![0i32; 8];
-        assert!(block_inter_prediction(
-            0, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut tiny
-        )
-        .is_err());
+        assert!(
+            block_inter_prediction(
+                0, 0, 0, &refp, 8, 8, 8, 0, 0, 1024, 1024, 4, 4, 0, 0, 3, 11, &mut tiny
+            )
+            .is_err()
+        );
     }
 
     /// `clip1_single_ref` bounds.
@@ -8611,23 +8623,28 @@ mod tests {
         let small_mask = vec![0u8; 16];
         let preds_c = vec![0i32; 4];
         let mut out_c = vec![0u16; 4];
-        assert!(mask_blend(
-            8,
-            0,
-            1,
-            1,
-            &preds_c,
-            &preds_c,
-            2,
-            2,
-            &small_mask,
-            0,
-            &mut out_c
-        )
-        .is_ok()); // 16 == 4*4 = 64? wait, 2*w=4, 2*h=4, stride*4-1+4 = 4*3+4 = 16 ⇒ exactly 16
+        assert!(
+            mask_blend(
+                8,
+                0,
+                1,
+                1,
+                &preds_c,
+                &preds_c,
+                2,
+                2,
+                &small_mask,
+                0,
+                &mut out_c
+            )
+            .is_ok()
+        ); // 16 == 4*4 = 64? wait, 2*w=4, 2*h=4, stride*4-1+4 = 4*3+4 = 16 ⇒ exactly 16
         let too_small = vec![0u8; 15];
         assert!(
-            mask_blend(8, 0, 1, 1, &preds_c, &preds_c, 2, 2, &too_small, 0, &mut out_c).is_err()
+            mask_blend(
+                8, 0, 1, 1, &preds_c, &preds_c, 2, 2, &too_small, 0, &mut out_c
+            )
+            .is_err()
         );
     }
 
@@ -8817,54 +8834,62 @@ mod tests {
         // is_inter_intra without InterIntraParams.
         assert!(call(false, true, &refs1, None, None).is_err());
         // is_inter_intra with out-of-range interintra_mode (> 3).
-        assert!(call(
-            false,
-            true,
-            &refs1,
-            None,
-            Some(InterIntraParams {
-                interintra_mode: 4,
-                wedge: None,
-            })
-        )
-        .is_err());
+        assert!(
+            call(
+                false,
+                true,
+                &refs1,
+                None,
+                Some(InterIntraParams {
+                    interintra_mode: 4,
+                    wedge: None,
+                })
+            )
+            .is_err()
+        );
         // is_compound && is_inter_intra is contradictory (RefFrame[1]
         // cannot be both > INTRA_FRAME and == INTRA_FRAME).
-        assert!(call(
-            true,
-            true,
-            &refs2,
-            Some(CompoundParams::Average),
-            Some(InterIntraParams {
-                interintra_mode: II_DC_PRED,
-                wedge: None,
-            })
-        )
-        .is_err());
+        assert!(
+            call(
+                true,
+                true,
+                &refs2,
+                Some(CompoundParams::Average),
+                Some(InterIntraParams {
+                    interintra_mode: II_DC_PRED,
+                    wedge: None,
+                })
+            )
+            .is_err()
+        );
         // Spurious inter_intra on a plain single-ref call.
-        assert!(call(
-            false,
-            false,
-            &refs1,
-            None,
-            Some(InterIntraParams {
-                interintra_mode: II_DC_PRED,
-                wedge: None,
-            })
-        )
-        .is_err());
+        assert!(
+            call(
+                false,
+                false,
+                &refs1,
+                None,
+                Some(InterIntraParams {
+                    interintra_mode: II_DC_PRED,
+                    wedge: None,
+                })
+            )
+            .is_err()
+        );
         // Valid interintra call succeeds.
-        assert!(call(
-            false,
-            true,
-            &refs1,
-            None,
-            Some(InterIntraParams {
-                interintra_mode: II_DC_PRED,
-                wedge: None,
-            })
-        )
-        .is_ok());
+        assert!(
+            call(
+                false,
+                true,
+                &refs1,
+                None,
+                Some(InterIntraParams {
+                    interintra_mode: II_DC_PRED,
+                    wedge: None,
+                })
+            )
+            .is_ok()
+        );
     }
 
     // ---------- r298 §7.11.3.1 wedge inter-intra driver arm ----------
@@ -9462,97 +9487,105 @@ mod tests {
         let mut pred = vec![0i32; 16 * 16];
         let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
         // plane > 2.
-        assert!(block_warp(
-            1,
-            3,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            16,
-            16,
-            &ref_plane,
-            64,
-            64,
-            64,
-            [0, 0, one, 0, 0, one],
-            3,
-            11,
-            16,
-            &mut pred,
-        )
-        .is_err());
+        assert!(
+            block_warp(
+                1,
+                3,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                16,
+                16,
+                &ref_plane,
+                64,
+                64,
+                64,
+                [0, 0, one, 0, 0, one],
+                3,
+                11,
+                16,
+                &mut pred,
+            )
+            .is_err()
+        );
         // w = 0.
-        assert!(block_warp(
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            16,
-            &ref_plane,
-            64,
-            64,
-            64,
-            [0, 0, one, 0, 0, one],
-            3,
-            11,
-            16,
-            &mut pred,
-        )
-        .is_err());
+        assert!(
+            block_warp(
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                16,
+                &ref_plane,
+                64,
+                64,
+                64,
+                [0, 0, one, 0, 0, one],
+                3,
+                11,
+                16,
+                &mut pred,
+            )
+            .is_err()
+        );
         // h = 0.
-        assert!(block_warp(
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            16,
-            0,
-            &ref_plane,
-            64,
-            64,
-            64,
-            [0, 0, one, 0, 0, one],
-            3,
-            11,
-            16,
-            &mut pred,
-        )
-        .is_err());
+        assert!(
+            block_warp(
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                16,
+                0,
+                &ref_plane,
+                64,
+                64,
+                64,
+                [0, 0, one, 0, 0, one],
+                3,
+                11,
+                16,
+                &mut pred,
+            )
+            .is_err()
+        );
         // i8b * 8 >= h ⇒ caller asked for an out-of-range sub-section.
-        assert!(block_warp(
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            2,
-            0,
-            16,
-            16,
-            &ref_plane,
-            64,
-            64,
-            64,
-            [0, 0, one, 0, 0, one],
-            3,
-            11,
-            16,
-            &mut pred,
-        )
-        .is_err());
+        assert!(
+            block_warp(
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                16,
+                16,
+                &ref_plane,
+                64,
+                64,
+                64,
+                [0, 0, one, 0, 0, one],
+                3,
+                11,
+                16,
+                &mut pred,
+            )
+            .is_err()
+        );
     }
 
     /// §7.11.3.5 — identity warp on a constant reference plane gives
@@ -9931,107 +9964,121 @@ mod tests {
         let mut curr = vec![0u16; 64];
         let obmc = vec![0u16; 64];
         // pred_w == 0
-        assert!(overlap_blending(
-            &mut curr,
-            8,
-            0,
-            0,
-            0,
-            4,
-            OverlapPass::Above,
-            &obmc,
-            4,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr,
+                8,
+                0,
+                0,
+                0,
+                4,
+                OverlapPass::Above,
+                &obmc,
+                4,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // pred_h == 0
-        assert!(overlap_blending(
-            &mut curr,
-            8,
-            0,
-            0,
-            4,
-            0,
-            OverlapPass::Above,
-            &obmc,
-            4,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr,
+                8,
+                0,
+                0,
+                4,
+                0,
+                OverlapPass::Above,
+                &obmc,
+                4,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // obmc_stride < pred_w
-        assert!(overlap_blending(
-            &mut curr,
-            8,
-            0,
-            0,
-            4,
-            4,
-            OverlapPass::Above,
-            &obmc,
-            3,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr,
+                8,
+                0,
+                0,
+                4,
+                4,
+                OverlapPass::Above,
+                &obmc,
+                3,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // curr_stride < pred_x + pred_w
-        assert!(overlap_blending(
-            &mut curr,
-            4,
-            2,
-            0,
-            4,
-            4,
-            OverlapPass::Above,
-            &obmc,
-            4,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr,
+                4,
+                2,
+                0,
+                4,
+                4,
+                OverlapPass::Above,
+                &obmc,
+                4,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // obmc too short
         let tiny = vec![0u16; 4];
-        assert!(overlap_blending(
-            &mut curr,
-            8,
-            0,
-            0,
-            4,
-            4,
-            OverlapPass::Above,
-            &tiny,
-            4,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr,
+                8,
+                0,
+                0,
+                4,
+                4,
+                OverlapPass::Above,
+                &tiny,
+                4,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // current_plane too short
         let mut small = vec![0u16; 8];
-        assert!(overlap_blending(
-            &mut small,
-            8,
-            0,
-            0,
-            4,
-            4,
-            OverlapPass::Above,
-            &obmc,
-            4,
-            &OBMC_MASK_4
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut small,
+                8,
+                0,
+                0,
+                4,
+                4,
+                OverlapPass::Above,
+                &obmc,
+                4,
+                &OBMC_MASK_4
+            )
+            .is_err()
+        );
         // mask too short for the pass axis
         let mut curr2 = vec![0u16; 64];
         let one = [64u8; 1];
-        assert!(overlap_blending(
-            &mut curr2,
-            8,
-            0,
-            0,
-            4,
-            4,
-            OverlapPass::Above,
-            &obmc,
-            4,
-            &one
-        )
-        .is_err());
+        assert!(
+            overlap_blending(
+                &mut curr2,
+                8,
+                0,
+                0,
+                4,
+                4,
+                OverlapPass::Above,
+                &obmc,
+                4,
+                &one
+            )
+            .is_err()
+        );
     }
 
     /// §7.11.3.9 `predict_overlap` step-8 wrapper — calling the helper
@@ -11266,7 +11313,10 @@ mod tests {
         // skip-this-hole sentinel).
         let bad_sizes = vec![crate::cdf::BLOCK_SIZES + 5; cells];
         assert_eq!(
-            run(&bad_sizes, &good_is, &good_rf, &good_mv, &good_if, &mut curr).unwrap_err(),
+            run(
+                &bad_sizes, &good_is, &good_rf, &good_mv, &good_if, &mut curr
+            )
+            .unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
     }
@@ -11380,7 +11430,7 @@ mod tests {
             is_scaled: &[false; 8],
         };
         macro_rules! build_grid {
-            ($warp:expr) => {
+            ($warp:expr_2021) => {
                 InterModeInfoGrid {
                     mi_sizes: &mi_sizes,
                     is_inters: &is_inters,
@@ -11740,7 +11790,7 @@ mod tests {
         }
 
         macro_rules! make_grid {
-            ($obmc:expr) => {
+            ($obmc:expr_2021) => {
                 InterModeInfoGrid {
                     mi_sizes: &mi_sizes,
                     is_inters: &is_inters,
@@ -12057,7 +12107,7 @@ mod tests {
         let mut curr_simple = vec![0u16; curr_w * curr_w];
 
         macro_rules! grid {
-            ($obmc:expr) => {
+            ($obmc:expr_2021) => {
                 InterModeInfoGrid {
                     mi_sizes: &mi_sizes,
                     is_inters: &is_inters,
@@ -14856,27 +14906,29 @@ mod tests {
             ref_frame: crate::uncompressed_header_tail::INTRA_FRAME as u8,
             mv: [0, 0],
         };
-        assert!(reconstruct_inter_block_warp(
-            mi_intra,
-            &warp,
-            &ref_frame_idx,
-            &store,
-            0,
-            0,
-            0,
-            8,
-            8,
-            8,
-            0,
-            0,
-            32,
-            32,
-            EIGHTTAP,
-            EIGHTTAP,
-            &mut curr,
-            32,
-        )
-        .is_err());
+        assert!(
+            reconstruct_inter_block_warp(
+                mi_intra,
+                &warp,
+                &ref_frame_idx,
+                &store,
+                0,
+                0,
+                0,
+                8,
+                8,
+                8,
+                0,
+                0,
+                32,
+                32,
+                EIGHTTAP,
+                EIGHTTAP,
+                &mut curr,
+                32,
+            )
+            .is_err()
+        );
 
         let mi = InterModeInfo {
             ref_frame: crate::uncompressed_header_tail::LAST_FRAME as u8,
@@ -14884,58 +14936,64 @@ mod tests {
         };
         // Out-of-range resolved refIdx (slot 0 -> 9, store has 1 entry).
         let bad_idx = [9u8; 7];
-        assert!(reconstruct_inter_block_warp(
-            mi, &warp, &bad_idx, &store, 0, 0, 0, 8, 8, 8, 0, 0, 32, 32, EIGHTTAP, EIGHTTAP,
-            &mut curr, 32,
-        )
-        .is_err());
+        assert!(
+            reconstruct_inter_block_warp(
+                mi, &warp, &bad_idx, &store, 0, 0, 0, 8, 8, 8, 0, 0, 32, 32, EIGHTTAP, EIGHTTAP,
+                &mut curr, 32,
+            )
+            .is_err()
+        );
 
         // curr_plane too small for the (x, y, w, h) write region.
         let mut tiny = vec![0u16; 8];
-        assert!(reconstruct_inter_block_warp(
-            mi,
-            &warp,
-            &ref_frame_idx,
-            &store,
-            0,
-            0,
-            0,
-            8,
-            8,
-            8,
-            0,
-            0,
-            32,
-            32,
-            EIGHTTAP,
-            EIGHTTAP,
-            &mut tiny,
-            32,
-        )
-        .is_err());
+        assert!(
+            reconstruct_inter_block_warp(
+                mi,
+                &warp,
+                &ref_frame_idx,
+                &store,
+                0,
+                0,
+                0,
+                8,
+                8,
+                8,
+                0,
+                0,
+                32,
+                32,
+                EIGHTTAP,
+                EIGHTTAP,
+                &mut tiny,
+                32,
+            )
+            .is_err()
+        );
 
         // Negative origin.
-        assert!(reconstruct_inter_block_warp(
-            mi,
-            &warp,
-            &ref_frame_idx,
-            &store,
-            0,
-            -4,
-            0,
-            8,
-            8,
-            8,
-            0,
-            0,
-            32,
-            32,
-            EIGHTTAP,
-            EIGHTTAP,
-            &mut curr,
-            32,
-        )
-        .is_err());
+        assert!(
+            reconstruct_inter_block_warp(
+                mi,
+                &warp,
+                &ref_frame_idx,
+                &store,
+                0,
+                -4,
+                0,
+                8,
+                8,
+                8,
+                0,
+                0,
+                32,
+                32,
+                EIGHTTAP,
+                EIGHTTAP,
+                &mut curr,
+                32,
+            )
+            .is_err()
+        );
     }
 
     /// §7.11.3.1 step-7 ◦ 1 — `w < 8 || h < 8` forces `useWarp = 0`
@@ -16774,7 +16832,7 @@ mod tests {
 
         let curr_w = (mi_cols * 4) as usize; // 8
         let curr_h = (mi_rows * 4) as usize; // 8
-                                             // Pre-seed the §7.11.2 intra prediction for the leaf footprint.
+        // Pre-seed the §7.11.2 intra prediction for the leaf footprint.
         let mut curr = vec![0u16; curr_w * curr_h];
         for i in 0..8usize {
             for j in 0..8usize {

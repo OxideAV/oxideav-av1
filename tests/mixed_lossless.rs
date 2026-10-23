@@ -18,8 +18,8 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_lossless_regions, encode_gop_yuv420_with_q_seg_lossless_tuned,
-    encode_gop_yuv420_with_q_seg_tuned, GopTuning, LosslessRegion, Yuv420Frame,
+    GopTuning, LosslessRegion, Yuv420Frame, encode_gop_yuv420_with_q_lossless_regions,
+    encode_gop_yuv420_with_q_seg_lossless_tuned, encode_gop_yuv420_with_q_seg_tuned,
 };
 
 /// Deterministic frame: a flat left half (luma 64, so the r413
@@ -48,11 +48,7 @@ fn half_flat_half_texture(
                 // these leaves through the lossless segment.
                 let (si, sj) = (i + shift_y, j + shift_x);
                 let hash = (si.wrapping_mul(2654435761) ^ sj.wrapping_mul(40503)).wrapping_add(s);
-                if (hash >> 4) & 1 == 1 {
-                    235
-                } else {
-                    16
-                }
+                if (hash >> 4) & 1 == 1 { 235 } else { 16 }
             };
         }
     }
@@ -188,11 +184,7 @@ fn camera_with_text_panel(
                 // on it at any quantiser.
                 let (gi, gj) = (i - py, j - px);
                 let hash = gi.wrapping_mul(2654435761) ^ gj.wrapping_mul(40503);
-                if (hash >> 3) & 3 == 0 {
-                    16
-                } else {
-                    235
-                }
+                if (hash >> 3) & 3 == 0 { 16 } else { 235 }
             } else {
                 // Smooth camera background with motion.
                 let (si, sj) = (i + shift, j + 2 * shift);

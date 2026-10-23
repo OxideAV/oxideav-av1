@@ -77,13 +77,13 @@
 //!   * §8.3.2   `tx_depth` / `txfm_split` ctx + CDF selection (p.363-364, p.376)
 //!   * §3       `MAX_VARTX_DEPTH = 2`      (p.7)
 
+use crate::Error;
 use crate::cdf::{
-    TileCdfContext, BLOCK_4X4, BLOCK_SIZES, MAX_TX_DEPTH, MAX_TX_DEPTH_TABLE, MAX_TX_SIZE_RECT,
-    MAX_VARTX_DEPTH, MI_SIZE, SPLIT_TX_SIZE, TXFM_PARTITION_CONTEXTS, TX_4X4, TX_HEIGHT,
-    TX_SIZES_ALL, TX_SIZE_CONTEXTS, TX_WIDTH,
+    BLOCK_4X4, BLOCK_SIZES, MAX_TX_DEPTH, MAX_TX_DEPTH_TABLE, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH,
+    MI_SIZE, SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT, TX_SIZE_CONTEXTS, TX_SIZES_ALL, TX_WIDTH,
+    TXFM_PARTITION_CONTEXTS, TileCdfContext,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::Error;
 
 /// `read_block_tx_size` / `read_tx_size` **writer** — emits the
 /// §5.11.15 `tx_depth` symbol for the §5.11.16 `else` arm.
@@ -416,7 +416,7 @@ pub enum VarTxNodeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdf::{BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, TX_16X16, TX_32X32, TX_64X64, TX_8X8};
+    use crate::cdf::{BLOCK_8X8, BLOCK_32X32, BLOCK_64X64, TX_8X8, TX_16X16, TX_32X32, TX_64X64};
     use crate::symbol_decoder::SymbolDecoder;
 
     /// Bridge helper: build a fresh `(SymbolWriter, TileCdfContext)`,

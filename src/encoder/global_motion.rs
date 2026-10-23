@@ -41,7 +41,7 @@
 
 use crate::encoder::frame_obu::quantize_global_param;
 use crate::inter_pred::setup_shear;
-use crate::uncompressed_header_tail::{WarpModelType, WARPEDMODEL_PREC_BITS};
+use crate::uncompressed_header_tail::{WARPEDMODEL_PREC_BITS, WarpModelType};
 
 /// Pre-pass block edge (luma samples). 16×16 keeps the sample count
 /// meaningful on the 64×64 conformance frames (16 samples) while

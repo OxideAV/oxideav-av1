@@ -17,7 +17,7 @@
 //! The fixture bytes are embedded as hex so the test runs in per-crate
 //! CI without the docs checkout.
 
-use oxideav_av1::decoder::{decode_av1_spec, Frame, SpecFrame};
+use oxideav_av1::decoder::{Frame, SpecFrame, decode_av1_spec};
 
 /// r409 public-API parity: every corpus stream the spec driver decodes
 /// must decode IDENTICALLY through the public [`oxideav_av1::decode_av1`]
@@ -47,7 +47,10 @@ fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    assert!(
+        s.len().is_multiple_of(2),
+        "hex literal must have even length"
+    );
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
         .collect()
@@ -155,12 +158,15 @@ fn spec_driver_rejects_truncated_input() {
 /// triples, each 6 hex chars — back to raw bytes. Used for the larger
 /// expected-plane payloads, which are long-run flat regions.
 fn unrle(s: &str) -> Vec<u8> {
-    assert!(s.len() % 6 == 0, "RLE literal must be (u8, u16) triples");
+    assert!(
+        s.len().is_multiple_of(6),
+        "RLE literal must be (u8, u16) triples"
+    );
     let mut out = Vec::new();
     for i in 0..s.len() / 6 {
         let v = u8::from_str_radix(&s[6 * i..6 * i + 2], 16).unwrap();
         let n = usize::from_str_radix(&s[6 * i + 2..6 * i + 6], 16).unwrap();
-        out.extend(std::iter::repeat(v).take(n));
+        out.extend(std::iter::repeat_n(v, n));
     }
     out
 }
@@ -748,9 +754,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {

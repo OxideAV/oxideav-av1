@@ -14,12 +14,12 @@
 //! its reconstruction dumped for external black-box decoder
 //! validation.
 
+use oxideav_av1::PRIMARY_REF_NONE;
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
     AdaptiveTuning, EncodedGop, PyramidTuning, RateModel, Yuv420Frame,
+    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
 };
-use oxideav_av1::PRIMARY_REF_NONE;
 
 /// Deterministic textured frame with translation `(sy, sx)`.
 fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> Yuv420Frame {
@@ -248,10 +248,11 @@ fn deep_and_baseline_round_trip() {
         );
         // The baseline never elects a primary reference; the deep
         // tuning records one election outcome per coded inter frame.
-        assert!(base
-            .primary_elections
-            .iter()
-            .all(|&(_, p)| p == PRIMARY_REF_NONE));
+        assert!(
+            base.primary_elections
+                .iter()
+                .all(|&(_, p)| p == PRIMARY_REF_NONE)
+        );
         assert_eq!(deep.primary_elections.len(), n - 1);
     }
 }

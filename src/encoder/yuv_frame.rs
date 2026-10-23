@@ -21,17 +21,17 @@
 //! widens those inputs into this representation so the whole encoder
 //! pipeline runs on one sample type.
 
-use crate::frame_header::{FrameHeader, FrameSize, FrameType, ALL_FRAMES_PUB, PRIMARY_REF_NONE};
+use crate::Error;
+use crate::frame_header::{ALL_FRAMES_PUB, FrameHeader, FrameSize, FrameType, PRIMARY_REF_NONE};
 use crate::sequence_header::{
-    ColorConfig, OperatingPoint, SequenceHeader, CP_UNSPECIFIED, CSP_UNKNOWN, MC_UNSPECIFIED,
-    SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, TC_UNSPECIFIED,
+    CP_UNSPECIFIED, CSP_UNKNOWN, ColorConfig, MC_UNSPECIFIED, OperatingPoint, SELECT_INTEGER_MV,
+    SELECT_SCREEN_CONTENT_TOOLS, SequenceHeader, TC_UNSPECIFIED,
 };
 use crate::tile_info::TileInfo;
 use crate::uncompressed_header_tail::{
     CdefParams, DeltaLfParams, DeltaQParams, FilmGrainParams, FrameRestorationType,
     GlobalMotionParams, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, TxMode,
 };
-use crate::Error;
 
 /// §6.4.2 chroma layout selector: the `(subsampling_x, subsampling_y,
 /// mono_chrome)` triple every geometry derivation keys off.
@@ -251,8 +251,8 @@ impl YuvFrame {
             || self.height < 8
             || self.width > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
             || self.height > crate::encoder::key_frame::KEY_FRAME_MAX_DIM
-            || self.width % 8 != 0
-            || self.height % 8 != 0
+            || !self.width.is_multiple_of(8)
+            || !self.height.is_multiple_of(8)
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -412,7 +412,7 @@ impl Yuv420Frame {
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        if self.width % MIN_DIM != 0 || self.height % MIN_DIM != 0 {
+        if !self.width.is_multiple_of(MIN_DIM) || !self.height.is_multiple_of(MIN_DIM) {
             return Err(Error::PartitionWalkOutOfRange);
         }
         let expected_y = (self.width * self.height) as usize;

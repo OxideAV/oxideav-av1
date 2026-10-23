@@ -32,7 +32,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_lossless_tuned, GopTuning, LosslessRegion, TunedGop, Yuv420Frame,
+    GopTuning, LosslessRegion, TunedGop, Yuv420Frame, encode_gop_yuv420_with_q_seg_lossless_tuned,
 };
 use oxideav_av1::frame_header::{FrameHeader, FrameType, RefInfo};
 use oxideav_av1::obu::{ObuIter, ObuType};

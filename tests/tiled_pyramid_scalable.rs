@@ -23,11 +23,11 @@
 //! Spec: docs/video/av1/av1-spec.txt §5.3.1, §5.3.3, §5.9.15,
 //! §5.11.1, §6.7.5, §6.10.1, §7.5.
 
-use oxideav_av1::decoder::{decode_av1_spec, decode_av1_spec_at_operating_point, SpecFrame};
+use oxideav_av1::decoder::{SpecFrame, decode_av1_spec, decode_av1_spec_at_operating_point};
 use oxideav_av1::encoder::{
-    encode_pyramid_gop_yuv420_with_q, encode_pyramid_gop_yuv420_with_q_tuned,
-    encode_temporal_layered_gop_yuv420_with_q, encode_temporal_layered_gop_yuv420_with_q_tiles,
-    temporal_layer_of, PyramidTuning, Yuv420Frame,
+    PyramidTuning, Yuv420Frame, encode_pyramid_gop_yuv420_with_q,
+    encode_pyramid_gop_yuv420_with_q_tuned, encode_temporal_layered_gop_yuv420_with_q,
+    encode_temporal_layered_gop_yuv420_with_q_tiles, temporal_layer_of,
 };
 use oxideav_av1::obu::{ObuIter, ObuType};
 

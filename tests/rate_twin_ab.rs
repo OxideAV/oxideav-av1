@@ -14,8 +14,8 @@
 //! external black-box decoder validation.
 
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_rate_model, encode_key_frame_yuv420_with_q_rate_model,
-    encode_pyramid_gop_yuv420_with_q_rate_model, RateModel, Yuv420Frame,
+    RateModel, Yuv420Frame, encode_gop_yuv420_with_q_seg_rate_model,
+    encode_key_frame_yuv420_with_q_rate_model, encode_pyramid_gop_yuv420_with_q_rate_model,
 };
 
 // ---------------------------------------------------------------------

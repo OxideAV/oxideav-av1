@@ -80,11 +80,7 @@ const EC_MIN_PROB: u32 = 4;
 
 /// `FloorLog2(x)` per §4.7.
 fn floor_log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// r421 — `round(256 · (log2(x) − 15))` for `x` in the §8.2.6

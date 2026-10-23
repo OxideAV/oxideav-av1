@@ -11,8 +11,8 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_spatial_layered_gop_yuv420_with_q, encode_spatial_temporal_layered_gop_yuv420_with_q,
-    temporal_layer_of, SpatialLayeredGop, Yuv420Frame,
+    SpatialLayeredGop, Yuv420Frame, encode_spatial_layered_gop_yuv420_with_q,
+    encode_spatial_temporal_layered_gop_yuv420_with_q, temporal_layer_of,
 };
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;

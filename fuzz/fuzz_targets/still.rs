@@ -20,7 +20,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_av1::decoder::SpecDecodeSession;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
-use oxideav_av1::encoder::{encode_still_yuv, StillOptions, StillSpeed};
+use oxideav_av1::encoder::{StillOptions, StillSpeed, encode_still_yuv};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 6 {

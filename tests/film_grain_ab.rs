@@ -25,7 +25,7 @@
 //! Spec: docs/video/av1/av1-spec.txt §5.9.30, §7.18.3, §7.20.
 
 use oxideav_av1::decoder::Frame;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_extras_tuned, GopTuning, Yuv420Frame};
+use oxideav_av1::encoder::{GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned};
 use oxideav_av1::frame_header::FrameHeader;
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;

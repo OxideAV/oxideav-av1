@@ -24,9 +24,9 @@
 //! `docs/video/av1/fixtures/tiny-i-only-16x16-prof0/input.ivf`).
 
 use oxideav_av1::encoder::ivf::{
-    IvfWriter, FOURCC_AV01, IVF_FILE_HEADER_LEN, IVF_FRAME_HEADER_LEN,
+    FOURCC_AV01, IVF_FILE_HEADER_LEN, IVF_FRAME_HEADER_LEN, IvfWriter,
 };
-use oxideav_av1::encoder::temporal_unit::{encode_temporal_unit, TemporalUnitPlan};
+use oxideav_av1::encoder::temporal_unit::{TemporalUnitPlan, encode_temporal_unit};
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;

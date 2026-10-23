@@ -40,12 +40,12 @@
 //! `[mv_row, mv_col]` in 1/8-luma-sample units. An integer-pel MV is a
 //! multiple of 8.
 
-use crate::cdf::{QuantizerParams, DCT_DCT, TX_4X4};
+use crate::Error;
+use crate::cdf::{DCT_DCT, QuantizerParams, TX_4X4};
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform_2d::forward_transform_2d;
 use crate::encoder::forward_wht::forward_wht_4x4;
-use crate::inter_pred::{reconstruct_inter_block, InterModeInfo, RefFrameStoreEntry, EIGHTTAP};
-use crate::Error;
+use crate::inter_pred::{EIGHTTAP, InterModeInfo, RefFrameStoreEntry, reconstruct_inter_block};
 
 /// One reference-plane view the encoder predicts against. Mirrors the
 /// per-plane resolved [`RefFrameStoreEntry`] the decoder builds from its
@@ -395,7 +395,7 @@ pub fn encode_inter_frame_y_opt(
     search: i32,
     subpel: bool,
 ) -> Result<EncodedInterFrameY, Error> {
-    if width % 4 != 0 || height % 4 != 0 {
+    if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err(Error::PartitionWalkOutOfRange);
     }
     let w = width as usize;
@@ -530,7 +530,7 @@ pub fn encode_inter_frame_yuv(
     search: i32,
     subpel: bool,
 ) -> Result<EncodedInterFrameYuv, Error> {
-    if width % 8 != 0 || height % 8 != 0 {
+    if !width.is_multiple_of(8) || !height.is_multiple_of(8) {
         return Err(Error::PartitionWalkOutOfRange);
     }
     // Luma pass — reuse the Y encoder for the motion field + recon.
@@ -803,7 +803,7 @@ mod tests {
     }
 
     use crate::inter_pred::{
-        reconstruct_inter_frame, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
+        InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry, reconstruct_inter_frame,
     };
 
     // Build the decoder's frame-walk prediction from an encoder motion

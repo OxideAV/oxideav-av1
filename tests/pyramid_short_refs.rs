@@ -34,8 +34,8 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
-    AdaptiveTuning, PyramidTuning, Yuv420Frame,
+    AdaptiveTuning, PyramidTuning, Yuv420Frame, encode_adaptive_gop_yuv420_with_q_tuned,
+    encode_pyramid_gop_yuv420_with_q_tuned,
 };
 use oxideav_av1::frame_header::{FrameHeader, FrameType, RefInfo};
 use oxideav_av1::obu::{ObuIter, ObuType};

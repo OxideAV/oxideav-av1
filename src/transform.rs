@@ -887,7 +887,7 @@ fn apply_col_kernel(t: &mut [i64], tx_type: usize, log2_h: u32, col_clamp_range:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdf::{TX_16X16, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X8};
+    use crate::cdf::{TX_4X4, TX_4X8, TX_8X8, TX_16X16, TX_32X32, TX_64X64};
 
     #[test]
     fn cos128_spec_anchor_points() {
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(cos128(64), 0); // cos(pi/2) * 4096.
         assert_eq!(cos128(128), -4096); // cos(pi) * 4096.
         assert_eq!(cos128(192), 0); // cos(3pi/2) * 4096.
-                                    // angle2 = 32 -> Cos128_Lookup[32] = 2896.
+        // angle2 = 32 -> Cos128_Lookup[32] = 2896.
         assert_eq!(cos128(32), 2896);
         // angle = 32 + 64 = 96, falls in (64..=128): -Cos128_Lookup[32] = -2896.
         assert_eq!(cos128(96), -2896);
@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(round2(4096, 12), 1);
         assert_eq!(round2(2048, 12), 1); // (2048 + 2048) >> 12 = 1.
         assert_eq!(round2(2047, 12), 0); // (2047 + 2048) >> 12 = 0.
-                                         // Negative: arithmetic shift; (-2048 + 2048) >> 12 = 0 >> 12 = 0.
+        // Negative: arithmetic shift; (-2048 + 2048) >> 12 = 0 >> 12 = 0.
         assert_eq!(round2(-2048, 12), 0);
         // (-4096 + 2048) = -2048; -2048 >> 12 (arith) = -1.
         assert_eq!(round2(-4096, 12), -1);

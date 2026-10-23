@@ -17,16 +17,16 @@
 //! (operating_point_idc semantics, choose_operating_point), §7.5
 //! (layered-stream ordering constraints).
 
+use oxideav_av1::Error;
 use oxideav_av1::decoder::{
-    decode_av1_spec, decode_av1_spec_at_operating_point, Frame, SpecDecodeSession,
+    Frame, SpecDecodeSession, decode_av1_spec, decode_av1_spec_at_operating_point,
 };
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q, write_obu_with_size, write_sequence_header_obu, IvfWriter,
-    ObuExtensionHeader, ObuHeader, Yuv420Frame,
+    IvfWriter, ObuExtensionHeader, ObuHeader, Yuv420Frame, encode_gop_yuv420_with_q,
+    write_obu_with_size, write_sequence_header_obu,
 };
 use oxideav_av1::obu::{ObuIter, ObuType};
-use oxideav_av1::sequence_header::{parse_sequence_header, OperatingPoint};
-use oxideav_av1::Error;
+use oxideav_av1::sequence_header::{OperatingPoint, parse_sequence_header};
 
 /// A little moving-gradient source so successive frames differ.
 fn source_frames(n: usize, w: u32, h: u32) -> Vec<Yuv420Frame> {

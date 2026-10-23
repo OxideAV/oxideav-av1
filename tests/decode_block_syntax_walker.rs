@@ -61,20 +61,20 @@
 //!   stub through the recursion.
 
 use oxideav_av1::encoder::block_mode_info::{
-    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip, IntrabcArmInputs,
+    IntrabcArmInputs, write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip,
 };
 use oxideav_av1::encoder::symbol_writer::SymbolWriter;
 use oxideav_av1::uncompressed_header_tail::{SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME};
 use oxideav_av1::{
-    get_palette_color_context, interintra_ctx, palette_color_ctx, BILINEAR, INTERINTRA_MODES,
-    PALETTE_COLORS, V_PRED,
+    BILINEAR, INTERINTRA_MODES, PALETTE_COLORS, V_PRED, get_palette_color_context, interintra_ctx,
+    palette_color_ctx,
 };
 use oxideav_av1::{
-    DecodedBlock, DecodedInterFrameModeInfo, DecodedPaletteMap, Error, FrameInterOrderHints,
-    InterFrameContext, MotionFieldMvs, PartitionWalker, QuantizerParams, SymbolDecoder,
-    TileCdfContext, TileDecodeParams, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8,
-    GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
-    TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
+    BLOCK_4X4, BLOCK_8X8, BLOCK_8X16, BLOCK_16X16, DecodedBlock, DecodedInterFrameModeInfo,
+    DecodedPaletteMap, Error, FrameInterOrderHints, GM_TYPE_IDENTITY, InterFrameContext,
+    MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, MotionFieldMvs, PartitionWalker, QuantizerParams,
+    SKIP_CONTEXTS, SymbolDecoder, TX_4X4, TX_8X8, TX_16X16, TX_SIZE_CONTEXTS, TileCdfContext,
+    TileDecodeParams, TileGeometry, WARPEDMODEL_PREC_BITS,
 };
 
 /// §5.9.14 `FeatureEnabled` table with segment 0's `SEG_LVL_REF_FRAME`
@@ -2812,8 +2812,8 @@ fn decoded_inter_frame_mode_info_struct_public_api_smoke() {
 // ----------------------------------------------------------------
 
 use oxideav_av1::{
-    get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
-    BLOCK_16X8, BLOCK_4X8,
+    BLOCK_4X8, BLOCK_16X8, ComputePredictionReadout, PlanePredictionTask, get_plane_residual_size,
+    predict_intra_dc_pred,
 };
 
 /// §5.11.38 `get_plane_residual_size` table sanity — plane 0 is a
@@ -3575,7 +3575,7 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
 /// frame's top-left 8×8 window.
 #[test]
 fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
-    use oxideav_av1::{PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+    use oxideav_av1::{LAST_FRAME, PlaneRefSpec, RefFrameStoreEntry};
 
     // 2×2 mi walker → an 8×8 luma frame; one BLOCK_8X8 inter leaf covers it.
     let mut walker = walker_n(2);
@@ -3700,7 +3700,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
 /// zero-MV integer-position EIGHTTAP copy of the reference window).
 #[test]
 fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
-    use oxideav_av1::{InterWalkPixels, PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+    use oxideav_av1::{InterWalkPixels, LAST_FRAME, PlaneRefSpec, RefFrameStoreEntry};
 
     let mut walker = walker_n(2);
     let mut cdfs = TileCdfContext::new_from_defaults();

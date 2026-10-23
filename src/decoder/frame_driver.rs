@@ -36,25 +36,25 @@
 //! Spec provenance: `docs/video/av1/av1-spec.txt` §5.9, §5.10, §5.11,
 //! §7.4, §7.12.2, §7.14, §7.15, §7.16, §7.17, §7.18.
 
+use crate::Error;
 use crate::cdf::{
     FrameInterOrderHints, InterFrameContext, InterWalkPixels, MotionFieldMvs, PartitionWalker,
     QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
 };
 use crate::encoder::ivf::IvfReader;
-use crate::encoder::tile_group_obu::{parse_tile_group_obu_body, TilePayload};
+use crate::encoder::tile_group_obu::{TilePayload, parse_tile_group_obu_body};
 use crate::film_grain::film_grain_synthesis;
 use crate::frame_header::{
-    parse_frame_header_with_refs, FrameHeader, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    FrameHeader, NUM_REF_FRAMES, PRIMARY_REF_NONE, RefInfo, parse_frame_header_with_refs,
 };
 use crate::inter_pred::get_relative_dist;
 use crate::loop_filter::PlaneBuffer;
 use crate::obu::{ObuIter, ObuType};
-use crate::sequence_header::{parse_sequence_header, SequenceHeader};
+use crate::sequence_header::{SequenceHeader, parse_sequence_header};
 use crate::symbol_decoder::SymbolDecoder;
 use crate::uncompressed_header_tail::{
-    SegmentationParams, ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP,
+    ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP, SegmentationParams,
 };
-use crate::Error;
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -901,14 +901,16 @@ fn decode_frame_spec_tiles(
                 let tx = tx.clone();
                 let next = &next;
                 let decode_one = &decode_one;
-                scope.spawn(move || loop {
-                    let t = next.fetch_add(1, Ordering::SeqCst);
-                    if t >= tiles.len() {
-                        break;
-                    }
-                    let out = decode_one(t);
-                    if tx.send((t, out)).is_err() {
-                        break;
+                scope.spawn(move || {
+                    loop {
+                        let t = next.fetch_add(1, Ordering::SeqCst);
+                        if t >= tiles.len() {
+                            break;
+                        }
+                        let out = decode_one(t);
+                        if tx.send((t, out)).is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -1040,47 +1042,46 @@ fn decode_frame_spec_tiles(
     // even though the §7.14.4 `loop_filter_delta_enabled` ref-delta
     // path could otherwise lift a per-edge strength above zero.
     let t_deblock = Instant::now();
-    if let Some(lf) = fh.loop_filter_params.as_ref() {
-        if (lf.loop_filter_level[0] != 0 || lf.loop_filter_level[1] != 0)
-            && !coded_lossless
-            && !fh.allow_intrabc
-        {
-            let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-                bufs.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
-            }
-            if threads > 1 {
-                walker.loop_filter_frame_parallel_from_grid(
-                    lf,
-                    sp,
-                    dlf.delta_lf_multi,
-                    cc.num_planes,
-                    cc.bit_depth,
-                    sub_x as u8,
-                    sub_y as u8,
-                    fs.frame_width,
-                    fs.frame_height,
-                    &mut bufs,
-                    threads,
-                );
-            } else {
-                walker.loop_filter_frame_from_grid(
-                    lf,
-                    sp,
-                    dlf.delta_lf_multi,
-                    cc.num_planes,
-                    cc.bit_depth,
-                    sub_x as u8,
-                    sub_y as u8,
-                    fs.frame_width,
-                    fs.frame_height,
-                    &mut bufs,
-                );
-            }
+    if let Some(lf) = fh.loop_filter_params.as_ref()
+        && (lf.loop_filter_level[0] != 0 || lf.loop_filter_level[1] != 0)
+        && !coded_lossless
+        && !fh.allow_intrabc
+    {
+        let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+            bufs.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
+        }
+        if threads > 1 {
+            walker.loop_filter_frame_parallel_from_grid(
+                lf,
+                sp,
+                dlf.delta_lf_multi,
+                cc.num_planes,
+                cc.bit_depth,
+                sub_x as u8,
+                sub_y as u8,
+                fs.frame_width,
+                fs.frame_height,
+                &mut bufs,
+                threads,
+            );
+        } else {
+            walker.loop_filter_frame_from_grid(
+                lf,
+                sp,
+                dlf.delta_lf_multi,
+                cc.num_planes,
+                cc.bit_depth,
+                sub_x as u8,
+                sub_y as u8,
+                fs.frame_width,
+                fs.frame_height,
+                &mut bufs,
+            );
         }
     }
     // §7.4 steps 2-5: CDEF, then loop restoration. `plane_bufs` holds
@@ -1200,43 +1201,46 @@ fn decode_frame_spec_tiles(
         } else {
             None
         };
-        if let Some(cdef) = fh.cdef_params.as_ref() {
-            if !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited {
-                // §7.15 filters from the deblocked frame. r453 — when
-                // §7.17 is active the `deblocked` copy above IS that
-                // frame (CDEF only reads its source), so borrow it
-                // instead of cloning a third full-frame buffer.
-                let mut fallback: Option<Vec<Vec<i32>>> = None;
-                let src_owned: &mut Vec<Vec<i32>> = match deblocked {
-                    Some(ref mut d) => d,
-                    None => fallback.insert(plane_bufs.clone()),
-                };
-                let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-                for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
-                    src.push(PlaneBuffer {
-                        rows: ph,
-                        cols: pw,
-                        samples: buf,
-                    });
-                }
-                let mut dst: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
-                for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-                    dst.push(PlaneBuffer {
-                        rows: ph,
-                        cols: pw,
-                        samples: buf,
-                    });
-                }
-                walker.cdef_frame_from_idx(
-                    cdef,
-                    cc.num_planes,
-                    cc.bit_depth,
-                    sub_x as u8,
-                    sub_y as u8,
-                    &src,
-                    &mut dst,
-                );
+        if let Some(cdef) = fh.cdef_params.as_ref()
+            && !coded_lossless
+            && !fh.allow_intrabc
+            && seq.enable_cdef
+            && !cdef.short_circuited
+        {
+            // §7.15 filters from the deblocked frame. r453 — when
+            // §7.17 is active the `deblocked` copy above IS that
+            // frame (CDEF only reads its source), so borrow it
+            // instead of cloning a third full-frame buffer.
+            let mut fallback: Option<Vec<Vec<i32>>> = None;
+            let src_owned: &mut Vec<Vec<i32>> = match deblocked {
+                Some(ref mut d) => d,
+                None => fallback.insert(plane_bufs.clone()),
+            };
+            let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
+                src.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
             }
+            let mut dst: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+                dst.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            walker.cdef_frame_from_idx(
+                cdef,
+                cc.num_planes,
+                cc.bit_depth,
+                sub_x as u8,
+                sub_y as u8,
+                &src,
+                &mut dst,
+            );
         }
         stages.cdef += t_cdef.elapsed();
         // §7.4 steps 3-4 / §7.16: horizontal superres upscaling of BOTH the
@@ -1576,7 +1580,7 @@ fn motion_field_estimation(
     mi_rows: u32,
     mi_cols: u32,
 ) -> Result<MotionFieldMvs, Error> {
-    use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+    use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
     let ir = fh
         .inter_refs
         .as_ref()
@@ -1992,35 +1996,34 @@ fn output_existing_frame(
         .ok_or(Error::PartitionWalkOutOfRange)?;
     // §7.18.3 on the OUTPUT copy only.
     let mut grain_bufs: Option<Vec<Vec<i32>>> = None;
-    if seq.film_grain_params_present {
-        if let Some(fg) = slot.grain_params.as_ref() {
-            if fg.apply_grain {
-                let mut bufs: Vec<Vec<i32>> = slot
-                    .planes
-                    .iter()
-                    .map(|p| p.iter().map(|&v| v as i32).collect())
-                    .collect();
-                let cc = &seq.color_config;
-                let mut views: Vec<PlaneBuffer<'_>> = Vec::with_capacity(bufs.len());
-                for (buf, &(pw, ph)) in bufs.iter_mut().zip(slot.plane_dims.iter()) {
-                    views.push(PlaneBuffer {
-                        rows: ph,
-                        cols: pw,
-                        samples: buf,
-                    });
-                }
-                film_grain_synthesis(
-                    fg,
-                    slot.bit_depth,
-                    cc.num_planes,
-                    u8::from(cc.subsampling_x),
-                    u8::from(cc.subsampling_y),
-                    cc.matrix_coefficients,
-                    &mut views,
-                );
-                grain_bufs = Some(bufs);
-            }
+    if seq.film_grain_params_present
+        && let Some(fg) = slot.grain_params.as_ref()
+        && fg.apply_grain
+    {
+        let mut bufs: Vec<Vec<i32>> = slot
+            .planes
+            .iter()
+            .map(|p| p.iter().map(|&v| v as i32).collect())
+            .collect();
+        let cc = &seq.color_config;
+        let mut views: Vec<PlaneBuffer<'_>> = Vec::with_capacity(bufs.len());
+        for (buf, &(pw, ph)) in bufs.iter_mut().zip(slot.plane_dims.iter()) {
+            views.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
         }
+        film_grain_synthesis(
+            fg,
+            slot.bit_depth,
+            cc.num_planes,
+            u8::from(cc.subsampling_x),
+            u8::from(cc.subsampling_y),
+            cc.matrix_coefficients,
+            &mut views,
+        );
+        grain_bufs = Some(bufs);
     }
     let max_val: i32 = (1i32 << slot.bit_depth) - 1;
     let planes: Vec<Vec<u8>> = match grain_bufs {

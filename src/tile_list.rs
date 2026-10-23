@@ -48,20 +48,20 @@
 //! Spec provenance: `docs/video/av1/av1-spec.txt` §5.12, §6.11, §7.1,
 //! §7.3 (incl. §7.3.2 decode camera tile process).
 
+use crate::Error;
 use crate::cdf::{
     FrameInterOrderHints, InterFrameContext, InterWalkPixels, MotionFieldMvs, PartitionWalker,
     QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
 };
-use crate::decoder::frame_driver::lossless_array;
 use crate::decoder::SpecFrame;
+use crate::decoder::frame_driver::lossless_array;
 use crate::frame_header::{
-    parse_frame_header_with_refs, FrameHeader, FrameType, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    FrameHeader, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE, RefInfo, parse_frame_header_with_refs,
 };
 use crate::obu::{ObuIter, ObuType};
-use crate::sequence_header::{parse_sequence_header, SequenceHeader};
+use crate::sequence_header::{SequenceHeader, parse_sequence_header};
 use crate::symbol_decoder::SymbolDecoder;
-use crate::uncompressed_header_tail::{SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q};
-use crate::Error;
+use crate::uncompressed_header_tail::{MAX_SEGMENTS, SEG_LVL_ALT_Q, SegmentationParams};
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
 
 /// One §5.12.2 `tile_list_entry`.
@@ -334,7 +334,9 @@ fn anchor_planes(
                 return Err(Error::TileListInvalid);
             }
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         };

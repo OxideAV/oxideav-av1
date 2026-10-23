@@ -13,7 +13,7 @@
 //! env-gated sweep dump below and pinned via `fixture_conformance.rs`.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_pyramid_gop_yuv420_with_q, EncodedGop, Yuv420Frame};
+use oxideav_av1::encoder::{EncodedGop, Yuv420Frame, encode_pyramid_gop_yuv420_with_q};
 
 /// Deterministic textured frame with per-frame translation `(sy, sx)`.
 fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> Yuv420Frame {

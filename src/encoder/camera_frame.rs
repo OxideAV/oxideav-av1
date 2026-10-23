@@ -34,17 +34,17 @@
 //! §6.11, §7.3 (incl. the §7.3.1 constraint list + §7.3.2 decode
 //! camera tile process).
 
+use crate::Error;
 use crate::encoder::inter_frame::{
-    encode_inter_frame_generic, GopFrameRecon, GopFrameReconYuv, InterFrameConfig, SavedMotionField,
+    GopFrameRecon, GopFrameReconYuv, InterFrameConfig, SavedMotionField, encode_inter_frame_generic,
 };
 use crate::encoder::rate_twin::RateModel;
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
 use crate::encoder::yuv_frame::{
-    build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq, Yuv420Frame, YuvFrame,
+    Yuv420Frame, YuvFrame, build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq,
 };
-use crate::frame_header::{parse_frame_header_with_refs, FrameHeader, RefInfo, PRIMARY_REF_NONE};
+use crate::frame_header::{FrameHeader, PRIMARY_REF_NONE, RefInfo, parse_frame_header_with_refs};
 use crate::sequence_header::SequenceHeader;
-use crate::Error;
 
 /// One encoded §7.3 camera frame.
 #[derive(Debug, Clone)]
@@ -162,10 +162,10 @@ pub fn encode_camera_frame_yuv420_tiles_qm(
     if input.width != anchor.width
         || input.height != anchor.height
         || input.height == 0
-        || input.height % 64 != 0
+        || !input.height.is_multiple_of(64)
         || input.height > 4096
         || input.width == 0
-        || input.width % 64 != 0
+        || !input.width.is_multiple_of(64)
         || input.width > 4096
     {
         return Err(Error::PartitionWalkOutOfRange);

@@ -24,11 +24,7 @@ use crate::Error;
 /// we return 0 (the §4.7 helper is undefined at zero; ns() is only
 /// invoked with `n >= 1`, so this convention is never reached).
 fn floor_log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// MSB-first bit reader.

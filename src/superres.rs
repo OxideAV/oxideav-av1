@@ -494,11 +494,7 @@ fn clip1(bit_depth: u8, x: i32) -> i32 {
 /// lines 17980-17986.
 #[inline]
 fn subsampling_for_plane(plane: u8, sub_x: u8, sub_y: u8) -> (u8, u8) {
-    if plane == 0 {
-        (0, 0)
-    } else {
-        (sub_x, sub_y)
-    }
+    if plane == 0 { (0, 0) } else { (sub_x, sub_y) }
 }
 
 /// Verbatim plane copy used by the `use_superres == 0` short-circuit.

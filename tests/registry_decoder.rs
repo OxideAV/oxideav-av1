@@ -16,7 +16,7 @@
 //! conformance-validated surface, not the historical intra-only
 //! encoder-mirror path.
 
-use oxideav_av1::registry::{make_decoder, register, register_codecs, CODEC_ID_STR};
+use oxideav_av1::registry::{CODEC_ID_STR, make_decoder, register, register_codecs};
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, CodecTag, Error as CoreError, Frame, Packet,
@@ -24,7 +24,7 @@ use oxideav_core::{
 };
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0);
+    assert!(s.len().is_multiple_of(2));
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
         .collect()

@@ -18,11 +18,14 @@
 
 use oxideav_av1::codec_config::Av1CodecConfig;
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::registry::{make_decoder, CODEC_ID_STR};
+use oxideav_av1::registry::{CODEC_ID_STR, make_decoder};
 use oxideav_core::{CodecId, CodecParameters, Frame as CoreFrame, Packet, TimeBase};
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    assert!(
+        s.len().is_multiple_of(2),
+        "hex literal must have even length"
+    );
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
         .collect()
@@ -51,9 +54,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {

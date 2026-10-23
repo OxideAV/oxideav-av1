@@ -18,7 +18,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use oxideav_av1::{parse_leb128, parse_obu, ObuIter, ObuType};
+use oxideav_av1::{ObuIter, ObuType, parse_leb128, parse_obu};
 
 fuzz_target!(|data: &[u8]| {
     // §4.10.5 leb128 primitive on the raw bytes.

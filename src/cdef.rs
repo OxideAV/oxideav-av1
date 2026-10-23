@@ -955,11 +955,7 @@ fn constrain_adj(diff: i32, threshold: i32, damping_adj: i32) -> i32 {
     };
     let inner = (threshold - shifted).max(0);
     let v = abs_diff.min(inner);
-    if diff < 0 {
-        -v
-    } else {
-        v
-    }
+    if diff < 0 { -v } else { v }
 }
 
 /// §7.15.3 `constrain` primitive — av1-spec p.324 lines 17919-17925.
@@ -991,11 +987,7 @@ pub fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 /// excludes 0).
 #[inline]
 fn floor_log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// §3 `Clip3(a, b, x)` — clamp `x` to `[a, b]`.

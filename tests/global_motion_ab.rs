@@ -16,7 +16,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_rate_model_gm, EncodedGop, RateModel, Yuv420Frame,
+    EncodedGop, RateModel, Yuv420Frame, encode_gop_yuv420_with_q_seg_rate_model_gm,
 };
 
 // ---------------------------------------------------------------------

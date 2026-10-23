@@ -20,10 +20,10 @@
 
 use oxideav_av1::encoder::stage_probe::set_stage_probe;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
-use oxideav_av1::encoder::{encode_still_yuv, StillOptions, StillSpeed};
+use oxideav_av1::encoder::{StillOptions, StillSpeed, encode_still_yuv};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 struct Counting;
@@ -65,37 +65,43 @@ fn maybe_sample(size: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        if layout.size() >= TRACE_MIN.load(Ordering::Relaxed) {
-            trace("ALLOC", layout.size(), live);
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            if layout.size() >= TRACE_MIN.load(Ordering::Relaxed) {
+                trace("ALLOC", layout.size(), live);
+            }
+            maybe_sample(layout.size());
+            System.alloc(layout)
         }
-        maybe_sample(layout.size());
-        System.alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let live = LIVE.fetch_sub(layout.size(), Ordering::Relaxed) - layout.size();
-        if layout.size() >= TRACE_MIN.load(Ordering::Relaxed) {
-            trace("FREE ", layout.size(), live);
+        unsafe {
+            let live = LIVE.fetch_sub(layout.size(), Ordering::Relaxed) - layout.size();
+            if layout.size() >= TRACE_MIN.load(Ordering::Relaxed) {
+                trace("FREE ", layout.size(), live);
+            }
+            System.dealloc(ptr, layout)
         }
-        System.dealloc(ptr, layout)
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let old = layout.size();
-        if new_size > old {
-            let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-            PEAK.fetch_max(live, Ordering::Relaxed);
-            if new_size >= TRACE_MIN.load(Ordering::Relaxed) {
-                trace("GROW ", new_size, live);
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let old = layout.size();
+            if new_size > old {
+                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                PEAK.fetch_max(live, Ordering::Relaxed);
+                if new_size >= TRACE_MIN.load(Ordering::Relaxed) {
+                    trace("GROW ", new_size, live);
+                }
+            } else {
+                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
             }
-        } else {
-            LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+            System.realloc(ptr, layout, new_size)
         }
-        System.realloc(ptr, layout, new_size)
     }
 }
 
@@ -256,7 +262,7 @@ fn frame_of(raw: &[u8], w: u32, h: u32, fmt: &str) -> YuvFrame {
     );
     let widen = |dst: &mut [u16], src: &[u8]| {
         if bps == 2 {
-            for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+            for (d, c) in dst.iter_mut().zip(src.as_chunks::<2>().0.iter()) {
                 *d = u16::from_le_bytes([c[0], c[1]]);
             }
         } else {

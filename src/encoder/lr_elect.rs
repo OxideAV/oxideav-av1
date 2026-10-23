@@ -55,14 +55,14 @@
 
 use crate::cdf::TileCdfContext;
 use crate::cdf::{LrUnit, RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_SWITCHABLE, RESTORE_WIENER};
-use crate::encoder::loop_restoration_write::{write_lr_unit, LrWriteState};
+use crate::encoder::loop_restoration_write::{LrWriteState, write_lr_unit};
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::loop_filter::PlaneBuffer;
 use crate::loop_restoration::{
-    box_filter, count_units_in_frame, loop_restore_rect, sgr_project, stripe_unit_rects,
-    LoopRestorationFrameContext, LrBlockGeometry, SGRPROJ_RST_BITS, SGRPROJ_XQD_MAX,
-    SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_MAX, WIENER_TAPS_MID, WIENER_TAPS_MIN,
+    LoopRestorationFrameContext, LrBlockGeometry, SGR_PARAMS, SGRPROJ_RST_BITS, SGRPROJ_XQD_MAX,
+    SGRPROJ_XQD_MIN, WIENER_COEFFS, WIENER_TAPS_MAX, WIENER_TAPS_MID, WIENER_TAPS_MIN, box_filter,
+    count_units_in_frame, loop_restore_rect, sgr_project, stripe_unit_rects,
 };
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams as HeaderLrParams};
 

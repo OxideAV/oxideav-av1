@@ -11,10 +11,10 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, encode_gop_yuv_seg_extras_tuned_layout, GopTuning,
-    TunedGop, TunedGopYuv, Yuv420Frame, YuvFrame,
+    GopTuning, TunedGop, TunedGopYuv, Yuv420Frame, YuvFrame,
+    encode_gop_yuv_seg_extras_tuned_layout, encode_gop_yuv420_with_q_seg_extras_tuned,
 };
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, FrameHeader, FrameSize, RefInfo};
+use oxideav_av1::frame_header::{FrameHeader, FrameSize, RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -207,8 +207,16 @@ fn mid_gop_election_fires_and_decodes_bit_exact() {
             off.gop.ivf_bytes.len(),
             psnr(&enc),
             psnr(&off),
-            enc.gop.temporal_units.iter().map(Vec::len).collect::<Vec<_>>(),
-            off.gop.temporal_units.iter().map(Vec::len).collect::<Vec<_>>(),
+            enc.gop
+                .temporal_units
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            off.gop
+                .temporal_units
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
         );
         std::fs::create_dir_all(&dir).expect("dump dir");
         std::fs::write(

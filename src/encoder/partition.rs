@@ -52,12 +52,12 @@
 //!
 //! [`crate::cdf::PartitionWalker`]: crate::cdf::PartitionWalker
 
+use crate::Error;
 use crate::cdf::{
-    split_or_horz_cdf, split_or_vert_cdf, TileCdfContext, BLOCK_8X8, BLOCK_SIZES, MI_WIDTH_LOG2,
-    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT,
+    BLOCK_8X8, BLOCK_SIZES, MI_WIDTH_LOG2, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
+    PARTITION_VERT, TileCdfContext, split_or_horz_cdf, split_or_vert_cdf,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::Error;
 
 /// Predicate: at this `b_size`, §5.11.4 emits *no* symbol because the
 /// block is too small to subdivide — `partition` is forced to
@@ -214,9 +214,9 @@ pub fn write_partition(
 mod tests {
     use super::*;
     use crate::cdf::{
-        partition_ctx, BLOCK_128X128, BLOCK_16X16, BLOCK_4X4, BLOCK_64X64, PARTITION_CONTEXTS,
-        PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_VERT_4, PARTITION_VERT_A,
-        PARTITION_VERT_B,
+        BLOCK_4X4, BLOCK_16X16, BLOCK_64X64, BLOCK_128X128, PARTITION_CONTEXTS, PARTITION_HORZ_4,
+        PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+        partition_ctx,
     };
     use crate::symbol_decoder::SymbolDecoder;
 

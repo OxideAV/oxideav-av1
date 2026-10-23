@@ -19,10 +19,10 @@
 //!    the malformed-input test here covers the public entry).
 
 use oxideav_av1::annexb::build_from_temporal_units;
-use oxideav_av1::decoder::{decode_av1_annexb, Frame};
+use oxideav_av1::decoder::{Frame, decode_av1_annexb};
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q, encode_key_frame_yuv420_with_q, encode_pyramid_gop_yuv420_with_q,
-    Yuv420Frame,
+    Yuv420Frame, encode_gop_yuv420_with_q, encode_key_frame_yuv420_with_q,
+    encode_pyramid_gop_yuv420_with_q,
 };
 
 fn unhex(s: &str) -> Vec<u8> {

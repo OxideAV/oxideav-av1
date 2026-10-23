@@ -123,19 +123,19 @@
 //! The bit count consumed is returned in [`FrameHeader::bits_consumed`]
 //! so the next round can continue at exactly the right bit.
 
+use crate::Error;
 use crate::bitreader::BitReader;
-use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
-use crate::tile_info::{read_tile_info, TileInfo};
+use crate::sequence_header::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, SequenceHeader};
+use crate::tile_info::{TileInfo, read_tile_info};
 use crate::uncompressed_header_tail::{
+    ALTREF_FRAME, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext, FilmGrainParams,
+    GlobalMotionParams, InterpolationFilter, LAST_FRAME, LoopFilterParams, LrParams, MAX_SEGMENTS,
+    QuantizationParams, REFS_PER_FRAME, SEG_LVL_ALT_Q, SegmentationParams, TxMode,
     prev_gm_params_default, read_cdef_params, read_delta_lf_params, read_delta_q_params,
     read_film_grain_params, read_global_motion_params, read_interpolation_filter,
     read_loop_filter_params, read_lr_params, read_quantization_params, read_segmentation_params,
-    read_tx_mode, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext, FilmGrainParams,
-    GlobalMotionParams, InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams,
-    SegmentationParams, TxMode, ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, REFS_PER_FRAME,
-    SEG_LVL_ALT_Q,
+    read_tx_mode,
 };
-use crate::Error;
 
 // ---------------------------------------------------------------------
 // §3 constants
@@ -2980,10 +2980,10 @@ mod tests {
         ];
         // Segmentation:
         bits.push(1); // segmentation_enabled
-                      // primary_ref_frame == PRIMARY_REF_NONE ⇒ no update-flag reads.
-                      // Segment 0 features:
-                      // feature 0 (SEG_LVL_ALT_Q): enabled=1, su(9) value = -123.
-                      // -123 in 9-bit two's complement: 2^9 - 123 = 389 = 0b1_1000_0101.
+        // primary_ref_frame == PRIMARY_REF_NONE ⇒ no update-flag reads.
+        // Segment 0 features:
+        // feature 0 (SEG_LVL_ALT_Q): enabled=1, su(9) value = -123.
+        // -123 in 9-bit two's complement: 2^9 - 123 = 389 = 0b1_1000_0101.
         bits.push(1); // feature_enabled[0][0]
         for i in (0..9).rev() {
             bits.push(((389u32 >> i) & 1) as u8);
@@ -3187,7 +3187,7 @@ mod tests {
             bits.push(((40u32 >> i) & 1) as u8);
         }
         bits.extend_from_slice(&[0, 0, 0, 0]); // 3 delta_coded + using_qmatrix
-                                               // segmentation_enabled(1)=0.
+        // segmentation_enabled(1)=0.
         bits.push(0);
         // delta_q_params: base_q_idx>0 ⇒ delta_q_present(1)=0.
         bits.push(0);

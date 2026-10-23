@@ -1435,11 +1435,7 @@ pub fn predict_intra_dc_pred(
 #[inline]
 fn clip1_bit_depth(x: u32, bit_depth: u8) -> u32 {
     let max = (1u32 << bit_depth) - 1;
-    if x > max {
-        max
-    } else {
-        x
-    }
+    if x > max { max } else { x }
 }
 
 // ---------------------------------------------------------------------
@@ -2592,11 +2588,7 @@ pub fn intra_edge_upsample_selection(w: usize, h: usize, filter_type: u8, delta:
     }
     let blk_wh = w + h;
     if filter_type == 0 {
-        if blk_wh <= 16 {
-            1
-        } else {
-            0
-        }
+        if blk_wh <= 16 { 1 } else { 0 }
     } else if blk_wh <= 8 {
         1
     } else {
@@ -11382,11 +11374,7 @@ pub fn neg_interleave(segment_id: u32, pred: u32, max: u32) -> u32 {
 /// [`MV_INTRABC_CONTEXT`] when `use_intrabc == 1` and `0` otherwise;
 /// the result is the first index into every `Mv*Cdf` selector above.
 pub fn mv_ctx(use_intrabc: bool) -> usize {
-    if use_intrabc {
-        MV_INTRABC_CONTEXT
-    } else {
-        0
-    }
+    if use_intrabc { MV_INTRABC_CONTEXT } else { 0 }
 }
 
 // ---------------------------------------------------------------------
@@ -12451,17 +12439,9 @@ pub fn comp_ref_type_ctx(
         if !above_comp_inter && !left_comp_inter {
             1 + 2 * samedir
         } else if !above_comp_inter {
-            if !left_uni_comp {
-                1
-            } else {
-                3 + samedir
-            }
+            if !left_uni_comp { 1 } else { 3 + samedir }
         } else if !left_comp_inter {
-            if !above_uni_comp {
-                1
-            } else {
-                3 + samedir
-            }
+            if !above_uni_comp { 1 } else { 3 + samedir }
         } else if !above_uni_comp && !left_uni_comp {
             0
         } else if !above_uni_comp || !left_uni_comp {
@@ -13997,13 +13977,13 @@ impl PartitionWalker {
             let dbase = ((dst_row + rr) * self.mi_cols + dst_col) as usize;
             let n = w4 as usize;
             macro_rules! copy_cells {
-                ($field:ident, $mult:expr) => {
+                ($field:ident, $mult:expr_2021) => {
                     self.$field[dbase * $mult..(dbase + n) * $mult]
                         .copy_from_slice(&src.$field[sbase * $mult..(sbase + n) * $mult]);
                 };
             }
             macro_rules! copy_lazy {
-                ($field:ident, $mult:expr, $default:expr) => {
+                ($field:ident, $mult:expr_2021, $default:expr_2021) => {
                     if !src.$field.is_empty() {
                         copy_cells!($field, $mult);
                     } else if !self.$field.is_empty() {
@@ -14700,11 +14680,7 @@ pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) ->
             mag + 14
         }
     } else if tx_class == TX_CLASS_HORIZ {
-        if col == 0 {
-            mag + 7
-        } else {
-            mag + 14
-        }
+        if col == 0 { mag + 7 } else { mag + 14 }
     } else if row == 0 {
         mag + 7
     } else {
@@ -14807,11 +14783,7 @@ pub fn interintra_ctx(mi_size: usize) -> Option<usize> {
         return None;
     }
     let g = SIZE_GROUP[mi_size];
-    if g == 0 {
-        None
-    } else {
-        Some(g - 1)
-    }
+    if g == 0 { None } else { Some(g - 1) }
 }
 
 /// §8.3.2 `comp_group_idx` context selection (av1-spec p.384). The
@@ -14872,11 +14844,7 @@ pub fn comp_group_idx_ctx(
             ctx += 3;
         }
     }
-    if ctx > 5 {
-        5
-    } else {
-        ctx
-    }
+    if ctx > 5 { 5 } else { ctx }
 }
 
 /// §8.3.2 `compound_idx` context selection (av1-spec p.384). The spec
@@ -15475,11 +15443,7 @@ pub const fn partition_subsize(partition: usize, b_size: usize) -> Option<usize>
         return None;
     }
     let v = PARTITION_SUBSIZE[partition][b_size];
-    if v == BLOCK_INVALID {
-        None
-    } else {
-        Some(v)
-    }
+    if v == BLOCK_INVALID { None } else { Some(v) }
 }
 
 // ===================================================================
@@ -20555,8 +20519,8 @@ impl PartitionWalker {
         frame_restoration_type: u8,
     ) -> Result<LrUnit, crate::Error> {
         use crate::loop_restoration::{
-            SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_XQD_MAX,
-            SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
+            SGR_PARAMS, SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K,
+            SGRPROJ_XQD_MAX, SGRPROJ_XQD_MIN, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
             WIENER_TAPS_MIN,
         };
         if plane >= 3 || frame_restoration_type > RESTORE_SWITCHABLE {
@@ -20929,8 +20893,8 @@ impl PartitionWalker {
         planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
         threads: usize,
     ) {
-        use crate::cdef::{cdef_band_in_place, CdefSrc};
-        use crate::loop_filter::{row_windows_mut, run_jobs, PlaneBuffer};
+        use crate::cdef::{CdefSrc, cdef_band_in_place};
+        use crate::loop_filter::{PlaneBuffer, row_windows_mut, run_jobs};
         const BAND_MI: u32 = 16;
         const HALO: usize = 2;
         let num_planes = num_planes.min(planes.len() as u8) as usize;
@@ -21114,7 +21078,7 @@ impl PartitionWalker {
         src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
         dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::cdef::{cdef_frame, CdefFrameContext};
+        use crate::cdef::{CdefFrameContext, cdef_frame};
         let sb_cols = self.mi_cols.div_ceil(16);
         let ctx = CdefFrameContext {
             mi_rows: self.mi_rows,
@@ -21270,7 +21234,7 @@ impl PartitionWalker {
         planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
         threads: usize,
     ) {
-        use crate::loop_filter::{loop_filter_rows_window, row_windows_mut, run_jobs, PlaneBuffer};
+        use crate::loop_filter::{PlaneBuffer, loop_filter_rows_window, row_windows_mut, run_jobs};
         const BAND_MI: u32 = 16;
         const SKIRT: usize = 7;
         let num_planes = num_planes.min(planes.len() as u8);
@@ -21466,11 +21430,7 @@ impl PartitionWalker {
             // signalled as `u8::MAX` for cells with no segment id).
             segment_id: &|r, c| {
                 let s = self.segment_id_at(r as i32, c as i32);
-                if s < 0 {
-                    u8::MAX
-                } else {
-                    s as u8
-                }
+                if s < 0 { u8::MAX } else { s as u8 }
             },
             // §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` — the per-mi snapshot
             // the §5.11.5 grid-fill stamped from the §5.11.13 accumulator.
@@ -21681,8 +21641,8 @@ impl PartitionWalker {
         boundary: &[crate::loop_restoration::StripeBoundaryRows],
         threads: usize,
     ) {
-        use crate::loop_filter::{row_windows_mut, run_jobs, PlaneBuffer};
-        use crate::loop_restoration::{plane_stripes, restore_stripe_in_place, PlaneStripe};
+        use crate::loop_filter::{PlaneBuffer, row_windows_mut, run_jobs};
+        use crate::loop_restoration::{PlaneStripe, plane_stripes, restore_stripe_in_place};
         if !lr_params.uses_lr {
             return;
         }
@@ -22853,7 +22813,7 @@ impl PartitionWalker {
         // §5.11.49 `aboveN = 0; if ((MiRow * MI_SIZE) % 64) aboveN =
         // PaletteSizes[plane][MiRow - 1][MiCol]`. MI_SIZE = 4 so
         // `MiRow * 4 % 64` simplifies to `MiRow % 16`.
-        let above_n: usize = if mi_row > 0 && ((mi_row as usize) * MI_SIZE) % 64 != 0 {
+        let above_n: usize = if mi_row > 0 && !((mi_row as usize) * MI_SIZE).is_multiple_of(64) {
             self.palette_size_at(plane, mi_row as i32 - 1, mi_col as i32) as usize
         } else {
             0
@@ -24152,11 +24112,7 @@ impl PartitionWalker {
         // lint is allowed on this block.
         #[allow(clippy::if_same_then_else)]
         let pred: i32 = if prev_u == -1 {
-            if prev_l == -1 {
-                0
-            } else {
-                prev_l
-            }
+            if prev_l == -1 { 0 } else { prev_l }
         } else if prev_l == -1 {
             prev_u
         } else if prev_ul == prev_u {
@@ -26720,11 +26676,7 @@ impl PartitionWalker {
                         "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
                     );
                     let signed = (1 + raw_u) as i8;
-                    if sign_u == 1 {
-                        -signed
-                    } else {
-                        signed
-                    }
+                    if sign_u == 1 { -signed } else { signed }
                 } else {
                     0
                 };
@@ -26738,11 +26690,7 @@ impl PartitionWalker {
                         "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
                     );
                     let signed = (1 + raw_v) as i8;
-                    if sign_v == 1 {
-                        -signed
-                    } else {
-                        signed
-                    }
+                    if sign_v == 1 { -signed } else { signed }
                 } else {
                     0
                 };
@@ -34546,7 +34494,7 @@ impl PartitionWalker {
         // sz )` in the §5.11.4 pseudocode routes through
         // `decode_block_syntax`.
         macro_rules! db {
-            ($self:ident, $r:expr, $c:expr, $sz:expr) => {
+            ($self:ident, $r:expr_2021, $c:expr_2021, $sz:expr_2021) => {
                 $self.decode_block_syntax(
                     decoder,
                     cdfs,
@@ -37205,11 +37153,7 @@ pub(crate) fn read_palette_entries_uv(
 #[inline]
 pub(crate) fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
     let max_val: u32 = (1u32 << bit_depth) - 1;
-    if x > max_val {
-        max_val
-    } else {
-        x
-    }
+    if x > max_val { max_val } else { x }
 }
 
 /// `CeilLog2( x )` per §4.7.
@@ -38940,7 +38884,9 @@ mod tests {
         ));
         // bit_depth out of range.
         assert!(matches!(
-            derive_above_row(0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, /* bit_depth = */ 9, &mut above),
+            derive_above_row(
+                0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, /* bit_depth = */ 9, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // above_row too small.
@@ -38956,13 +38902,17 @@ mod tests {
         ));
         // have_above == 1 with y == 0 (caller bug — no row -1).
         assert!(matches!(
-            derive_above_row(1, 0, 0, 0, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut above),
+            derive_above_row(
+                1, 0, 0, 0, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // have_left == 1 with have_above == 0, x == 0 (caller bug
         // — no col -1).
         assert!(matches!(
-            derive_above_row(0, 1, 0, /* x = */ 0, 1, 4, 4, 3, &frame, 4, 8, &mut above),
+            derive_above_row(
+                0, 1, 0, /* x = */ 0, 1, 4, 4, 3, &frame, 4, 8, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
@@ -38982,12 +38932,16 @@ mod tests {
         ));
         // have_left == 1 with x == 0 (no col -1).
         assert!(matches!(
-            derive_left_col(1, 0, 0, /* x = */ 0, 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            derive_left_col(
+                1, 0, 0, /* x = */ 0, 0, 4, 4, 3, &frame, 4, 8, &mut left
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // have_above == 1 with y == 0 (no row -1).
         assert!(matches!(
-            derive_left_col(0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            derive_left_col(
+                0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
@@ -39743,7 +39697,7 @@ mod tests {
         assert_eq!(segment_id_ctx(Some(3), Some(3), Some(5)), 1); // UL==U
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(3)), 1); // UL==L
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(5)), 1); // U==L
-                                                                  // all distinct ⇒ 0.
+        // all distinct ⇒ 0.
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(7)), 0);
         // A missing U/L cannot equal a present UL, so it falls through.
         assert_eq!(segment_id_ctx(Some(3), None, Some(3)), 1); // UL==L
@@ -39837,7 +39791,9 @@ mod tests {
         // Default_Mv_Class_Cdf — first row, by literal §9.4 listing.
         assert_eq!(
             DEFAULT_MV_CLASS_CDF[0],
-            [28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0]
+            [
+                28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0
+            ]
         );
         // The leading `2` axis carries identical rows per spec.
         assert_eq!(DEFAULT_MV_CLASS_CDF[0], DEFAULT_MV_CLASS_CDF[1]);
@@ -40425,7 +40381,7 @@ mod tests {
         // Palette colour-index: a size-K table codes K symbols (row len
         // K + 1), with PALETTE_COLOR_CONTEXTS rows each.
         macro_rules! check_color {
-            ($tab:expr, $size:expr) => {{
+            ($tab:expr_2021, $size:expr_2021) => {{
                 assert_eq!($tab.len(), PALETTE_COLOR_CONTEXTS);
                 for r in &$tab {
                     assert_eq!(r.len(), $size + 1, "size-{} table row len", $size);
@@ -41527,12 +41483,14 @@ mod tests {
         assert!(ctx.inter_tx_type_cdf(TX_SET_DCTONLY, 0).is_none());
 
         // Out-of-range tx_size_sqr for Set1 / Set3.
-        assert!(ctx
-            .inter_tx_type_cdf(TX_SET_INTER_1, INTER_TX_TYPE_SET1_SIZES as u32)
-            .is_none());
-        assert!(ctx
-            .inter_tx_type_cdf(TX_SET_INTER_3, INTER_TX_TYPE_SET3_SIZES as u32)
-            .is_none());
+        assert!(
+            ctx.inter_tx_type_cdf(TX_SET_INTER_1, INTER_TX_TYPE_SET1_SIZES as u32)
+                .is_none()
+        );
+        assert!(
+            ctx.inter_tx_type_cdf(TX_SET_INTER_3, INTER_TX_TYPE_SET3_SIZES as u32)
+                .is_none()
+        );
 
         // Out-of-range set.
         assert!(ctx.inter_tx_type_cdf(99, 0).is_none());
@@ -41748,20 +41706,24 @@ mod tests {
 
         // Out-of-range tx_size_sqr for Set1 (only TX_4X4 / TX_8X8) /
         // Set2 (only TX_4X4 / TX_8X8 / TX_16X16).
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_1, INTRA_TX_TYPE_SET1_SIZES as u32, 0)
-            .is_none());
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_2, INTRA_TX_TYPE_SET2_SIZES as u32, 0)
-            .is_none());
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_1, INTRA_TX_TYPE_SET1_SIZES as u32, 0)
+                .is_none()
+        );
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_2, INTRA_TX_TYPE_SET2_SIZES as u32, 0)
+                .is_none()
+        );
 
         // Out-of-range intra_dir.
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_1, 0, INTRA_MODES)
-            .is_none());
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_2, 2, INTRA_MODES)
-            .is_none());
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_1, 0, INTRA_MODES)
+                .is_none()
+        );
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_2, 2, INTRA_MODES)
+                .is_none()
+        );
 
         // Out-of-range set (the inter set IDs share the same numeric
         // space — but the intra selector should not return a row for an
@@ -42455,7 +42417,9 @@ mod tests {
         assert_eq!(SIZE_GROUP.len(), BLOCK_SIZES);
         assert_eq!(
             SIZE_GROUP,
-            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2]
+            [
+                0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2
+            ]
         );
         for (mi_size, &want) in SIZE_GROUP.iter().enumerate() {
             let g = size_group(mi_size);
@@ -42481,7 +42445,9 @@ mod tests {
         assert_eq!(MI_WIDTH_LOG2.len(), BLOCK_SIZES);
         assert_eq!(
             MI_WIDTH_LOG2,
-            [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4]
+            [
+                0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4
+            ]
         );
         for (mi_size, &want) in MI_WIDTH_LOG2.iter().enumerate() {
             assert_eq!(mi_width_log2(mi_size), want);
@@ -42498,7 +42464,9 @@ mod tests {
         assert_eq!(MI_HEIGHT_LOG2.len(), BLOCK_SIZES);
         assert_eq!(
             MI_HEIGHT_LOG2,
-            [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2]
+            [
+                0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2
+            ]
         );
         for (mi_size, &want) in MI_HEIGHT_LOG2.iter().enumerate() {
             assert_eq!(mi_height_log2(mi_size), want);
@@ -42514,7 +42482,9 @@ mod tests {
         assert_eq!(NUM_4X4_BLOCKS_WIDE.len(), BLOCK_SIZES);
         assert_eq!(
             NUM_4X4_BLOCKS_WIDE,
-            [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16]
+            [
+                1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16
+            ]
         );
         for (mi_size, &want) in NUM_4X4_BLOCKS_WIDE.iter().enumerate() {
             assert_eq!(num_4x4_blocks_wide(mi_size), want);
@@ -42534,7 +42504,9 @@ mod tests {
         assert_eq!(NUM_4X4_BLOCKS_HIGH.len(), BLOCK_SIZES);
         assert_eq!(
             NUM_4X4_BLOCKS_HIGH,
-            [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4]
+            [
+                1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4
+            ]
         );
         for (mi_size, &want) in NUM_4X4_BLOCKS_HIGH.iter().enumerate() {
             assert_eq!(num_4x4_blocks_high(mi_size), want);
@@ -43147,9 +43119,10 @@ mod tests {
         assert!(ctx.angle_delta_cdf(0).is_none());
         // SMOOTH_PRED (9 == V_PRED + DIRECTIONAL_MODES) and beyond → None.
         assert!(ctx.angle_delta_cdf(V_PRED + DIRECTIONAL_MODES).is_none());
-        assert!(ctx
-            .angle_delta_cdf(V_PRED + DIRECTIONAL_MODES + 3)
-            .is_none());
+        assert!(
+            ctx.angle_delta_cdf(V_PRED + DIRECTIONAL_MODES + 3)
+                .is_none()
+        );
     }
 
     /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
@@ -43224,7 +43197,7 @@ mod tests {
 
         // Eob_Pt_{16..256}: [4][2][2][N]; Eob_Pt_{512,1024}: [4][2][N].
         macro_rules! check_eob_two {
-            ($t:expr, $inner:expr) => {{
+            ($t:expr_2021, $inner:expr_2021) => {{
                 assert_eq!($t.len(), COEFF_CDF_Q_CTXS);
                 for q in &$t {
                     assert_eq!(q.len(), PLANE_TYPES);
@@ -43245,7 +43218,7 @@ mod tests {
         check_eob_two!(DEFAULT_EOB_PT_256_CDF, 10);
 
         macro_rules! check_eob_one {
-            ($t:expr, $inner:expr) => {{
+            ($t:expr_2021, $inner:expr_2021) => {{
                 assert_eq!($t.len(), COEFF_CDF_Q_CTXS);
                 for q in &$t {
                     assert_eq!(q.len(), PLANE_TYPES);
@@ -43311,7 +43284,9 @@ mod tests {
         // Eob_Pt_1024: longest EOB-position rows (12 wide).
         assert_eq!(
             DEFAULT_EOB_PT_1024_CDF[0][0],
-            [393, 421, 751, 1623, 3160, 6352, 13345, 18047, 22571, 25830, 32768, 0]
+            [
+                393, 421, 751, 1623, 3160, 6352, 13345, 18047, 22571, 25830, 32768, 0
+            ]
         );
 
         // Eob_Extra first anchor.
@@ -43627,9 +43602,10 @@ mod tests {
         // Out-of-range on each axis.
         assert!(ctx.coeff_base_eob_cdf(TX_SIZES, 0, 0).is_none());
         assert!(ctx.coeff_base_eob_cdf(0, PLANE_TYPES, 0).is_none());
-        assert!(ctx
-            .coeff_base_eob_cdf(0, 0, SIG_COEF_CONTEXTS_EOB)
-            .is_none());
+        assert!(
+            ctx.coeff_base_eob_cdf(0, 0, SIG_COEF_CONTEXTS_EOB)
+                .is_none()
+        );
     }
 
     /// End-to-end: drive the real §8.2 `SymbolDecoder` through the
@@ -44395,7 +44371,7 @@ mod tests {
     #[test]
     fn compute_tx_type_lossless_and_large_fallback() {
         let tx_types = |_: u32, _: u32| ADST_ADST; // would-be luma result
-                                                   // Lossless: must collapse to DCT_DCT even for plane 0.
+        // Lossless: must collapse to DCT_DCT even for plane 0.
         assert_eq!(
             compute_tx_type(
                 0,
@@ -44660,7 +44636,7 @@ mod tests {
     fn compute_tx_type_uses_selector_consistent_tx_set() {
         // tx_sz = TX_16X16 -> sqr = sqr_up = TX_16X16.
         let tx_sz_sqr = TX_WIDTH[TX_16X16].trailing_zeros() - 2; // 16 -> log2=4, bwl_index 2
-                                                                 // Just use the spec's explicit ordinal: TX_16X16.
+        // Just use the spec's explicit ordinal: TX_16X16.
         let tx_set = inter_tx_type_set(TX_16X16 as u32, TX_16X16 as u32, false);
         assert_eq!(tx_set, TX_SET_INTER_2);
 
@@ -49242,11 +49218,7 @@ mod tests {
                 subsampling_y: 0,
                 cdef_params: &params,
                 cdef_idx: &|r, c| {
-                    if r == 0 && c == 0 {
-                        0
-                    } else {
-                        -1
-                    }
+                    if r == 0 && c == 0 { 0 } else { -1 }
                 },
                 skip: &|_, _| false,
             };
@@ -53858,7 +53830,7 @@ mod tests {
         assert!(is_samedir_ref_pair(5, 7)); // BWDREF+ALTREF — both bwd
         assert!(!is_samedir_ref_pair(1, 7)); // LAST+ALTREF — mixed
         assert!(!is_samedir_ref_pair(4, 5)); // GOLDEN+BWDREF — mixed
-                                             // INTRA (0) counts as forward (0 < 5).
+        // INTRA (0) counts as forward (0 < 5).
         assert!(is_samedir_ref_pair(0, 1));
         // NONE (-1) counts as forward too.
         assert!(is_samedir_ref_pair(-1, 0));
@@ -54211,7 +54183,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54296,7 +54271,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
         // the §5.11.23 Arm 4 single-pred cascade then reads at least the
         // `new_mv` symbol.
@@ -54363,7 +54341,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(dec.position(), pos_before);
         // RefFrames[0][0] = [LAST_FRAME = 1, NONE = -1].
         assert_eq!(walker.ref_frames()[0], 1);
@@ -54412,7 +54393,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(dec2.position(), pos_before);
         assert_eq!(walker2.ref_frames()[0], 1);
         assert_eq!(walker2.ref_frames()[1], -1);
@@ -54476,7 +54460,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // The single-ref cascade reads at least the single_ref_p1
         // symbol, which is a conformant binary S() against the §9.4
         // default CDF — at minimum one bit gets consumed (the §8.2.6
@@ -54553,7 +54540,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         let r0 = walker.ref_frames()[0];
         let r1 = walker.ref_frames()[1];
         // Either single-pred (r0 in 1..=7, r1 = NONE = -1) or compound
@@ -54734,7 +54724,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
         assert_eq!(
             walker.ref_frames()[1],
@@ -54931,7 +54924,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54996,7 +54992,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -55080,7 +55079,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(
             dec.position() > pos_before,
             "Arm 3 ⇒ compound_mode S() must consume bits"
@@ -55160,7 +55162,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(
             dec.position() > pos_before,
             "Arm 4 ⇒ new_mv + single_ref cascade must consume bits"
@@ -55237,7 +55242,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(dec.position() > pos_before);
     }
 
@@ -55310,7 +55318,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
     }
 
     /// §5.11.23 drl_mode short-circuit: `NumMvFound = 0` on a fresh
@@ -55385,7 +55396,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // drl_mode CDFs must NOT have adapted (no read fired).
         for row in &cdfs.drl_mode {
             assert_eq!(
@@ -55671,7 +55685,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -55749,7 +55766,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -55844,7 +55864,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
         // [0, 0], so final Mv[0] = [0, 0].
         assert_eq!(walker.mvs()[0], 0);
@@ -55938,7 +55961,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
         for list in 0..2 {
             for comp in 0..2 {
@@ -61924,7 +61950,9 @@ mod tests {
         // (0, 1), left neighbour is (1, 0). Both default to DC_PRED
         // (= 0), so get_filter_type is 0 even with avail flags set.
         assert_eq!(
-            walker.get_filter_type(0, 1, 1, /* avail_u */ true, /* avail_l */ true, 0, 0),
+            walker.get_filter_type(
+                0, 1, 1, /* avail_u */ true, /* avail_l */ true, 0, 0
+            ),
             0,
             "DC_PRED neighbours ⇒ filterType 0",
         );
@@ -61942,7 +61970,9 @@ mod tests {
         // though its grid cell is smooth — get_filter_type falls back
         // to the (DC_PRED) left neighbour ⇒ 0.
         assert_eq!(
-            walker.get_filter_type(0, 1, 1, /* avail_u */ false, /* avail_l */ true, 0, 0),
+            walker.get_filter_type(
+                0, 1, 1, /* avail_u */ false, /* avail_l */ true, 0, 0
+            ),
             0,
             "AvailU == 0 masks the smooth above neighbour",
         );
@@ -63162,8 +63192,8 @@ mod tests {
     fn r303_walker_reconstructs_inter_intra_block_pixels() {
         use crate::inter_pred::{EIGHTTAP, II_H_PRED};
         use crate::{
-            reconstruct_inter_block_interintra, InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec, RefFrameStoreEntry,
+            reconstruct_inter_block_interintra,
         };
 
         // §7.11.3.3 reference frame (one plane, 16×16) — caller-owned
@@ -63436,7 +63466,7 @@ mod tests {
     #[test]
     fn r304_walker_reconstructs_single_ref_inter_block_pixels() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // §7.11.3.3 reference frame (one plane, 16×16) — caller-owned
         // decoder state the parser doesn't track.
@@ -63565,7 +63595,7 @@ mod tests {
     #[test]
     fn r346_walker_reconstructs_inter_frame_from_grids() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // §7.11.3.3 reference frame (one plane, 16×16).
         let ref_w: usize = 16;
@@ -63912,7 +63942,7 @@ mod tests {
     #[test]
     fn r346_walker_reconstructs_multi_leaf_subpel_inter_frame() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // Reference frame large enough for both leaves' sub-pel taps.
         let ref_w: usize = 24;
@@ -64417,8 +64447,8 @@ mod tests {
     fn r338_walker_reconstructs_warped_causal_block_pixels() {
         use crate::inter_pred::EIGHTTAP;
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_warp, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry, WarpDriverParams,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, WarpDriverParams,
+            reconstruct_inter_block, reconstruct_inter_block_warp,
         };
 
         // High-frequency reference so a sub-pel warp shift diverges from
@@ -64668,10 +64698,10 @@ mod tests {
     /// overlap blend actually fired).
     #[test]
     fn r355_walker_reconstructs_obmc_block_pixels() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block,
+            reconstruct_inter_block_obmc,
         };
 
         // High-frequency reference so a neighbour's shifted MV diverges
@@ -64857,7 +64887,7 @@ mod tests {
     /// [`crate::Error::PartitionWalkOutOfRange`].
     #[test]
     fn r355_walker_obmc_bridge_guards() {
-        use crate::inter_pred::{ObmcParams, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcParams};
         use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![3u16; 16 * 16];
@@ -64960,10 +64990,10 @@ mod tests {
     /// the translational SIMPLE fallback.
     #[test]
     fn r355_walker_obmc_left_pass_bridge() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block,
+            reconstruct_inter_block_obmc,
         };
 
         let ref_w: usize = 48;
@@ -65132,9 +65162,9 @@ mod tests {
     /// (half-extent) chroma `CurrFrame[1]` buffer.
     #[test]
     fn r355_walker_obmc_chroma_plane_bridge() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block_obmc,
         };
 
         // Chroma reference plane (already subsampled — the bundle carries
@@ -65289,10 +65319,10 @@ mod tests {
     #[test]
     fn r305_walker_reconstructs_compound_average_inter_block_pixels() {
         use crate::inter_pred::{
-            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
-            EIGHTTAP,
+            CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP,
+            reconstruct_inter_block_compound,
         };
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         // Two §7.11.3.3 reference frames (one plane each, 16×16) with
         // distinct content so the two predictions genuinely differ.
@@ -65430,7 +65460,7 @@ mod tests {
     #[test]
     fn r305_walker_compound_bridge_guards() {
         use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![0u16; 16 * 16];
         let entry = RefFrameStoreEntry {
@@ -65564,11 +65594,11 @@ mod tests {
     #[test]
     fn r306_walker_reconstructs_diffwtd_compound_block_multiplane() {
         use crate::inter_pred::{
-            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
-            EIGHTTAP,
+            CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP,
+            reconstruct_inter_block_compound,
         };
         use crate::{
-            block_height, block_width, PlaneRefSpec, RefFrameStoreEntry, COMPOUND_DIFFWTD,
+            COMPOUND_DIFFWTD, PlaneRefSpec, RefFrameStoreEntry, block_height, block_width,
         };
 
         // 4:2:0 reference planes: luma 16×16, chroma 8×8. Two distinct
@@ -65840,7 +65870,7 @@ mod tests {
     #[test]
     fn r306_walker_compound_multiplane_bridge_guards() {
         use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![0u16; 16 * 16];
         let entry = RefFrameStoreEntry {
@@ -65991,7 +66021,7 @@ mod tests {
     #[test]
     fn r307_walker_reconstructs_single_ref_block_multiplane() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{block_height, block_width, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, block_height, block_width};
 
         // 4:2:0 reference planes: luma 16×16, chroma 8×8.
         let build_plane = |w: usize, h: usize, a: usize, b: usize, c: usize| -> Vec<u16> {

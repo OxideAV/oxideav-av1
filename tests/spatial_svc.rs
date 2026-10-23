@@ -21,8 +21,8 @@
 //! §5.9.5, §5.9.7, §6.7.5, §7.5.
 
 use oxideav_av1::decoder::Frame;
-use oxideav_av1::encoder::{encode_spatial_layered_gop_yuv420_with_q, Yuv420Frame};
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, FrameType, RefInfo};
+use oxideav_av1::encoder::{Yuv420Frame, encode_spatial_layered_gop_yuv420_with_q};
+use oxideav_av1::frame_header::{FrameType, RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 

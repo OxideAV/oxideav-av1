@@ -30,9 +30,9 @@
 //! Spec: docs/video/av1/av1-spec.txt §5.9.2.
 
 use oxideav_av1::decoder::decode_av1_spec;
-use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning, Yuv420Frame};
+use oxideav_av1::encoder::{GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_tuned};
 use oxideav_av1::frame_header::{
-    FrameHeader, FrameType, RefInfo, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
+    ALL_FRAMES_PUB, FrameHeader, FrameType, PRIMARY_REF_NONE, RefInfo,
 };
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;

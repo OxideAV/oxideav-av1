@@ -56,18 +56,18 @@
 
 use crate::encoder::bitwriter::BitWriter;
 use crate::frame_header::{
-    FrameHeader, FrameSize, FrameType, InterFrameRefs, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
+    ALL_FRAMES_PUB, FrameHeader, FrameSize, FrameType, InterFrameRefs, PRIMARY_REF_NONE,
     SUPERRES_DENOM_BITS, SUPERRES_DENOM_MIN, SUPERRES_NUM,
 };
-use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
-use crate::tile_info::{TileInfo, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH};
+use crate::sequence_header::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, SequenceHeader};
+use crate::tile_info::{MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH, TileInfo};
 use crate::uncompressed_header_tail::{
-    CdefParams, DeltaLfParams, DeltaQParams, FilmGrainParams, GlobalMotionParams,
-    InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams,
-    TxMode, WarpModelType, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
-    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, MAX_LOOP_FILTER, MAX_SEGMENTS,
-    REFS_PER_FRAME, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
-    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX, TOTAL_REFS_PER_FRAME, WARPEDMODEL_PREC_BITS,
+    CdefParams, DeltaLfParams, DeltaQParams, FilmGrainParams, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS,
+    GM_ABS_TRANS_ONLY_BITS, GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS,
+    GlobalMotionParams, InterpolationFilter, LoopFilterParams, LrParams, MAX_LOOP_FILTER,
+    MAX_SEGMENTS, QuantizationParams, REFS_PER_FRAME, SEG_LVL_MAX, SEGMENTATION_FEATURE_BITS,
+    SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED, SegmentationParams,
+    TOTAL_REFS_PER_FRAME, TxMode, WARPEDMODEL_PREC_BITS, WarpModelType,
 };
 
 /// Encode a `frame_header_obu()` payload per §5.9.1 / §5.9.2 from a
@@ -2033,7 +2033,7 @@ mod tests {
             sp.update_map = true; // forced under PRIMARY_REF_NONE
             sp.temporal_update = false; // forced 0
             sp.update_data = true; // forced 1
-                                   // Activate ALT_Q on segment 1 with a small offset.
+            // Activate ALT_Q on segment 1 with a small offset.
             sp.segment_feature_active[1][SEG_LVL_ALT_Q] = true;
             sp.segment_feature_data[1][SEG_LVL_ALT_Q] = 4;
             sp.last_active_seg_id = 1;
@@ -2147,8 +2147,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::uncompressed_header_tail::{
-        parse_global_motion_params, prev_gm_params_default, TOTAL_REFS_PER_FRAME,
-        WARPEDMODEL_PREC_BITS,
+        TOTAL_REFS_PER_FRAME, WARPEDMODEL_PREC_BITS, parse_global_motion_params,
+        prev_gm_params_default,
     };
 
     /// Write `gm` through the §5.9.24 inverse and re-parse it with the

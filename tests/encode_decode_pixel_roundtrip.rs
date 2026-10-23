@@ -20,8 +20,8 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q, encode_key_frame_yuv420_with_q, encode_key_frame_yuv_with_q,
-    ChromaFormat, Yuv420Frame, YuvFrame,
+    ChromaFormat, Yuv420Frame, YuvFrame, encode_gop_yuv420_with_q, encode_key_frame_yuv_with_q,
+    encode_key_frame_yuv420_with_q,
 };
 use oxideav_av1::{decode_av1, encode_av1};
 
@@ -68,7 +68,7 @@ fn checker(w: u32, h: u32, cell: usize) -> Yuv420Frame {
     let mut f = Yuv420Frame::filled(w, h, 0);
     for r in 0..hu {
         for c in 0..wu {
-            f.y[r * wu + c] = if ((r / cell) + (c / cell)) % 2 == 0 {
+            f.y[r * wu + c] = if ((r / cell) + (c / cell)).is_multiple_of(2) {
                 225
             } else {
                 40
@@ -78,7 +78,7 @@ fn checker(w: u32, h: u32, cell: usize) -> Yuv420Frame {
     let (cw, ch) = (wu / 2, hu / 2);
     for r in 0..ch {
         for c in 0..cw {
-            f.u[r * cw + c] = if ((r / cell) + (c / cell)) % 2 == 0 {
+            f.u[r * cw + c] = if ((r / cell) + (c / cell)).is_multiple_of(2) {
                 90
             } else {
                 170

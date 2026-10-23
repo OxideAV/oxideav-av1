@@ -35,9 +35,9 @@
 
 use crate::encoder::bitwriter::BitWriter;
 use crate::sequence_header::{
-    ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint, SequenceHeader,
-    TimingInfo, CP_UNSPECIFIED, CSP_UNKNOWN, MC_UNSPECIFIED, SELECT_INTEGER_MV,
-    SELECT_SCREEN_CONTENT_TOOLS, TC_UNSPECIFIED,
+    CP_UNSPECIFIED, CSP_UNKNOWN, ColorConfig, DecoderModelInfo, MC_UNSPECIFIED,
+    OperatingParametersInfo, OperatingPoint, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS,
+    SequenceHeader, TC_UNSPECIFIED, TimingInfo,
 };
 
 // §5.5.2 colour-config fast-path constants — duplicated locally to

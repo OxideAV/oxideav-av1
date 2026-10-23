@@ -24,9 +24,9 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_tuned, encode_key_frame_yuv420_with_q, GopTuning, Yuv420Frame,
+    GopTuning, Yuv420Frame, encode_gop_yuv420_with_q_seg_tuned, encode_key_frame_yuv420_with_q,
 };
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, RefInfo};
+use oxideav_av1::frame_header::{RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -204,9 +204,11 @@ fn qm_election_fires_on_texture_and_decodes_bit_exact() {
     // The baseline decodes too and never codes the flag.
     let off = arm(&frames, 100, false);
     assert!(off.qm_elections.iter().all(|&e| !e));
-    assert!(wire_qm(&off.gop.temporal_units, 96, 80)
-        .iter()
-        .all(|&(u, _)| !u));
+    assert!(
+        wire_qm(&off.gop.temporal_units, 96, 80)
+            .iter()
+            .all(|&(u, _)| !u)
+    );
     assert_decodes_to_recons("qm-off", &off);
 }
 
@@ -269,13 +271,13 @@ fn qm_measurement_matrix() {
         return;
     }
     let mut rows = Vec::new();
-    for (kind, gen) in [
+    for (kind, r#gen) in [
         ("natural", natural as fn(u32, u32, usize) -> Yuv420Frame),
         ("gradient", gradient as fn(u32, u32, usize) -> Yuv420Frame),
     ] {
         for &(w, h) in &[(96u32, 80u32), (128, 128)] {
             for &q in &[60u8, 100, 140, 180, 220] {
-                let frames: Vec<Yuv420Frame> = (0..4).map(|t| gen(w, h, t)).collect();
+                let frames: Vec<Yuv420Frame> = (0..4).map(|t| r#gen(w, h, t)).collect();
                 let on = arm(&frames, q, true);
                 let off = arm(&frames, q, false);
                 let (bon, boff) = (on.gop.ivf_bytes.len(), off.gop.ivf_bytes.len());

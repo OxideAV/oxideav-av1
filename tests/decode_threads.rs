@@ -12,7 +12,7 @@
 //!    a per-sample budget.
 
 use oxideav_av1::decoder::SpecDecodeSession;
-use oxideav_av1::encoder::still::{encode_still_yuv, StillOptions};
+use oxideav_av1::encoder::still::{StillOptions, encode_still_yuv};
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::registry::make_decoder;
 use oxideav_core::{CodecParameters, ExecutionContext, Frame, Packet, TimeBase};

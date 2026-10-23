@@ -468,11 +468,7 @@ pub(crate) fn chroma_noise_gate(
     let cw = frames[0].chroma_width() as usize;
     let ch = frames[0].chroma_height() as usize;
     fn pl(f: &YuvFrame, plane: usize) -> &[u16] {
-        if plane == 1 {
-            &f.u
-        } else {
-            &f.v
-        }
+        if plane == 1 { &f.u } else { &f.v }
     }
     if pl(&frames[0], plane).is_empty() {
         return false;
@@ -528,11 +524,7 @@ pub(crate) fn lag_h_rho(a: &[u16], b: &[u16], w: usize, h: usize, lag: usize) ->
             }
         }
     }
-    if e <= 0.0 {
-        0.0
-    } else {
-        lagsum / e
-    }
+    if e <= 0.0 { 0.0 } else { lagsum / e }
 }
 
 /// The film-grain arm's CONTENT gate. Fires only when the luma

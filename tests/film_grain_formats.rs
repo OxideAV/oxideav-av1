@@ -28,9 +28,9 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_gop_yuv_seg_extras_tuned, ChromaFormat, GopTuning, TunedGopYuv, YuvFrame,
+    ChromaFormat, GopTuning, TunedGopYuv, YuvFrame, encode_gop_yuv_seg_extras_tuned,
 };
-use oxideav_av1::frame_header::{parse_frame_header, FrameHeader};
+use oxideav_av1::frame_header::{FrameHeader, parse_frame_header};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 

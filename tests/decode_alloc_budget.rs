@@ -5,7 +5,7 @@
 //! allocates during the measurement): the pre-r475 driver held three
 //! frame-sized `i32` copies plus a second copy of the output.
 
-use oxideav_av1::encoder::still::{encode_still_yuv, StillOptions};
+use oxideav_av1::encoder::still::{StillOptions, encode_still_yuv};
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::registry::make_decoder;
 use oxideav_core::{CodecParameters, Frame, Packet, TimeBase};
@@ -20,27 +20,33 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        System.alloc(layout)
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            System.alloc(layout)
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            System.dealloc(ptr, layout)
+        }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let old = layout.size();
-        if new_size > old {
-            let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        } else {
-            LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let old = layout.size();
+            if new_size > old {
+                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            } else {
+                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+            }
+            System.realloc(ptr, layout, new_size)
         }
-        System.realloc(ptr, layout, new_size)
     }
 }
 

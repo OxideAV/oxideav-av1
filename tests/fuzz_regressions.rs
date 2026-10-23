@@ -18,11 +18,13 @@ static TOTAL_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        TOTAL_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        System.alloc(layout)
+        unsafe {
+            TOTAL_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+            System.alloc(layout)
+        }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
@@ -47,7 +49,10 @@ fn allocated_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// Decode raw hex into bytes (test-local helper; fixtures embed hex so
 /// the suite runs in per-crate CI without a fixture checkout).
 fn hex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    assert!(
+        s.len().is_multiple_of(2),
+        "hex literal must have even length"
+    );
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))

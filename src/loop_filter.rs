@@ -395,14 +395,16 @@ pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + '
     std::thread::scope(|scope| {
         for _ in 0..threads.min(queue.lock().map(|q| q.len()).unwrap_or(1)) {
             let queue = &queue;
-            scope.spawn(move || loop {
-                let job = match queue.lock() {
-                    Ok(mut q) => q.pop(),
-                    Err(_) => None,
-                };
-                match job {
-                    Some(job) => job(),
-                    None => break,
+            scope.spawn(move || {
+                loop {
+                    let job = match queue.lock() {
+                        Ok(mut q) => q.pop(),
+                        Err(_) => None,
+                    };
+                    match job {
+                        Some(job) => job(),
+                        None => break,
+                    }
                 }
             });
         }
@@ -505,15 +507,15 @@ pub(crate) fn loop_filter_edge_in(
     let prev_tx_sz = (ctx.lf_tx_size)(plane as usize, prev_row >> sub_y, prev_col >> sub_x);
     // av1-spec p.308 line 17079-17084: isBlockEdge.
     let is_block_edge = if pass == 0 {
-        (x_p as u32) % block_width(plane_size).max(1) == 0
+        (x_p as u32).is_multiple_of(block_width(plane_size).max(1))
     } else {
-        (y_p as u32) % block_height(plane_size).max(1) == 0
+        (y_p as u32).is_multiple_of(block_height(plane_size).max(1))
     };
     // av1-spec p.308 line 17088-17099: isTxEdge.
     let is_tx_edge = if pass == 0 {
-        (x_p as u32) % crate::cdf::TX_WIDTH[tx_sz].max(1) as u32 == 0
+        (x_p as u32).is_multiple_of(crate::cdf::TX_WIDTH[tx_sz].max(1) as u32)
     } else {
-        (y_p as u32) % crate::cdf::TX_HEIGHT[tx_sz].max(1) as u32 == 0
+        (y_p as u32).is_multiple_of(crate::cdf::TX_HEIGHT[tx_sz].max(1) as u32)
     };
     // av1-spec p.309 line 17101-17107: applyFilter.
     let apply_filter = if !is_tx_edge {
@@ -1067,11 +1069,7 @@ fn clip3_i32(a: i32, b: i32, x: i32) -> i32 {
 /// log2_size)` post-shift).
 #[inline]
 fn round2_i32(x: i32, n: u32) -> i32 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1 << (n - 1))) >> n
-    }
+    if n == 0 { x } else { (x + (1 << (n - 1))) >> n }
 }
 
 /// `filter4_clamp(v) = Clip3(-(1 << (BitDepth - 1)), (1 << (BitDepth -

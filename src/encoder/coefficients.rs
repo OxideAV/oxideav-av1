@@ -80,14 +80,14 @@
 //! [`PartitionWalker::coefficients`]: crate::cdf::PartitionWalker::coefficients
 //! [`block_mode_info`]: crate::encoder::block_mode_info
 
+use crate::Error;
 use crate::cdf::{
-    get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, TileCdfContext, BR_CDF_SIZE,
-    COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS, NUM_BASE_LEVELS,
-    PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TXB_SKIP_CONTEXTS, TX_SIZES,
-    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
+    BR_CDF_SIZE, COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS,
+    NUM_BASE_LEVELS, PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TX_SIZE_SQR_UP,
+    TX_SIZES, TX_SIZES_ALL, TX_WIDTH, TX_WIDTH_LOG2, TXB_SKIP_CONTEXTS, TileCdfContext, get_br_ctx,
+    get_coeff_base_ctx, get_coeff_base_eob_ctx,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::Error;
 
 /// Maximum §5.11.39 golomb `length` permitted by the conformance
 /// constraint of §6.10.34 (av1-spec p.392): "If length is equal to 20,
@@ -1169,8 +1169,8 @@ pub fn write_coefficients_gate_open(
 mod tests {
     use super::*;
     use crate::cdf::{
-        get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, TileCdfContext, TX_16X16, TX_32X32,
-        TX_4X4, TX_8X8, TX_CLASS_2D, TX_CLASS_HORIZ,
+        TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_CLASS_2D, TX_CLASS_HORIZ, TileCdfContext,
+        get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -2097,7 +2097,7 @@ mod tests {
     // `PartitionWalker::coefficients`.
     // =================================================================
 
-    use crate::cdf::{PartitionWalker, TileGeometry, TX_4X4 as TX_4X4_C, TX_8X8 as TX_8X8_C};
+    use crate::cdf::{PartitionWalker, TX_4X4 as TX_4X4_C, TX_8X8 as TX_8X8_C, TileGeometry};
 
     /// Helper: build a minimal `PartitionWalker` to host a
     /// `coefficients()` invocation. The reader is stateless on `self`

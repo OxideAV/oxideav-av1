@@ -391,10 +391,10 @@ use crate::cdf::{
     TX_WIDTH, TX_WIDTH_LOG2, V_ADST, V_DCT, V_FLIPADST,
 };
 
-use super::forward_adst::{forward_adst_16, forward_adst_4, forward_adst_8};
-use super::forward_identity::{forward_idtx_16, forward_idtx_32, forward_idtx_4, forward_idtx_8};
+use super::forward_adst::{forward_adst_4, forward_adst_8, forward_adst_16};
+use super::forward_identity::{forward_idtx_4, forward_idtx_8, forward_idtx_16, forward_idtx_32};
 use super::forward_transform::{
-    forward_dct_16, forward_dct_32, forward_dct_4, forward_dct_64, forward_dct_8,
+    forward_dct_4, forward_dct_8, forward_dct_16, forward_dct_32, forward_dct_64,
 };
 use super::forward_wht::forward_wht_4x4;
 
@@ -763,8 +763,8 @@ fn round2_12(x: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::cdf::{
-        TX_16X16, TX_16X32, TX_16X4, TX_16X64, TX_16X8, TX_32X16, TX_32X32, TX_32X64, TX_32X8,
-        TX_4X16, TX_4X4, TX_4X8, TX_64X16, TX_64X32, TX_64X64, TX_8X16, TX_8X32, TX_8X4, TX_8X8,
+        TX_4X4, TX_4X8, TX_4X16, TX_8X4, TX_8X8, TX_8X16, TX_8X32, TX_16X4, TX_16X8, TX_16X16,
+        TX_16X32, TX_16X64, TX_32X8, TX_32X16, TX_32X32, TX_32X64, TX_64X16, TX_64X32, TX_64X64,
     };
     use crate::transform::inverse_transform_2d;
 

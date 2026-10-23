@@ -15,7 +15,7 @@
 
 use oxideav_av1::decoder::decode_av1_spec;
 use oxideav_av1::encoder::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, GopTuning, SegExtras, Yuv420Frame,
+    GopTuning, SegExtras, Yuv420Frame, encode_gop_yuv420_with_q_seg_extras_tuned,
 };
 
 /// Static textured background with a small moving square: the

@@ -30,9 +30,9 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
+    ChromaFormat, Yuv420Frame, YuvFrame, encode_key_frame_yuv_with_q_tiles,
     encode_key_frame_yuv420_with_q, encode_key_frame_yuv420_with_q_tiles,
-    encode_key_frame_yuv_with_q_tiles, parse_tile_group_obu_body, ChromaFormat, Yuv420Frame,
-    YuvFrame,
+    parse_tile_group_obu_body,
 };
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};
@@ -284,7 +284,7 @@ fn moving(w: u32, h: u32, t: usize) -> Yuv420Frame {
 /// sample-exact.
 #[test]
 fn multi_tile_gop_round_trips_pixel_exact() {
-    use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning};
+    use oxideav_av1::encoder::{GopTuning, encode_gop_yuv420_with_q_seg_tuned};
     let frames: Vec<Yuv420Frame> = (0..3).map(|t| moving(192, 128, t)).collect();
     let tuning = GopTuning {
         tiles: (1, 1),
@@ -308,7 +308,7 @@ fn multi_tile_gop_round_trips_pixel_exact() {
 #[test]
 fn gop_tiles_0_0_is_byte_identical() {
     use oxideav_av1::encoder::{
-        encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg_tuned, GopTuning,
+        GopTuning, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg_tuned,
     };
     let frames: Vec<Yuv420Frame> = (0..3).map(|t| moving(128, 64, t)).collect();
     let a = encode_gop_yuv420_with_q(&frames, 72).expect("default GOP");
@@ -335,7 +335,7 @@ fn gop_tiles_0_0_is_byte_identical() {
 fn camera_frame_tile_columns_feed_the_tile_list() {
     use oxideav_av1::decoder::SpecFrame;
     use oxideav_av1::encoder::encode_camera_frame_yuv420_tiles;
-    use oxideav_av1::tile_list::{decode_tile_list, TileListEntry, TileListObu};
+    use oxideav_av1::tile_list::{TileListEntry, TileListObu, decode_tile_list};
 
     // Textured anchor + a camera view the RD ladder can motion-
     // compensate from (content shifted, brightness ramped).
@@ -454,7 +454,7 @@ fn multi_tile_fixture_staging() {
     // The tiled GOP (KEY + 2 P-frames, full election set, 2×2 tiles
     // on every frame).
     {
-        use oxideav_av1::encoder::{encode_gop_yuv420_with_q_seg_tuned, GopTuning};
+        use oxideav_av1::encoder::{GopTuning, encode_gop_yuv420_with_q_seg_tuned};
         let frames: Vec<Yuv420Frame> = (0..3).map(|t| moving(192, 128, t)).collect();
         let tuning = GopTuning {
             tiles: (1, 1),

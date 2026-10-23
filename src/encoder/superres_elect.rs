@@ -14,11 +14,11 @@
 //! at 1/64-sample precision. Only election quality depends on it —
 //! conformance never does.
 
+use crate::Error;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::frame_header::{SUPERRES_DENOM_MIN, SUPERRES_NUM};
 use crate::loop_filter::PlaneBuffer;
-use crate::superres::{upscale_frame, SuperresFrameContext};
-use crate::Error;
+use crate::superres::{SuperresFrameContext, upscale_frame};
 
 /// §5.9.8 `FrameWidth` derivation:
 /// `(UpscaledWidth * SUPERRES_NUM + (SuperresDenom / 2)) /
@@ -39,7 +39,7 @@ pub(crate) fn candidate_denoms(width: u32) -> Vec<u32> {
     (SUPERRES_DENOM_MIN..=16)
         .filter(|&d| {
             let wd = superres_coded_width(width, d);
-            wd >= 8 && wd % 8 == 0 && wd < width
+            wd >= 8 && wd.is_multiple_of(8) && wd < width
         })
         .collect()
 }
@@ -488,9 +488,11 @@ mod tests {
             Some(vec![2, 2])
         );
         let cands = inter_candidate_denoms(320, 96, (0, 0), Some((&[3, 2], &[2])), None);
-        assert!(cands
-            .iter()
-            .all(|&d| denom_explicit_ok(320, 96, d, &[3, 2], &[2]).is_some()));
+        assert!(
+            cands
+                .iter()
+                .all(|&d| denom_explicit_ok(320, 96, d, &[3, 2], &[2]).is_some())
+        );
         assert!(cands.contains(&16));
     }
 
@@ -510,7 +512,10 @@ mod tests {
         for w in (8..=512).step_by(8) {
             for d in candidate_denoms(w) {
                 let wd = superres_coded_width(w, d);
-                assert!(wd >= 8 && wd % 8 == 0 && wd < w, "w={w} d={d} wd={wd}");
+                assert!(
+                    wd >= 8 && wd.is_multiple_of(8) && wd < w,
+                    "w={w} d={d} wd={wd}"
+                );
             }
         }
         // 128 admits exactly denominator 16 (129..1023/d never lands

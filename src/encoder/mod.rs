@@ -318,110 +318,112 @@ pub mod yuv_frame;
 pub use bitwriter::BitWriter;
 #[doc(hidden)]
 pub use block_mode_info::{
-    write_inter_block_mode_info, write_inter_block_mode_info_bootstrap,
-    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
-    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_use_intrabc, write_y_mode,
-    IntrabcArmInputs, IntrabcBlockInfo,
+    IntrabcArmInputs, IntrabcBlockInfo, write_inter_block_mode_info,
+    write_inter_block_mode_info_bootstrap, write_intra_frame_intrabc_arm, write_intra_frame_y_mode,
+    write_intra_segment_id, write_intra_uv_mode, write_palette_tokens_plane, write_skip,
+    write_use_intrabc, write_y_mode,
 };
 // r430 — §7.3 large-scale-tile camera-frame write arm (single-tile
 // camera frames; the tile-list assembly lives in
 // [`crate::tile_list`]).
 #[doc(hidden)]
 pub use camera_frame::{
-    build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420, encode_camera_frame_yuv420_tiles,
-    encode_camera_frame_yuv420_tiles_qm, CameraFrameEncode,
+    CameraFrameEncode, build_camera_seq_yuv420_8bit, encode_camera_frame_yuv420,
+    encode_camera_frame_yuv420_tiles, encode_camera_frame_yuv420_tiles_qm,
 };
 #[doc(hidden)]
 pub use coefficients::{
-    write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
-    write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
+    GOLOMB_MAX_LENGTH, write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients,
+    write_dc_sign, write_eob_pt, write_golomb, write_txb_skip,
 };
 #[doc(hidden)]
 pub use forward_adst::{
-    forward_adst_16, forward_adst_16x16, forward_adst_4, forward_adst_4x4, forward_adst_8,
-    forward_adst_8x8, forward_flipadst_16, forward_flipadst_16x16, forward_flipadst_4,
-    forward_flipadst_4x4, forward_flipadst_8, forward_flipadst_8x8,
+    forward_adst_4, forward_adst_4x4, forward_adst_8, forward_adst_8x8, forward_adst_16,
+    forward_adst_16x16, forward_flipadst_4, forward_flipadst_4x4, forward_flipadst_8,
+    forward_flipadst_8x8, forward_flipadst_16, forward_flipadst_16x16,
 };
 #[doc(hidden)]
 pub use forward_identity::{
-    forward_idtx_16, forward_idtx_16x16, forward_idtx_32, forward_idtx_32x32, forward_idtx_4,
-    forward_idtx_4x4, forward_idtx_8, forward_idtx_8x8,
+    forward_idtx_4, forward_idtx_4x4, forward_idtx_8, forward_idtx_8x8, forward_idtx_16,
+    forward_idtx_16x16, forward_idtx_32, forward_idtx_32x32,
 };
 #[doc(hidden)]
 pub use forward_quantize::forward_quantize;
 #[doc(hidden)]
 pub use forward_transform::{
-    forward_dct_16, forward_dct_16x16, forward_dct_32, forward_dct_32x32, forward_dct_4,
-    forward_dct_4x4, forward_dct_64, forward_dct_64x64, forward_dct_8, forward_dct_8x8,
+    forward_dct_4, forward_dct_4x4, forward_dct_8, forward_dct_8x8, forward_dct_16,
+    forward_dct_16x16, forward_dct_32, forward_dct_32x32, forward_dct_64, forward_dct_64x64,
 };
 #[doc(hidden)]
 pub use forward_transform_2d::forward_transform_2d;
 #[doc(hidden)]
-pub use forward_wht::{forward_wht4, forward_wht_4x4};
+pub use forward_wht::{forward_wht_4x4, forward_wht4};
 #[doc(hidden)]
 pub use frame_obu::write_frame_header_obu;
 #[doc(hidden)]
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model;
 #[doc(hidden)]
 pub use inter_frame::encode_gop_yuv420_with_q_seg_rate_model_gm;
-pub use inter_frame::{encode_gop_yuv, encode_gop_yuv_with_q, EncodedGopYuv, GopFrameReconYuv};
 pub use inter_frame::{
-    encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_lossless_regions,
-    encode_gop_yuv420_with_q_seg, EncodedGop, GopFrameRecon, LosslessRegion, GOP_MAX_FRAMES,
+    EncodedGop, GOP_MAX_FRAMES, GopFrameRecon, LosslessRegion, encode_gop_yuv420,
+    encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_lossless_regions,
+    encode_gop_yuv420_with_q_seg,
 };
+pub use inter_frame::{EncodedGopYuv, GopFrameReconYuv, encode_gop_yuv, encode_gop_yuv_with_q};
 #[doc(hidden)]
 pub use inter_frame::{
-    encode_gop_yuv420_with_q_seg_extras_tuned, encode_gop_yuv420_with_q_seg_lossless_tuned,
-    encode_gop_yuv420_with_q_seg_tuned, GopTuning, SegExtras, TunedGop,
-};
-pub use inter_frame::{
-    encode_gop_yuv420_with_q_tile_layout, encode_gop_yuv_seg_extras_tuned_layout,
-    encode_gop_yuv_with_q_tile_layout,
+    GopTuning, SegExtras, TunedGop, encode_gop_yuv420_with_q_seg_extras_tuned,
+    encode_gop_yuv420_with_q_seg_lossless_tuned, encode_gop_yuv420_with_q_seg_tuned,
 };
 #[doc(hidden)]
-pub use inter_frame::{encode_gop_yuv_seg_extras_tuned, TunedGopYuv};
+pub use inter_frame::{TunedGopYuv, encode_gop_yuv_seg_extras_tuned};
+pub use inter_frame::{
+    encode_gop_yuv_seg_extras_tuned_layout, encode_gop_yuv_with_q_tile_layout,
+    encode_gop_yuv420_with_q_tile_layout,
+};
 #[doc(hidden)]
 pub use inter_predict::{
+    EncRefPlane, EncodedInterFrameY, EncodedInterFrameYuv, InterResidualLeaf,
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,
     encode_inter_frame_yuv, estimate_motion_4x4_full_search, estimate_motion_4x4_subpel,
-    predict_inter_block_single, EncRefPlane, EncodedInterFrameY, EncodedInterFrameYuv,
-    InterResidualLeaf,
+    predict_inter_block_single,
 };
 #[doc(hidden)]
-pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
+pub use ivf::{IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter, parse_file_header};
 #[doc(hidden)]
 pub use key_frame::encode_key_frame_yuv420_with_q_rate_model;
-pub use key_frame::{encode_key_frame_yuv, encode_key_frame_yuv_with_q, EncodedKeyFrameYuv};
 pub use key_frame::{
-    encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
+    EncodedKeyFrame, KEY_FRAME_MAX_DIM, encode_key_frame_yuv420, encode_key_frame_yuv420_with_q,
 };
+pub use key_frame::{EncodedKeyFrameYuv, encode_key_frame_yuv, encode_key_frame_yuv_with_q};
 // r431 — §5.9.15 multi-tile write arm (uniform tile layouts,
 // explicitly configured; `(0, 0)` reproduces the single-tile stream
 // byte for byte).
 pub use key_frame::{
-    encode_key_frame_yuv420_with_q_tile_groups, encode_key_frame_yuv_with_q_tile_groups,
+    encode_key_frame_yuv_with_q_tile_groups, encode_key_frame_yuv420_with_q_tile_groups,
 };
 pub use key_frame::{
-    encode_key_frame_yuv420_with_q_tile_layout, encode_key_frame_yuv_with_q_tile_layout,
+    encode_key_frame_yuv_with_q_tile_layout, encode_key_frame_yuv420_with_q_tile_layout,
 };
-pub use key_frame::{encode_key_frame_yuv420_with_q_tiles, encode_key_frame_yuv_with_q_tiles};
+pub use key_frame::{encode_key_frame_yuv_with_q_tiles, encode_key_frame_yuv420_with_q_tiles};
 // r431 — KEY-frame §5.9.17 delta-q A/B hook (hidden).
 #[doc(hidden)]
 pub use key_frame::encode_key_frame_yuv420_with_q_dq;
 #[doc(hidden)]
-pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
+pub use loop_restoration_write::{LrWriteState, write_lr, write_lr_unit};
 #[doc(hidden)]
 pub use obu::{
-    build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
-    ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
+    ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter, build_temporal_unit,
+    obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
 };
 #[doc(hidden)]
 pub use partition::{partition_none_only, partition_split_only, write_partition};
 #[doc(hidden)]
 pub use partition_tree::{
-    write_block_syntax, write_partition_tree, write_partition_tree_syntax, EncodeBlock, EncodeNode,
-    PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients, SyntaxBlock, SyntaxFrameParams,
-    SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, SyntaxPalette, VarTxSyntaxTree,
+    EncodeBlock, EncodeNode, PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients,
+    SyntaxBlock, SyntaxFrameParams, SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode,
+    SyntaxPalette, VarTxSyntaxTree, write_block_syntax, write_partition_tree,
+    write_partition_tree_syntax,
 };
 // r428 — the encoder-mirror emit arms are retired (see the r428
 // CHANGELOG entry); the shared frame/sequence scaffolding they
@@ -429,75 +431,74 @@ pub use partition_tree::{
 pub use yuv_frame::Yuv420Frame;
 #[doc(hidden)]
 pub use yuv_frame::{
-    build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_fh_with_q,
-    build_intra_only_yuv420_8bit_seq, sb_grid_origins, MAX_DIM, MIN_DIM, SB_SIZE4_64,
+    MAX_DIM, MIN_DIM, SB_SIZE4_64, build_intra_only_yuv420_8bit_fh,
+    build_intra_only_yuv420_8bit_fh_with_q, build_intra_only_yuv420_8bit_seq, sb_grid_origins,
 };
 // r421 — rate-model selector, exposed (hidden) so the sweep harnesses
 // can A/B the twin-priced elections against the heuristic baseline.
 #[doc(hidden)]
 pub use pyramid_gop::encode_pyramid_gop_yuv420_with_q_rate_model;
+pub use pyramid_gop::{encode_adaptive_gop_yuv_with_q, encode_pyramid_gop_yuv_with_q};
 pub use pyramid_gop::{
     encode_adaptive_gop_yuv420_with_q, encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q,
 };
-pub use pyramid_gop::{encode_adaptive_gop_yuv_with_q, encode_pyramid_gop_yuv_with_q};
 // r424 — deep-pyramid / adaptive-mini-GOP tuning surfaces, exposed
 // (hidden) for the measurement harnesses.
 #[doc(hidden)]
 pub use pyramid_gop::{
-    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
     AdaptiveTuning, PyramidTuning, TunedAdaptiveGop, TunedPyramidGop,
+    encode_adaptive_gop_yuv420_with_q_tuned, encode_pyramid_gop_yuv420_with_q_tuned,
 };
 #[doc(hidden)]
 pub use pyramid_gop::{
-    encode_adaptive_gop_yuv_with_q_tuned, encode_pyramid_gop_yuv_with_q_tuned, TunedAdaptiveGopYuv,
-    TunedPyramidGopYuv,
+    TunedAdaptiveGopYuv, TunedPyramidGopYuv, encode_adaptive_gop_yuv_with_q_tuned,
+    encode_pyramid_gop_yuv_with_q_tuned,
 };
 #[doc(hidden)]
 pub use rate_twin::RateModel;
 // r430 — temporally scalable GOP arm (§6.7.5 operating points +
 // §5.3.3 extension headers on the wire).
 pub use scalable_gop::{
-    encode_temporal_layered_gop_yuv420_with_q, encode_temporal_layered_gop_yuv_with_q,
-    temporal_layer_of, TemporalLayeredGop, TemporalLayeredGopYuv,
+    TemporalLayeredGop, TemporalLayeredGopYuv, encode_temporal_layered_gop_yuv_with_q,
+    encode_temporal_layered_gop_yuv420_with_q, temporal_layer_of,
 };
 // r433 — tiled scalable-ladder siblings.
 pub use scalable_gop::{
-    encode_temporal_layered_gop_yuv420_with_q_tiles, encode_temporal_layered_gop_yuv_with_q_tiles,
+    encode_temporal_layered_gop_yuv_with_q_tiles, encode_temporal_layered_gop_yuv420_with_q_tiles,
 };
 // r431 — spatially scalable arm: independently-coded spatial layers,
 // spatial_id extension headers, nested §6.7.5 operating points.
 pub use scalable_gop::{
-    encode_spatial_layered_gop_yuv420_with_q, encode_spatial_layered_gop_yuv_with_q,
-    SpatialLayeredGop, SpatialLayeredGopYuv,
+    SpatialLayeredGop, SpatialLayeredGopYuv, encode_spatial_layered_gop_yuv_with_q,
+    encode_spatial_layered_gop_yuv420_with_q,
 };
 // r436 — per-layer tile layouts + tile-group packaging on the
 // spatial-SVC driver.
 pub use scalable_gop::{
-    encode_spatial_layered_gop_yuv420_with_q_inter_layer,
-    encode_spatial_layered_gop_yuv420_with_q_tiles,
     encode_spatial_layered_gop_yuv_with_q_inter_layer, encode_spatial_layered_gop_yuv_with_q_tiles,
+    encode_spatial_layered_gop_yuv420_with_q_inter_layer,
+    encode_spatial_layered_gop_yuv420_with_q_tiles, encode_spatial_temporal_layered_gop_yuv_with_q,
     encode_spatial_temporal_layered_gop_yuv420_with_q,
-    encode_spatial_temporal_layered_gop_yuv_with_q,
 };
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 pub use still::{
+    DEFAULT_STILL_BASE_Q_IDX, EncodedStill, SEQ_LEVEL_IDX_MAX_PARAMETERS, StillOptions, StillSpeed,
     elect_seq_level_idx, encode_key_frame_yuv_with_options, encode_still_yuv, encode_still_yuv420,
-    quality_to_base_q_idx, EncodedStill, StillOptions, StillSpeed, DEFAULT_STILL_BASE_Q_IDX,
-    SEQ_LEVEL_IDX_MAX_PARAMETERS,
+    quality_to_base_q_idx,
 };
 #[doc(hidden)]
 pub use symbol_writer::SymbolWriter;
 #[doc(hidden)]
-pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};
+pub use temporal_unit::{TemporalUnitPlan, encode_sequence_header_obu, encode_temporal_unit};
 #[doc(hidden)]
 pub use tile_group_obu::{
-    parse_tile_group_obu_body, write_tile_group_obu, ParsedTileGroup, TileGroupObu,
-    TileGroupObuWriter, TilePayload,
+    ParsedTileGroup, TileGroupObu, TileGroupObuWriter, TilePayload, parse_tile_group_obu_body,
+    write_tile_group_obu,
 };
 #[doc(hidden)]
-pub use transform_tree::{write_block_tx_size, write_var_tx_size, VarTxNode, VarTxNodeKind};
+pub use transform_tree::{VarTxNode, VarTxNodeKind, write_block_tx_size, write_var_tx_size};
 
 pub use yuv_frame::{
-    build_intra_only_seq_yuv, color_config_for, elect_seq_profile, ChromaFormat, YuvFrame,
+    ChromaFormat, YuvFrame, build_intra_only_seq_yuv, color_config_for, elect_seq_profile,
 };
