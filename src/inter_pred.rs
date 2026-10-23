@@ -7871,7 +7871,10 @@ mod tests {
                                     &plane, pw, pw as i32, ph as i32, x, y, xs, ys, w, h, hf, vf,
                                     r0, 11,
                                 );
-                                assert_eq!(pred, want, "bd {bd} step ({xs},{ys}) {w}x{h} at ({x},{y}) filters ({fx},{fy})");
+                                assert_eq!(
+                                    pred, want,
+                                    "bd {bd} step ({xs},{ys}) {w}x{h} at ({x},{y}) filters ({fx},{fy})"
+                                );
                             }
                         }
                     }
