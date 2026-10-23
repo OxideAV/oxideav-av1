@@ -5,12 +5,17 @@
 //! takes) and a digest of every output plane.
 //!
 //! ```text
-//! cargo run --release --example decode_bench -- input.ivf [more ...] [threads=N] [repeat=N]
+//! cargo run --release --example decode_bench -- input.ivf [more ...] [threads=N] [repeat=N] [stream=1]
 //! ```
 //!
 //! `threads=N` hands the registry decoder an `ExecutionContext` budget
 //! of `N` workers (serial when absent); `repeat=N` decodes each input
 //! `N` times with a fresh decoder (the reported times are the best).
+//! `stream=1` feeds the registry decoder one IVF record per packet and
+//! drains it after every packet, the way a player does (the default
+//! sends the whole file as one packet, so the output queue holds every
+//! frame until the drain — fine for a still, but it hides the
+//! frame-parallel pipeline's real resident set on a sequence).
 //! The digest is a 64-bit FNV-1a over the planes in output order, so
 //! two runs are byte-identical iff their digests agree. Peak memory is
 //! the caller's job (`/usr/bin/time -l` on macOS, `-v` on Linux).
@@ -104,11 +109,14 @@ fn main() {
     let mut repeat = 1usize;
     let mut mode = Mode::Both;
     let mut dump: Option<String> = None;
+    let mut stream = false;
     for a in std::env::args().skip(1) {
         if let Some(v) = a.strip_prefix("threads=") {
             threads = v.parse().expect("threads=N");
         } else if let Some(v) = a.strip_prefix("repeat=") {
             repeat = v.parse().expect("repeat=N");
+        } else if let Some(v) = a.strip_prefix("stream=") {
+            stream = v != "0";
         } else if let Some(v) = a.strip_prefix("mode=") {
             mode = match v {
                 "direct" => Mode::Direct,
@@ -123,10 +131,10 @@ fn main() {
     }
     assert!(
         !inputs.is_empty(),
-        "usage: decode_bench <in.ivf|in.obu> [more ...] [threads=N] [repeat=N]"
+        "usage: decode_bench <in.ivf|in.obu> [more ...] [threads=N] [repeat=N] [stream=1]"
     );
     for input in &inputs {
-        bench(input, threads, repeat, mode, dump.as_deref());
+        bench(input, threads, repeat, mode, dump.as_deref(), stream);
     }
 }
 
@@ -144,9 +152,22 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
-fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&str>) {
+fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&str>, stream: bool) {
     let data = std::fs::read(input).expect("read input");
     let is_ivf = data.len() >= 4 && &data[..4] == b"DKIF";
+    // `stream=1`: the packets a demuxer would hand over, one temporal
+    // unit each (a raw `.obu` is one unit already).
+    let packets: Vec<Vec<u8>> = if stream && is_ivf {
+        oxideav_av1::encoder::ivf::IvfReader::new(&data)
+            .expect("ivf")
+            .read_all()
+            .expect("ivf records")
+            .into_iter()
+            .map(|rec| rec.payload)
+            .collect()
+    } else {
+        vec![data.clone()]
+    };
 
     // ---- Per-stage breakdown through the direct session. ----
     let mut best_direct = f64::MAX;
@@ -203,12 +224,11 @@ fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&s
         if threads > 1 {
             dec.set_execution_context(&ExecutionContext::with_threads(threads));
         }
-        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), data.clone()))
-            .expect("send_packet");
-        dec.flush().expect("flush");
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         frames = 0;
-        loop {
+        // Drain what is ready; `NeedMore` before the flush means the
+        // head frame is still decoding (or nothing is queued).
+        let mut drain = |dec: &mut Box<dyn oxideav_core::Decoder>| loop {
             match dec.receive_frame() {
                 Ok(Frame::Video(v)) => {
                     frames += 1;
@@ -223,11 +243,19 @@ fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&s
                     }
                 }
                 Ok(_) => {}
-                Err(oxideav_core::Error::NeedMore) => continue,
-                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore | oxideav_core::Error::Eof) => break,
                 Err(e) => panic!("receive_frame: {e}"),
             }
+        };
+        for (i, pkt) in packets.iter().enumerate() {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), pkt.clone()).with_pts(i as i64))
+                .expect("send_packet");
+            if stream {
+                drain(&mut dec);
+            }
         }
+        dec.flush().expect("flush");
+        drain(&mut dec);
         drop(dec);
         let wall = t0.elapsed().as_secs_f64();
         if wall < best {
@@ -247,10 +275,16 @@ fn bench(input: &str, threads: usize, repeat: usize, mode: Mode, dump: Option<&s
             format!("{v:.3} s")
         }
     };
+    let fps = if best == f64::MAX || frames == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.1} fps", frames as f64 / best)
+    };
     println!(
-        "{input}: {frames} frame(s) {}x{} (plane 0 bytes), threads={threads}, best {} (direct session {}), digest {digest:016x}, {allocs} allocations, peak live {:.1} MiB",
+        "{input}: {frames} frame(s) {}x{} (plane 0 bytes), threads={threads}{}, best {} = {fps} (direct session {}), digest {digest:016x}, {allocs} allocations, peak live {:.1} MiB",
         dims.0,
         dims.1,
+        if stream { ", stream" } else { "" },
         fmt_s(best),
         fmt_s(best_direct),
         peak as f64 / (1024.0 * 1024.0)

@@ -2156,6 +2156,56 @@ pipeline would halve it), the per-tile state of the parallel walk
 (one tile-sized walker per worker in flight), and NEON / AVX2
 kernels for CDEF and deblocking.
 
+#### Frame-parallel video decode (r480)
+
+Under a worker budget every frame decodes on a worker thread as soon
+as its tiles are in. The split that makes this exact: everything a
+later frame's HEADER reads from a reference slot — the §5.9.2 order
+hints, frame sizes and `RefFrameType`, §7.20 `SavedGmParams`, the
+saved loop-filter deltas and segmentation parameters — is derived
+from the storing frame's own header, so the session updates its
+`RefInfo` as each header is parsed and the parse never waits for a
+decode. The §7.20 payload (planes, §7.19 motion field, CDFs, segment
+ids, grain state) lives in a per-slot cell the decode fills in later;
+a worker waits for exactly the slots its frame reads (the seven
+`ref_frame_idx` entries, which cover the primary reference, and a
+predicted film-grain source) and then decodes from the same inputs as
+the serial decode. A `show_existing_frame` output waits on its slot's
+cell. At most `4 × threads` frames are in flight and at most
+`threads` decode at once — a frame waiting on its references holds no
+worker — so the independent branches of a hierarchical group and the
+next group's anchor decode together. Inside each frame the r475
+tile-parallel walk and band-parallel deblock / CDEF / restoration
+still run on the same budget (forcing them serial under frame
+parallelism costs 15–35 %). A failed or panicking worker marks its
+slot failed (readers error instead of hanging), the panic is
+re-raised to the caller, and a hidden frame's error surfaces at the
+next frame the session admits.
+
+`SpecDecodeSession::decode_temporal_unit_pipelined` returns the shown
+frames as `PendingSpecFrame`s (`into_frame` waits); the registry
+decoder queues them in output order and answers `NeedMore` while the
+head is still decoding (until `flush`). `decode_temporal_unit` and the
+serial budget decode in line as before.
+
+1920×1080 8-bit 4:2:0, 120 frames, SVT-AV1 preset 8 (one tile,
+16-frame hierarchical groups), release build, Apple M4-class, one
+temporal unit per packet (`examples/decode_bench … stream=1`), best
+of two; every frame byte-identical to `dav1d` at every budget:
+
+| Step | 1 worker | 2 | 4 | 8 | Peak live (1 / 8) |
+|---|---|---|---|---|---|
+| 0.1.21 | 28.7 fps | | | 28.6 fps | 95 MiB |
+| #27 interior taps + `i32` sums, #28 phase-0 paths, #30 row-slice mirror | 48.4 fps | | | 51 fps | |
+| #31 non-reference frames on workers | 50 fps | 79 | | 84 | |
+| #32 every frame on a worker | 50 fps | 83 | 132 | 170 | 95 / 373 MiB |
+
+The 8-worker run keeps about four cores busy: a frame starts only
+when its references have finished every in-loop pass, so the
+hierarchical chain sets the pace and faster per-frame decode raises
+the threaded rate in proportion. A 1080p libaom stream with two tile
+columns goes 33 → 87 fps at 8 workers.
+
 ## Module layout
 
 `obu`, `sequence_header`, `frame_header`, `tile_info`,

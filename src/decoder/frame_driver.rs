@@ -348,12 +348,16 @@ const FRAME_WINDOW_PER_WORKER: usize = 4;
 /// `FRAME_WINDOW_PER_WORKER * threads` frames are in flight, and at
 /// most `threads` of them decode at once (a frame takes its turn once
 /// its references are decoded). The handles of frames nobody waits on
-/// (hidden frames) are kept to re-raise a worker panic.
+/// (hidden frames) are kept so that a worker panic is re-raised and a
+/// decode error surfaces from the session — at the next frame it
+/// admits, where the serial decode would have returned it from the
+/// hidden frame's own temporal unit — rather than only through the
+/// frames that read the failed slot.
 #[derive(Debug, Default)]
 struct FrameJobs {
     window: Arc<Gate>,
     running: Arc<Gate>,
-    hidden: Vec<std::thread::JoinHandle<()>>,
+    hidden: Vec<std::thread::JoinHandle<Result<(), Error>>>,
 }
 
 /// Leaves the window (and the running set, once entered) when a job
@@ -379,24 +383,28 @@ impl Drop for JobGuard {
 
 impl FrameJobs {
     /// Wait for room in the window, re-raising the panic of any
-    /// finished hidden frame.
-    fn admit(&mut self, threads: usize) -> JobGuard {
+    /// finished hidden frame and returning the error of one whose
+    /// decode failed (its slot is already marked failed, so the frames
+    /// that read it fail too).
+    fn admit(&mut self, threads: usize) -> Result<JobGuard, Error> {
         let mut i = 0;
         while i < self.hidden.len() {
             if self.hidden[i].is_finished() {
-                if let Err(panic) = self.hidden.swap_remove(i).join() {
-                    std::panic::resume_unwind(panic);
+                match self.hidden.swap_remove(i).join() {
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    Ok(Err(e)) => return Err(e),
+                    Ok(Ok(())) => {}
                 }
             } else {
                 i += 1;
             }
         }
         self.window.enter(FRAME_WINDOW_PER_WORKER * threads);
-        JobGuard {
+        Ok(JobGuard {
             window: Arc::clone(&self.window),
             running: None,
             cell: None,
-        }
+        })
     }
 }
 
@@ -501,7 +509,7 @@ fn decode_or_defer(
 ) -> Result<(), Error> {
     let mask = slots_read(&fh);
     if let Some(jobs) = jobs.filter(|_| threads > 1) {
-        let mut guard = jobs.admit(threads);
+        let mut guard = jobs.admit(threads)?;
         // What the frame reads, as it stands before the frame's own
         // reference update.
         let mut reads = SessionRefs {
@@ -554,9 +562,7 @@ fn decode_or_defer(
             out.push(PendingSpecFrame(PendingState::Running(handle)));
         } else {
             let handle = builder
-                .spawn(move || {
-                    let _ = job();
-                })
+                .spawn(move || job().map(drop))
                 .map_err(|_| Error::PartitionWalkOutOfRange)?;
             jobs.hidden.push(handle);
         }
