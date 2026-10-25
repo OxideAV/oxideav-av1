@@ -4,6 +4,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- The registry decoder reports its output stream parameters (oxideav-core 0.1.42 `Decoder::output_params` / `output_params_generation`; `output_pixel_format` forwards to it): the emitted frames' width / height (`UpscaledWidth × FrameHeight`, the planes' own size), `pixel_format` (`Gray8` / `Gray10Le` / `Gray12Le` for `mono_chrome`, else `Yuv420P` / `Yuv422P` / `Yuv444P` at 8 / 10 / 12 bits), the §5.5.2 colour signal (`color_range` + colour description code points) and the §5.5.3 picture rate when `equal_picture_interval` states one. Answered before the first frame: the layout alone from an `av1C` extradata record, the full description once a sequence header is parsed (extradata `configOBUs` or the first temporal unit; §5.5.1 maximum frame size as the size). After a frame is returned the answer describes that frame; each queued frame keeps the sequence header it was decoded under, and the generation bumps exactly when the first frame of a new shape (size, layout, colour or rate) is returned — not when the new sequence header is parsed. `SpecDecodeSession::sequence_header()` exposes the cached header. `tests/output_params.rs` pins libsvtav1 fixtures (`tests/fixtures/output_params/gen.sh`) and the crate's own 4:2:2 / 4:4:4 / monochrome / 12-bit streams against `ffprobe -show_streams` and the emitted plane shapes, plus a size → bit-depth / colour → layout switch stream at 1 and 8 worker threads.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.

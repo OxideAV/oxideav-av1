@@ -2278,6 +2278,16 @@ impl SpecDecodeSession {
     pub fn reset_references(&mut self) {
         self.refs = SessionRefs::new();
     }
+
+    /// The §5.5 sequence header the session currently holds (the most
+    /// recently parsed one — from the extradata configuration OBUs or
+    /// the stream itself), `None` before any was seen. Frames already
+    /// returned by an earlier call were decoded under the header that
+    /// was current at that call.
+    #[must_use]
+    pub fn sequence_header(&self) -> Option<&SequenceHeader> {
+        self.seq.as_ref()
+    }
 }
 
 /// §7.20 `reference_frame_update()` — store the just-decoded frame
