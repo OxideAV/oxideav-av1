@@ -559,6 +559,536 @@ pub(crate) fn loop_filter_edge_in(
 }
 
 // =====================================================================
+// §7.14.2 / §7.14.4 — the per-cell edge inputs, gathered once.
+// =====================================================================
+
+/// The block-independent §7.14.4 / §7.14.5 inputs: the frame's
+/// loop-filter levels, deltas and segmentation alt-LF features.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct LfLevelParams {
+    /// `loop_filter_level[ 0..=3 ]` (§5.9.11).
+    pub loop_filter_level: [u8; 4],
+    /// `loop_filter_sharpness` (§5.9.11).
+    pub loop_filter_sharpness: u8,
+    /// `loop_filter_delta_enabled` (§5.9.11).
+    pub loop_filter_delta_enabled: bool,
+    /// `loop_filter_ref_deltas[ ]` (§5.9.11).
+    pub loop_filter_ref_deltas: [i8; TOTAL_REFS_PER_FRAME],
+    /// `loop_filter_mode_deltas[ ]` (§5.9.11).
+    pub loop_filter_mode_deltas: [i8; 2],
+    /// `delta_lf_multi` (§5.9.18).
+    pub delta_lf_multi: bool,
+    /// `FeatureEnabled[ segment ][ SEG_LVL_ALT_LF_Y_V + i ]`, `i = 0..4`.
+    pub seg_alt_lf_active: [[bool; 4]; 8],
+    /// `FeatureData[ segment ][ SEG_LVL_ALT_LF_Y_V + i ]`.
+    pub seg_alt_lf_data: [[i16; 4]; 8],
+}
+
+impl LfLevelParams {
+    /// §7.14.4 `modeType` + §7.14.5 `lvl` for one block and one
+    /// `i = plane == 0 ? pass : plane + 1`. `segment` is the block's
+    /// `SegmentIds[ ][ ]` (`u8::MAX` = none), `delta_lf` its
+    /// `DeltaLFs[ ][ ][ i or 0 ]` already selected by `delta_lf_multi`.
+    #[inline]
+    #[must_use]
+    pub fn level(&self, segment: u8, ref_frame: u8, mode: u8, delta_lf: i8, i: usize) -> u8 {
+        let mode_type =
+            usize::from(mode >= NEARESTMV && mode != GLOBALMV && mode != GLOBAL_GLOBALMV);
+        let max = MAX_LOOP_FILTER as i32;
+        let mut lvl_seg = clip3_i32(
+            0,
+            max,
+            i32::from(delta_lf) + i32::from(self.loop_filter_level[i]),
+        );
+        if let Some(seg) = self.seg_alt_lf_active.get(segment as usize)
+            && seg[i]
+        {
+            lvl_seg = clip3_i32(
+                0,
+                max,
+                i32::from(self.seg_alt_lf_data[segment as usize][i]) + lvl_seg,
+            );
+        }
+        if self.loop_filter_delta_enabled {
+            let n_shift = lvl_seg >> 5;
+            if ref_frame as usize == INTRA_FRAME {
+                lvl_seg += i32::from(self.loop_filter_ref_deltas[INTRA_FRAME]) << n_shift;
+            } else {
+                let ref_idx = (ref_frame as usize).min(TOTAL_REFS_PER_FRAME - 1);
+                lvl_seg += i32::from(self.loop_filter_ref_deltas[ref_idx]) << n_shift;
+                lvl_seg += i32::from(self.loop_filter_mode_deltas[mode_type]) << n_shift;
+            }
+            lvl_seg = clip3_i32(0, max, lvl_seg);
+        }
+        lvl_seg as u8
+    }
+
+    /// The `DeltaLFs[ ][ ][ idx ]` slot §7.14.4 reads for `i`.
+    #[inline]
+    #[must_use]
+    pub fn delta_lf_slot(&self, i: usize) -> usize {
+        if self.delta_lf_multi { i } else { 0 }
+    }
+}
+
+/// §7.14.4 `limit` / `blimit` / `thresh` for every `lvl` at one
+/// sharpness.
+fn strength_table(sharpness: u8) -> [[u8; 3]; MAX_LOOP_FILTER as usize + 1] {
+    let shift = if sharpness > 4 {
+        2
+    } else if sharpness > 0 {
+        1
+    } else {
+        0
+    };
+    core::array::from_fn(|lvl| {
+        let lvl_i = lvl as i32;
+        let limit = if sharpness > 0 {
+            (lvl_i >> shift).clamp(1, 9 - sharpness as i32)
+        } else {
+            (lvl_i >> shift).max(1)
+        };
+        let blimit = 2 * (lvl_i + 2) + limit;
+        [limit as u8, blimit as u8, (lvl >> 4) as u8]
+    })
+}
+
+/// Every per-cell input the §7.14.2 edge loop consults, gathered once
+/// per frame: `lvl` for each of the four `i` slots (§7.14.4 / §7.14.5
+/// evaluated at the cell), `MiSizes`, the `Skips && is_inter` term of
+/// `applyFilter`, and `LoopfilterTxSizes` per plane. The edge loop
+/// over this table makes exactly the decisions the closure-driven
+/// [`loop_filter_edge`] makes.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct LfEdgeTable {
+    pub(crate) mi_rows: u32,
+    pub(crate) mi_cols: u32,
+    pub(crate) bit_depth: u8,
+    pub(crate) subsampling_x: u8,
+    pub(crate) subsampling_y: u8,
+    pub(crate) frame_width: u32,
+    pub(crate) frame_height: u32,
+    pub(crate) loop_filter_level: [u8; 4],
+    pub(crate) lvl: Vec<[u8; 4]>,
+    pub(crate) mi_size: Vec<u8>,
+    pub(crate) skip_inter: Vec<bool>,
+    pub(crate) tx: [Vec<u8>; 3],
+    pub(crate) tx_cols: [usize; 3],
+    pub(crate) strength: [[u8; 3]; MAX_LOOP_FILTER as usize + 1],
+}
+
+impl LfEdgeTable {
+    /// An empty table for an `mi_rows × mi_cols` frame; the caller
+    /// fills the per-cell arrays (see [`Self::tx_dims`]).
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn with_geometry(
+        mi_rows: u32,
+        mi_cols: u32,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        loop_filter_level: [u8; 4],
+        loop_filter_sharpness: u8,
+    ) -> Self {
+        let cells = (mi_rows as usize) * (mi_cols as usize);
+        let mut t = Self {
+            mi_rows,
+            mi_cols,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            loop_filter_level,
+            lvl: vec![[0; 4]; cells],
+            mi_size: vec![0; cells],
+            skip_inter: vec![false; cells],
+            tx: Default::default(),
+            tx_cols: [0; 3],
+            strength: strength_table(loop_filter_sharpness),
+        };
+        for plane in 0..3usize {
+            let (rows, cols) = t.tx_dims(plane);
+            t.tx[plane] = vec![0; rows * cols];
+            t.tx_cols[plane] = cols;
+        }
+        t
+    }
+
+    /// `(rows, cols)` of plane `plane`'s `LoopfilterTxSizes` grid: the
+    /// `row >> subY` / `col >> subX` indices §7.14.2 forms for
+    /// `row < MiRows`, `col < MiCols`.
+    #[must_use]
+    pub fn tx_dims(&self, plane: usize) -> (usize, usize) {
+        let (sx, sy) = if plane == 0 {
+            (0, 0)
+        } else {
+            (self.subsampling_x, self.subsampling_y)
+        };
+        let rows = if self.mi_rows == 0 {
+            0
+        } else {
+            (((self.mi_rows - 1) >> sy) + 1) as usize
+        };
+        let cols = if self.mi_cols == 0 {
+            0
+        } else {
+            (((self.mi_cols - 1) >> sx) + 1) as usize
+        };
+        (rows, cols)
+    }
+
+    /// Build the table through a closure-driven context (the reference
+    /// path; the decoder fills it straight from its grids).
+    #[must_use]
+    pub fn from_ctx(ctx: &LoopFilterFrameContext<'_>) -> Self {
+        let mut t = Self::with_geometry(
+            ctx.mi_rows,
+            ctx.mi_cols,
+            ctx.bit_depth,
+            ctx.subsampling_x,
+            ctx.subsampling_y,
+            ctx.frame_width,
+            ctx.frame_height,
+            ctx.loop_filter_level,
+            ctx.loop_filter_sharpness,
+        );
+        for row in 0..ctx.mi_rows {
+            for col in 0..ctx.mi_cols {
+                let idx = (row * ctx.mi_cols + col) as usize;
+                t.mi_size[idx] = (ctx.mi_size)(row, col) as u8;
+                t.skip_inter[idx] = (ctx.skip)(row, col) && !(ctx.is_intra)(row, col);
+                for plane in 0..3u8 {
+                    for pass in 0..2u8 {
+                        let s = adaptive_filter_strength(ctx, row, col, plane, pass);
+                        let i = if plane == 0 {
+                            pass as usize
+                        } else {
+                            plane as usize + 1
+                        };
+                        t.lvl[idx][i] = s.lvl;
+                    }
+                }
+            }
+        }
+        for plane in 0..3usize {
+            let (rows, cols) = t.tx_dims(plane);
+            for r in 0..rows {
+                for c in 0..cols {
+                    t.tx[plane][r * cols + c] = (ctx.lf_tx_size)(plane, r as u32, c as u32) as u8;
+                }
+            }
+        }
+        t
+    }
+}
+
+/// [`loop_filter_rows_window`] over a precomputed [`LfEdgeTable`]:
+/// the same §7.14.2 gates, §7.14.3 sizes and §7.14.4 strengths, read
+/// from the table instead of re-derived per edge.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn loop_filter_rows_window_table(
+    t: &LfEdgeTable,
+    plane: u8,
+    pass: u8,
+    window: &mut PlaneBuffer<'_>,
+    window_row0: u32,
+    mi_row_start: u32,
+    mi_row_end: u32,
+) {
+    if plane > 0 && t.loop_filter_level[(1 + plane) as usize] == 0 {
+        return;
+    }
+    let (sub_x, sub_y) = subsampling_for_plane(plane, t.subsampling_x, t.subsampling_y);
+    let (sub_x, sub_y) = (u32::from(sub_x), u32::from(sub_y));
+    let row_step: u32 = 1 << sub_y;
+    let col_step: u32 = 1 << sub_x;
+    let mi_row_end = mi_row_end.min(t.mi_rows);
+    let (dx, dy) = if pass == 0 { (1i32, 0i32) } else { (0, 1) };
+    let i = if plane == 0 {
+        pass as usize
+    } else {
+        plane as usize + 1
+    };
+    let tx_grid = &t.tx[plane as usize];
+    let tx_cols = t.tx_cols[plane as usize];
+    let mi_cols = t.mi_cols as usize;
+    let mut row = mi_row_start;
+    while row < mi_row_end {
+        let y = row * MI_SIZE as u32;
+        // §7.14.2 onScreen: rows past the frame and the frame's top
+        // edge (horizontal pass) never filter.
+        if y >= t.frame_height || (pass == 1 && y == 0) {
+            row += row_step;
+            continue;
+        }
+        let srow = row | sub_y;
+        if srow >= t.mi_rows {
+            row += row_step;
+            continue;
+        }
+        let prow = srow - ((dy as u32) << sub_y);
+        let y_p = (y >> sub_y) as i32;
+        let tx_row = &tx_grid[(srow >> sub_y) as usize * tx_cols..];
+        let prev_tx_row = &tx_grid[(prow >> sub_y) as usize * tx_cols..];
+        let cell_row = srow as usize * mi_cols;
+        let prev_cell_row = prow as usize * mi_cols;
+        let mut col = 0u32;
+        while col < t.mi_cols {
+            let x = col * MI_SIZE as u32;
+            if x >= t.frame_width {
+                break;
+            }
+            let scol = col | sub_x;
+            col += col_step;
+            if (pass == 0 && x == 0) || scol >= t.mi_cols {
+                continue;
+            }
+            let pcol = scol - ((dx as u32) << sub_x);
+            let x_p = (x >> sub_x) as i32;
+            let tx_sz = tx_row[(scol >> sub_x) as usize] as usize;
+            // §7.14.2 isTxEdge.
+            let is_tx_edge = if pass == 0 {
+                (x_p as usize).is_multiple_of(crate::cdf::TX_WIDTH[tx_sz])
+            } else {
+                (y_p as usize).is_multiple_of(crate::cdf::TX_HEIGHT[tx_sz])
+            };
+            if !is_tx_edge {
+                continue;
+            }
+            let cell = cell_row + scol as usize;
+            // §7.14.2 applyFilter = isBlockEdge || skip == 0 || isIntra.
+            if t.skip_inter[cell] {
+                let mi_size = t.mi_size[cell] as usize;
+                let plane_size =
+                    crate::cdf::get_plane_residual_size(mi_size, plane, sub_x as u8, sub_y as u8)
+                        .unwrap_or(mi_size);
+                let is_block_edge = if pass == 0 {
+                    (x_p as u32).is_multiple_of(block_width(plane_size).max(1))
+                } else {
+                    (y_p as u32).is_multiple_of(block_height(plane_size).max(1))
+                };
+                if !is_block_edge {
+                    continue;
+                }
+            }
+            // §7.14.2: the current side's level, else the previous side's.
+            let prev_cell = if pass == 0 {
+                cell_row + pcol as usize
+            } else {
+                prev_cell_row + scol as usize
+            };
+            let mut lvl = t.lvl[cell][i];
+            if lvl == 0 {
+                lvl = t.lvl[prev_cell][i];
+            }
+            if lvl == 0 {
+                continue;
+            }
+            let prev_tx_sz = if pass == 0 {
+                tx_row[(pcol >> sub_x) as usize]
+            } else {
+                prev_tx_row[(scol >> sub_x) as usize]
+            } as usize;
+            let filter_size = filter_size(tx_sz, prev_tx_sz, pass, plane);
+            let [limit, blimit, thresh] = t.strength[lvl as usize];
+            let y_w = y_p - window_row0 as i32;
+            // The four lines of the edge with every tap inside the
+            // window (always, away from a window's skirt): one fused
+            // §7.14.6 pass per line on direct indices.
+            let reach: i32 = match filter_size {
+                16 => 7,
+                8 => 4,
+                _ => 2,
+            };
+            let (lo_y, lo_x, hi_y, hi_x) = if pass == 0 {
+                (y_w, x_p - reach, y_w + 3, x_p + reach - 1)
+            } else {
+                (y_w - reach, x_p, y_w + reach - 1, x_p + 3)
+            };
+            if lo_y >= 0 && lo_x >= 0 && hi_y < window.rows as i32 && hi_x < window.cols as i32 {
+                let cols = window.cols as usize;
+                let (along, across) = if pass == 0 { (cols, 1) } else { (1, cols) };
+                let q0 = y_w as usize * cols + x_p as usize;
+                for k in 0..MI_SIZE {
+                    filter_line(
+                        window.samples,
+                        q0 + k * along,
+                        across,
+                        filter_size,
+                        plane,
+                        limit,
+                        blimit,
+                        thresh,
+                        t.bit_depth,
+                    );
+                }
+                continue;
+            }
+            for k in 0..(MI_SIZE as i32) {
+                sample_filtering(
+                    window,
+                    x_p + dy * k,
+                    y_w + dx * k,
+                    plane,
+                    limit,
+                    blimit,
+                    thresh,
+                    dx,
+                    dy,
+                    filter_size,
+                    t.bit_depth,
+                );
+            }
+        }
+        row += row_step;
+    }
+}
+
+/// §7.14.6.1 sample filtering of one line across an edge, on direct
+/// indices: `s[ q0 ]` is the first sample past the edge and `across`
+/// the index step across it; every tap the §7.14.6.2 mask and the
+/// §7.14.6.3 / §7.14.6.4 filters read (`filter_size` / 2 + 3 either
+/// side at most) is inside `s`. The same decisions and arithmetic as
+/// [`sample_filtering`].
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn filter_line(
+    s: &mut [i32],
+    q0: usize,
+    across: usize,
+    filter_size: u32,
+    plane: u8,
+    limit: u8,
+    blimit: u8,
+    thresh: u8,
+    bit_depth: u8,
+) {
+    let reach: usize = match filter_size {
+        16 => 7,
+        8 => 4,
+        _ => 2,
+    };
+    let mut taps = [0i32; 14];
+    let first = q0 - reach * across;
+    for (k, tap) in taps[7 - reach..7 + reach].iter_mut().enumerate() {
+        *tap = s[first + k * across];
+    }
+    let [p6, p5, p4, p3, p2, p1, p0, q0v, q1, q2, q3, q4, q5, q6] = taps;
+    let bd_shift = bit_depth - 8;
+    // §7.14.6.2 hevMask / filterMask / flatMask / flatMask2.
+    let thresh_bd = i32::from(thresh) << bd_shift;
+    let hev_mask = (p1 - p0).abs() > thresh_bd || (q1 - q0v).abs() > thresh_bd;
+    let filter_len: u32 = if filter_size == 4 {
+        4
+    } else if plane != 0 {
+        6
+    } else {
+        filter_size
+    };
+    let limit_bd = i32::from(limit) << bd_shift;
+    let blimit_bd = i32::from(blimit) << bd_shift;
+    let mut mask = (p1 - p0).abs() > limit_bd;
+    mask |= (q1 - q0v).abs() > limit_bd;
+    mask |= (p0 - q0v).abs() * 2 + (p1 - q1).abs() / 2 > blimit_bd;
+    if filter_len >= 6 {
+        mask |= (p2 - p1).abs() > limit_bd;
+        mask |= (q2 - q1).abs() > limit_bd;
+    }
+    if filter_len >= 8 {
+        mask |= (p3 - p2).abs() > limit_bd;
+        mask |= (q3 - q2).abs() > limit_bd;
+    }
+    if mask {
+        return;
+    }
+    let one = 1i32 << bd_shift;
+    let flat_mask = filter_size >= 8 && {
+        let mut m = (p1 - p0).abs() > one;
+        m |= (q1 - q0v).abs() > one;
+        m |= (p2 - p0).abs() > one;
+        m |= (q2 - q0v).abs() > one;
+        if filter_len >= 8 {
+            m |= (p3 - p0).abs() > one;
+            m |= (q3 - q0v).abs() > one;
+        }
+        !m
+    };
+    if filter_size == 4 || !flat_mask {
+        // §7.14.6.3 narrow filter.
+        let half = 0x80i32 << bd_shift;
+        let (ps1, ps0, qs0, qs1) = (p1 - half, p0 - half, q0v - half, q1 - half);
+        let lo = -(1i32 << (bit_depth - 1));
+        let hi = (1i32 << (bit_depth - 1)) - 1;
+        let c4 = |v: i32| v.clamp(lo, hi);
+        let mut filter = if hev_mask { c4(ps1 - qs1) } else { 0 };
+        filter = c4(filter + 3 * (qs0 - ps0));
+        let filter1 = c4(filter + 4) >> 3;
+        let filter2 = c4(filter + 3) >> 3;
+        s[q0] = c4(qs0 - filter1) + half;
+        s[q0 - across] = c4(ps0 + filter2) + half;
+        if !hev_mask {
+            let f = (filter1 + 1) >> 1;
+            s[q0 + across] = c4(qs1 - f) + half;
+            s[q0 - 2 * across] = c4(ps1 + f) + half;
+        }
+        return;
+    }
+    let flat_mask2 = filter_size >= 16 && {
+        let mut m = (p6 - p0).abs() > one;
+        m |= (q6 - q0v).abs() > one;
+        m |= (p5 - p0).abs() > one;
+        m |= (q5 - q0v).abs() > one;
+        m |= (p4 - p0).abs() > one;
+        m |= (q4 - q0v).abs() > one;
+        !m
+    };
+    // §7.14.6.4 wide filter: `F[ i ] = Round2( Σ_{j=-n..n} tap( j ) ·
+    // p[ Clip3( -(n+1), n, i + j ) ], log2Size )`, `tap( j ) = 2` for
+    // `|j| <= n2`, else 1 — as a sliding unit-weight window plus the
+    // doubled centre taps (integer sums, so exactly the spec's).
+    let log2_size: u32 = if filter_size == 8 || !flat_mask2 {
+        3
+    } else {
+        4
+    };
+    let n: i32 = if log2_size == 4 {
+        6
+    } else if plane == 0 {
+        3
+    } else {
+        2
+    };
+    let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
+    let tap_at = |k: i32| taps[(k.clamp(-(n + 1), n) + 7) as usize];
+    let mut window: i32 = 0;
+    for j in -n..=n {
+        window += tap_at(-n + j);
+    }
+    let mut f = [0i32; 12];
+    for (idx, i) in (-n..n).enumerate() {
+        if i > -n {
+            window += tap_at(i + n) - tap_at(i - 1 - n);
+        }
+        let mut acc = window;
+        for j in -n2..=n2 {
+            acc += tap_at(i + j);
+        }
+        f[idx] = (acc + (1 << (log2_size - 1))) >> log2_size;
+    }
+    let start = q0 - n as usize * across;
+    for (idx, v) in f.iter().take(2 * n as usize).enumerate() {
+        s[start + idx * across] = *v;
+    }
+}
+
+// =====================================================================
 // §7.14.3 — Filter size derivation. av1-spec p.310.
 // =====================================================================
 
@@ -1003,7 +1533,7 @@ pub fn wide_filter(
         }
         f[idx] = round2_i32(t, log2_size);
     }
-    if let Some(base) = base {
+    if let (Some(base), Some(_)) = (base, end) {
         let first = base + stride;
         for (idx, _) in (-n..n).enumerate() {
             plane_buf.samples[first + idx * stride] = f[idx];
@@ -1408,5 +1938,216 @@ mod tests {
             4,
             "expected 4 on-screen edges across both passes"
         );
+    }
+
+    // --- r481 table-driven edge loop ------------------------------
+
+    /// Deterministic LCG for the randomized equivalence checks.
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u32
+    }
+
+    #[test]
+    fn table_level_matches_strength_selection() {
+        let mut st = 7u64;
+        for _ in 0..4000 {
+            let mut lp = LfLevelParams {
+                loop_filter_level: core::array::from_fn(|_| (lcg(&mut st) % 64) as u8),
+                loop_filter_sharpness: (lcg(&mut st) % 8) as u8,
+                loop_filter_delta_enabled: lcg(&mut st).is_multiple_of(2),
+                loop_filter_ref_deltas: core::array::from_fn(|_| (lcg(&mut st) % 127) as i8 - 63),
+                loop_filter_mode_deltas: core::array::from_fn(|_| (lcg(&mut st) % 127) as i8 - 63),
+                delta_lf_multi: lcg(&mut st).is_multiple_of(2),
+                seg_alt_lf_active: [[false; 4]; 8],
+                seg_alt_lf_data: [[0; 4]; 8],
+            };
+            for seg in 0..8 {
+                for i in 0..4 {
+                    lp.seg_alt_lf_active[seg][i] = lcg(&mut st).is_multiple_of(3);
+                    lp.seg_alt_lf_data[seg][i] = (lcg(&mut st) % 127) as i16 - 63;
+                }
+            }
+            let active = |seg: u32, f: usize| {
+                seg < 8 && (1..=4).contains(&f) && lp.seg_alt_lf_active[seg as usize][f - 1]
+            };
+            let data = |seg: u32, f: usize| {
+                if seg < 8 && (1..=4).contains(&f) {
+                    lp.seg_alt_lf_data[seg as usize][f - 1]
+                } else {
+                    0
+                }
+            };
+            let mut ctx = make_ctx(
+                2,
+                2,
+                lp.loop_filter_level,
+                &|_, _| false,
+                &|_, _| false,
+                &|_, _| 0,
+                &|_, _| 0,
+                &|_, _| 0,
+                &|_, _, _| 0,
+                &active,
+                &data,
+                &|_, _, _| 0,
+                &|_, _| 0,
+            );
+            ctx.loop_filter_sharpness = lp.loop_filter_sharpness;
+            ctx.loop_filter_delta_enabled = lp.loop_filter_delta_enabled;
+            ctx.loop_filter_ref_deltas = lp.loop_filter_ref_deltas;
+            ctx.loop_filter_mode_deltas = lp.loop_filter_mode_deltas;
+            let segment = if lcg(&mut st).is_multiple_of(9) {
+                u8::MAX
+            } else {
+                (lcg(&mut st) % 8) as u8
+            };
+            let r = (lcg(&mut st) % 8) as u8;
+            let mode = (lcg(&mut st) % 26) as u8;
+            let dl = (lcg(&mut st) % 127) as i8 - 63;
+            for i in 0..4 {
+                let (plane, pass) = if i < 2 {
+                    (0u8, i as u8)
+                } else {
+                    (i as u8 - 1, 0)
+                };
+                let mode_type =
+                    u8::from(mode >= NEARESTMV && mode != GLOBALMV && mode != GLOBAL_GLOBALMV);
+                let want = adaptive_filter_strength_selection(
+                    &ctx,
+                    u32::from(segment),
+                    r,
+                    mode_type,
+                    dl,
+                    plane,
+                    pass,
+                );
+                assert_eq!(lp.level(segment, r, mode, dl, i), want);
+            }
+        }
+    }
+
+    #[test]
+    fn table_edge_loop_matches_closure_driver() {
+        let mut st = 11u64;
+        for case in 0..24u32 {
+            let (mi_rows, mi_cols) = (6 + (case % 5) * 3, 7 + (case % 4) * 4);
+            let cells = (mi_rows * mi_cols) as usize;
+            let bit_depth = [8u8, 10, 12][(case % 3) as usize];
+            let (sx, sy) = [(1u8, 1u8), (1, 0), (0, 0)][((case / 3) % 3) as usize];
+            let mut grid =
+                |n: usize, m: u32| -> Vec<u32> { (0..n).map(|_| lcg(&mut st) % m).collect() };
+            let intra = grid(cells, 3);
+            let skip = grid(cells, 2);
+            let refs = grid(cells, 8);
+            let modes = grid(cells, 26);
+            let segs = grid(cells, 9);
+            let dlfs = grid(cells * 4, 31);
+            let sizes = grid(cells, crate::cdf::BLOCK_SIZES as u32);
+            let txs = grid(cells * 3, crate::cdf::TX_SIZES_ALL as u32);
+            let at = |r: u32, c: u32| (r * mi_cols + c) as usize;
+            let ctx_owned = (
+                move |r, c| intra[at(r, c)] == 0,
+                move |r, c| skip[at(r, c)] == 1,
+            );
+            let ref_frame = |r, c| refs[at(r, c)] as u8;
+            let mode = |r, c| modes[at(r, c)] as u8;
+            let segment_id = |r, c| {
+                let s = segs[at(r, c)];
+                if s == 8 { u8::MAX } else { s as u8 }
+            };
+            let delta_lf = |r, c, i: usize| dlfs[at(r, c) * 4 + i] as i8 - 15;
+            let active = |seg: u32, f: usize| seg < 8 && (seg as usize + f).is_multiple_of(3);
+            let data = |seg: u32, f: usize| (seg as i16 * 7 + f as i16 * 5) % 40 - 20;
+            let lf_tx = |p: usize, r: u32, c: u32| {
+                txs[((r as usize) * mi_cols as usize + c as usize) * 3 + p] as usize
+            };
+            let mi_size = |r, c| sizes[at(r, c)] as usize;
+            let mut ctx = make_ctx(
+                mi_rows,
+                mi_cols,
+                [
+                    (20 + case % 40) as u8,
+                    (10 + case % 50) as u8,
+                    (case % 3 * 20) as u8,
+                    33,
+                ],
+                &ctx_owned.0,
+                &ctx_owned.1,
+                &ref_frame,
+                &mode,
+                &segment_id,
+                &delta_lf,
+                &active,
+                &data,
+                &lf_tx,
+                &mi_size,
+            );
+            ctx.bit_depth = bit_depth;
+            ctx.subsampling_x = sx;
+            ctx.subsampling_y = sy;
+            ctx.loop_filter_sharpness = (case % 8) as u8;
+            ctx.loop_filter_delta_enabled = case.is_multiple_of(2);
+            ctx.loop_filter_ref_deltas = [1, 0, -1, -1, 0, 2, -3, 1];
+            ctx.loop_filter_mode_deltas = [0, 3];
+            ctx.delta_lf_multi = case % 4 < 2;
+            ctx.frame_width = mi_cols * 4 - (case % 4);
+            ctx.frame_height = mi_rows * 4 - (case % 3);
+            let dims: Vec<(u32, u32)> = (0..3)
+                .map(|p| {
+                    let (px, py) = if p == 0 { (0, 0) } else { (sx, sy) };
+                    ((mi_rows * 4) >> py, (mi_cols * 4) >> px)
+                })
+                .collect();
+            let max = (1i32 << bit_depth) - 1;
+            let base: Vec<Vec<i32>> = dims
+                .iter()
+                .map(|&(r, c)| {
+                    (0..r * c)
+                        .map(|i| {
+                            let smooth = ((i % c) * 3 + (i / c) * 2) as i32;
+                            (smooth + (lcg(&mut st) % 9) as i32).min(max)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut want = base.clone();
+            {
+                let mut planes: Vec<PlaneBuffer<'_>> = want
+                    .iter_mut()
+                    .zip(&dims)
+                    .map(|(s, &(r, c))| PlaneBuffer {
+                        rows: r,
+                        cols: c,
+                        samples: s,
+                    })
+                    .collect();
+                loop_filter_frame(&ctx, &mut planes);
+            }
+            let table = LfEdgeTable::from_ctx(&ctx);
+            let mut got = base.clone();
+            for (plane, (s, &(r, c))) in got.iter_mut().zip(&dims).enumerate() {
+                for pass in 0..2 {
+                    let mut pb = PlaneBuffer {
+                        rows: r,
+                        cols: c,
+                        samples: s,
+                    };
+                    loop_filter_rows_window_table(
+                        &table,
+                        plane as u8,
+                        pass,
+                        &mut pb,
+                        0,
+                        0,
+                        mi_rows,
+                    );
+                }
+            }
+            assert_eq!(got, want, "case {case}");
+            assert_ne!(want, base, "case {case} filtered nothing");
+        }
     }
 }

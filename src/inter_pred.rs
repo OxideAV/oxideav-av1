@@ -743,11 +743,204 @@ pub fn block_inter_prediction(
         interp_filter_y as usize
     };
 
+    let unscaled = 1i32 << SCALE_SUBPEL_BITS;
+    if step_x == unscaled && step_y == unscaled {
+        convolve_unscaled(
+            ref_plane,
+            ref_stride,
+            last_x,
+            last_y,
+            start_x,
+            start_y,
+            w,
+            h,
+            &SUBPEL_FILTERS[h_filter],
+            &SUBPEL_FILTERS[v_filter],
+            inter_round0,
+            inter_round1,
+            pred,
+        );
+        return Ok(());
+    }
+
     // §7.11.3.4 intermediate buffer. The post-Round2 value fits in
     // ~14 bits for 8-bit content (sum of |coef| at one phase is at
     // most 384, times max sample 255 = 97920, Round2 by 3 = 12240
     // — well within i32). We use i32 for headroom across bit depths.
-    let mut intermediate: Vec<i32> = vec![0i32; intermediate_height * w];
+    CONVOLVE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (intermediate, _) = &mut *scratch;
+        if intermediate.len() < intermediate_height * w {
+            intermediate.resize(intermediate_height * w, 0);
+        }
+        convolve_scaled(
+            ref_plane,
+            ref_stride,
+            last_x,
+            last_y,
+            start_x,
+            start_y,
+            step_x,
+            step_y,
+            w,
+            h,
+            h_filter,
+            v_filter,
+            inter_round0,
+            inter_round1,
+            &mut intermediate[..intermediate_height * w],
+            pred,
+        );
+    });
+    Ok(())
+}
+
+thread_local! {
+    /// Per-thread §7.11.3.4 scratch: the `intermediate` array and one
+    /// edge-extended reference row, reused across blocks so the
+    /// prediction allocates nothing per call.
+    static CONVOLVE_SCRATCH: std::cell::RefCell<(Vec<i32>, Vec<u16>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// One output row of an 8-tap §7.11.3.4 convolution at a FIXED phase:
+/// `out[ c ] = Round2( sum_t k[ t ] * src[ c + t ], shift )` for
+/// `c in 0..out.len()` (`src.len() >= out.len() + 7`). Zero taps (the
+/// 4-tap kernels' outer pairs, phase 0's off-centre taps) are skipped;
+/// every partial sum fits `i32` (samples of at most 15 bits in
+/// magnitude against kernels of absolute sum at most 240).
+#[inline]
+fn convolve_row_fixed_phase<T: Copy + Into<i32>>(
+    k: &[i32; 8],
+    src: &[T],
+    out: &mut [i32],
+    shift: u32,
+) {
+    let w = out.len();
+    out.fill(1 << (shift - 1));
+    for (t, &kt) in k.iter().enumerate() {
+        if kt == 0 {
+            continue;
+        }
+        for (o, &s) in out.iter_mut().zip(&src[t..t + w]) {
+            *o += kt * s.into();
+        }
+    }
+    for o in out.iter_mut() {
+        *o >>= shift;
+    }
+}
+
+/// §7.11.3.4 for an UNSCALED reference (`xStep == yStep == 1 <<
+/// SCALE_SUBPEL_BITS`): every column shares the horizontal phase
+/// `(startX >> 6) & SUBPEL_MASK` and every row the vertical phase,
+/// output row `r` reads intermediate rows `r .. r + 7`, and the
+/// `Clip3( 0, lastX, .. )` fetch reduces to one edge-extended copy of
+/// the `w + 7` source columns when the block's taps leave the plane.
+/// Identical to the general process term by term.
+#[allow(clippy::too_many_arguments)]
+fn convolve_unscaled(
+    ref_plane: &[u16],
+    ref_stride: usize,
+    last_x: i32,
+    last_y: i32,
+    start_x: i32,
+    start_y: i32,
+    w: usize,
+    h: usize,
+    h_kernels: &[[i32; 8]; 16],
+    v_kernels: &[[i32; 8]; 16],
+    inter_round0: u32,
+    inter_round1: u32,
+    pred: &mut [i32],
+) {
+    let shift = SCALE_SUBPEL_BITS - SUBPEL_BITS;
+    let x0 = (start_x >> SCALE_SUBPEL_BITS) - 3;
+    let y0 = (start_y >> SCALE_SUBPEL_BITS) - 3;
+    let phase_x = ((start_x >> shift) as u32 & SUBPEL_MASK) as usize;
+    let phase_y = ((start_y >> shift) as u32 & SUBPEL_MASK) as usize;
+    let kx = &h_kernels[phase_x];
+    let ky = &v_kernels[phase_y];
+    let span = w + 7;
+    let interior_x = x0 >= 0 && x0 + span as i32 - 1 <= last_x;
+    CONVOLVE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (intermediate, edge_row) = &mut *scratch;
+        // Every intermediate row the vertical pass reads is written
+        // first, so the reused buffer needs no clearing.
+        if intermediate.len() < (h + 7) * w {
+            intermediate.resize((h + 7) * w, 0);
+        }
+        if !interior_x && edge_row.len() < span {
+            edge_row.resize(span, 0);
+        }
+        // Phase 0 is { 0, 0, 0, 128, 0, 0, 0, 0 }: a whole-sample
+        // vertical position reads only intermediate rows 3 ..= h + 2.
+        let rows = if phase_y == 0 { 3..h + 3 } else { 0..h + 7 };
+        for r in rows {
+            let ry = clip3_i32(0, last_y, y0 + r as i32) as usize;
+            let row = &ref_plane[ry * ref_stride..];
+            let src: &[u16] = if interior_x {
+                &row[x0 as usize..x0 as usize + span]
+            } else {
+                for (k, e) in edge_row[..span].iter_mut().enumerate() {
+                    *e = row[clip3_i32(0, last_x, x0 + k as i32) as usize];
+                }
+                &edge_row[..span]
+            };
+            convolve_row_fixed_phase(kx, src, &mut intermediate[r * w..(r + 1) * w], inter_round0);
+        }
+        for r in 0..h {
+            convolve_column_fixed_phase(
+                ky,
+                &intermediate[r * w..(r + 8) * w],
+                w,
+                &mut pred[r * w..(r + 1) * w],
+                inter_round1,
+            );
+        }
+    });
+}
+
+/// One output row of the §7.11.3.4 vertical pass at a fixed phase:
+/// `out[ c ] = Round2( sum_t k[ t ] * rows[ t * w + c ], shift )`.
+#[inline]
+fn convolve_column_fixed_phase(k: &[i32; 8], rows: &[i32], w: usize, out: &mut [i32], shift: u32) {
+    out.fill(1 << (shift - 1));
+    for (t, &kt) in k.iter().enumerate() {
+        if kt == 0 {
+            continue;
+        }
+        for (o, &s) in out.iter_mut().zip(&rows[t * w..(t + 1) * w]) {
+            *o += kt * s;
+        }
+    }
+    for o in out.iter_mut() {
+        *o >>= shift;
+    }
+}
+
+/// The general (scaled-reference) §7.11.3.4 process.
+#[allow(clippy::too_many_arguments)]
+fn convolve_scaled(
+    ref_plane: &[u16],
+    ref_stride: usize,
+    last_x: i32,
+    last_y: i32,
+    start_x: i32,
+    start_y: i32,
+    step_x: i32,
+    step_y: i32,
+    w: usize,
+    h: usize,
+    h_filter: usize,
+    v_filter: usize,
+    inter_round0: u32,
+    inter_round1: u32,
+    intermediate: &mut [i32],
+    pred: &mut [i32],
+) {
+    let intermediate_height = intermediate.len() / w;
 
     // ---------- §7.11.3.4 step 1: horizontal filter ----------
     //
@@ -858,8 +1051,6 @@ pub fn block_inter_prediction(
             *out = round2(s as i64, inter_round1) as i32;
         }
     }
-
-    Ok(())
 }
 
 /// §7.11.3.1 single-ref post-prediction `Clip1` (av1-spec p.258 line
@@ -7847,8 +8038,18 @@ mod tests {
                 .collect();
             let r0 = if bd == 12 { 5 } else { 3 };
             for (xs, ys) in [(1024, 1024), (2048, 1024), (1024, 1536), (1500, 1300)] {
-                for (w, h) in [(4usize, 4usize), (8, 8), (16, 4)] {
-                    for x in [-9000, -1024, 0, 64, 1024 * 5 + 320, 1024 * 40, 1024 * 60] {
+                for (w, h) in [(4usize, 4usize), (8, 8), (16, 4), (2, 2), (32, 8), (8, 16)] {
+                    for x in [
+                        -9000,
+                        -1024,
+                        0,
+                        64,
+                        1024 * 3 + 64,
+                        1024 * 5 + 320,
+                        1024 * 8 + 448,
+                        1024 * 40,
+                        1024 * 60,
+                    ] {
                         for y in [-7000, 0, 512, 1024 * 3, 1024 * 30 + 64, 1024 * 50] {
                             for (fx, fy) in [(0u8, 0u8), (1, 2), (2, 1)] {
                                 let mut pred = vec![0i32; w * h];

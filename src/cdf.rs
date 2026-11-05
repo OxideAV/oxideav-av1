@@ -21200,6 +21200,51 @@ impl PartitionWalker {
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
+        let table = self.lf_edge_table(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+        );
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            for pass in 0..2u8 {
+                crate::loop_filter::loop_filter_rows_window_table(
+                    &table,
+                    plane,
+                    pass,
+                    &mut planes[plane as usize],
+                    0,
+                    mi_row_start,
+                    mi_row_end,
+                );
+            }
+        }
+    }
+
+    /// The closure-driven reference of [`Self::loop_filter_rows_from_grid`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_filter_rows_from_grid_reference(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        mi_row_start: u32,
+        mi_row_end: u32,
+    ) {
         self.with_lf_ctx(
             lf_params,
             seg_params,
@@ -21212,6 +21257,90 @@ impl PartitionWalker {
             frame_height,
             |ctx| crate::loop_filter::loop_filter_rows(ctx, planes, mi_row_start, mi_row_end),
         );
+    }
+
+    /// r481 — the §7.14 per-cell edge inputs of this walker's frame
+    /// (see [`crate::loop_filter::LfEdgeTable`]), read straight from
+    /// the mode-info grids: the values the [`Self::with_lf_ctx`]
+    /// closures return, cell by cell.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lf_edge_table(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> crate::loop_filter::LfEdgeTable {
+        use crate::loop_filter::{LfEdgeTable, LfLevelParams, SEG_LVL_ALT_LF_Y_V};
+        let lp = LfLevelParams {
+            loop_filter_level: lf_params.loop_filter_level,
+            loop_filter_sharpness: lf_params.loop_filter_sharpness,
+            loop_filter_delta_enabled: lf_params.loop_filter_delta_enabled,
+            loop_filter_ref_deltas: lf_params.loop_filter_ref_deltas,
+            loop_filter_mode_deltas: lf_params.loop_filter_mode_deltas,
+            delta_lf_multi,
+            seg_alt_lf_active: core::array::from_fn(|seg| {
+                core::array::from_fn(|i| {
+                    seg_params.segment_feature_active[seg][SEG_LVL_ALT_LF_Y_V + i]
+                })
+            }),
+            seg_alt_lf_data: core::array::from_fn(|seg| {
+                core::array::from_fn(|i| {
+                    seg_params.segment_feature_data[seg][SEG_LVL_ALT_LF_Y_V + i]
+                })
+            }),
+        };
+        let _ = num_planes;
+        let mut t = LfEdgeTable::with_geometry(
+            self.mi_rows,
+            self.mi_cols,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            lf_params.loop_filter_level,
+            lf_params.loop_filter_sharpness,
+        );
+        let cells = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let slots: [usize; 4] = core::array::from_fn(|i| lp.delta_lf_slot(i));
+        for idx in 0..cells {
+            t.mi_size[idx] = self.mi_sizes[idx] as u8;
+            let ref0 = self.ref_frames[idx * 2];
+            t.skip_inter[idx] =
+                self.skips[idx] != 0 && ref0 > crate::uncompressed_header_tail::INTRA_FRAME as i8;
+            let seg = self.segment_ids[idx];
+            let seg = if seg < 0 { u8::MAX } else { seg as u8 };
+            let mode = self.y_modes[idx];
+            let r = ref0.max(0) as u8;
+            let dl = self
+                .delta_lfs
+                .get(idx * FRAME_LF_COUNT..idx * FRAME_LF_COUNT + FRAME_LF_COUNT);
+            t.lvl[idx] = core::array::from_fn(|i| {
+                let d = dl.map_or(0, |d| d[slots[i]]);
+                lp.level(seg, r, mode, d, i)
+            });
+        }
+        for plane in 0..3usize {
+            let (rows, cols) = t.tx_dims(plane);
+            for sr in 0..rows {
+                for sc in 0..cols {
+                    t.tx[plane][sr * cols + sc] = self.loopfilter_tx_size_at(
+                        plane,
+                        sr as u32,
+                        sc as u32,
+                        subsampling_x,
+                        subsampling_y,
+                    ) as u8;
+                }
+            }
+        }
+        t
     }
 
     /// r475 — [`Self::loop_filter_frame_from_grid`] `threads`-wide by
@@ -21236,9 +21365,23 @@ impl PartitionWalker {
         planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
         threads: usize,
     ) {
-        use crate::loop_filter::{PlaneBuffer, loop_filter_rows_window, row_windows_mut, run_jobs};
+        use crate::loop_filter::{
+            PlaneBuffer, loop_filter_rows_window_table, row_windows_mut, run_jobs,
+        };
         const BAND_MI: u32 = 16;
         const SKIRT: usize = 7;
+        let table = self.lf_edge_table(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+        );
+        let table = &table;
         let num_planes = num_planes.min(planes.len() as u8);
         for plane in 0..num_planes {
             if plane > 0 && lf_params.loop_filter_level[(1 + plane) as usize] == 0 {
@@ -21290,32 +21433,19 @@ impl PartitionWalker {
                     windows.into_iter().zip(selected.iter().zip(ranges.iter()))
                 {
                     let f = move || {
-                        self.with_lf_ctx(
-                            lf_params,
-                            seg_params,
-                            delta_lf_multi,
-                            num_planes,
-                            bit_depth,
-                            subsampling_x,
-                            subsampling_y,
-                            frame_width,
-                            frame_height,
-                            |ctx| {
-                                let mut window = PlaneBuffer {
-                                    rows: (w1 - w0) as u32,
-                                    cols: cols as u32,
-                                    samples: win,
-                                };
-                                loop_filter_rows_window(
-                                    ctx,
-                                    plane,
-                                    pass,
-                                    &mut window,
-                                    w0 as u32,
-                                    mi0,
-                                    mi1,
-                                );
-                            },
+                        let mut window = PlaneBuffer {
+                            rows: (w1 - w0) as u32,
+                            cols: cols as u32,
+                            samples: win,
+                        };
+                        loop_filter_rows_window_table(
+                            table,
+                            plane,
+                            pass,
+                            &mut window,
+                            w0 as u32,
+                            mi0,
+                            mi1,
                         );
                     };
                     jobs.push(Box::new(f));
