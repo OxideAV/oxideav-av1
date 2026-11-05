@@ -14688,6 +14688,80 @@ pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) ->
     }
 }
 
+/// r481 — padding (columns right of / rows below the transform block)
+/// of the coefficient-context level copy: the largest §8.3.2
+/// neighbour offset.
+const LEVELS_PAD: usize = 4;
+
+/// r481 — [`get_coeff_base_ctx`] (`isEob == 0`) over the padded level
+/// copy: `levels[ lpos ]` is position `pos` (row `pos >> bwl`), rows
+/// `stride` apart. Same value for every input.
+#[inline]
+fn coeff_base_ctx_from_levels(
+    levels: &[u8],
+    stride: usize,
+    lpos: usize,
+    tx_size: usize,
+    tx_class: usize,
+    pos: usize,
+    bwl: usize,
+) -> usize {
+    let l = |off: usize| u32::from(levels[lpos + off].min(3));
+    let mag = match tx_class {
+        TX_CLASS_2D => l(1) + l(stride) + l(stride + 1) + l(2) + l(2 * stride),
+        TX_CLASS_HORIZ => l(1) + l(stride) + l(2) + l(3) + l(4),
+        _ => l(1) + l(stride) + l(2 * stride) + l(3 * stride) + l(4 * stride),
+    };
+    let ctx = ((mag + 1) >> 1).min(4) as usize;
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+    if tx_class == TX_CLASS_2D {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        return ctx + COEFF_BASE_CTX_OFFSET[tx_size][row.min(4)][col.min(4)];
+    }
+    let idx = if tx_class == TX_CLASS_VERT { row } else { col };
+    ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+}
+
+/// r481 — [`get_br_ctx`] over the padded level copy (levels stored
+/// clamped to `COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 = 15`).
+#[inline]
+fn br_ctx_from_levels(
+    levels: &[u8],
+    stride: usize,
+    lpos: usize,
+    tx_class: usize,
+    pos: usize,
+    bwl: usize,
+) -> usize {
+    let l = |off: usize| u32::from(levels[lpos + off]);
+    let mag = match tx_class {
+        TX_CLASS_2D => l(1) + l(stride) + l(stride + 1),
+        TX_CLASS_HORIZ => l(1) + l(stride) + l(2),
+        _ => l(1) + l(stride) + l(2 * stride),
+    };
+    let mag = ((mag + 1) >> 1).min(6) as usize;
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+    if pos == 0 {
+        mag
+    } else if tx_class == TX_CLASS_2D {
+        if row < 2 && col < 2 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    } else if tx_class == TX_CLASS_HORIZ {
+        if col == 0 { mag + 7 } else { mag + 14 }
+    } else if row == 0 {
+        mag + 7
+    } else {
+        mag + 14
+    }
+}
+
 // ---------------------------------------------------------------------
 // Round 143 — inter-intra group (§9.4): `Default_Inter_Intra_Cdf`,
 // `Default_Inter_Intra_Mode_Cdf`, `Default_Wedge_Inter_Intra_Cdf`. All
@@ -15807,6 +15881,9 @@ pub struct PartitionWalker {
     /// reads has published the rows the leaf's motion vectors reach,
     /// and predicts from that published prefix.
     ref_rows: Option<std::sync::Arc<RefRowSources>>,
+    /// r481 — the §8.3.2 coefficient-context level copy (see
+    /// [`Self::coefficients_gate_open`]), reused across blocks.
+    coeff_levels: Vec<u8>,
     /// §5.11.18 per-cell `AvailU` (`is_inside( MiRow - 1, MiCol )`,
     /// av1-spec line 3915) for the current tile geometry — rebuilt at
     /// [`Self::begin_tile`] (and at construction) and consumed by the
@@ -16919,6 +16996,7 @@ impl PartitionWalker {
             enable_intra_edge_filter: false,
             parse_only: false,
             ref_rows: None,
+            coeff_levels: Vec::new(),
             walk_avail_u,
             walk_avail_l,
             inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
@@ -31246,10 +31324,28 @@ impl PartitionWalker {
         // the already-written cells. The `Quant[]` array is the
         // §5.11.39 line-9 zero-initialised buffer; the buffer must be
         // wide enough to be indexed at every `pos = scan[c]`.
+        // r481 — the §8.3.2 `get_coeff_base_ctx` / `get_br_ctx`
+        // neighbour reads run over a zero-padded copy of the levels
+        // decoded so far (`Min( level, 15 )`, the larger of the two
+        // clamps; `get_coeff_base_ctx` clamps it further to 3): every
+        // neighbour offset is at most 4 rows / columns, and a neighbour
+        // outside the (adjusted) transform block reads the padding zero
+        // exactly as the spec's bounds test excludes it.
+        let adj = ADJUSTED_TX_SIZE[tx_size];
+        let bwl = TX_WIDTH_LOG2[adj];
+        let stride = (1usize << bwl) + LEVELS_PAD;
+        let levels_len = (TX_HEIGHT[adj] + LEVELS_PAD) * stride;
+        if self.coeff_levels.len() < levels_len {
+            self.coeff_levels.resize(levels_len, 0);
+        }
+        let levels = &mut self.coeff_levels[..levels_len];
+        levels.fill(0);
         if eob > 0 {
             let mut c: i32 = eob as i32 - 1;
             while c >= 0 {
                 let pos = scan[c as usize] as usize;
+                let row = pos >> bwl;
+                let lpos = row * stride + (pos - (row << bwl));
                 // §8.3.2 ctx derivations — see [`get_coeff_base_ctx`] /
                 // [`get_coeff_base_eob_ctx`].
                 let is_eob = c == (eob as i32 - 1);
@@ -31271,7 +31367,9 @@ impl PartitionWalker {
                 } else {
                     // §8.3.2 `coeff_base`: ctx via
                     // [`get_coeff_base_ctx`] with `is_eob = false`.
-                    let ctx = get_coeff_base_ctx(quant, tx_size, tx_class, pos, c as usize, false);
+                    let ctx = coeff_base_ctx_from_levels(
+                        levels, stride, lpos, tx_size, tx_class, pos, bwl,
+                    );
                     let cdf = cdfs
                         .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
@@ -31289,8 +31387,11 @@ impl PartitionWalker {
                 // than BR_CDF_SIZE - 1 = 3.
                 if level as usize > NUM_BASE_LEVELS {
                     let br_iters = COEFF_BASE_RANGE / (BR_CDF_SIZE - 1);
+                    // The neighbours `get_br_ctx` reads do not change
+                    // across the `coeff_br` reads of one position.
+                    let br_ctx = br_ctx_from_levels(levels, stride, lpos, tx_class, pos, bwl);
                     for _ in 0..br_iters {
-                        let ctx = get_br_ctx(quant, tx_size, tx_class, pos);
+                        let ctx = br_ctx;
                         let cdf = cdfs
                             .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
                             .ok_or(crate::Error::PartitionWalkOutOfRange)?;
@@ -31308,6 +31409,7 @@ impl PartitionWalker {
                 // §5.11.39 line 71: `Quant[ pos ] = level` (magnitude
                 // only; the sign-apply runs in the forward-scan loop).
                 quant[pos] = level as i32;
+                levels[lpos] = level.min(15) as u8;
                 c -= 1;
             }
         }

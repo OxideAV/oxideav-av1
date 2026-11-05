@@ -896,18 +896,78 @@ fn convolve_unscaled(
                 }
                 &edge_row[..span]
             };
-            convolve_row_fixed_phase(kx, src, &mut intermediate[r * w..(r + 1) * w], inter_round0);
+            let out = &mut intermediate[r * w..(r + 1) * w];
+            if phase_x == 0 {
+                // Phase 0 is { 0, 0, 0, 128, 0, 0, 0, 0 }: the centre
+                // tap alone, `Round2( 128 * sample, InterRound0 )`.
+                let bias = 1i32 << (inter_round0 - 1);
+                for (o, &v) in out.iter_mut().zip(&src[3..3 + w]) {
+                    *o = (128 * i32::from(v) + bias) >> inter_round0;
+                }
+                continue;
+            }
+            match w {
+                2 => convolve_row_w::<2>(kx, src, out, inter_round0),
+                4 => convolve_row_w::<4>(kx, src, out, inter_round0),
+                8 => convolve_row_w::<8>(kx, src, out, inter_round0),
+                16 => convolve_row_w::<16>(kx, src, out, inter_round0),
+                32 => convolve_row_w::<32>(kx, src, out, inter_round0),
+                64 => convolve_row_w::<64>(kx, src, out, inter_round0),
+                128 => convolve_row_w::<128>(kx, src, out, inter_round0),
+                _ => convolve_row_fixed_phase(kx, src, out, inter_round0),
+            }
         }
         for r in 0..h {
-            convolve_column_fixed_phase(
-                ky,
-                &intermediate[r * w..(r + 8) * w],
-                w,
-                &mut pred[r * w..(r + 1) * w],
-                inter_round1,
-            );
+            let rows = &intermediate[r * w..(r + 8) * w];
+            let out = &mut pred[r * w..(r + 1) * w];
+            match w {
+                2 => convolve_column_w::<2>(ky, rows, out, inter_round1),
+                4 => convolve_column_w::<4>(ky, rows, out, inter_round1),
+                8 => convolve_column_w::<8>(ky, rows, out, inter_round1),
+                16 => convolve_column_w::<16>(ky, rows, out, inter_round1),
+                32 => convolve_column_w::<32>(ky, rows, out, inter_round1),
+                64 => convolve_column_w::<64>(ky, rows, out, inter_round1),
+                128 => convolve_column_w::<128>(ky, rows, out, inter_round1),
+                _ => convolve_column_fixed_phase(ky, rows, w, out, inter_round1),
+            }
         }
     });
+}
+
+/// [`convolve_row_fixed_phase`] for a row of exactly `W` outputs: the
+/// sizes are compile-time constants, so every tap's multiply-add runs
+/// across the row in vector lanes (zero taps included — cheaper than a
+/// branch at these widths).
+#[inline(always)]
+fn convolve_row_w<const W: usize>(k: &[i32; 8], src: &[u16], out: &mut [i32], shift: u32) {
+    let src = &src[..W + 7];
+    let mut acc = [1i32 << (shift - 1); W];
+    for (t, &kt) in k.iter().enumerate() {
+        for (a, &s) in acc.iter_mut().zip(&src[t..t + W]) {
+            *a += kt * i32::from(s);
+        }
+    }
+    for (o, a) in out[..W].iter_mut().zip(acc) {
+        *o = a >> shift;
+    }
+}
+
+/// [`convolve_column_fixed_phase`] for rows of exactly `W` samples.
+#[inline(always)]
+fn convolve_column_w<const W: usize>(k: &[i32; 8], rows: &[i32], out: &mut [i32], shift: u32) {
+    let rows = &rows[..8 * W];
+    let mut acc = [1i32 << (shift - 1); W];
+    for (t, &kt) in k.iter().enumerate() {
+        if kt == 0 {
+            continue;
+        }
+        for (a, &s) in acc.iter_mut().zip(&rows[t * W..(t + 1) * W]) {
+            *a += kt * s;
+        }
+    }
+    for (o, a) in out[..W].iter_mut().zip(acc) {
+        *o = a >> shift;
+    }
 }
 
 /// One output row of the §7.11.3.4 vertical pass at a fixed phase:
@@ -8046,7 +8106,16 @@ mod tests {
                 .collect();
             let r0 = if bd == 12 { 5 } else { 3 };
             for (xs, ys) in [(1024, 1024), (2048, 1024), (1024, 1536), (1500, 1300)] {
-                for (w, h) in [(4usize, 4usize), (8, 8), (16, 4), (2, 2), (32, 8), (8, 16)] {
+                for (w, h) in [
+                    (4usize, 4usize),
+                    (8, 8),
+                    (16, 4),
+                    (2, 2),
+                    (32, 8),
+                    (8, 16),
+                    (64, 3),
+                    (128, 2),
+                ] {
                     for x in [
                         -9000,
                         -1024,

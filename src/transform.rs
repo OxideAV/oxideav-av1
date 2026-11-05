@@ -807,13 +807,29 @@ pub fn inverse_transform_2d(
     for cell in residual.iter_mut() {
         *cell = clip3(lo, hi, *cell);
     }
-    // Column transforms.
+    // Column transforms. r481 — the column process is a function of
+    // the column's input alone, so a column whose input equals the
+    // previous column's input takes that column's output (a DC-only
+    // block's row pass leaves every column the same input: one column
+    // transform instead of `w`).
     let mut tbuf = [0i64; 64];
     let tbuf = &mut tbuf[..h];
+    let mut prev_in = [0i64; 64];
+    let prev_in = &mut prev_in[..h];
     for j in 0..w {
+        let mut same = j > 0;
         for i in 0..h {
-            tbuf[i] = residual[i * w + j];
+            let v = residual[i * w + j];
+            same &= v == prev_in[i];
+            tbuf[i] = v;
         }
+        if same {
+            for i in 0..h {
+                residual[i * w + j] = residual[i * w + j - 1];
+            }
+            continue;
+        }
+        prev_in.copy_from_slice(tbuf);
         if lossless {
             inverse_wht4(tbuf, 0);
         } else {
