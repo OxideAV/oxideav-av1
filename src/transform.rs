@@ -738,6 +738,20 @@ pub fn inverse_transform_2d(
     bit_depth: u32,
     lossless: bool,
 ) -> Vec<i64> {
+    let mut residual = Vec::new();
+    inverse_transform_2d_into(dequant, tx_sz, tx_type, bit_depth, lossless, &mut residual);
+    residual
+}
+
+/// r481 — [`inverse_transform_2d`] into a reused buffer.
+pub(crate) fn inverse_transform_2d_into(
+    dequant: &[i64],
+    tx_sz: usize,
+    tx_type: usize,
+    bit_depth: u32,
+    lossless: bool,
+    residual: &mut Vec<i64>,
+) {
     assert!(
         tx_sz < TX_SIZES_ALL,
         "oxideav-av1 §7.13.3: tx_sz {tx_sz} out of range (TX_SIZES_ALL = {TX_SIZES_ALL})"
@@ -761,7 +775,8 @@ pub fn inverse_transform_2d(
     let row_clamp_range = bit_depth + 8;
     let col_clamp_range = core::cmp::max(bit_depth + 6, 16);
 
-    let mut residual = vec![0i64; w * h];
+    residual.clear();
+    residual.resize(w * h, 0);
     // Row transforms. r475 — stack scratch (the per-call heap buffers
     // were measurable at 12 MP), and an all-zero input row is left as
     // the all-zero output row it transforms to (every §7.13.2 kernel
@@ -839,7 +854,6 @@ pub fn inverse_transform_2d(
             residual[i * w + j] = round2(tbuf[i], col_shift);
         }
     }
-    residual
 }
 
 /// §7.13.3 row-pass kernel selector (av1-spec p.306). DCT path for

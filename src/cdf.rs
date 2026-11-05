@@ -13641,6 +13641,34 @@ pub fn dequantize_step1(
     seg_qm_level: u8,
     quant: &QuantizerParams,
 ) -> Vec<i64> {
+    let mut dequant = Vec::new();
+    dequantize_step1_into(
+        quant_levels,
+        tx_size,
+        plane,
+        segment_id,
+        plane_tx_type,
+        seg_qm_level,
+        quant,
+        &mut dequant,
+    );
+    dequant
+}
+
+/// r481 — [`dequantize_step1`] into a reused buffer; a zero level
+/// dequantizes to zero (`0 * q2 = 0`), so only the non-zero levels are
+/// evaluated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dequantize_step1_into(
+    quant_levels: &[i32],
+    tx_size: usize,
+    plane: u8,
+    segment_id: u8,
+    plane_tx_type: usize,
+    seg_qm_level: u8,
+    quant: &QuantizerParams,
+    dequant: &mut Vec<i64>,
+) {
     debug_assert!(tx_size < TX_SIZES_ALL);
     let w = TX_WIDTH[tx_size];
     let h = TX_HEIGHT[tx_size];
@@ -13654,9 +13682,13 @@ pub fn dequantize_step1(
 
     let qm_active = quant.using_qmatrix && plane_tx_type < IDTX && seg_qm_level < 15;
 
-    let mut dequant = vec![0i64; w * h];
+    dequant.clear();
+    dequant.resize(w * h, 0);
     for i in 0..th {
         for j in 0..tw {
+            if quant_levels[i * tw + j] == 0 {
+                continue;
+            }
             let q = if i == 0 && j == 0 { dc_q_val } else { ac_q_val };
             // §7.12.3 step 1b: `q2 = q` on the no-QM arm; the
             // QM-active arm reads §9.5.3 Quantizer_Matrix.
@@ -13679,7 +13711,6 @@ pub fn dequantize_step1(
             dequant[i * w + j] = dq2.clamp(clip_min, clip_max);
         }
     }
-    dequant
 }
 
 // ---------------------------------------------------------------------
@@ -15884,6 +15915,14 @@ pub struct PartitionWalker {
     /// r481 — the §8.3.2 coefficient-context level copy (see
     /// [`Self::coefficients_gate_open`]), reused across blocks.
     coeff_levels: Vec<u8>,
+    /// r481 — reused transform-block buffers (coefficients, dequantized
+    /// coefficients, residual).
+    tx_quant_scratch: Vec<i32>,
+    tx_dequant_scratch: Vec<i64>,
+    tx_residual_scratch: Vec<i64>,
+    /// Whether `residual()` readouts carry each transform block's
+    /// residual (the API's default); the frame decoder turns it off.
+    keep_residual_readouts: bool,
     /// §5.11.18 per-cell `AvailU` (`is_inside( MiRow - 1, MiCol )`,
     /// av1-spec line 3915) for the current tile geometry — rebuilt at
     /// [`Self::begin_tile`] (and at construction) and consumed by the
@@ -16997,6 +17036,10 @@ impl PartitionWalker {
             parse_only: false,
             ref_rows: None,
             coeff_levels: Vec::new(),
+            tx_quant_scratch: Vec::new(),
+            tx_dequant_scratch: Vec::new(),
+            tx_residual_scratch: Vec::new(),
+            keep_residual_readouts: true,
             walk_avail_u,
             walk_avail_l,
             inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
@@ -21555,6 +21598,12 @@ impl PartitionWalker {
     /// samples.
     pub(crate) fn set_parse_only(&mut self, on: bool) {
         self.parse_only = on;
+    }
+
+    /// r481 — stop `residual()` readouts from carrying each transform
+    /// block's residual (the frame decoder reads none of them).
+    pub(crate) fn set_keep_residual_readouts(&mut self, on: bool) {
+        self.keep_residual_readouts = on;
     }
 
     /// r481 — the §7.14 per-cell edge inputs of this walker's frame
@@ -32380,29 +32429,10 @@ impl PartitionWalker {
         // `uv_mode` carries the §5.11.7 / §5.11.22 decoded `UVMode`
         // (or `DC_PRED` when the `HasChroma` arm did not run — the
         // §5.11.33 chroma planes are not visited in that case).
-        if !self.parse_only {
-            let _readout = self.compute_prediction(
-                mi_row_b,
-                mi_col_b,
-                sub_size,
-                has_chroma,
-                avail_u,
-                avail_l,
-                avail_u_chroma,
-                avail_l_chroma,
-                subsampling_x,
-                subsampling_y,
-                is_inter != 0,
-                /* y_mode = */ y_mode,
-                /* uv_mode = */ uv_mode.unwrap_or(0),
-                /* ref_frame_1_is_intra = */ false,
-                // §5.11.28 `interintra_mode` — the §5.11.5 walker emits no
-                // inter-intra blocks (`ref_frame_1_is_intra == false`), so
-                // this is unread; pass `II_DC_PRED` as the inert default.
-                /* interintra_mode = */
-                II_DC_PRED,
-            )?;
-        }
+        // r481 — the §5.11.33 task readout of an intra block is not
+        // consumed (the §7.11.2 writes run from `residual()`), and its
+        // derivation reads no state the walk needs, so it is not
+        // evaluated here.
 
         // §5.11.33 `is_inter` arm, realised — on the §5.11.7 intra
         // path the only `is_inter == 1` blocks are `use_intrabc == 1`
@@ -32797,7 +32827,9 @@ impl PartitionWalker {
         // it prepends one intra-half task per plane (r301).
         // r481 — a syntax-only walk predicts nothing, so it skips the
         // §5.11.33 task derivation (it reads no state the syntax needs).
-        let readout = if self.parse_only {
+        // r481 — the readout is consumed only by the inter-intra arm
+        // (its intra tasks), so it is derived only there.
+        let readout = if self.parse_only || !ref_frame_1_is_intra {
             None
         } else {
             Some(self.compute_prediction(
@@ -33234,25 +33266,10 @@ impl PartitionWalker {
         // (the §7.11.2 prediction itself happens per-TU inside the
         // §5.11.34 `residual()` dispatch below, mirroring the §5.11.7
         // intra-frame arm).
-        if !self.parse_only {
-            let _readout = self.compute_prediction(
-                mi_row,
-                mi_col,
-                sub_size,
-                has_chroma,
-                avail_u,
-                avail_l,
-                avail_u_chroma,
-                avail_l_chroma,
-                subsampling_x,
-                subsampling_y,
-                /* is_inter = */ false,
-                y_mode,
-                uv_mode.unwrap_or(0),
-                /* ref_frame_1_is_intra = */ false,
-                /* interintra_mode = */ II_DC_PRED,
-            )?;
-        }
+        // r481 — the §5.11.33 task readout of an intra block is not
+        // consumed (the §7.11.2 writes run from `residual()`), and its
+        // derivation reads no state the walk needs, so it is not
+        // evaluated here.
 
         // §5.11.5 line `residual( )` — the full intra `ResidualContext`
         // (mode-info + the caller-threaded §5.9.12 quantiser pair).
@@ -34808,7 +34825,11 @@ impl PartitionWalker {
                 // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
                 // Mcol scan table the §5.11.39 reader walks.
                 let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
-                let mut quant = vec![0i32; tx_w * tx_h];
+                // r481 — reused per-walker coefficient / dequant /
+                // residual buffers (the per-transform-block allocations).
+                let mut quant = std::mem::take(&mut self.tx_quant_scratch);
+                quant.clear();
+                quant.resize(tx_w * tx_h, 0);
                 let coeffs = self.coefficients_gate_open(
                     decoder,
                     cdfs,
@@ -34835,7 +34856,8 @@ impl PartitionWalker {
                 // §7.12.3 dequantization (step 1) + §7.13 inverse
                 // transform + §7.12.3 step-3 frame-buffer merge.
                 if coeffs.eob > 0 && !self.parse_only {
-                    let dequant = dequantize_step1(
+                    let mut dequant = std::mem::take(&mut self.tx_dequant_scratch);
+                    dequantize_step1_into(
                         &quant,
                         tx_sz,
                         plane,
@@ -34843,14 +34865,18 @@ impl PartitionWalker {
                         plane_tx_type,
                         ctx.seg_qm_level[plane as usize],
                         &ctx.quant,
+                        &mut dequant,
                     );
-                    let residual = crate::transform::inverse_transform_2d(
+                    let mut residual = std::mem::take(&mut self.tx_residual_scratch);
+                    crate::transform::inverse_transform_2d_into(
                         &dequant,
                         tx_sz,
                         plane_tx_type,
                         ctx.quant.bit_depth as u32,
                         lossless,
+                        &mut residual,
                     );
+                    self.tx_dequant_scratch = dequant;
                     // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
                     // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
                     // xx]` with the `flipLR` / `flipUD` destination remap
@@ -34869,10 +34895,14 @@ impl PartitionWalker {
                         sub_x,
                         sub_y,
                     );
-                    readout.residuals.push(Some(residual));
+                    readout
+                        .residuals
+                        .push(self.keep_residual_readouts.then(|| residual.clone()));
+                    self.tx_residual_scratch = residual;
                 } else {
                     readout.residuals.push(None);
                 }
+                self.tx_quant_scratch = quant;
             }
         } else if plane == 0 {
             // §5.11.39 `all_zero == 1` luma stamp — the §5.11.39

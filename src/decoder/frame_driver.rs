@@ -1318,6 +1318,7 @@ fn decode_frame_spec_tiles(
     };
 
     walker.set_parse_only(parse_only);
+    walker.set_keep_residual_readouts(false);
     if any_pending {
         walker.set_ref_rows(Some(Arc::new(row_sources)));
     }
@@ -1471,6 +1472,7 @@ fn decode_frame_spec_tiles(
             )
             .ok_or(Error::PartitionWalkOutOfRange)?;
             local.set_parse_only(true);
+            local.set_keep_residual_readouts(false);
             local.begin_tile(geom);
             local.set_current_q_index(i32::from(qp.base_q_idx));
             let tile = &tiles[t];
@@ -1616,6 +1618,7 @@ fn decode_frame_spec_tiles(
                 .ok_or(Error::PartitionWalkOutOfRange)?;
                 local.set_lr_origin(r0, c0);
                 local.set_parse_only(parse_only);
+                local.set_keep_residual_readouts(false);
                 local.begin_tile(TileGeometry {
                     mi_row_start: 0,
                     mi_row_end: h4,
