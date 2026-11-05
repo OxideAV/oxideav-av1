@@ -20431,18 +20431,28 @@ impl PartitionWalker {
             let sb_height4 = (mi_row_end - r as i32) >> sub_y;
             let y_max = sb_size4 >> sub_y;
             let x_max = sb_size4 >> sub_x;
-            for y in -1..=y_max {
-                for x in -1..=x_max {
-                    // §5.11.3 lines: the top border (`y < 0`) within the
-                    // in-frame column span and the left border (`x < 0`)
-                    // within the in-frame row span are `1`; everything
-                    // else (interior + off-frame border tails) is `0`.
-                    // The two `1` arms in the spec collapse to a single
-                    // boolean `or` (both yield the same value).
-                    let val = u8::from((y < 0 && x < sb_width4) || (x < 0 && y < sb_height4));
-                    if let Some(slot) = Self::block_decoded_slot(plane, y, x) {
-                        self.block_decoded[slot] = val;
+            // §5.11.3 lines: the top border (`y < 0`) within the
+            // in-frame column span and the left border (`x < 0`)
+            // within the in-frame row span are `1`; everything else
+            // (interior + off-frame border tails) is `0`. r481 — one
+            // row slice at a time: on the top row the value is `x <
+            // sbWidth4` (`x = -1` included, `sbWidth4 >= 0`), on every
+            // other row only the left-border cell can be `1`.
+            let base = plane * BD_STRIDE * BD_STRIDE;
+            let cols = ((x_max + 2) as usize).min(BD_STRIDE);
+            for (y, row) in (-1..=y_max).zip(
+                self.block_decoded[base..base + BD_STRIDE * BD_STRIDE]
+                    .as_chunks_mut::<BD_STRIDE>()
+                    .0,
+            ) {
+                let row = &mut row[..cols];
+                if y < 0 {
+                    for (xi, cell) in row.iter_mut().enumerate() {
+                        *cell = u8::from((xi as i32 - 1) < sb_width4);
                     }
+                } else {
+                    row.fill(0);
+                    row[0] = u8::from(y < sb_height4);
                 }
             }
             // §5.11.3 final line: `BlockDecoded[ plane ][ sbSize4 >>

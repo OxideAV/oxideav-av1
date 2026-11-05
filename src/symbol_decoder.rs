@@ -82,6 +82,9 @@ pub struct SymbolDecoder<'a> {
     window_bits: u32,
     /// The next partition byte to load into `window`.
     next_byte: usize,
+    /// `sz` exceeds the buffer: a renormalization reaching past the
+    /// buffer fails as `f()` would (checked only then).
+    short: bool,
     /// `SymbolValue` — §8.2.2 / §8.2.4.
     value: u32,
     /// `SymbolRange` — §8.2.2 / §8.2.4. Always in `(1 << 8) ..= (1 << 15)`.
@@ -137,6 +140,7 @@ impl<'a> SymbolDecoder<'a> {
             window: 0,
             window_bits: 0,
             next_byte: consumed / 8,
+            short: sz > bytes.len(),
             value,
             range,
             max_bits,
@@ -273,15 +277,16 @@ impl<'a> SymbolDecoder<'a> {
         // 2. SymbolRange = SymbolRange << bits
         self.range <<= bits;
         // 3. numBits = Min(bits, Max(0, SymbolMaxBits))
-        let avail = self.max_bits.max(0);
-        let num_bits = core::cmp::min(i64::from(bits), avail) as u32;
         // 4. newData = f(numBits): the partition's next bits — read
         //    through the window, which holds zeros past `8 * sz`, so
         // 5. paddedData = newData << (bits - numBits) is simply the
         //    window's next `bits` bits. (A partition running past the
         //    end of the buffer fails as `f()` would.)
-        if num_bits > 0 && self.bits_consumed() + num_bits as usize > self.bytes.len() * 8 {
-            return Err(Error::UnexpectedEnd);
+        if self.short {
+            let num_bits = core::cmp::min(i64::from(bits), self.max_bits.max(0)) as usize;
+            if num_bits > 0 && self.bits_consumed() + num_bits > self.bytes.len() * 8 {
+                return Err(Error::UnexpectedEnd);
+            }
         }
         if self.window_bits < bits {
             self.refill();
@@ -546,6 +551,7 @@ impl<'a> SymbolDecoder<'a> {
 ///   }
 ///   cdf[N] += (cdf[N] < 32)
 /// ```
+#[inline]
 pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
     let count = u32::from(cdf[n as usize]);
     let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
