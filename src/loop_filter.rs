@@ -916,19 +916,18 @@ pub fn loop_filter_rows_window_table(
                 let cols = window.cols as usize;
                 let (along, across) = if pass == 0 { (cols, 1) } else { (1, cols) };
                 let q0 = y_w as usize * cols + x_p as usize;
-                for k in 0..MI_SIZE {
-                    filter_line(
-                        window.samples,
-                        q0 + k * along,
-                        across,
-                        filter_size,
-                        plane,
-                        limit,
-                        blimit,
-                        thresh,
-                        t.bit_depth,
-                    );
-                }
+                filter_edge4(
+                    window.samples,
+                    q0,
+                    along,
+                    across,
+                    filter_size,
+                    plane,
+                    limit,
+                    blimit,
+                    thresh,
+                    t.bit_depth,
+                );
                 continue;
             }
             for k in 0..(MI_SIZE as i32) {
@@ -951,17 +950,24 @@ pub fn loop_filter_rows_window_table(
     }
 }
 
-/// §7.14.6.1 sample filtering of one line across an edge, on direct
-/// indices: `s[ q0 ]` is the first sample past the edge and `across`
-/// the index step across it; every tap the §7.14.6.2 mask and the
-/// §7.14.6.3 / §7.14.6.4 filters read (`filter_size` / 2 + 3 either
-/// side at most) is inside `s`. The same decisions and arithmetic as
-/// [`sample_filtering`].
+/// Lanes of [`filter_edge4`]: the `MI_SIZE` lines of one edge.
+const LANES: usize = MI_SIZE;
+
+/// §7.14.6.1 sample filtering of the four lines of one edge at once
+/// (`s[ q0 + k * along ]` the first sample past the edge on line `k`,
+/// `across` the step across it; every tap inside `s`). The lines are
+/// independent and share `filter_size` and the strength, so each tap
+/// is a 4-lane vector: the §7.14.6.2 masks, the §7.14.6.3 narrow filter
+/// and the §7.14.6.4 wide filters are evaluated for every lane and the
+/// lane's §7.14.6.1 choice selects its outputs (an unfiltered lane
+/// writes its samples back unchanged). The same values as
+/// [`sample_filtering`] line by line.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn filter_line(
+fn filter_edge4(
     s: &mut [i32],
     q0: usize,
+    along: usize,
     across: usize,
     filter_size: u32,
     plane: u8,
@@ -970,21 +976,28 @@ fn filter_line(
     thresh: u8,
     bit_depth: u8,
 ) {
+    type V = [i32; LANES];
     let reach: usize = match filter_size {
         16 => 7,
         8 => 4,
         _ => 2,
     };
-    let mut taps = [0i32; 14];
-    let first = q0 - reach * across;
-    for (k, tap) in taps[7 - reach..7 + reach].iter_mut().enumerate() {
-        *tap = s[first + k * across];
+    // tp[ 7 + i ] = p[ i ] for i in -reach..reach (p[ -1 ] = p0, p[ 0 ] = q0).
+    let mut tp: [V; 14] = [[0; LANES]; 14];
+    for (k, tap) in tp.iter_mut().enumerate().take(7 + reach).skip(7 - reach) {
+        for (l, v) in tap.iter_mut().enumerate() {
+            let line = q0 + l * along;
+            *v = s[line + k * across - 7 * across];
+        }
     }
-    let [p6, p5, p4, p3, p2, p1, p0, q0v, q1, q2, q3, q4, q5, q6] = taps;
+    let at = |i: i32| tp[(i + 7) as usize];
+    let (p0, p1, p2, p3) = (at(-1), at(-2), at(-3), at(-4));
+    let (q0v, q1, q2, q3) = (at(0), at(1), at(2), at(3));
     let bd_shift = bit_depth - 8;
-    // §7.14.6.2 hevMask / filterMask / flatMask / flatMask2.
     let thresh_bd = i32::from(thresh) << bd_shift;
-    let hev_mask = (p1 - p0).abs() > thresh_bd || (q1 - q0v).abs() > thresh_bd;
+    let limit_bd = i32::from(limit) << bd_shift;
+    let blimit_bd = i32::from(blimit) << bd_shift;
+    let one = 1i32 << bd_shift;
     let filter_len: u32 = if filter_size == 4 {
         4
     } else if plane != 0 {
@@ -992,99 +1005,123 @@ fn filter_line(
     } else {
         filter_size
     };
-    let limit_bd = i32::from(limit) << bd_shift;
-    let blimit_bd = i32::from(blimit) << bd_shift;
-    let mut mask = (p1 - p0).abs() > limit_bd;
-    mask |= (q1 - q0v).abs() > limit_bd;
-    mask |= (p0 - q0v).abs() * 2 + (p1 - q1).abs() / 2 > blimit_bd;
-    if filter_len >= 6 {
-        mask |= (p2 - p1).abs() > limit_bd;
-        mask |= (q2 - q1).abs() > limit_bd;
+    // §7.14.6.2 masks per lane.
+    let mut hev = [false; LANES];
+    let mut fmask = [false; LANES];
+    let mut flat = [false; LANES];
+    let mut flat2 = [false; LANES];
+    for l in 0..LANES {
+        hev[l] = (p1[l] - p0[l]).abs() > thresh_bd || (q1[l] - q0v[l]).abs() > thresh_bd;
+        let mut m = (p1[l] - p0[l]).abs() > limit_bd;
+        m |= (q1[l] - q0v[l]).abs() > limit_bd;
+        m |= (p0[l] - q0v[l]).abs() * 2 + (p1[l] - q1[l]).abs() / 2 > blimit_bd;
+        if filter_len >= 6 {
+            m |= (p2[l] - p1[l]).abs() > limit_bd;
+            m |= (q2[l] - q1[l]).abs() > limit_bd;
+        }
+        if filter_len >= 8 {
+            m |= (p3[l] - p2[l]).abs() > limit_bd;
+            m |= (q3[l] - q2[l]).abs() > limit_bd;
+        }
+        fmask[l] = !m;
+        if filter_size >= 8 {
+            let mut f = (p1[l] - p0[l]).abs() > one;
+            f |= (q1[l] - q0v[l]).abs() > one;
+            f |= (p2[l] - p0[l]).abs() > one;
+            f |= (q2[l] - q0v[l]).abs() > one;
+            if filter_len >= 8 {
+                f |= (p3[l] - p0[l]).abs() > one;
+                f |= (q3[l] - q0v[l]).abs() > one;
+            }
+            flat[l] = !f;
+        }
+        if filter_size >= 16 {
+            let (p4, p5, p6, q4, q5, q6) = (at(-5), at(-6), at(-7), at(4), at(5), at(6));
+            let mut f = (p6[l] - p0[l]).abs() > one;
+            f |= (q6[l] - q0v[l]).abs() > one;
+            f |= (p5[l] - p0[l]).abs() > one;
+            f |= (q5[l] - q0v[l]).abs() > one;
+            f |= (p4[l] - p0[l]).abs() > one;
+            f |= (q4[l] - q0v[l]).abs() > one;
+            flat2[l] = !f;
+        }
     }
-    if filter_len >= 8 {
-        mask |= (p3 - p2).abs() > limit_bd;
-        mask |= (q3 - q2).abs() > limit_bd;
-    }
-    if mask {
+    if !fmask.iter().any(|&f| f) {
         return;
     }
-    let one = 1i32 << bd_shift;
-    let flat_mask = filter_size >= 8 && {
-        let mut m = (p1 - p0).abs() > one;
-        m |= (q1 - q0v).abs() > one;
-        m |= (p2 - p0).abs() > one;
-        m |= (q2 - q0v).abs() > one;
-        if filter_len >= 8 {
-            m |= (p3 - p0).abs() > one;
-            m |= (q3 - q0v).abs() > one;
+    // Output taps, starting from the input (an unselected arm leaves a
+    // sample as it was).
+    let mut out = tp;
+    // §7.14.6.3 narrow filter.
+    let half = 0x80i32 << bd_shift;
+    let lo = -(1i32 << (bit_depth - 1));
+    let hi = (1i32 << (bit_depth - 1)) - 1;
+    let c4 = |v: i32| v.clamp(lo, hi);
+    let narrow_lane = |l: usize| filter_size == 4 || !flat[l];
+    for l in 0..LANES {
+        if !(fmask[l] && narrow_lane(l)) {
+            continue;
         }
-        !m
-    };
-    if filter_size == 4 || !flat_mask {
-        // §7.14.6.3 narrow filter.
-        let half = 0x80i32 << bd_shift;
-        let (ps1, ps0, qs0, qs1) = (p1 - half, p0 - half, q0v - half, q1 - half);
-        let lo = -(1i32 << (bit_depth - 1));
-        let hi = (1i32 << (bit_depth - 1)) - 1;
-        let c4 = |v: i32| v.clamp(lo, hi);
-        let mut filter = if hev_mask { c4(ps1 - qs1) } else { 0 };
+        let (ps1, ps0, qs0, qs1) = (p1[l] - half, p0[l] - half, q0v[l] - half, q1[l] - half);
+        let mut filter = if hev[l] { c4(ps1 - qs1) } else { 0 };
         filter = c4(filter + 3 * (qs0 - ps0));
         let filter1 = c4(filter + 4) >> 3;
         let filter2 = c4(filter + 3) >> 3;
-        s[q0] = c4(qs0 - filter1) + half;
-        s[q0 - across] = c4(ps0 + filter2) + half;
-        if !hev_mask {
+        out[7][l] = c4(qs0 - filter1) + half;
+        out[6][l] = c4(ps0 + filter2) + half;
+        if !hev[l] {
             let f = (filter1 + 1) >> 1;
-            s[q0 + across] = c4(qs1 - f) + half;
-            s[q0 - 2 * across] = c4(ps1 + f) + half;
+            out[8][l] = c4(qs1 - f) + half;
+            out[5][l] = c4(ps1 + f) + half;
         }
-        return;
     }
-    let flat_mask2 = filter_size >= 16 && {
-        let mut m = (p6 - p0).abs() > one;
-        m |= (q6 - q0v).abs() > one;
-        m |= (p5 - p0).abs() > one;
-        m |= (q5 - q0v).abs() > one;
-        m |= (p4 - p0).abs() > one;
-        m |= (q4 - q0v).abs() > one;
-        !m
-    };
-    // §7.14.6.4 wide filter: `F[ i ] = Round2( Σ_{j=-n..n} tap( j ) ·
+    // §7.14.6.4 wide filters: `F[ i ] = Round2( Σ_{j=-n..n} tap( j ) ·
     // p[ Clip3( -(n+1), n, i + j ) ], log2Size )`, `tap( j ) = 2` for
     // `|j| <= n2`, else 1 — as a sliding unit-weight window plus the
     // doubled centre taps (integer sums, so exactly the spec's).
-    let log2_size: u32 = if filter_size == 8 || !flat_mask2 {
-        3
-    } else {
-        4
-    };
-    let n: i32 = if log2_size == 4 {
-        6
-    } else if plane == 0 {
-        3
-    } else {
-        2
-    };
-    let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
-    let tap_at = |k: i32| taps[(k.clamp(-(n + 1), n) + 7) as usize];
-    let mut window: i32 = 0;
-    for j in -n..=n {
-        window += tap_at(-n + j);
-    }
-    let mut f = [0i32; 12];
-    for (idx, i) in (-n..n).enumerate() {
-        if i > -n {
-            window += tap_at(i + n) - tap_at(i - 1 - n);
+    let mut wide = |log2_size: u32, select: &dyn Fn(usize) -> bool| {
+        let n: i32 = if log2_size == 4 {
+            6
+        } else if plane == 0 {
+            3
+        } else {
+            2
+        };
+        let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
+        for l in 0..LANES {
+            if !(fmask[l] && select(l)) {
+                continue;
+            }
+            let tap_at = |k: i32| tp[(k.clamp(-(n + 1), n) + 7) as usize][l];
+            let mut window: i32 = 0;
+            for j in -n..=n {
+                window += tap_at(-n + j);
+            }
+            for i in -n..n {
+                if i > -n {
+                    window += tap_at(i + n) - tap_at(i - 1 - n);
+                }
+                let mut acc = window;
+                for j in -n2..=n2 {
+                    acc += tap_at(i + j);
+                }
+                out[(i + 7) as usize][l] = (acc + (1 << (log2_size - 1))) >> log2_size;
+            }
         }
-        let mut acc = window;
-        for j in -n2..=n2 {
-            acc += tap_at(i + j);
-        }
-        f[idx] = (acc + (1 << (log2_size - 1))) >> log2_size;
+    };
+    if filter_size >= 8 {
+        wide(3, &|l| flat[l] && (filter_size == 8 || !flat2[l]));
     }
-    let start = q0 - n as usize * across;
-    for (idx, v) in f.iter().take(2 * n as usize).enumerate() {
-        s[start + idx * across] = *v;
+    if filter_size >= 16 {
+        wide(4, &|l| flat[l] && flat2[l]);
+    }
+    // Write back the samples any arm can change: p6 ..= q5 at most.
+    let first = 7 - reach;
+    let last = (7 + reach).min(13);
+    for (l, line_q0) in (0..LANES).map(|l| (l, q0 + l * along)) {
+        for (k, tap) in out.iter().enumerate().take(last).skip(first) {
+            s[line_q0 + k * across - 7 * across] = tap[l];
+        }
     }
 }
 
