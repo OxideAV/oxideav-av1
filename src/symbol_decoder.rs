@@ -348,8 +348,22 @@ impl<'a> SymbolDecoder<'a> {
     /// never reused — we honour that by feeding a fresh local array
     /// each call, so any adaptation that does happen is discarded.
     pub fn read_bool(&mut self) -> Result<u32, Error> {
-        let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
-        self.read_symbol(&mut cdf)
+        // §8.2.6 over `[ 1 << 14, 1 << 15, 0 ]` evaluated directly:
+        // `cur( 0 ) = ( ( SymbolRange >> 8 ) * ( ( 1 << 14 ) >> 6 ) >> 1 )
+        // + EC_MIN_PROB`, `cur( 1 ) = 0`; the CDF update is moot (the
+        // array is discarded).
+        let cur0 = (((self.range >> 8) * ((1u32 << 14) >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+            + EC_MIN_PROB;
+        let symbol = if self.value >= cur0 {
+            self.range -= cur0;
+            self.value -= cur0;
+            0
+        } else {
+            self.range = cur0;
+            1
+        };
+        self.renormalize()?;
+        Ok(symbol)
     }
 
     /// `read_literal( n )` — §8.2.5.
