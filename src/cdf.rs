@@ -15736,6 +15736,40 @@ impl FrameInterOrderHints {
 const MAX_SB4: usize = 32;
 const BD_STRIDE: usize = MAX_SB4 + 2;
 
+/// r481 — `grid[ ( r * mi_cols + c ) * K .. + K ] = val` over the
+/// `h × w` mi block at `( r0, c0 )`, clipped to the `mi_rows × mi_cols`
+/// grid (the §5.11.5 grid-fill of a block straddling the bottom / right
+/// edge writes only its in-grid part), one row slice at a time.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn stamp_rect<T: Copy, const K: usize>(
+    grid: &mut [T],
+    mi_rows: u32,
+    mi_cols: u32,
+    r0: u32,
+    c0: u32,
+    h: u32,
+    w: u32,
+    val: [T; K],
+) {
+    if c0 >= mi_cols {
+        return;
+    }
+    let c1 = (c0 + w).min(mi_cols) as usize;
+    let cols = mi_cols as usize;
+    for r in r0..(r0 + h).min(mi_rows) {
+        let row = r as usize * cols;
+        let cells = &mut grid[(row + c0 as usize) * K..(row + c1) * K];
+        if K == 1 {
+            cells.fill(val[0]);
+        } else {
+            for cell in cells.as_chunks_mut::<K>().0 {
+                *cell = val;
+            }
+        }
+    }
+}
+
 /// r481 — the still-decoding §7.20 slots a frame-parallel walk reads
 /// (by slot index; `None` = final, read through the frame store).
 #[derive(Debug, Default)]
@@ -23333,14 +23367,30 @@ impl PartitionWalker {
         // §5.11.18 per-cell `AvailU` / `AvailL` follow the tile
         // geometry (`is_inside` is tile-relative) — rebuild for the
         // in-walk §5.11.33 OBMC dispatch.
+        // r481 — row-slice fills: `is_inside( r - 1, c )` holds exactly
+        // for `r - 1` in the tile's rows and `c` in its columns,
+        // `is_inside( r, c - 1 )` for `r` in its rows and `c - 1` in
+        // its columns.
+        let (rows, cols) = (self.mi_rows as usize, self.mi_cols as usize);
+        let g = self.geometry;
         self.walk_avail_u.clear();
+        self.walk_avail_u.resize(rows * cols, 0);
         self.walk_avail_l.clear();
-        for r in 0..self.mi_rows {
-            for c in 0..self.mi_cols {
-                self.walk_avail_u
-                    .push(u8::from(self.geometry.is_inside(r as i32 - 1, c as i32)));
-                self.walk_avail_l
-                    .push(u8::from(self.geometry.is_inside(r as i32, c as i32 - 1)));
+        self.walk_avail_l.resize(rows * cols, 0);
+        let (cs, ce) = (
+            (g.mi_col_start as usize).min(cols),
+            (g.mi_col_end as usize).min(cols),
+        );
+        let (ls, le) = (
+            (g.mi_col_start as usize + 1).min(cols),
+            (g.mi_col_end as usize + 1).min(cols),
+        );
+        for r in (g.mi_row_start as usize).min(rows)..(g.mi_row_end as usize).min(rows) {
+            if r + 1 < rows && cs < ce {
+                self.walk_avail_u[(r + 1) * cols + cs..(r + 1) * cols + ce].fill(1);
+            }
+            if ls < le {
+                self.walk_avail_l[r * cols + ls..r * cols + le].fill(1);
             }
         }
     }
@@ -27555,21 +27605,16 @@ impl PartitionWalker {
         // so the next block's §5.11.18 prologue / §8.3.2 ref-frame ctx
         // walks observe the value. Mirrors the §5.11.7 grid-stamp
         // convention applied to the y_modes / skips / etc. grids.
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = ((rr * self.mi_cols + cc) as usize) * 2;
-                self.ref_frames[cell] = ref_frame[0] as i8;
-                self.ref_frames[cell + 1] = ref_frame[1] as i8;
-            }
-        }
+        stamp_rect(
+            &mut self.ref_frames,
+            self.mi_rows,
+            self.mi_cols,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ref_frame[0] as i8, ref_frame[1] as i8],
+        );
 
         // §5.11.23 line 5: `find_mv_stack( isCompound )` per §7.10.2.
         // r205: full §7.10.2 driver wired in (r173 spatial scans plus
@@ -27733,38 +27778,45 @@ impl PartitionWalker {
         // §6.10.27 conformance bound `Abs( Mv[ i ][ comp ] ) < ( 1 <<
         // 14 )` keeps the value in i16 range).
         self.ensure_inter_grids();
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                // [row][list][comp] flat layout: `(cell * 2 + list) * 2 + comp`.
-                self.mvs[(cell * 2) * 2] = mv[0][0] as i16;
-                self.mvs[(cell * 2) * 2 + 1] = mv[0][1] as i16;
-                self.mvs[(cell * 2 + 1) * 2] = mv[1][0] as i16;
-                self.mvs[(cell * 2 + 1) * 2 + 1] = mv[1][1] as i16;
-                // §5.11.5 `YModes[ r + y ][ c + x ] = YMode` — the
-                // inter-arm grid-fill. §7.10.2.8 reads it back as
-                // `candMode` (the `has_newmv( candMode )` NewMvCount
-                // increment driving the §7.10.2.14 `NewMvContext`
-                // derivation, and the GLOBALMV `candMv` special case),
-                // and the §7.14.4 deblock strength selection reads it
-                // as `mode` for the `Mode_Deltas` modeType split.
-                // (r390 fix: the inter arm previously left the grid at
-                // its DC_PRED prefill, so a NEWMV neighbour never
-                // advanced `NewMvCount` and every `new_mv` read after
-                // one used ctx `5` where §7.10.2.14 requires `4` —
-                // desynchronising the arithmetic decoder on the first
-                // inter frame with a NEWMV-coded neighbour.)
-                self.y_modes[cell] = y_mode;
-            }
-        }
+        // [row][list][comp] flat layout: `(cell * 2 + list) * 2 + comp`.
+        // §5.11.5 `YModes[ r + y ][ c + x ] = YMode` — the inter-arm
+        // grid-fill. §7.10.2.8 reads it back as `candMode` (the
+        // `has_newmv( candMode )` NewMvCount increment driving the
+        // §7.10.2.14 `NewMvContext` derivation, and the GLOBALMV
+        // `candMv` special case), and the §7.14.4 deblock strength
+        // selection reads it as `mode` for the `Mode_Deltas` modeType
+        // split. (r390 fix: the inter arm previously left the grid at
+        // its DC_PRED prefill, so a NEWMV neighbour never advanced
+        // `NewMvCount` and every `new_mv` read after one used ctx `5`
+        // where §7.10.2.14 requires `4` — desynchronising the
+        // arithmetic decoder on the first inter frame with a
+        // NEWMV-coded neighbour.)
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.mvs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [
+                mv[0][0] as i16,
+                mv[0][1] as i16,
+                mv[1][0] as i16,
+                mv[1][1] as i16,
+            ],
+        );
+        stamp_rect(
+            &mut self.y_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [y_mode],
+        );
 
         // §5.11.23 line 33: `read_interintra_mode( isCompound )` per
         // §5.11.28 (av1-spec p.79-80). Reads the inter-intra blending
@@ -27798,20 +27850,16 @@ impl PartitionWalker {
             // §5.11.x readers below see the post-override state
             // exactly as the spec's imperative assignment implies.
             // Slot 0 is unchanged.
-            for dr in 0..bh4 {
-                let rr = mi_row + dr;
-                if rr >= self.mi_rows {
-                    break;
-                }
-                for dc in 0..bw4 {
-                    let cc = mi_col + dc;
-                    if cc >= self.mi_cols {
-                        break;
-                    }
-                    let cell = ((rr * self.mi_cols + cc) as usize) * 2;
-                    self.ref_frames[cell + 1] = 0; // INTRA_FRAME
-                }
-            }
+            stamp_rect(
+                &mut self.ref_frames,
+                self.mi_rows,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bh4,
+                bw4,
+                [ref_frame[0] as i8, 0], // RefFrame[ 1 ] = INTRA_FRAME
+            );
             [ref_frame[0], 0]
         } else {
             ref_frame
@@ -27921,21 +27969,27 @@ impl PartitionWalker {
         // defaults (`0` / `1`) — matching the §5.11.29 line-1 / line-2
         // imperatives.
         self.ensure_inter_grids();
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.comp_group_idxs[cell] = compound_type.comp_group_idx;
-                self.compound_idxs[cell] = compound_type.compound_idx;
-            }
-        }
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.comp_group_idxs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [compound_type.comp_group_idx],
+        );
+        stamp_rect(
+            &mut self.compound_idxs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [compound_type.compound_idx],
+        );
 
         // §5.11.23 line 37: `read_interpolation_filter( )` per §5.11.x
         // (av1-spec p.74). The LAST leaf of the §5.11.23 inter cascade.
@@ -27967,21 +28021,16 @@ impl PartitionWalker {
         // `!enable_dual_filter` mirror already applied inside
         // [`Self::read_interpolation_filter`]).
         self.ensure_inter_grids();
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.interp_filters[cell * 2] = interp_filter.interp_filter[0];
-                self.interp_filters[cell * 2 + 1] = interp_filter.interp_filter[1];
-            }
-        }
+        stamp_rect(
+            &mut self.interp_filters,
+            self.mi_rows,
+            self.mi_cols,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            interp_filter.interp_filter,
+        );
 
         // §5.11.27 / §5.11.28 / §5.11.29 side-data grid stamp: write the
         // already-resolved `motion_mode` / inter-intra blend triple /
@@ -28003,27 +28052,87 @@ impl PartitionWalker {
         let ii_wedge = interintra.wedge_interintra.unwrap_or(0);
         let ii_wedge_index = interintra.wedge_index.unwrap_or(0);
         self.ensure_inter_grids();
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.motion_modes[cell] = motion_mode;
-                self.compound_types[cell] = comp_type;
-                self.compound_wedge_indices[cell] = comp_wedge_index;
-                self.compound_wedge_signs[cell] = comp_wedge_sign;
-                self.compound_mask_types[cell] = comp_mask_type;
-                self.interintra_modes[cell] = ii_mode;
-                self.wedge_interintras[cell] = ii_wedge;
-                self.interintra_wedge_indices[cell] = ii_wedge_index;
-            }
-        }
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.motion_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [motion_mode],
+        );
+        stamp_rect(
+            &mut self.compound_types,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_type],
+        );
+        stamp_rect(
+            &mut self.compound_wedge_indices,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_wedge_index],
+        );
+        stamp_rect(
+            &mut self.compound_wedge_signs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_wedge_sign],
+        );
+        stamp_rect(
+            &mut self.compound_mask_types,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_mask_type],
+        );
+        stamp_rect(
+            &mut self.interintra_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_mode],
+        );
+        stamp_rect(
+            &mut self.wedge_interintras,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_wedge],
+        );
+        stamp_rect(
+            &mut self.interintra_wedge_indices,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_wedge_index],
+        );
 
         Ok(DecodedInterBlockModeInfo {
             mi_row,
@@ -36761,8 +36870,27 @@ pub struct MotionFieldMvs {
     /// Layout: `data[((ref - 1) * h8 + y8) * w8 + x8) * 2 + comp]`.
     /// Slot 0 of the outer dimension corresponds to `LAST_FRAME = 1`
     /// (the §7.9.1 grid skips `INTRA_FRAME = 0` since it is never an
-    /// inter prediction reference).
+    /// inter prediction reference). r481 — empty until an explicit
+    /// [`Self::set`]: the grid is held in projected form instead.
     data: Vec<i16>,
+    /// r481 — the §7.9.2 projection result per position: every valid
+    /// projection writes `MotionFieldMvs[ dst ][ PosY8 ][ PosX8 ] =
+    /// get_mv_projection( mv, refToDst, refOffset )` for ALL seven
+    /// destinations at once, so a position is fully described by the
+    /// last projected `( mv, refOffset )` (`refOffset > 0`; `0` = never
+    /// projected, every destination the sentinel), and a destination's
+    /// vector is derived when read.
+    projected: Vec<ProjectedMv>,
+    /// `refToDst = get_relative_dist( OrderHint, OrderHints[ dst ] )`.
+    ref_to_dst: [i32; 8],
+}
+
+/// r481 — one position of the projected motion field (see
+/// [`MotionFieldMvs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedMv {
+    mv: [i16; 2],
+    ref_offset: i8,
 }
 
 impl MotionFieldMvs {
@@ -36781,12 +36909,62 @@ impl MotionFieldMvs {
     pub fn new_invalid(mi_rows: u32, mi_cols: u32) -> Self {
         let h8 = mi_rows >> 1;
         let w8 = mi_cols >> 1;
-        let total = Self::NUM_REFS * (h8 as usize) * (w8 as usize) * 2;
         Self {
             h8,
             w8,
-            data: vec![MFMV_INVALID; total],
+            data: Vec::new(),
+            projected: vec![
+                ProjectedMv {
+                    mv: [0, 0],
+                    ref_offset: 0
+                };
+                (h8 as usize) * (w8 as usize)
+            ],
+            ref_to_dst: [0; 8],
         }
+    }
+
+    /// r481 — the §7.9.2 `refToDst` per destination reference.
+    pub(crate) fn set_ref_to_dst(&mut self, ref_to_dst: [i32; 8]) {
+        self.ref_to_dst = ref_to_dst;
+    }
+
+    /// r481 — record a valid §7.9.2 projection at `( y8, x8 )`: the
+    /// saved `mv` and its `refOffset` (`1..=MAX_FRAME_DISTANCE`), the
+    /// value of every destination's `MotionFieldMvs` there.
+    pub(crate) fn set_projected(&mut self, y8: u32, x8: u32, mv: [i16; 2], ref_offset: i32) {
+        if !self.data.is_empty() {
+            for dst in 1..=Self::NUM_REFS {
+                let v = get_mv_projection(mv, self.ref_to_dst[dst], ref_offset);
+                self.set(dst, y8, x8, v);
+            }
+            return;
+        }
+        self.projected[(y8 as usize) * (self.w8 as usize) + x8 as usize] = ProjectedMv {
+            mv,
+            ref_offset: ref_offset as i8,
+        };
+    }
+
+    /// Switch to the explicit per-destination grid (for [`Self::set`]).
+    fn materialize(&mut self) {
+        if !self.data.is_empty() {
+            return;
+        }
+        let (h8, w8) = (self.h8, self.w8);
+        let mut data = vec![MFMV_INVALID; Self::NUM_REFS * (h8 as usize) * (w8 as usize) * 2];
+        for dst in 1..=Self::NUM_REFS {
+            for y8 in 0..h8 {
+                for x8 in 0..w8 {
+                    let v = self.get(dst, y8, x8);
+                    let base = self.slot_index(dst, y8, x8, 0);
+                    data[base] = v[0];
+                    data[base + 1] = v[1];
+                }
+            }
+        }
+        self.data = data;
+        self.projected = Vec::new();
     }
 
     /// Height of the motion-field grid in 8×8-luma-sample units
@@ -36827,6 +37005,13 @@ impl MotionFieldMvs {
         if !(1..=7).contains(&ref_frame) || y8 >= self.h8 || x8 >= self.w8 {
             return [MFMV_INVALID, MFMV_INVALID];
         }
+        if self.data.is_empty() {
+            let p = self.projected[(y8 as usize) * (self.w8 as usize) + x8 as usize];
+            if p.ref_offset == 0 {
+                return [MFMV_INVALID, MFMV_INVALID];
+            }
+            return get_mv_projection(p.mv, self.ref_to_dst[ref_frame], i32::from(p.ref_offset));
+        }
         let base = self.slot_index(ref_frame, y8, x8, 0);
         [self.data[base], self.data[base + 1]]
     }
@@ -36837,6 +37022,7 @@ impl MotionFieldMvs {
     /// `ref_frame in 1..=7`.
     #[inline]
     pub fn set(&mut self, ref_frame: usize, y8: u32, x8: u32, mv: [i16; 2]) {
+        self.materialize();
         let base = self.slot_index(ref_frame, y8, x8, 0);
         self.data[base] = mv[0];
         self.data[base + 1] = mv[1];

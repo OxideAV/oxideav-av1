@@ -583,6 +583,7 @@ fn decode_or_defer(
                         FrameMode::Recon {
                             writer,
                             on_meta: Some(&mut publish),
+                            mfmvs: None,
                         },
                     )
                 } else {
@@ -595,7 +596,8 @@ fn decode_or_defer(
                         threads,
                         FrameMode::ParseOnly,
                     )?;
-                    publish(parsed.meta.ok_or(Error::PartitionWalkOutOfRange)?);
+                    let mut parsed = parsed;
+                    publish(parsed.meta.take().ok_or(Error::PartitionWalkOutOfRange)?);
                     decode_frame_spec_tiles(
                         &seq,
                         &fh,
@@ -606,6 +608,7 @@ fn decode_or_defer(
                         FrameMode::Recon {
                             writer,
                             on_meta: None,
+                            mfmvs: parsed.mfmvs,
                         },
                     )
                 }
@@ -706,6 +709,9 @@ struct DecodedFrameInternal {
     /// The rest of the §7.20 payload; `None` when the decode handed it
     /// out early ([`FrameMode::Recon`]).
     meta: Option<FrameMeta>,
+    /// r481 — a syntax-only walk's §7.9 motion field (projected once:
+    /// the full walk of the same frame reuses it).
+    mfmvs: Option<MotionFieldMvs>,
 }
 
 /// How [`decode_frame_spec_tiles`] runs one frame.
@@ -720,6 +726,8 @@ enum FrameMode<'m> {
     Recon {
         writer: RefPlanesWriter,
         on_meta: Option<&'m mut dyn FnMut(FrameMeta)>,
+        /// The §7.9 motion field the frame's syntax-only walk projected.
+        mfmvs: Option<MotionFieldMvs>,
     },
 }
 
@@ -869,9 +877,13 @@ fn decode_frame_spec_tiles(
     mode: FrameMode<'_>,
 ) -> Result<DecodedFrameInternal, Error> {
     let parse_only = matches!(mode, FrameMode::ParseOnly);
-    let (mut writer, mut on_meta) = match mode {
-        FrameMode::Recon { writer, on_meta } => (Some(writer), on_meta),
-        _ => (None, None),
+    let (mut writer, mut on_meta, projected_mfmvs) = match mode {
+        FrameMode::Recon {
+            writer,
+            on_meta,
+            mfmvs,
+        } => (Some(writer), on_meta, mfmvs),
+        _ => (None, None, None),
     };
     if fh.show_existing_frame {
         // §7.21 output-existing path is the caller's (no tile group).
@@ -1070,13 +1082,16 @@ fn decode_frame_spec_tiles(
             .as_ref()
             .is_some_and(|ir| ir.use_ref_frame_mvs)
     {
-        motion_field_estimation(
-            refs.ok_or(Error::PartitionWalkOutOfRange)?,
-            fh,
-            seq,
-            mi_rows,
-            mi_cols,
-        )?
+        match projected_mfmvs {
+            Some(m) => m,
+            None => motion_field_estimation(
+                refs.ok_or(Error::PartitionWalkOutOfRange)?,
+                fh,
+                seq,
+                mi_rows,
+                mi_cols,
+            )?,
+        }
     } else {
         MotionFieldMvs::new_invalid(mi_rows, mi_cols)
     };
@@ -1489,8 +1504,13 @@ fn decode_frame_spec_tiles(
             for r in r0..r1 {
                 for c in c0..c1 {
                     let cell = (r * mi_cols + c) as usize;
-                    let (rf, row, col) = motion_field_cell(raw_refs, raw_mvs, cell, &past_refs)
-                        .unwrap_or((-1, 0, 0));
+                    // Only the odd cells §7.9.2 reads (see the frame walk).
+                    let (rf, row, col) = if r % 2 == 1 && c % 2 == 1 {
+                        motion_field_cell(raw_refs, raw_mvs, cell, &past_refs)
+                    } else {
+                        None
+                    }
+                    .unwrap_or((-1, 0, 0));
                     out.mf_refs.push(rf);
                     out.mf_mvs.extend_from_slice(&[row, col]);
                     out.segment_ids.push(segs[cell].max(0));
@@ -1558,6 +1578,7 @@ fn decode_frame_spec_tiles(
                 segment_ids,
                 grain_params: effective_grain,
             }),
+            mfmvs: Some(mfmvs),
         });
     }
 
@@ -1747,7 +1768,10 @@ fn decode_frame_spec_tiles(
     if is_inter_frame {
         let raw_refs = walker.ref_frames();
         let raw_mvs = walker.mvs();
-        for cell in 0..cells {
+        // §7.9.2 reads `SavedRefFrames` / `SavedMvs` only at `( 2 y8 + 1,
+        // 2 x8 + 1 )` — the odd cells — so only those are stored; the
+        // rest keep `NONE`.
+        for cell in odd_cells(mi_rows, mi_cols) {
             if let Some((r, row, col)) = motion_field_cell(raw_refs, raw_mvs, cell, &past_refs) {
                 mf_ref_frames[cell] = r;
                 mf_mvs[cell * 2] = row;
@@ -1789,6 +1813,7 @@ fn decode_frame_spec_tiles(
             },
             ref_planes: None,
             meta: Some(meta),
+            mfmvs: Some(mfmvs),
         });
     }
     // r481 — the frame-parallel decode stores the slot now: a later
@@ -2316,6 +2341,7 @@ fn decode_frame_spec_tiles(
         },
         ref_planes,
         meta,
+        mfmvs: None,
     })
 }
 
@@ -2344,6 +2370,16 @@ fn effective_grain_params(
         Some(fg) if fg.apply_grain => Some(fg.clone()),
         _ => None,
     }
+}
+
+/// The mi cells at odd rows and odd columns, the §7.9.2 projection
+/// sources (`row = 2 * y8 + 1`, `col = 2 * x8 + 1`).
+fn odd_cells(mi_rows: u32, mi_cols: u32) -> impl Iterator<Item = usize> {
+    (1..mi_rows).step_by(2).flat_map(move |r| {
+        (1..mi_cols)
+            .step_by(2)
+            .map(move |c| (r * mi_cols + c) as usize)
+    })
 }
 
 /// §7.19 motion field motion vector storage for one cell: the LAST
@@ -2830,6 +2866,7 @@ fn split_decoded(
         frame,
         ref_planes,
         meta,
+        ..
     } = decoded;
     let planes = ref_planes.unwrap_or_else(|| RefPlanes::complete(Vec::new(), Vec::new(), 0));
     let meta = meta.ok_or(Error::PartitionWalkOutOfRange)?;

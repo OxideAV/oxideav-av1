@@ -7859,6 +7859,11 @@ pub fn motion_field_estimation_core(
     let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
     let w8 = (mi_cols >> 1) as i32;
     let h8 = (mi_rows >> 1) as i32;
+    // `refToDst = get_relative_dist( OrderHint, OrderHints[ dst ] )` per
+    // destination — the same for every projected position.
+    let ref_to_dst: [i32; 8] =
+        core::array::from_fn(|dst| get_relative_dist(order_hint, order_hints[dst], hint_bits));
+    mfmvs.set_ref_to_dst(ref_to_dst);
 
     // §7.9.2 projection for one source reference.
     let project_ref = |src: usize, dst_sign: i32, mfmvs: &mut MotionFieldMvs| -> bool {
@@ -7869,6 +7874,12 @@ pub fn motion_field_estimation_core(
         if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
             return false;
         }
+        // `refToCur` depends only on `src`, `refOffset` only on
+        // `srcRef`: evaluated once each.
+        let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
+        let ref_offsets: [i32; 8] = core::array::from_fn(|r| {
+            get_relative_dist(order_hints[src], slot.saved_order_hints[r], hint_bits)
+        });
         for y8 in 0..h8 {
             for x8 in 0..w8 {
                 let row = (2 * y8 + 1) as usize;
@@ -7878,12 +7889,7 @@ pub fn motion_field_estimation_core(
                 if src_ref <= 0 {
                     continue;
                 }
-                let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
-                let ref_offset = get_relative_dist(
-                    order_hints[src],
-                    slot.saved_order_hints[src_ref as usize],
-                    hint_bits,
-                );
+                let ref_offset = ref_offsets[(src_ref as usize) & 7];
                 let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
                     && ref_offset.abs() <= MAX_FRAME_DISTANCE
                     && ref_offset > 0;
@@ -7932,21 +7938,15 @@ pub fn motion_field_estimation_core(
                 if !(vy && vx) {
                     continue;
                 }
-                for (dst, &dst_hint) in order_hints
-                    .iter()
-                    .enumerate()
-                    .take(ALTREF_FRAME + 1)
-                    .skip(LAST_FRAME)
-                {
-                    let ref_to_dst = get_relative_dist(order_hint, dst_hint, hint_bits);
-                    let out = mv_projection(mv, ref_to_dst, ref_offset);
-                    mfmvs.set(
-                        dst,
-                        pos_y8 as u32,
-                        pos_x8 as u32,
-                        [out[0] as i16, out[1] as i16],
-                    );
-                }
+                // Every destination's `MotionFieldMvs` at the position is
+                // `get_mv_projection( mv, refToDst, refOffset )`: recorded
+                // once, derived per destination when read.
+                mfmvs.set_projected(
+                    pos_y8 as u32,
+                    pos_x8 as u32,
+                    [mv[0] as i16, mv[1] as i16],
+                    ref_offset,
+                );
             }
         }
         true
