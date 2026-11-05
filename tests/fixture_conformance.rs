@@ -25,6 +25,7 @@ use oxideav_av1::decoder::{Frame, SpecFrame, decode_av1_spec};
 /// streams are all external-encoder streams, so none may be claimed by
 /// the constrained encoder-mirror path).
 fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    assert_frame_parallel_parity(name, ivf, spec_frames);
     let pub_frames = oxideav_av1::decode_av1(ivf)
         .unwrap_or_else(|e| panic!("{name}: public decode_av1 rejected the fixture: {e:?}"));
     assert_eq!(
@@ -42,6 +43,47 @@ fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
                 "{name}: public-API frame {i} rode the encoder-mirror path ({other:?}) — \
                  an external stream must never be claimed by the mirror driver"
             ),
+        }
+    }
+}
+
+/// r481 — every corpus stream decodes BYTE-IDENTICALLY under a worker
+/// budget: one temporal unit at a time through the frame-parallel
+/// session (each referenced frame walks its syntax first, then
+/// reconstructs with its in-loop passes behind the walk while later
+/// frames motion-compensate from its published rows), for budgets that
+/// put several frames in flight at once.
+fn assert_frame_parallel_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    use oxideav_av1::decoder::SpecDecodeSession;
+    use oxideav_av1::encoder::ivf::IvfReader;
+    let records = IvfReader::new(ivf)
+        .and_then(|r| r.read_all())
+        .unwrap_or_else(|e| panic!("{name}: IVF: {e:?}"));
+    for threads in [2usize, 3, 8] {
+        let mut session = SpecDecodeSession::new();
+        session.set_threads(threads);
+        let mut pending = Vec::new();
+        for rec in &records {
+            pending.extend(
+                session
+                    .decode_temporal_unit_pipelined(&rec.payload)
+                    .unwrap_or_else(|e| panic!("{name}: {threads} workers: {e:?}")),
+            );
+        }
+        let frames: Vec<SpecFrame> = pending
+            .into_iter()
+            .map(|p| {
+                p.into_frame()
+                    .unwrap_or_else(|e| panic!("{name}: {threads} workers: {e:?}"))
+            })
+            .collect();
+        assert_eq!(
+            frames.len(),
+            spec_frames.len(),
+            "{name}: {threads} workers: frame count"
+        );
+        for (i, (a, b)) in frames.iter().zip(spec_frames).enumerate() {
+            assert!(a == b, "{name}: {threads} workers: frame {i} differs");
         }
     }
 }

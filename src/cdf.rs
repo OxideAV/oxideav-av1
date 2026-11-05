@@ -15736,6 +15736,13 @@ impl FrameInterOrderHints {
 const MAX_SB4: usize = 32;
 const BD_STRIDE: usize = MAX_SB4 + 2;
 
+/// r481 — the still-decoding §7.20 slots a frame-parallel walk reads
+/// (by slot index; `None` = final, read through the frame store).
+#[derive(Debug, Default)]
+pub(crate) struct RefRowSources {
+    pub(crate) slots: [Option<std::sync::Arc<crate::decoder::ref_planes::RefPlanes>>; 8],
+}
+
 // r421: `Clone` so the encoder's search-side rate twin can price
 // candidate symbol sequences on a snapshot of the write-side mirror.
 #[derive(Debug, Clone)]
@@ -15752,6 +15759,20 @@ pub struct PartitionWalker {
     /// (the unfiltered/un-upsampled path) on a freshly constructed
     /// walker.
     enable_intra_edge_filter: bool,
+    /// r481 — syntax-only walk: every symbol is read and every
+    /// mode-info / context grid stamped exactly as in the full walk
+    /// (AV1 parsing never reads a reconstructed sample), but no sample
+    /// is predicted or reconstructed. The frame-parallel decoder runs
+    /// it ahead of the full walk so that a later frame's walk (which
+    /// needs this frame's §7.20 CDFs, §7.19 motion field and segment
+    /// ids) can start before this frame's samples exist.
+    parse_only: bool,
+    /// r481 — the §7.20 slots whose planes are still being decoded by
+    /// an earlier frame (frame-parallel decode), by slot index: before
+    /// motion-compensating a leaf the walker waits until each slot it
+    /// reads has published the rows the leaf's motion vectors reach,
+    /// and predicts from that published prefix.
+    ref_rows: Option<std::sync::Arc<RefRowSources>>,
     /// §5.11.18 per-cell `AvailU` (`is_inside( MiRow - 1, MiCol )`,
     /// av1-spec line 3915) for the current tile geometry — rebuilt at
     /// [`Self::begin_tile`] (and at construction) and consumed by the
@@ -16862,6 +16883,8 @@ impl PartitionWalker {
             mi_cols,
             geometry,
             enable_intra_edge_filter: false,
+            parse_only: false,
+            ref_rows: None,
             walk_avail_u,
             walk_avail_l,
             inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
@@ -17205,6 +17228,17 @@ impl PartitionWalker {
             self.luma_overhang = LumaOverhang::new(rows, cols);
         }
         self.luma_overhang.as_mut()?.slot(y, x)
+    }
+
+    /// r481 — allocate every `CurrFrame` plane of the frame up front
+    /// (the frame-parallel in-loop passes run on them mid-walk).
+    pub(crate) fn ensure_curr_frame_planes(&mut self, num_planes: usize, sub_x: u8, sub_y: u8) {
+        for plane in 0..num_planes.min(3) {
+            let (sx, sy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> sy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> sx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+        }
     }
 
     fn ensure_curr_frame_plane(&mut self, plane: usize, rows: u32, cols: u32) {
@@ -19580,6 +19614,34 @@ impl PartitionWalker {
             is_scaled_by_ref[crate::uncompressed_header_tail::LAST_FRAME + i] = *s;
         }
 
+        // r481 — frame-parallel decode: wait for the rows of every
+        // still-decoding reference this leaf reads, then predict from
+        // the published prefixes.
+        let ref_rows = self.ref_rows.clone();
+        let mut prefix_stores: Vec<[crate::RefFrameStoreEntry<'_>; 8]> = Vec::new();
+        if let Some(sources) = ref_rows.as_deref() {
+            let needs =
+                self.leaf_ref_rows_needed(mi_row, mi_col, mi_size, ctx, &pixels.ref_frame_idx);
+            for (planes, &need) in sources.slots.iter().zip(needs.iter()) {
+                if let (Some(planes), true) = (planes, need > 0) {
+                    planes.wait_rows(need)?;
+                }
+            }
+            for spec in pixels.plane_refs {
+                if spec.frame_store.len() < 8 {
+                    return Err(crate::Error::PartitionWalkOutOfRange);
+                }
+                let mut entries: [crate::RefFrameStoreEntry<'_>; 8] =
+                    core::array::from_fn(|slot| spec.frame_store[slot]);
+                for (entry, planes) in entries.iter_mut().zip(sources.slots.iter()) {
+                    if let Some(planes) = planes {
+                        entry.plane = planes.readable(spec.plane as usize);
+                    }
+                }
+                prefix_stores.push(entries);
+            }
+        }
+
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
         // plane contexts borrow `inter_pred_scratch` mutably.
@@ -19637,7 +19699,7 @@ impl PartitionWalker {
             let mut slots: [Option<&mut Vec<u16>>; 3] = [Some(s0), Some(s1), Some(s2)];
             let mut planes: Vec<crate::PlaneReconContext<'_>> =
                 Vec::with_capacity(pixels.plane_refs.len());
-            for (spec, rect) in pixels.plane_refs.iter().zip(rects.iter()) {
+            for (i, (spec, rect)) in pixels.plane_refs.iter().zip(rects.iter()).enumerate() {
                 let buf = slots[rect.plane]
                     .take()
                     .ok_or(crate::Error::PartitionWalkOutOfRange)?;
@@ -19645,7 +19707,10 @@ impl PartitionWalker {
                     plane: spec.plane,
                     subsampling_x: spec.subsampling_x,
                     subsampling_y: spec.subsampling_y,
-                    frame_store: spec.frame_store,
+                    frame_store: match prefix_stores.get(i) {
+                        Some(entries) => &entries[..],
+                        None => spec.frame_store,
+                    },
                     frame_width: spec.frame_width,
                     frame_height: spec.frame_height,
                     curr: buf.as_mut_slice(),
@@ -21023,7 +21088,7 @@ impl PartitionWalker {
 
     /// The §7.15 frame context over this walker's `cdef_idx[]` /
     /// `Skips[]` grids, handed to `f`.
-    fn with_cdef_ctx(
+    pub(crate) fn with_cdef_ctx(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
@@ -21259,6 +21324,117 @@ impl PartitionWalker {
         );
     }
 
+    /// r481 — hand the walker the still-decoding §7.20 slots of its
+    /// frame (see the `ref_rows` field); `None` when every slot is
+    /// final.
+    pub(crate) fn set_ref_rows(&mut self, sources: Option<std::sync::Arc<RefRowSources>>) {
+        self.ref_rows = sources;
+    }
+
+    /// r481 — the luma rows of each §7.20 slot the inter leaf at
+    /// `( mi_row, mi_col )` may read, as an exclusive bound (`0` = not
+    /// read, `u32::MAX` = the whole frame). Every §7.11.3 prediction
+    /// the leaf runs — its own references, the §7.11.3.9 OBMC
+    /// neighbours along the row above and the column to the left, and
+    /// the §5.11.33 sub-8×8 chroma candidates above / left — uses the
+    /// motion vector of a cell in `[ mi_row - 1, mi_row + bh4 ) ×
+    /// [ mi_col - 1, mi_col + bw4 )` and writes rows above the leaf's
+    /// bottom edge; a translational §7.11.3.4 read then ends at most
+    /// `( mv_row >> 3 ) + 4` luma rows below that edge plus the chroma
+    /// rounding, covered by a 16-row margin. Warped (§7.11.3.5, local
+    /// or global) and scaled-reference (§7.11.3.3) predictions take
+    /// the whole frame.
+    fn leaf_ref_rows_needed(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        ctx: &InterFrameContext<'_>,
+        ref_frame_idx: &[u8; 7],
+    ) -> [u32; 8] {
+        let mut needs = [0u32; 8];
+        let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size] as u32;
+        let bottom = i64::from((mi_row + bh4) * MI_SIZE as u32);
+        let (r0, r1) = (mi_row.saturating_sub(1), (mi_row + bh4).min(self.mi_rows));
+        let (c0, c1) = (mi_col.saturating_sub(1), (mi_col + bw4).min(self.mi_cols));
+        for r in r0..r1 {
+            for c in c0..c1 {
+                let cell = (r * self.mi_cols + c) as usize;
+                if self.is_inters.get(cell).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                let y_mode = self.y_modes.get(cell).copied().unwrap_or(0);
+                let warped =
+                    self.motion_modes.get(cell).copied() == Some(MOTION_MODE_WARPED_CAUSAL);
+                for list in 0..2 {
+                    let rf = self.ref_frames.get(cell * 2 + list).copied().unwrap_or(-1);
+                    if rf <= 0 {
+                        continue;
+                    }
+                    let rf = rf as usize;
+                    let Some(&slot) = ref_frame_idx.get(rf - 1) else {
+                        continue;
+                    };
+                    let global_warp = (y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV)
+                        && ctx.gm_type.get(rf).copied().unwrap_or(0) > 1;
+                    let scaled = ctx.is_scaled_per_ref.get(rf - 1).copied().unwrap_or(true);
+                    let need = if warped || global_warp || scaled {
+                        u32::MAX
+                    } else {
+                        let mv_row =
+                            i64::from(self.mvs.get((cell * 2 + list) * 2).copied().unwrap_or(0));
+                        (bottom + (mv_row >> 3) + 16).clamp(0, i64::from(u32::MAX)) as u32
+                    };
+                    let n = &mut needs[(slot as usize) & 7];
+                    *n = (*n).max(need);
+                }
+            }
+        }
+        needs
+    }
+
+    /// r481 — run `f` over this walker's `CurrFrame` planes (the
+    /// mi-grid-padded `rows × cols` sample buffers, one per allocated
+    /// plane) with the walker's grids readable.
+    pub(crate) fn with_curr_frame_planes<R>(
+        &mut self,
+        num_planes: usize,
+        f: impl FnOnce(&Self, &mut [crate::loop_filter::PlaneBuffer<'_>]) -> R,
+    ) -> R {
+        let mut taken: Vec<(u32, u32, Vec<i32>)> = (0..num_planes.min(3))
+            .map_while(|p| {
+                self.curr_frame[p]
+                    .as_mut()
+                    .map(|cp| (cp.rows, cp.cols, std::mem::take(&mut cp.samples)))
+            })
+            .collect();
+        let out = {
+            let mut bufs: Vec<crate::loop_filter::PlaneBuffer<'_>> = taken
+                .iter_mut()
+                .map(|(rows, cols, samples)| crate::loop_filter::PlaneBuffer {
+                    rows: *rows,
+                    cols: *cols,
+                    samples: samples.as_mut_slice(),
+                })
+                .collect();
+            f(self, &mut bufs)
+        };
+        for (p, (_, _, samples)) in taken.into_iter().enumerate() {
+            if let Some(cp) = self.curr_frame[p].as_mut() {
+                cp.samples = samples;
+            }
+        }
+        out
+    }
+
+    /// r481 — switch the walk to syntax only (see the `parse_only`
+    /// field): symbols, grids and contexts as in the full walk, no
+    /// samples.
+    pub(crate) fn set_parse_only(&mut self, on: bool) {
+        self.parse_only = on;
+    }
+
     /// r481 — the §7.14 per-cell edge inputs of this walker's frame
     /// (see [`crate::loop_filter::LfEdgeTable`]), read straight from
     /// the mode-info grids: the values the [`Self::with_lf_ctx`]
@@ -21276,8 +21452,31 @@ impl PartitionWalker {
         frame_width: u32,
         frame_height: u32,
     ) -> crate::loop_filter::LfEdgeTable {
-        use crate::loop_filter::{LfEdgeTable, LfLevelParams, SEG_LVL_ALT_LF_Y_V};
-        let lp = LfLevelParams {
+        let _ = num_planes;
+        let mut t = crate::loop_filter::LfEdgeTable::with_geometry(
+            self.mi_rows,
+            self.mi_cols,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            lf_params.loop_filter_level,
+            lf_params.loop_filter_sharpness,
+        );
+        let lp = Self::lf_level_params(lf_params, seg_params, delta_lf_multi);
+        self.fill_lf_edge_table(&mut t, &lp, 0, self.mi_rows);
+        t
+    }
+
+    /// r481 — the block-independent §7.14.4 / §7.14.5 inputs.
+    pub(crate) fn lf_level_params(
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+    ) -> crate::loop_filter::LfLevelParams {
+        use crate::loop_filter::SEG_LVL_ALT_LF_Y_V;
+        crate::loop_filter::LfLevelParams {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
             loop_filter_delta_enabled: lf_params.loop_filter_delta_enabled,
@@ -21294,22 +21493,23 @@ impl PartitionWalker {
                     seg_params.segment_feature_data[seg][SEG_LVL_ALT_LF_Y_V + i]
                 })
             }),
-        };
-        let _ = num_planes;
-        let mut t = LfEdgeTable::with_geometry(
-            self.mi_rows,
-            self.mi_cols,
-            bit_depth,
-            subsampling_x,
-            subsampling_y,
-            frame_width,
-            frame_height,
-            lf_params.loop_filter_level,
-            lf_params.loop_filter_sharpness,
-        );
-        let cells = (self.mi_rows as usize) * (self.mi_cols as usize);
+        }
+    }
+
+    /// r481 — fill the mi rows `[ r0, r1 )` of `t` from this walker's
+    /// grids (the plane `LoopfilterTxSizes` rows whose luma row lies
+    /// there).
+    pub(crate) fn fill_lf_edge_table(
+        &self,
+        t: &mut crate::loop_filter::LfEdgeTable,
+        lp: &crate::loop_filter::LfLevelParams,
+        r0: u32,
+        r1: u32,
+    ) {
+        let r1 = r1.min(self.mi_rows);
+        let mi_cols = self.mi_cols as usize;
         let slots: [usize; 4] = core::array::from_fn(|i| lp.delta_lf_slot(i));
-        for idx in 0..cells {
+        for idx in (r0 as usize) * mi_cols..(r1 as usize) * mi_cols {
             t.mi_size[idx] = self.mi_sizes[idx] as u8;
             let ref0 = self.ref_frames[idx * 2];
             t.skip_inter[idx] =
@@ -21326,21 +21526,19 @@ impl PartitionWalker {
                 lp.level(seg, r, mode, d, i)
             });
         }
+        let (sx, sy) = (t.subsampling_x, t.subsampling_y);
         for plane in 0..3usize {
             let (rows, cols) = t.tx_dims(plane);
-            for sr in 0..rows {
+            let s = if plane == 0 { 0 } else { u32::from(sy) };
+            let sr0 = (r0 >> s) as usize + usize::from((r0 & ((1 << s) - 1)) != 0);
+            let sr1 = (r1.div_ceil(1 << s) as usize).min(rows);
+            for sr in sr0..sr1 {
                 for sc in 0..cols {
-                    t.tx[plane][sr * cols + sc] = self.loopfilter_tx_size_at(
-                        plane,
-                        sr as u32,
-                        sc as u32,
-                        subsampling_x,
-                        subsampling_y,
-                    ) as u8;
+                    t.tx[plane][sr * cols + sc] =
+                        self.loopfilter_tx_size_at(plane, sr as u32, sc as u32, sx, sy) as u8;
                 }
             }
         }
-        t
     }
 
     /// r475 — [`Self::loop_filter_frame_from_grid`] `threads`-wide by
@@ -21838,7 +22036,7 @@ impl PartitionWalker {
     /// The §7.17 frame context over this walker's §5.11.58 unit grid,
     /// handed to `f`.
     #[allow(clippy::too_many_arguments)]
-    fn with_lr_ctx(
+    pub(crate) fn with_lr_ctx(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -31961,27 +32159,29 @@ impl PartitionWalker {
         // `uv_mode` carries the §5.11.7 / §5.11.22 decoded `UVMode`
         // (or `DC_PRED` when the `HasChroma` arm did not run — the
         // §5.11.33 chroma planes are not visited in that case).
-        let _readout = self.compute_prediction(
-            mi_row_b,
-            mi_col_b,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            is_inter != 0,
-            /* y_mode = */ y_mode,
-            /* uv_mode = */ uv_mode.unwrap_or(0),
-            /* ref_frame_1_is_intra = */ false,
-            // §5.11.28 `interintra_mode` — the §5.11.5 walker emits no
-            // inter-intra blocks (`ref_frame_1_is_intra == false`), so
-            // this is unread; pass `II_DC_PRED` as the inert default.
-            /* interintra_mode = */
-            II_DC_PRED,
-        )?;
+        if !self.parse_only {
+            let _readout = self.compute_prediction(
+                mi_row_b,
+                mi_col_b,
+                sub_size,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                is_inter != 0,
+                /* y_mode = */ y_mode,
+                /* uv_mode = */ uv_mode.unwrap_or(0),
+                /* ref_frame_1_is_intra = */ false,
+                // §5.11.28 `interintra_mode` — the §5.11.5 walker emits no
+                // inter-intra blocks (`ref_frame_1_is_intra == false`), so
+                // this is unread; pass `II_DC_PRED` as the inert default.
+                /* interintra_mode = */
+                II_DC_PRED,
+            )?;
+        }
 
         // §5.11.33 `is_inter` arm, realised — on the §5.11.7 intra
         // path the only `is_inter == 1` blocks are `use_intrabc == 1`
@@ -31991,7 +32191,7 @@ impl PartitionWalker {
         // between `compute_prediction( )` and `residual( )`, so the
         // §7.12.3 step-3 merge lands on the real prediction and later
         // blocks read reconstructed neighbours.
-        if use_intrabc != 0 {
+        if use_intrabc != 0 && !self.parse_only {
             self.predict_intrabc_leaf_into_curr_frame(
                 mi_row_b,
                 mi_col_b,
@@ -32374,28 +32574,34 @@ impl PartitionWalker {
         // (plane, 4x4-cell) on the `is_inter == 1` arm; on the
         // §5.11.28 inter-intra arm (`ref_frame_1_is_intra == true`)
         // it prepends one intra-half task per plane (r301).
-        let readout = self.compute_prediction(
-            mi_row,
-            mi_col,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            /* is_inter = */ true,
-            /* y_mode = */ inter_block.y_mode,
-            /* uv_mode = */ uv_mode_for_compute,
-            ref_frame_1_is_intra,
-            // §5.11.28 `interintra_mode` — present (`Some`) on the
-            // inter-intra arm (`ref_frame_1_is_intra == true`); the
-            // §5.11.33 dispatcher reads it only there. `None` (the
-            // non-interintra path) maps to the inert `II_DC_PRED`.
-            /* interintra_mode = */
-            inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
-        )?;
+        // r481 — a syntax-only walk predicts nothing, so it skips the
+        // §5.11.33 task derivation (it reads no state the syntax needs).
+        let readout = if self.parse_only {
+            None
+        } else {
+            Some(self.compute_prediction(
+                mi_row,
+                mi_col,
+                sub_size,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                /* is_inter = */ true,
+                /* y_mode = */ inter_block.y_mode,
+                /* uv_mode = */ uv_mode_for_compute,
+                ref_frame_1_is_intra,
+                // §5.11.28 `interintra_mode` — present (`Some`) on the
+                // inter-intra arm (`ref_frame_1_is_intra == true`); the
+                // §5.11.33 dispatcher reads it only there. `None` (the
+                // non-interintra path) maps to the inert `II_DC_PRED`.
+                /* interintra_mode = */
+                inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
+            )?)
+        };
 
         // §5.11.33 `IsInterIntra` end-to-end propagation. The walker
         // tracks no `CurrFrame[plane]` sample buffers, so it cannot
@@ -32418,7 +32624,9 @@ impl PartitionWalker {
         // condition. A mismatch is a §5.11.33 dispatcher contract
         // breach (a future spec/reader edit drifting the two apart),
         // surfaced as a caller-bug guard rather than silently trusted.
-        let is_inter_intra = readout.is_inter_intra;
+        let is_inter_intra = readout
+            .as_ref()
+            .map_or(ref_frame_1_is_intra, |r| r.is_inter_intra);
         if is_inter_intra != ref_frame_1_is_intra {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
@@ -32470,7 +32678,7 @@ impl PartitionWalker {
             // dispatcher above emitted one intra task per plane
             // (`mode != COMPUTE_PRED_MODE_INTER`); drive each through
             // the §7.11.2 writer.
-            if is_inter_intra {
+            if let (true, Some(readout)) = (is_inter_intra, readout.as_ref()) {
                 let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
                 for task in readout
                     .tasks
@@ -32556,7 +32764,9 @@ impl PartitionWalker {
                 }
             }
             let _ = px.bit_depth;
-            self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, ctx)?;
+            if !self.parse_only {
+                self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, ctx)?;
+            }
         }
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
@@ -32803,23 +33013,25 @@ impl PartitionWalker {
         // (the §7.11.2 prediction itself happens per-TU inside the
         // §5.11.34 `residual()` dispatch below, mirroring the §5.11.7
         // intra-frame arm).
-        let _readout = self.compute_prediction(
-            mi_row,
-            mi_col,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            /* is_inter = */ false,
-            y_mode,
-            uv_mode.unwrap_or(0),
-            /* ref_frame_1_is_intra = */ false,
-            /* interintra_mode = */ II_DC_PRED,
-        )?;
+        if !self.parse_only {
+            let _readout = self.compute_prediction(
+                mi_row,
+                mi_col,
+                sub_size,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                /* is_inter = */ false,
+                y_mode,
+                uv_mode.unwrap_or(0),
+                /* ref_frame_1_is_intra = */ false,
+                /* interintra_mode = */ II_DC_PRED,
+            )?;
+        }
 
         // §5.11.5 line `residual( )` — the full intra `ResidualContext`
         // (mode-info + the caller-threaded §5.9.12 quantiser pair).
@@ -34051,7 +34263,7 @@ impl PartitionWalker {
         // j]` so the subsequent §7.12.3 step-3 merge adds the residual
         // on top. The non-palette / non-CfL / non-filter-intra arm is
         // covered here; palette / CfL / filter-intra route elsewhere.
-        if !is_inter && ctx.is_intra {
+        if !is_inter && ctx.is_intra && !self.parse_only {
             // §5.11.35 palette arm: `if ( ( plane == 0 && PaletteSizeY )
             // || ( plane != 0 && PaletteSizeUV ) ) predict_palette(...)`
             // — a palette-coded plane takes the §7.11.4 sample write
@@ -34401,7 +34613,7 @@ impl PartitionWalker {
                 // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
                 // §7.12.3 dequantization (step 1) + §7.13 inverse
                 // transform + §7.12.3 step-3 frame-buffer merge.
-                if coeffs.eob > 0 {
+                if coeffs.eob > 0 && !self.parse_only {
                     let dequant = dequantize_step1(
                         &quant,
                         tx_sz,
@@ -34964,6 +35176,34 @@ impl PartitionWalker {
         quant: &QuantizerParams,
         read_deltas: bool,
     ) -> Result<(), crate::Error> {
+        self.decode_tile_syntax_rows(
+            decoder,
+            cdfs,
+            params,
+            lr_params,
+            inter_ctx,
+            quant,
+            read_deltas,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// r481 — [`Self::decode_tile_syntax_with_lr`] calling `on_row(
+    /// self, r_end )` after each superblock row of the tile (`r_end` =
+    /// the mi row below it): the frame-parallel decoder runs its
+    /// in-loop filters behind the walk from there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_tile_syntax_rows(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        params: &TileDecodeParams<'_>,
+        lr_params: Option<&LrParams>,
+        inter_ctx: Option<&InterFrameContext>,
+        quant: &QuantizerParams,
+        read_deltas: bool,
+        on_row: &mut dyn FnMut(&mut Self, u32) -> Result<(), crate::Error>,
+    ) -> Result<(), crate::Error> {
         // §5.11.2: `sbSize = use_128x128_superblock ? BLOCK_128X128 :
         // BLOCK_64X64`; `sbSize4 = Num_4x4_Blocks_Wide[ sbSize ]`.
         let sb_size = if params.use_128x128_superblock {
@@ -35062,6 +35302,7 @@ impl PartitionWalker {
                 c += sb_size4;
             }
             r += sb_size4;
+            on_row(self, r.min(mi_row_end))?;
         }
         Ok(())
     }

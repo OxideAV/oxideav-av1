@@ -248,19 +248,61 @@ pub fn cdef_frame(
 /// [`cdef_frame`] — byte-identical — without the frame-sized source
 /// copy (73 MiB at 12 MP 4:2:0).
 pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer<'_>]) {
-    let num_planes = ctx.num_planes.min(planes.len() as u8) as usize;
-    if num_planes == 0 {
-        return;
-    }
-    const BAND_MI: u32 = 16;
-    const HALO: usize = 2;
-    let mut windows: Vec<Vec<i32>> = vec![Vec::new(); num_planes];
-    // Per plane: the frame rows the window currently holds.
-    let mut win_rows: Vec<(usize, usize)> = vec![(0, 0); num_planes];
+    let mut stepper = CdefInPlace::new();
     let mut band_r = 0u32;
     while band_r < ctx.mi_rows {
-        let band_r1 = (band_r + BAND_MI).min(ctx.mi_rows);
-        for (plane, (window, held)) in windows.iter_mut().zip(win_rows.iter_mut()).enumerate() {
+        let band_r1 = (band_r + CdefInPlace::BAND_MI).min(ctx.mi_rows);
+        stepper.band(ctx, planes, band_r, band_r1);
+        band_r = band_r1;
+    }
+}
+
+/// r481 — [`cdef_frame_in_place`] one 64-luma-row band at a time:
+/// the rolling window of UNFILTERED rows the next band's taps read
+/// lives here between calls. Bands must be filtered in order, each
+/// exactly once; a band's source rows (the band ± 2) must be final
+/// deblocked samples when it runs, and nothing else may write the
+/// band's rows or the two rows below it before the next band runs.
+#[derive(Debug, Default)]
+pub(crate) struct CdefInPlace {
+    windows: Vec<Vec<i32>>,
+    /// Per plane: the frame rows the window currently holds.
+    win_rows: Vec<(usize, usize)>,
+}
+
+impl CdefInPlace {
+    /// Band height in mi rows (64 luma rows, the §7.15 filter-block
+    /// row).
+    pub(crate) const BAND_MI: u32 = 16;
+    const HALO: usize = 2;
+
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter the mi rows `[ band_r, band_r1 )` in place.
+    pub(crate) fn band(
+        &mut self,
+        ctx: &CdefFrameContext<'_>,
+        planes: &mut [PlaneBuffer<'_>],
+        band_r: u32,
+        band_r1: u32,
+    ) {
+        let num_planes = ctx.num_planes.min(planes.len() as u8) as usize;
+        if num_planes == 0 {
+            return;
+        }
+        if self.windows.len() < num_planes {
+            self.windows.resize(num_planes, Vec::new());
+            self.win_rows.resize(num_planes, (0, 0));
+        }
+        for (plane, (window, held)) in self
+            .windows
+            .iter_mut()
+            .zip(self.win_rows.iter_mut())
+            .take(num_planes)
+            .enumerate()
+        {
             let sub_y = if plane == 0 {
                 0
             } else {
@@ -270,8 +312,8 @@ pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer
             let (rows, cols) = (pb.rows as usize, pb.cols as usize);
             let by0 = (((band_r * MI_SIZE as u32) >> sub_y) as usize).min(rows);
             let by1 = (((band_r1 * MI_SIZE as u32) >> sub_y) as usize).min(rows);
-            let new0 = by0.saturating_sub(HALO);
-            let new1 = (by1 + HALO).min(rows);
+            let new0 = by0.saturating_sub(Self::HALO);
+            let new1 = (by1 + Self::HALO).min(rows);
             let (old0, old1) = *held;
             if window.is_empty() || old1 <= new0 || new0 < old0 {
                 window.clear();
@@ -290,8 +332,9 @@ pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer
         let mut srcs = [None, None, None];
         for ((slot, (window, &(row0, _))), pb) in srcs
             .iter_mut()
-            .zip(windows.iter().zip(win_rows.iter()))
+            .zip(self.windows.iter().zip(self.win_rows.iter()))
             .zip(planes.iter())
+            .take(num_planes)
         {
             *slot = Some(CdefSrc {
                 samples: window,
@@ -302,7 +345,6 @@ pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer
             });
         }
         cdef_band_in_place(ctx, &srcs, planes, [0; 3], band_r, band_r1);
-        band_r = band_r1;
     }
 }
 

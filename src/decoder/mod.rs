@@ -31,6 +31,8 @@
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod frame_driver;
+mod inloop_pipeline;
+pub(crate) mod ref_planes;
 
 #[doc(hidden)]
 pub use frame_driver::{

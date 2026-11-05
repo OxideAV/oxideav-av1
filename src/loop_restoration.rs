@@ -1168,24 +1168,50 @@ pub(crate) struct StripeBoundaryRows {
 impl StripeBoundaryRows {
     /// Capture the boundary rows of `plane` (`sub_y` its subsampling).
     pub(crate) fn capture(plane: &PlaneBuffer<'_>, plane_end_y: i32, sub_y: u8) -> Self {
-        let cols = plane.cols as usize;
-        let mut rows = Vec::new();
+        let mut out = Self {
+            cols: plane.cols as usize,
+            rows: Vec::new(),
+        };
+        while out.push_next(plane, plane_end_y, sub_y) {}
+        out
+    }
+
+    /// r481 — the number of boundaries a plane of last row
+    /// `plane_end_y` has (`s >= 1` with `( 64 s - 8 ) >> subY <=
+    /// PlaneEndY`).
+    pub(crate) fn boundary_count(plane_end_y: i32, sub_y: u8) -> usize {
         let mut s = 1i32;
-        loop {
-            let b = (64 * s - 8) >> sub_y;
-            if b > plane_end_y {
-                break;
-            }
-            let mut four = Vec::with_capacity(4 * cols);
-            for k in -2..2 {
-                let y = (b + k).clamp(0, plane_end_y.max(0)) as usize;
-                let y = y.min(plane.rows.saturating_sub(1) as usize);
-                four.extend_from_slice(&plane.samples[y * cols..(y + 1) * cols]);
-            }
-            rows.push(four);
+        while (64 * s - 8) >> sub_y <= plane_end_y {
             s += 1;
         }
-        Self { cols, rows }
+        (s - 1) as usize
+    }
+
+    /// r481 — capture the next boundary (`s = rows.len() + 1`) from
+    /// `plane`; `false` (nothing captured) once past the last one. The
+    /// four rows must be final deblocked samples not yet touched by
+    /// CDEF.
+    pub(crate) fn push_next(
+        &mut self,
+        plane: &PlaneBuffer<'_>,
+        plane_end_y: i32,
+        sub_y: u8,
+    ) -> bool {
+        let cols = plane.cols as usize;
+        self.cols = cols;
+        let s = self.rows.len() as i32 + 1;
+        let b = (64 * s - 8) >> sub_y;
+        if b > plane_end_y {
+            return false;
+        }
+        let mut four = Vec::with_capacity(4 * cols);
+        for k in -2..2 {
+            let y = (b + k).clamp(0, plane_end_y.max(0)) as usize;
+            let y = y.min(plane.rows.saturating_sub(1) as usize);
+            four.extend_from_slice(&plane.samples[y * cols..(y + 1) * cols]);
+        }
+        self.rows.push(four);
+        true
     }
 
     /// The two rows above stripe `s` (`s >= 1`) / below stripe `s`.

@@ -69,7 +69,19 @@ fn inverse_recenter(r: i64, v: i64) -> i64 {
 /// of bytes long).
 #[derive(Debug)]
 pub struct SymbolDecoder<'a> {
-    reader: BitReader<'a>,
+    /// The bytes the decoder was initialised over (the partition is
+    /// the first `sz` of them).
+    bytes: &'a [u8],
+    /// `sz` of §8.2.2.
+    sz: usize,
+    /// r481 — the partition bits not yet consumed, MSB-first: the top
+    /// `window_bits` bits of `window` are the next bits `f()` would
+    /// return. Bits past the partition's `8 * sz` (the §8.2.6 padding
+    /// once `SymbolMaxBits` runs out) read as zero.
+    window: u64,
+    window_bits: u32,
+    /// The next partition byte to load into `window`.
+    next_byte: usize,
     /// `SymbolValue` — §8.2.2 / §8.2.4.
     value: u32,
     /// `SymbolRange` — §8.2.2 / §8.2.4. Always in `(1 << 8) ..= (1 << 15)`.
@@ -109,6 +121,7 @@ impl<'a> SymbolDecoder<'a> {
         let num_bits = core::cmp::min(sz.saturating_mul(8), 15) as u32;
         // buf = f(numBits)
         let buf = reader.f(num_bits)? as u32;
+        let consumed = reader.position();
         // paddedBuf = buf << (15 - numBits)
         let padded_buf = buf << (15 - num_bits);
         // SymbolValue = ((1 << 15) - 1) ^ paddedBuf
@@ -118,20 +131,54 @@ impl<'a> SymbolDecoder<'a> {
         // SymbolMaxBits = 8 * sz - 15
         let max_bits = (sz as i64) * 8 - 15;
 
-        Ok(Self {
-            reader,
+        let mut d = Self {
+            bytes,
+            sz,
+            window: 0,
+            window_bits: 0,
+            next_byte: consumed / 8,
             value,
             range,
             max_bits,
             disable_cdf_update,
-        })
+        };
+        // Position the window at bit `consumed` of the partition.
+        d.refill();
+        let skip = (consumed % 8) as u32;
+        d.window <<= skip;
+        d.window_bits -= skip;
+        Ok(d)
+    }
+
+    /// Top the window up to at least 57 bits (zeros past the
+    /// partition).
+    #[inline]
+    fn refill(&mut self) {
+        while self.window_bits <= 56 {
+            let byte = if self.next_byte < self.sz {
+                self.bytes.get(self.next_byte).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            self.window |= u64::from(byte) << (56 - self.window_bits);
+            self.window_bits += 8;
+            self.next_byte += 1;
+        }
+    }
+
+    /// The §8.2 bit position indicator: the partition bits `f()` has
+    /// consumed (`8 * sz - SymbolMaxBits` while bits remain, `8 * sz`
+    /// once the padding zeros take over).
+    fn bits_consumed(&self) -> usize {
+        let total = (self.sz as i64).saturating_mul(8);
+        (total - self.max_bits.max(0)).max(0) as usize
     }
 
     /// `get_position()` — the underlying bit position indicator, exposed
     /// so [`Self::exit_symbol`] callers / tests can reason about the
     /// §8.2.4 trailing-bit accounting.
     pub fn position(&self) -> usize {
-        self.reader.position()
+        self.bits_consumed()
     }
 
     /// `SymbolValue` accessor (§8.2.4 state) — for tests / debugging.
@@ -176,23 +223,22 @@ impl<'a> SymbolDecoder<'a> {
         //        cur = ((SymbolRange >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)
         //        cur += EC_MIN_PROB * (N - symbol - 1)
         //   } while ( SymbolValue < cur )
-        let mut cur = self.range;
-        let mut prev;
-        // symbol starts at -1 and is pre-incremented at the loop top, so
-        // the first iteration evaluates symbol = 0.
-        let mut symbol: i64 = -1;
+        // `cdf[N - 1] == 1 << 15` makes the last candidate's `cur` zero,
+        // so the search ends by `symbol = N - 1`.
+        let r8 = self.range >> 8;
+        let mut prev = self.range;
+        let mut cur;
+        let mut symbol: u32 = 0;
         loop {
-            symbol += 1;
-            prev = cur;
-            let s = symbol as usize;
-            let f = (1u32 << 15) - u32::from(cdf[s]);
-            cur = ((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT);
-            cur += EC_MIN_PROB * (n - symbol as u32 - 1);
-            if self.value >= cur {
+            let f = (1u32 << 15) - u32::from(cdf[symbol as usize]);
+            cur = ((r8 * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (n - symbol - 1);
+            if self.value >= cur || symbol + 1 >= n {
                 break;
             }
+            prev = cur;
+            symbol += 1;
         }
-        let symbol = symbol as u32;
 
         // SymbolRange = prev - cur
         self.range = prev - cur;
@@ -220,6 +266,7 @@ impl<'a> SymbolDecoder<'a> {
     /// arithmetic bug that drives the state out of range surfaces as
     /// [`Error::SymbolStateInvariantBroken`] instead of leaving the
     /// decoder in an undefined state.
+    #[inline]
     fn renormalize(&mut self) -> Result<(), Error> {
         // 1. bits = 15 - FloorLog2(SymbolRange)
         let bits = 15 - floor_log2(self.range);
@@ -228,10 +275,24 @@ impl<'a> SymbolDecoder<'a> {
         // 3. numBits = Min(bits, Max(0, SymbolMaxBits))
         let avail = self.max_bits.max(0);
         let num_bits = core::cmp::min(i64::from(bits), avail) as u32;
-        // 4. newData = f(numBits)
-        let new_data = self.reader.f(num_bits)? as u32;
-        // 5. paddedData = newData << (bits - numBits)
-        let padded_data = new_data << (bits - num_bits);
+        // 4. newData = f(numBits): the partition's next bits — read
+        //    through the window, which holds zeros past `8 * sz`, so
+        // 5. paddedData = newData << (bits - numBits) is simply the
+        //    window's next `bits` bits. (A partition running past the
+        //    end of the buffer fails as `f()` would.)
+        if num_bits > 0 && self.bits_consumed() + num_bits as usize > self.bytes.len() * 8 {
+            return Err(Error::UnexpectedEnd);
+        }
+        if self.window_bits < bits {
+            self.refill();
+        }
+        let padded_data = if bits == 0 {
+            0
+        } else {
+            (self.window >> (64 - bits)) as u32
+        };
+        self.window <<= bits;
+        self.window_bits -= bits;
         // 6. SymbolValue = paddedData ^ (((SymbolValue + 1) << bits) - 1)
         self.value = padded_data ^ (((self.value + 1) << bits) - 1);
         // 7. SymbolMaxBits = SymbolMaxBits - bits
@@ -441,7 +502,14 @@ impl<'a> SymbolDecoder<'a> {
         }
 
         // trailingBitPosition = get_position() - Min(15, SymbolMaxBits + 15)
-        let pos = self.reader.position() as i64;
+        let mut reader = BitReader::new(self.bytes);
+        let mut remaining = self.bits_consumed();
+        while remaining > 0 {
+            let chunk = core::cmp::min(remaining, 32) as u32;
+            reader.f(chunk)?;
+            remaining -= chunk as usize;
+        }
+        let pos = reader.position() as i64;
         let trailing = pos - core::cmp::min(15, self.max_bits + 15);
         let trailing_bit_position = trailing as usize;
 
@@ -452,12 +520,13 @@ impl<'a> SymbolDecoder<'a> {
         let mut remaining = advance;
         while remaining > 0 {
             let chunk = core::cmp::min(remaining, 32) as u32;
-            self.reader.f(chunk)?;
+            reader.f(chunk)?;
             remaining -= chunk as usize;
         }
+        self.max_bits -= self.max_bits.max(0);
 
         // paddingEndPosition = get_position()
-        let padding_end_position = self.reader.position();
+        let padding_end_position = reader.position();
 
         Ok((trailing_bit_position, padding_end_position))
     }
@@ -481,18 +550,16 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
     let count = u32::from(cdf[n as usize]);
     let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
 
-    let mut tmp: u32 = 0;
-    for i in 0..(n - 1) {
-        if i == symbol {
-            tmp = 1 << 15;
-        }
-        let c = u32::from(cdf[i as usize]);
-        let updated = if tmp < c {
-            c - ((c - tmp) >> rate)
-        } else {
-            c + ((tmp - c) >> rate)
-        };
-        cdf[i as usize] = updated as u16;
+    // `tmp` is 0 below `symbol` (so `cdf[i] -= cdf[i] >> rate`; a zero
+    // entry stays zero either way) and `1 << 15` from `symbol` on (no
+    // entry exceeds it, so `cdf[i] += ((1 << 15) - cdf[i]) >> rate`).
+    let split = (symbol as usize).min((n - 1) as usize);
+    let (below, above) = cdf[..(n - 1) as usize].split_at_mut(split);
+    for c in below {
+        *c -= *c >> rate;
+    }
+    for c in above {
+        *c += ((1u16 << 15) - *c) >> rate;
     }
     // cdf[N] += (cdf[N] < 32)
     if count < 32 {

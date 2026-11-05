@@ -688,9 +688,6 @@ pub fn block_inter_prediction(
     if ref_width == 0 || ref_height == 0 || ref_stride < plane_w {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    if ref_plane.len() < plane_h * ref_stride {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
     if w == 0 || h == 0 || w > 256 || h > 256 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -728,6 +725,17 @@ pub fn block_inter_prediction(
         ((((h as i64) - 1) * (step_y as i64) + (1i64 << SCALE_SUBPEL_BITS) - 1)
             >> SCALE_SUBPEL_BITS) as usize
             + 8;
+    // The rows the fetch reaches (every read is `Clip3( 0, lastY, .. )`
+    // of these): the plane may be a published prefix of a reference
+    // still decoding (frame-parallel decode), which must cover them.
+    let last_row_read = clip3_i32(
+        0,
+        last_y,
+        (start_y >> SCALE_SUBPEL_BITS) - 3 + intermediate_height as i32 - 1,
+    ) as usize;
+    if ref_plane.len() < (last_row_read + 1) * ref_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
 
     // §7.11.3.4 horizontal filter small-block remap (lines 14602-14608).
     let h_filter = if w <= 4 {
