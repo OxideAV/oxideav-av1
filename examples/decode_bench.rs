@@ -16,7 +16,7 @@
 //! sends the whole file as one packet, so the output queue holds every
 //! frame until the drain — fine for a still, but it hides the
 //! frame-parallel pipeline's real resident set on a sequence).
-//! The digest is a 64-bit FNV-1a over the planes in output order, so
+//! The digest is a 64-bit FNV-1a (over 64-bit words) of the planes in output order, so
 //! two runs are byte-identical iff their digests agree. Peak memory is
 //! the caller's job (`/usr/bin/time -l` on macOS, `-v` on Linux).
 
@@ -96,8 +96,16 @@ fn reset_alloc_stats() {
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
+/// FNV-1a over 64-bit little-endian words (bytes for the tail) — the
+/// harness hashes every output plane on the draining thread, so a
+/// byte-at-a-time hash would cap the measured multi-worker rate.
 fn fnv1a(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
+    let (words, tail) = bytes.as_chunks::<8>();
+    for w in words {
+        *h ^= u64::from_le_bytes(*w);
+        *h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    for &b in tail {
         *h ^= u64::from(b);
         *h = h.wrapping_mul(0x0100_0000_01b3);
     }

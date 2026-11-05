@@ -2206,6 +2206,53 @@ hierarchical chain sets the pace and faster per-frame decode raises
 the threaded rate in proportion. A 1080p libaom stream with two tile
 columns goes 33 → 87 fps at 8 workers.
 
+#### Row-granular frame-parallel decode (r481)
+
+Under a worker budget a frame that later frames read is decoded in two
+walks. The first is syntax only (every symbol read and every
+mode-info / context grid stamped exactly as in the full walk — AV1
+parsing never reads a sample — but nothing predicted or reconstructed);
+it stores the frame's §7.20 payload (frame-end CDFs, §7.19 motion
+field, segment ids, grain state) at once, so the next frame's walk
+waits for this frame's parse rather than its whole decode. The full
+walk then runs the §7.4 in-loop passes behind itself in 8-row units
+(`decoder::inloop_pipeline`: deblocking pass 0 once a unit is 4 rows
+above the walk, pass 1 once pass 0 covers its edges' reach, the
+§7.17.6 boundary rows captured once deblocked for good, CDEF once 8
+rows below are deblocked, restoration stripe by stripe) and publishes
+each row into the slot's planes (`decoder::ref_planes`, a published
+prefix readable by any thread) as soon as it is final — about 40 rows
+behind the walk. A later frame's walk waits, per inter leaf, for the
+rows its references' motion vectors reach (plus the §7.11.3.4 taps;
+the whole frame for warped or scaled prediction) and predicts from
+that prefix. Multi-tile inter syntax walks parse their tiles
+concurrently. The serial and still-picture paths are unchanged, and
+every corpus stream decodes byte-identical at 2 / 3 / 8 workers
+(`tests/fixture_conformance.rs`).
+
+1920×1080, 300 frames (10 s at 30 fps), one temporal unit per packet
+through the registry decoder (`examples/decode_bench … stream=1`),
+Apple M5-class on a shared host, release build; every frame
+byte-identical to `dav1d` at every budget. Seconds per clip before
+(0.1.21 + r480) → after, peak RSS after:
+
+| Clip | 1 worker | 4 | 8 | 16 | Peak RSS 1 / 8 / 16 |
+|---|---|---|---|---|---|
+| SVT-AV1 preset 8, 8-bit, one tile | 5.15 → 4.04 s | 1.75 → 1.56 s | 1.57 → 0.94 s | 1.40 → 0.63 s | 118 / 597 / 1009 MiB |
+| SVT-AV1 preset 8, 10-bit | 5.94 → 4.81 s | 1.75 → 1.73 s | 1.56 → 1.06 s | 1.40 → 0.74 s | 113 / 536 / 1045 MiB |
+| libaom `cpu-used 8`, 2×2 tiles, row-mt | 9.66 → 5.65 s | 6.87 → 2.74 s | 6.30 → 2.16 s | 6.22 → 1.85 s | 118 / 632 / 966 MiB |
+| libaom `cpu-used 8`, one tile | 8.91 → 5.47 s | 5.87 → 2.51 s | 5.62 → 2.07 s | 5.53 → 2.00 s | 122 / 543 / 674 MiB |
+
+Where the time goes now. One worker: the tile walk (symbol decoding,
+coefficient contexts, inter prediction, inverse transforms) is ~60 %,
+deblocking 10–30 % (content dependent), CDEF ~10 %. Many workers:
+the syntax walks form the serial chain — each frame's parse needs its
+primary reference's frame-end CDFs — at ~4–5 ms per 1080p frame
+(libaom one tile: ~150 fps), and a multi-column frame's full walk
+publishes rows only as its last tile column passes them. The resident
+set grows with the workers (one frame-sized walker and `i32`
+`CurrFrame` per running frame).
+
 ## Module layout
 
 `obu`, `sequence_header`, `frame_header`, `tile_info`,

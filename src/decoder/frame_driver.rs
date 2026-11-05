@@ -2246,12 +2246,7 @@ fn decode_frame_spec_tiles(
         if cc.bit_depth == 8 {
             buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
         } else {
-            let mut out = Vec::with_capacity(buf.len() * 2);
-            for v in buf {
-                let v = v.clamp(0, max_val) as u16;
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out
+            le_bytes(buf.iter().map(|&v| v.clamp(0, max_val) as u16), buf.len())
         }
     };
     // The §7.20 store copy of one plane: into the writer's planes
@@ -2346,6 +2341,16 @@ fn decode_frame_spec_tiles(
         meta,
         mfmvs: None,
     })
+}
+
+/// The 10 / 12-bit output layout: each sample as two little-endian
+/// bytes, written into a buffer sized up front.
+fn le_bytes(samples: impl Iterator<Item = u16>, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len * 2];
+    for (o, v) in out.as_chunks_mut::<2>().0.iter_mut().zip(samples) {
+        *o = v.to_le_bytes();
+    }
+    out
 }
 
 /// §7.18.3 / §5.9.30 the frame's resolved film-grain state: on the
@@ -2959,11 +2964,7 @@ fn output_existing_frame(slot: &SpecRefSlot, seq: &SequenceHeader) -> Result<Spe
                 if slot.bit_depth == 8 {
                     p.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
                 } else {
-                    let mut out = Vec::with_capacity(p.len() * 2);
-                    for v in p {
-                        out.extend_from_slice(&(v.clamp(0, max_val) as u16).to_le_bytes());
-                    }
-                    out
+                    le_bytes(p.iter().map(|&v| v.clamp(0, max_val) as u16), p.len())
                 }
             })
             .collect(),
@@ -2973,11 +2974,7 @@ fn output_existing_frame(slot: &SpecRefSlot, seq: &SequenceHeader) -> Result<Spe
                 if slot.bit_depth == 8 {
                     p.iter().map(|&v| v.min(255) as u8).collect()
                 } else {
-                    let mut out = Vec::with_capacity(p.len() * 2);
-                    for &v in p.iter() {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                    out
+                    le_bytes(p.iter().copied(), p.len())
                 }
             })
             .collect(),
