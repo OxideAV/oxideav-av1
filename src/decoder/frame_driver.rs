@@ -542,13 +542,13 @@ fn decode_or_defer(
         let job = move || -> Result<SpecFrame, Error> {
             let mut guard = guard;
             let result = reads.resolve(mask).and_then(|snapshot| {
-                guard.run(&running, threads);
                 let mut st = DecodeStageTimings::default();
                 let cell = guard
                     .cell
                     .clone()
                     .filter(|_| !seq.reduced_still_picture_header);
                 let Some(cell) = cell else {
+                    guard.run(&running, threads);
                     return decode_frame_spec_tiles(
                         &seq,
                         &fh,
@@ -573,6 +573,7 @@ fn decode_or_defer(
                     cell.fulfil(Ok(slot_payload(&fh, Arc::clone(&planes), meta, bit_depth)));
                 };
                 if seq.still_picture {
+                    guard.run(&running, threads);
                     decode_frame_spec_tiles(
                         &seq,
                         &fh,
@@ -597,6 +598,15 @@ fn decode_or_defer(
                         FrameMode::ParseOnly,
                     )?;
                     let mut parsed = parsed;
+                    // The syntax walks of successive frames form the
+                    // decode's serial chain (each needs its primary
+                    // reference's frame-end CDFs), so a frame walks its
+                    // syntax without waiting for a worker turn. It takes
+                    // its turn before storing the payload: a frame that
+                    // reads this one can then only hold a turn while this
+                    // one holds one too, so no turn-holder ever waits on
+                    // a frame stuck waiting for a turn.
+                    guard.run(&running, threads);
                     publish(parsed.meta.take().ok_or(Error::PartitionWalkOutOfRange)?);
                     decode_frame_spec_tiles(
                         &seq,
