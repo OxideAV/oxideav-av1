@@ -2232,16 +2232,16 @@ every corpus stream decodes byte-identical at 2 / 3 / 8 workers
 
 1920×1080, 300 frames (10 s at 30 fps), one temporal unit per packet
 through the registry decoder (`examples/decode_bench … stream=1`),
-Apple M5-class on a shared host, release build; every frame
-byte-identical to `dav1d` at every budget. Seconds per clip before
-(0.1.21 + r480) → after, peak RSS after:
+Apple M5-class on a shared host, release build, best of two; every
+frame byte-identical to `dav1d` at every budget. Seconds per clip
+before (0.1.21 + r480) → after, peak RSS after:
 
 | Clip | 1 worker | 4 | 8 | 16 | Peak RSS 1 / 8 / 16 |
 |---|---|---|---|---|---|
-| SVT-AV1 preset 8, 8-bit, one tile | 5.15 → 4.04 s | 1.75 → 1.56 s | 1.57 → 0.94 s | 1.40 → 0.63 s | 118 / 597 / 1009 MiB |
-| SVT-AV1 preset 8, 10-bit | 5.94 → 4.81 s | 1.75 → 1.73 s | 1.56 → 1.06 s | 1.40 → 0.74 s | 113 / 536 / 1045 MiB |
-| libaom `cpu-used 8`, 2×2 tiles, row-mt | 9.66 → 5.65 s | 6.87 → 2.74 s | 6.30 → 2.16 s | 6.22 → 1.85 s | 118 / 632 / 966 MiB |
-| libaom `cpu-used 8`, one tile | 8.91 → 5.47 s | 5.87 → 2.51 s | 5.62 → 2.07 s | 5.53 → 2.00 s | 122 / 543 / 674 MiB |
+| SVT-AV1 preset 8, 8-bit, one tile | 4.78 → 3.77 s | 1.48 → 1.19 s | 1.37 → 0.77 s | 1.24 → 0.54 s | 113 / 561 / 1021 MiB |
+| SVT-AV1 preset 8, 10-bit | 6.05 → 4.50 s | 1.75 → 1.38 s | 1.61 → 0.85 s | 1.46 → 0.59 s | 114 / 645 / 1162 MiB |
+| libaom `cpu-used 8`, 2×2 tiles, row-mt | 9.12 → 5.27 s | 6.26 → 2.25 s | 5.98 → 1.88 s | 6.03 → 1.65 s | 115 / 613 / 921 MiB |
+| libaom `cpu-used 8`, one tile | 8.80 → 5.14 s | 5.98 → 2.00 s | 5.71 → 1.78 s | 5.66 → 1.65 s | 120 / 524 / 688 MiB |
 
 Where the time goes now. One worker: the tile walk (symbol decoding,
 coefficient contexts, inter prediction, inverse transforms) is ~60 %,
