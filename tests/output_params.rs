@@ -82,18 +82,77 @@ fn assert_frame_matches(vf: &VideoFrame, params: &CodecParameters) {
 
 /// Feed `units` one per packet, draining after each; returns, per
 /// returned frame, `(generation, params)` read right after it.
+///
+/// Checks the `Frame::StreamParams` contract on the way: an event is
+/// returned exactly when the generation moves (one per bump, never for
+/// the first frame, never twice in a row), its payload equals
+/// `output_params()` at that point, and the frame right after it has
+/// that shape.
 fn decode_all(dec: &mut dyn Decoder, units: &[Vec<u8>]) -> Vec<(u64, CodecParameters)> {
-    let mut seen = Vec::new();
-    let drain = |dec: &mut dyn Decoder, seen: &mut Vec<_>| {
+    decode_all_with_events(dec, units).0
+}
+
+/// [`decode_all`] plus the indices (into the returned frames) of the
+/// frames each `Frame::StreamParams` event announced.
+fn decode_all_with_events(
+    dec: &mut dyn Decoder,
+    units: &[Vec<u8>],
+) -> (Vec<(u64, CodecParameters)>, Vec<usize>) {
+    let mut seen: Vec<(u64, CodecParameters)> = Vec::new();
+    let mut events = Vec::new();
+    let mut announced: Option<String> = None;
+    let mut drain = |dec: &mut dyn Decoder,
+                     seen: &mut Vec<(u64, CodecParameters)>,
+                     events: &mut Vec<usize>| {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Video(vf)) => {
                     let p = dec.output_params().expect("described after a frame");
                     assert_frame_matches(&vf, &p);
                     assert_eq!(dec.output_pixel_format(), p.pixel_format);
-                    seen.push((dec.output_params_generation(), p));
+                    let g = dec.output_params_generation();
+                    match (seen.last(), announced.take()) {
+                        (None, None) => assert_eq!(g, 0, "first frame: generation 0"),
+                        (None, Some(_)) => panic!("event before the first frame"),
+                        (Some((pg, pp)), None) => {
+                            assert_eq!(g, *pg, "a bump without an event");
+                            assert_eq!(format!("{pp:?}"), format!("{p:?}"), "shape moved silently");
+                        }
+                        (Some((pg, _)), Some(ev)) => {
+                            assert_eq!(g, pg.wrapping_add(1), "one bump per event");
+                            assert_eq!(
+                                ev,
+                                format!("{p:?}"),
+                                "the announced frame has the event's shape"
+                            );
+                            events.push(seen.len());
+                        }
+                    }
+                    seen.push((g, p));
                 }
-                Ok(_) => panic!("video only"),
+                Ok(Frame::StreamParams(ev)) => {
+                    assert!(announced.is_none(), "two events in a row");
+                    assert!(!seen.is_empty(), "no event for the first shape");
+                    let now = dec.output_params().expect("described at an event");
+                    assert_eq!(
+                        format!("{ev:?}"),
+                        format!("{now:?}"),
+                        "payload == output_params()"
+                    );
+                    let prev = &seen.last().unwrap().1;
+                    assert_ne!(
+                        format!("{prev:?}"),
+                        format!("{now:?}"),
+                        "an event changes the shape"
+                    );
+                    assert_ne!(
+                        dec.output_params_generation(),
+                        seen.last().unwrap().0,
+                        "generation already moved"
+                    );
+                    announced = Some(format!("{now:?}"));
+                }
+                Ok(_) => panic!("video or StreamParams only"),
                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                 Err(e) => panic!("decode: {e}"),
             }
@@ -102,11 +161,11 @@ fn decode_all(dec: &mut dyn Decoder, units: &[Vec<u8>]) -> Vec<(u64, CodecParame
     for (i, u) in units.iter().enumerate() {
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), u.clone()).with_pts(i as i64))
             .expect("packet");
-        drain(dec, &mut seen);
+        drain(dec, &mut seen, &mut events);
     }
     dec.flush().unwrap();
-    drain(dec, &mut seen);
-    seen
+    drain(dec, &mut seen, &mut events);
+    (seen, events)
 }
 
 fn bt709_full() -> ColorSignal {
@@ -294,7 +353,9 @@ fn mid_stream_changes_bump_the_generation_at_the_first_new_frame() {
     let mut runs = Vec::new();
     for threads in [1, 8] {
         let mut dec = decoder(Vec::new(), threads);
-        let seen = decode_all(dec.as_mut(), &units);
+        let (seen, events) = decode_all_with_events(dec.as_mut(), &units);
+        // One `StreamParams` event before each new shape's first frame.
+        assert_eq!(events, [2, 4], "threads={threads}: events");
         let got: Vec<_> = seen
             .iter()
             .map(|(g, p)| {
@@ -329,4 +390,34 @@ fn mid_stream_changes_bump_the_generation_at_the_first_new_frame() {
         assert_eq!(format!("{:?}", dec.output_params().unwrap()), before);
     }
     assert_eq!(runs[0], runs[1], "1 vs 8 threads");
+}
+
+/// r482 — a new sequence header that changes only the layout at the
+/// same frame size (monochrome on / off, bit depth, subsampling) is a
+/// change too: one `Frame::StreamParams` event each, at the first frame
+/// under the new header, for every worker budget; a header repeating
+/// the same shape is not.
+#[test]
+fn layout_only_sequence_changes_are_announced() {
+    let shapes = [
+        PixelFormat::Yuv420P,
+        PixelFormat::Gray8,
+        PixelFormat::Gray8,
+        PixelFormat::Yuv420P10Le,
+        PixelFormat::Yuv444P,
+        PixelFormat::Yuv420P,
+    ];
+    let units: Vec<Vec<u8>> = shapes
+        .iter()
+        .flat_map(|&pf| own_encode(pf, 32, 32, 2, false).0)
+        .collect();
+    for threads in [1, 2, 3, 8] {
+        let mut dec = decoder(Vec::new(), threads);
+        let (seen, events) = decode_all_with_events(dec.as_mut(), &units);
+        assert_eq!(events, [2, 6, 8, 10], "threads={threads}");
+        let got: Vec<_> = seen.iter().map(|(_, p)| p.pixel_format.unwrap()).collect();
+        let want: Vec<_> = shapes.iter().flat_map(|&pf| [pf, pf]).collect();
+        assert_eq!(got, want, "threads={threads}");
+        assert_eq!(dec.output_params_generation(), 4);
+    }
 }

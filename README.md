@@ -2118,6 +2118,32 @@ payload omits the sequence header still decodes (a payload that
 repeats it simply re-caches it). Item payloads with or without a
 leading temporal delimiter decode alike.
 
+**Mid-stream shape changes** (r482, oxideav-core 0.1.43): the
+framework decoder states its output at the stream level
+(`output_params()`: the planes' size `UpscaledWidth × FrameHeight`,
+the pixel layout, the colour signal, the §5.5.3 picture rate) and
+announces every later change in band: `receive_frame` returns one
+`Frame::StreamParams` event — payload equal to `output_params()`,
+`output_params_generation()` already moved — immediately before the
+first frame of the new shape. That covers a new sequence header
+(bit depth, subsampling, monochrome, colour, rate) and a new frame
+size inside one sequence (§5.9.5 `frame_size_override_flag`, §5.9.7
+`frame_size_with_refs`, superres on a resized frame, a §7.21
+`show_existing_frame` of a slot at another size). Superres alone is
+not a change: the emitted size is the upscaled one. The §5.9.6 render
+size is not the emitted size. Frames are queued in output order, so
+every old-shape frame (still decoding on a worker or not) comes out
+first, at every worker budget and while draining after `flush()`; no
+event for the first shape or a constant stream; after `reset()` the
+next frame is compared against the last shape announced. Pinned on the
+corpus (every stream through the registry decoder at 1 / 2 / 3 / 8
+workers: the eight streams with size changes get one event per change,
+the rest none, frames byte-identical) and on five black-box `aomenc` /
+`SvtAv1EncApp` resize / superres streams in `tests/stream_params.rs`
+(byte-identical to two independent reference decoders). The encoder
+rejects the event with `Error::Unsupported` (its coded size and
+sequence header are fixed at construction).
+
 #### Still-image decode budgets (r475)
 
 Measured on a 4032×3024 (12 MP) 8-bit 4:2:0 single-frame AV1 stream

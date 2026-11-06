@@ -25,6 +25,15 @@
 //! at a time — returning `Error::NeedMore` while empty and `Error::Eof`
 //! once the stream has been flushed and the queue is exhausted.
 //!
+//! A mid-stream change of the output shape (a new sequence header's
+//! layout / colour signal / picture rate, a new frame size) is
+//! announced in band: `receive_frame` returns one
+//! [`CoreFrame::StreamParams`] event carrying the new
+//! [`Decoder::output_params`] immediately before the first frame of
+//! the new shape, after every frame of the old shape (one per change,
+//! never for the first shape; `output_params_generation` moves with
+//! it).
+//!
 //! Registration claims the three container identifiers an AV1
 //! elementary stream is carried under:
 //!
@@ -126,6 +135,7 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         eof: false,
         shown: None,
         generation: 0,
+        held: None,
         config_pixel_format: Av1CodecConfig::parse(&params.extradata)
             .as_ref()
             .and_then(config_record_pixel_format),
@@ -162,8 +172,13 @@ struct Av1Decoder {
     /// last (`None` before the first one).
     shown: Option<OutputShape>,
     /// `Decoder::output_params_generation` — bumped (wrapping) when a
-    /// returned frame's shape differs from the previous one's.
+    /// returned frame's shape differs from the previous one's, as the
+    /// `Frame::StreamParams` event announcing it is returned.
     generation: u64,
+    /// The first frame of a new shape, held back for one call while
+    /// the `Frame::StreamParams` event announcing it is returned
+    /// (`shown` already describes it).
+    held: Option<VideoFrame>,
     /// The layout an `av1C` extradata record states — the answer
     /// before any sequence header was seen (a record without
     /// `configOBUs` carries no size).
@@ -361,6 +376,11 @@ impl Decoder for Av1Decoder {
     }
 
     fn receive_frame(&mut self) -> CoreResult<CoreFrame> {
+        // The frame whose shape change was announced on the previous
+        // call comes out first.
+        if let Some(frame) = self.held.take() {
+            return Ok(CoreFrame::Video(frame));
+        }
         // A frame still decoding holds back the queue until the caller
         // flushes (then it is waited for).
         let ready = match self.queue.front() {
@@ -384,14 +404,27 @@ impl Decoder for Av1Decoder {
             .copied()
             .unwrap_or((frame.width, frame.height));
         let shape = OutputShape { size, seq };
-        // The first frame resolves the description (no bump); a later
-        // frame of a different shape bumps the generation as it is
-        // returned.
-        if self.shown.is_some_and(|prev| !prev.same_output(&shape)) {
-            self.generation = self.generation.wrapping_add(1);
-        }
+        // The first frame resolves the description (no bump, no
+        // event). A later frame of a different shape — a new sequence
+        // header's layout / colour signal / picture rate, or a new
+        // frame size (§5.9.5 / §5.9.7 / §5.9.8 superres, a §7.21
+        // `show_existing_frame` of a slot holding another size) — is
+        // announced first: the generation moves and a
+        // `Frame::StreamParams` event carrying the new description is
+        // returned, with the frame held for the next call. The queue is
+        // in output order, so every frame of the old shape (the ones
+        // still decoding included) has already been returned.
+        let changed = self.shown.is_some_and(|prev| !prev.same_output(&shape));
         self.shown = Some(shape);
-        Ok(CoreFrame::Video(spec_frame_to_video_frame(frame, pts)))
+        let video = spec_frame_to_video_frame(frame, pts);
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+            self.held = Some(video);
+            return Ok(CoreFrame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
+        }
+        Ok(CoreFrame::Video(video))
     }
 
     fn flush(&mut self) -> CoreResult<()> {
@@ -404,7 +437,11 @@ impl Decoder for Av1Decoder {
         // reference store (the landing point must be a KEY frame,
         // which rebuilds every slot); keep the cached sequence header
         // (containers need not repeat it mid-stream).
+        // A frame held behind its `StreamParams` event is dropped too:
+        // the event was returned, so `shown` (the shape the next
+        // frame is compared against) stays the announced one.
         self.queue.clear();
+        self.held = None;
         self.session.reset_references();
         self.eof = false;
         Ok(())
@@ -412,7 +449,8 @@ impl Decoder for Av1Decoder {
 
     /// The emitted frames' description: after a frame was returned,
     /// that frame's size / layout / colour signal / §5.5.3 picture
-    /// rate; before, the sequence header's (from the extradata
+    /// rate (after a `Frame::StreamParams` event, the held frame's —
+    /// the event's payload is exactly this answer); before, the sequence header's (from the extradata
     /// configuration OBUs or the first temporal unit), with the
     /// §5.5.1 maximum frame size as the size; before any sequence
     /// header, the layout alone from an `av1C` extradata record.
@@ -839,10 +877,22 @@ impl Encoder for Av1Encoder {
     }
 
     fn send_frame(&mut self, frame: &CoreFrame) -> CoreResult<()> {
-        let CoreFrame::Video(vf) = frame else {
-            return Err(CoreError::invalid(
-                "oxideav-av1: encoder takes video frames",
-            ));
+        let vf = match frame {
+            CoreFrame::Video(vf) => vf,
+            // The coded size, layout and sequence header are fixed at
+            // construction (`output_params` / the `av1C` extradata
+            // already describe them), so a mid-stream input-shape
+            // change is not re-configured.
+            CoreFrame::StreamParams(_) => {
+                return Err(CoreError::unsupported(
+                    "oxideav-av1: encoder cannot re-configure for a mid-stream input-shape change",
+                ));
+            }
+            _ => {
+                return Err(CoreError::invalid(
+                    "oxideav-av1: encoder takes video frames",
+                ));
+            }
         };
         let input = self.to_yuv(vf)?;
         let opts = self.opts.still_options(self.thread_budget);
