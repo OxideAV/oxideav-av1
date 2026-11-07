@@ -109,6 +109,7 @@ use crate::uncompressed_header_tail::{GOLDEN_FRAME, LAST_FRAME};
 /// One frame's reconstructed planes (row-major; U/V at
 /// `(width/2) × (height/2)`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GopFrameRecon {
     /// Luma plane.
     pub y: Vec<u8>,
@@ -118,10 +119,13 @@ pub struct GopFrameRecon {
     pub v: Vec<u8>,
 }
 
+impl GopFrameRecon {}
+
 /// r427 — general-format sibling of [`GopFrameRecon`]: `u16` planes
 /// at the stream's bit depth, chroma at the subsampled extent (empty
 /// on the monochrome arm).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GopFrameReconYuv {
     /// Luma plane.
     pub y: Vec<u16>,
@@ -131,9 +135,12 @@ pub struct GopFrameReconYuv {
     pub v: Vec<u16>,
 }
 
+impl GopFrameReconYuv {}
+
 /// r427 — result of [`encode_gop_yuv_with_q`]: the general-format
 /// sibling of [`EncodedGop`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedGopYuv {
     /// Complete IVF v0 file (header + one record per frame).
     pub ivf_bytes: Vec<u8>,
@@ -146,6 +153,8 @@ pub struct EncodedGopYuv {
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
 }
+
+impl EncodedGopYuv {}
 
 /// r427 (hidden) — [`EncodedGopYuv`] plus the per-P-frame election
 /// outcomes: the general-format sibling of [`TunedGop`].
@@ -189,6 +198,7 @@ pub struct TunedGopYuv {
 
 /// Result of [`encode_gop_yuv420_with_q`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedGop {
     /// Complete IVF v0 file (header + one record per frame).
     pub ivf_bytes: Vec<u8>,
@@ -202,6 +212,8 @@ pub struct EncodedGop {
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
 }
+
+impl EncodedGop {}
 
 /// r423 (hidden) — [`EncodedGop`] plus the per-P-frame §5.9.14
 /// `segmentation_temporal_update` election outcomes (index 0 is the

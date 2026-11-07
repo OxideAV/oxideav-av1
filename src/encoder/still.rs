@@ -40,6 +40,7 @@ use crate::sequence_header::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, Seq
 
 /// Search-effort presets for [`StillOptions::speed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum StillSpeed {
     /// r464 — the production point (the framework encoder's default):
     /// the largest transform size per leaf, the intra-mode pre-screen,
@@ -65,6 +66,7 @@ pub enum StillSpeed {
 
 /// Options for [`encode_still_yuv`] / [`encode_still_yuv420`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StillOptions {
     /// §5.9.12 `base_q_idx` (0..=255). `0` codes the §5.9.2
     /// `CodedLossless` arm: the decoded picture equals the input
@@ -109,6 +111,62 @@ pub struct StillOptions {
     /// `threads.next_power_of_two()` of them) instead of
     /// `tile_cols_log2` / `tile_rows_log2`. Off by default (one tile).
     pub auto_tiles: bool,
+}
+
+impl StillOptions {
+    /// Set `base_q_idx`.
+    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
+        self.base_q_idx = base_q_idx;
+        self
+    }
+
+    /// Set `tile_cols_log2`.
+    pub fn with_tile_cols_log2(mut self, tile_cols_log2: u32) -> Self {
+        self.tile_cols_log2 = tile_cols_log2;
+        self
+    }
+
+    /// Set `tile_rows_log2`.
+    pub fn with_tile_rows_log2(mut self, tile_rows_log2: u32) -> Self {
+        self.tile_rows_log2 = tile_rows_log2;
+        self
+    }
+
+    /// Set `speed`.
+    pub fn with_speed(mut self, speed: StillSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+
+    /// Set `full_range`.
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Set `reduced_header`.
+    pub fn with_reduced_header(mut self, reduced_header: bool) -> Self {
+        self.reduced_header = reduced_header;
+        self
+    }
+
+    /// Set `color_description`.
+    pub fn with_color_description(mut self, color_description: Option<(u8, u8, u8)>) -> Self {
+        self.color_description = color_description;
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Set `auto_tiles`.
+    pub fn with_auto_tiles(mut self, auto_tiles: bool) -> Self {
+        self.auto_tiles = auto_tiles;
+        self
+    }
 }
 
 impl StillOptions {
@@ -173,6 +231,7 @@ pub fn quality_to_base_q_idx(quality: u8) -> u8 {
 
 /// Result of [`encode_still_yuv`] / [`encode_still_yuv420`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedStill {
     /// The bare §7.5 temporal unit (TD + SH + `OBU_FRAME`) — the AV1
     /// Image Item Data / ISOBMFF sample payload.
@@ -198,6 +257,8 @@ pub struct EncodedStill {
     /// `seq` (`config_obus` empty, per av1-avif §2.2.1).
     pub codec_config: Av1CodecConfig,
 }
+
+impl EncodedStill {}
 
 impl EncodedStill {
     fn from_key(k: EncodedKeyFrameYuv) -> Self {

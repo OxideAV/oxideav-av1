@@ -82,11 +82,9 @@ fn textured(width: u32, height: u32, format: ChromaFormat) -> YuvFrame {
 }
 
 fn encode_tiled(frame: &YuvFrame) -> Vec<u8> {
-    let opts = StillOptions {
-        tile_cols_log2: 1,
-        tile_rows_log2: 1,
-        ..StillOptions::new(100)
-    };
+    let opts = StillOptions::new(100)
+        .with_tile_cols_log2(1)
+        .with_tile_rows_log2(1);
     encode_still_yuv(frame, &opts)
         .expect("still encode")
         .temporal_unit_bytes

@@ -80,6 +80,7 @@ use std::rc::Rc;
 /// the stream signals (index = display position; `temporal_ids[0] ==
 /// 0` — the KEY frame anchors the base layer).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TemporalLayeredGopYuv {
     /// The encoded stream (IVF wrap + bare §7.5 temporal units +
     /// per-frame reconstructions + the emitted sequence header, which
@@ -89,14 +90,19 @@ pub struct TemporalLayeredGopYuv {
     pub temporal_ids: Vec<u8>,
 }
 
+impl TemporalLayeredGopYuv {}
+
 /// 8-bit 4:2:0 sibling of [`TemporalLayeredGopYuv`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TemporalLayeredGop {
     /// The encoded stream (see [`TemporalLayeredGopYuv::gop`]).
     pub gop: EncodedGop,
     /// §5.3.3 `temporal_id` per display frame.
     pub temporal_ids: Vec<u8>,
 }
+
+impl TemporalLayeredGop {}
 
 /// §5.3.3 `temporal_id` of display position `i` in the dyadic
 /// `layers`-deep ladder (see the module docs).
@@ -460,6 +466,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
 /// r431 — an encoded spatially scalable stream (see
 /// [`encode_spatial_layered_gop_yuv_with_q`]).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SpatialLayeredGopYuv {
     /// Complete IVF v0 file (one record per §7.5 temporal unit).
     pub ivf_bytes: Vec<u8>,
@@ -486,8 +493,11 @@ pub struct SpatialLayeredGopYuv {
     pub operating_points: Vec<(u8, u8)>,
 }
 
+impl SpatialLayeredGopYuv {}
+
 /// 8-bit 4:2:0 sibling of [`SpatialLayeredGopYuv`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SpatialLayeredGop {
     pub ivf_bytes: Vec<u8>,
     pub temporal_units: Vec<Vec<u8>>,
@@ -500,6 +510,8 @@ pub struct SpatialLayeredGop {
     /// The §6.7.5 operating points as `(spatial, temporal)` layer counts.
     pub operating_points: Vec<(u8, u8)>,
 }
+
+impl SpatialLayeredGop {}
 
 /// The §6.7.5 operating-point list for `s_count` INDEPENDENTLY CODED
 /// spatial layers (one temporal layer): entry `k` selects spatial

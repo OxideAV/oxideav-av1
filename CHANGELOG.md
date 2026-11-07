@@ -4,6 +4,14 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the option records `Av1EncoderOptions`, `StillOptions` and `Av1CodecConfig`; the option enum `StillSpeed`; the encoder output records `EncodedStill`, `EncodedGop`, `EncodedGopYuv`, `GopFrameRecon`, `GopFrameReconYuv`, `EncodedKeyFrame`, `EncodedKeyFrameYuv`, `TemporalLayeredGop`, `TemporalLayeredGopYuv`, `SpatialLayeredGop` and `SpatialLayeredGopYuv`. Code outside the crate builds the option records through their constructors and `with_*` setters and needs a `_ =>` arm when matching `StillSpeed`. `ChromaFormat` (the four AV1 chroma layouts) stays exhaustive; plane containers (`YuvFrame`, `Yuv420Frame`, `SpecFrame`), the §5.12 tile-list syntax records and the `LosslessRegion` rectangle are unchanged.
+
+### Added
+
+- `with_*` setters for every field of `Av1EncoderOptions` (start from `from_params`), `StillOptions` (start from `new` / `from_quality` / `Default`) and `Av1CodecConfig` (start from `from_sequence_header` / `parse`).
+
 ## [0.1.22](https://github.com/OxideAV/oxideav-av1/compare/v0.1.21...v0.1.22) - 2026-11-06
 
 ### Fixed

@@ -136,6 +136,7 @@ use crate::uncompressed_header_tail::FilmGrainParams;
 /// planes are `u16` at the input's bit depth, chroma at the input's
 /// subsampled extent (empty on the monochrome arm).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedKeyFrameYuv {
     /// Complete IVF v0 file (header + one frame record).
     pub ivf_bytes: Vec<u8>,
@@ -156,9 +157,12 @@ pub struct EncodedKeyFrameYuv {
     pub fh: FrameHeader,
 }
 
+impl EncodedKeyFrameYuv {}
+
 /// Result of [`encode_key_frame_yuv420`] /
 /// [`encode_key_frame_yuv420_with_q`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedKeyFrame {
     /// Complete IVF v0 file (header + one frame record).
     pub ivf_bytes: Vec<u8>,
@@ -178,6 +182,8 @@ pub struct EncodedKeyFrame {
     /// The emitted frame header descriptor.
     pub fh: FrameHeader,
 }
+
+impl EncodedKeyFrame {}
 
 /// Per-axis extent bound (inclusive) for [`encode_key_frame_yuv420`]
 /// — r410 raises the r409 `512` cap to `4096` (the RD search works

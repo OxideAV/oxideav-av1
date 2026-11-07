@@ -22,6 +22,7 @@ use crate::sequence_header::SequenceHeader;
 
 /// The `av1C` / `AV1CodecConfigurationRecord` fields (r460).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Av1CodecConfig {
     /// §5.5.1 `seq_profile` (0 Main, 1 High, 2 Professional).
     pub seq_profile: u8,
@@ -51,6 +52,77 @@ pub struct Av1CodecConfig {
     /// recommends leaving this empty for image items (av1-avif
     /// §2.2.1: "Sequence Header OBUs should not be present").
     pub config_obus: Vec<u8>,
+}
+
+impl Av1CodecConfig {
+    /// Set `seq_profile`.
+    pub fn with_seq_profile(mut self, seq_profile: u8) -> Self {
+        self.seq_profile = seq_profile;
+        self
+    }
+
+    /// Set `seq_level_idx`.
+    pub fn with_seq_level_idx(mut self, seq_level_idx: u8) -> Self {
+        self.seq_level_idx = seq_level_idx;
+        self
+    }
+
+    /// Set `seq_tier`.
+    pub fn with_seq_tier(mut self, seq_tier: u8) -> Self {
+        self.seq_tier = seq_tier;
+        self
+    }
+
+    /// Set `high_bitdepth`.
+    pub fn with_high_bitdepth(mut self, high_bitdepth: bool) -> Self {
+        self.high_bitdepth = high_bitdepth;
+        self
+    }
+
+    /// Set `twelve_bit`.
+    pub fn with_twelve_bit(mut self, twelve_bit: bool) -> Self {
+        self.twelve_bit = twelve_bit;
+        self
+    }
+
+    /// Set `monochrome`.
+    pub fn with_monochrome(mut self, monochrome: bool) -> Self {
+        self.monochrome = monochrome;
+        self
+    }
+
+    /// Set `chroma_subsampling_x`.
+    pub fn with_chroma_subsampling_x(mut self, chroma_subsampling_x: bool) -> Self {
+        self.chroma_subsampling_x = chroma_subsampling_x;
+        self
+    }
+
+    /// Set `chroma_subsampling_y`.
+    pub fn with_chroma_subsampling_y(mut self, chroma_subsampling_y: bool) -> Self {
+        self.chroma_subsampling_y = chroma_subsampling_y;
+        self
+    }
+
+    /// Set `chroma_sample_position`.
+    pub fn with_chroma_sample_position(mut self, chroma_sample_position: u8) -> Self {
+        self.chroma_sample_position = chroma_sample_position;
+        self
+    }
+
+    /// Set `initial_presentation_delay_minus_one`.
+    pub fn with_initial_presentation_delay_minus_one(
+        mut self,
+        initial_presentation_delay_minus_one: Option<u8>,
+    ) -> Self {
+        self.initial_presentation_delay_minus_one = initial_presentation_delay_minus_one;
+        self
+    }
+
+    /// Set `config_obus`.
+    pub fn with_config_obus(mut self, config_obus: Vec<u8>) -> Self {
+        self.config_obus = config_obus;
+        self
+    }
 }
 
 impl Av1CodecConfig {

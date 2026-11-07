@@ -537,6 +537,7 @@ fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
 /// sequence header repeated per temporal unit (an all-intra AV1
 /// video every packet of which is a sync sample).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Av1EncoderOptions {
     /// See the schema table.
     pub still: bool,
@@ -561,6 +562,62 @@ pub struct Av1EncoderOptions {
     /// explicit `tile_*_log2` was given; only matters when more than
     /// one thread runs).
     pub auto_tiles: bool,
+}
+
+impl Av1EncoderOptions {
+    /// Set `still`.
+    pub fn with_still(mut self, still: bool) -> Self {
+        self.still = still;
+        self
+    }
+
+    /// Set `base_q_idx`.
+    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
+        self.base_q_idx = base_q_idx;
+        self
+    }
+
+    /// Set `speed`.
+    pub fn with_speed(mut self, speed: StillSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+
+    /// Set `tile_cols_log2`.
+    pub fn with_tile_cols_log2(mut self, tile_cols_log2: u32) -> Self {
+        self.tile_cols_log2 = tile_cols_log2;
+        self
+    }
+
+    /// Set `tile_rows_log2`.
+    pub fn with_tile_rows_log2(mut self, tile_rows_log2: u32) -> Self {
+        self.tile_rows_log2 = tile_rows_log2;
+        self
+    }
+
+    /// Set `full_range`.
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Set `color_description`.
+    pub fn with_color_description(mut self, color_description: Option<(u8, u8, u8)>) -> Self {
+        self.color_description = color_description;
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, threads: Option<usize>) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Set `auto_tiles`.
+    pub fn with_auto_tiles(mut self, auto_tiles: bool) -> Self {
+        self.auto_tiles = auto_tiles;
+        self
+    }
 }
 
 impl Av1EncoderOptions {
