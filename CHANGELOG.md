@@ -4,6 +4,42 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.22](https://github.com/OxideAV/oxideav-av1/compare/v0.1.21...v0.1.22) - 2026-11-06
+
+### Fixed
+
+- fixup for #32: hidden-frame decode errors surface from the session, decode_bench stream mode + fps, CHANGELOG + README
+- fixup for #31: CHANGELOG entry
+- fixup for #30: CHANGELOG entry
+- fixup for #28: rustfmt reflow of the literal-process assert, CHANGELOG entry
+- fixup for #27: drop the i32 -> i32 cast clippy 1.98 rejects, pin the 240 kernel bound in the comment, CHANGELOG entry
+
+### Other
+
+- registry decoder: Frame::StreamParams before the first frame of every new output shape
+- r481 throughput table, best of two on the final tip
+- symbol decoder: direct read_bool
+- frame-parallel decode: syntax walk ahead of the worker turn, turn taken before the payload is stored
+- 10/12-bit output packing sized up front; decode_bench word-wise digest; README r481 throughput table
+- reused transform-block buffers, no residual copies in decode readouts, prediction tasks only for inter-intra
+- four-line lane-parallel edge filter
+- syntax walk: cheaper renormalization checks, inlined CDF update, row-slice BlockDecoded clear
+- decode throughput: width-specialised convolution rows, column-transform reuse, padded coefficient-context levels
+- frame-parallel decode: 8-row in-loop units, projected motion field, row-slice grid fills
+- frame-parallel decode: syntax-first walks, in-loop passes behind the walk, row-granular references
+- decode throughput: unscaled fixed-phase inter convolution, table-driven deblocking
+- registry decoder: output_params + output_params_generation (stream-level output description)
+- decode reference frames on worker threads too
+- decode non-reference frames on worker threads
+- mirror the leaf rect a row slice at a time
+- whole-sample positions use only the centre tap
+- unclamped interior taps, row slices and i32 sums in block_inter_prediction
+- edition 2024, MSRV 1.95
+- r479 still-picture memory — per-stage attribution, the before / after table on 8-bit, 10-bit and 4:4:4 at 1 / 4 / 8 workers, what cannot be windowed and why, the AVIF grid-threshold note
+- per-superblock source scratch for the search (`SbSource`) + stage wall clock in the bench
+- the tile search reads the source through a window (`SourceView`), not a per-tile crop — 12 MP 8-bit 4:2:0 peak RSS 270/294 → 245/257 MiB at 4/8 workers, bytes identical
+- r479 still-picture memory — the resident set is a window, not the picture (12 MP 8-bit 4:2:0 peak RSS 448/563/573 → 221/270/294 MiB at 1/4/8 workers, bytes identical at every budget)
+
 ### Added
 
 - `Frame::StreamParams` (oxideav-core 0.1.43, r482): the registry decoder returns one event immediately before the first frame of every new output shape — a new sequence header changing the layout (bit depth / subsampling / monochrome), colour signal or picture rate, or a new frame size (§5.9.5 `frame_size_override_flag`, §5.9.7 `frame_size_with_refs`, superres on a resized frame, a §7.21 `show_existing_frame` of a slot at another size). The payload equals `output_params()` and `output_params_generation()` has moved when it is returned (one event per bump); the frame it announces is held for the next call. Old-shape frames still in flight come out first at every worker budget and while draining after `flush()`; no event for the first shape, a constant stream or superres alone (the emitted size is the upscaled one); `reset()` drops a held frame and compares the next one against the last announced shape. Pinned on every corpus stream through the registry decoder at 1 / 2 / 3 / 8 workers (`tests/fixture_conformance.rs`: eight streams with size changes, one event per change, frames byte-identical) and on five black-box `aomenc` / `SvtAv1EncApp` resize / superres streams (`tests/stream_params.rs`, `tests/fixtures/stream_params/`; byte-identical to two independent reference decoders, including §7.21 outputs at a new size). Decode throughput unchanged.
