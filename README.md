@@ -2279,6 +2279,30 @@ publishes rows only as its last tile column passes them. The resident
 set grows with the workers (one frame-sized walker and `i32`
 `CurrFrame` per running frame).
 
+#### Threading model at a glance
+
+All three levels are in and run together on one budget: tiles of a
+frame (§5.11 walks in parallel, intra and inter), the in-loop filters
+(deblocking / CDEF / restoration by row band on stills, in 8-row units
+behind the walk on video) and frames (each frame on a worker, waiting
+per inter leaf only for the reference rows its motion vectors reach).
+Threads are plain `std::thread` (no thread-pool dependency); the
+budget is the core `ExecutionContext` (`Decoder::set_execution_context`)
+or `SpecDecodeSession::set_threads`, serial by default, and every
+budget is byte-identical to the serial decode. On targets that cannot
+start a thread (bare WebAssembly) every budget runs serial.
+
+r484, Apple M5 Max (18 cores), release build, one temporal unit per
+packet through the registry decoder (`examples/decode_bench …
+stream=1`), synthetic `testsrc2` content; every output byte-identical
+to `dav1d` (MD5 of all planes) at 16 workers:
+
+| Clip | 1 worker | 2 | 4 | 8 | 16 | Peak RSS 1 / 16 |
+|---|---|---|---|---|---|---|
+| 1080p, 300 frames, SVT-AV1 preset 8, one tile | 75 fps | 139 | 215 | 366 | 504 fps | 146 / 969 MiB |
+| 1080p, 300 frames, libaom `cpu-used 8`, 2×2 tiles | 55 fps | | 129 | 156 | 178 fps | 135 / 1026 MiB |
+| 2160p, 120 frames, SVT-AV1 preset 8 | 21 fps | | | 96 | 134 fps | 464 / 2790 MiB |
+
 ## WebAssembly
 
 The decoder and encoder run on `wasm32-unknown-unknown` (no clock, no
