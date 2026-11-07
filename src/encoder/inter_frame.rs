@@ -119,8 +119,6 @@ pub struct GopFrameRecon {
     pub v: Vec<u8>,
 }
 
-impl GopFrameRecon {}
-
 /// r427 — general-format sibling of [`GopFrameRecon`]: `u16` planes
 /// at the stream's bit depth, chroma at the subsampled extent (empty
 /// on the monochrome arm).
@@ -134,8 +132,6 @@ pub struct GopFrameReconYuv {
     /// Cr plane.
     pub v: Vec<u16>,
 }
-
-impl GopFrameReconYuv {}
 
 /// r427 — result of [`encode_gop_yuv_with_q`]: the general-format
 /// sibling of [`EncodedGop`].
@@ -153,8 +149,6 @@ pub struct EncodedGopYuv {
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
 }
-
-impl EncodedGopYuv {}
 
 /// r427 (hidden) — [`EncodedGopYuv`] plus the per-P-frame election
 /// outcomes: the general-format sibling of [`TunedGop`].
@@ -212,8 +206,6 @@ pub struct EncodedGop {
     /// The emitted sequence header descriptor.
     pub seq: SequenceHeader,
 }
-
-impl EncodedGop {}
 
 /// r423 (hidden) — [`EncodedGop`] plus the per-P-frame §5.9.14
 /// `segmentation_temporal_update` election outcomes (index 0 is the

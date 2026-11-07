@@ -157,8 +157,6 @@ pub struct EncodedKeyFrameYuv {
     pub fh: FrameHeader,
 }
 
-impl EncodedKeyFrameYuv {}
-
 /// Result of [`encode_key_frame_yuv420`] /
 /// [`encode_key_frame_yuv420_with_q`].
 #[derive(Debug, Clone)]
@@ -182,8 +180,6 @@ pub struct EncodedKeyFrame {
     /// The emitted frame header descriptor.
     pub fh: FrameHeader,
 }
-
-impl EncodedKeyFrame {}
 
 /// Per-axis extent bound (inclusive) for [`encode_key_frame_yuv420`]
 /// — r410 raises the r409 `512` cap to `4096` (the RD search works

@@ -90,8 +90,6 @@ pub struct TemporalLayeredGopYuv {
     pub temporal_ids: Vec<u8>,
 }
 
-impl TemporalLayeredGopYuv {}
-
 /// 8-bit 4:2:0 sibling of [`TemporalLayeredGopYuv`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -101,8 +99,6 @@ pub struct TemporalLayeredGop {
     /// §5.3.3 `temporal_id` per display frame.
     pub temporal_ids: Vec<u8>,
 }
-
-impl TemporalLayeredGop {}
 
 /// §5.3.3 `temporal_id` of display position `i` in the dyadic
 /// `layers`-deep ladder (see the module docs).
@@ -493,8 +489,6 @@ pub struct SpatialLayeredGopYuv {
     pub operating_points: Vec<(u8, u8)>,
 }
 
-impl SpatialLayeredGopYuv {}
-
 /// 8-bit 4:2:0 sibling of [`SpatialLayeredGopYuv`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -510,8 +504,6 @@ pub struct SpatialLayeredGop {
     /// The §6.7.5 operating points as `(spatial, temporal)` layer counts.
     pub operating_points: Vec<(u8, u8)>,
 }
-
-impl SpatialLayeredGop {}
 
 /// The §6.7.5 operating-point list for `s_count` INDEPENDENTLY CODED
 /// spatial layers (one temporal layer): entry `k` selects spatial

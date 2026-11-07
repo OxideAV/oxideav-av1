@@ -258,8 +258,6 @@ pub struct EncodedStill {
     pub codec_config: Av1CodecConfig,
 }
 
-impl EncodedStill {}
-
 impl EncodedStill {
     fn from_key(k: EncodedKeyFrameYuv) -> Self {
         let codec_config = Av1CodecConfig::from_sequence_header(&k.seq);
