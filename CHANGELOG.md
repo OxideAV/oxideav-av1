@@ -4,6 +4,15 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.22...v0.2.0) - 2026-11-07
+
+### Other
+
+- threading model at a glance + r484 1080p / 2160p throughput ([#26](https://github.com/OxideAV/oxideav-av1/pull/26))
+- Bare WebAssembly: no clock read, no thread start on wasm32-unknown-unknown ([#33](https://github.com/OxideAV/oxideav-av1/pull/33))
+- Drop the empty impl blocks left by the non_exhaustive pass
+- API hygiene: non_exhaustive option and output records, StillSpeed
+
 ### Fixed
 
 - Bare WebAssembly (`wasm32-unknown-unknown`): the decoder no longer panics on its first frame. The per-stage decode timings (`SpecDecodeSession::last_stage_timings`) read a clock only where the target has one and are zero on that target; every worker budget (decoder `set_threads` / `ExecutionContext`, encoder `threads`) runs serial on WebAssembly targets that cannot start a thread, and the encoder's luma/chroma deblocking split no longer spawns a thread there (it did so even on a serial encode). Output is byte-identical to the native decode/encode. CI gains a `wasm32` job: a library check plus `wasm-probe/`, a decode + encode run under Node whose digest must equal the native one (#33).
