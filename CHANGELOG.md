@@ -4,6 +4,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bare WebAssembly (`wasm32-unknown-unknown`): the decoder no longer panics on its first frame. The per-stage decode timings (`SpecDecodeSession::last_stage_timings`) read a clock only where the target has one and are zero on that target; every worker budget (decoder `set_threads` / `ExecutionContext`, encoder `threads`) runs serial on WebAssembly targets that cannot start a thread, and the encoder's luma/chroma deblocking split no longer spawns a thread there (it did so even on a serial encode). Output is byte-identical to the native decode/encode. CI gains a `wasm32` job: a library check plus `wasm-probe/`, a decode + encode run under Node whose digest must equal the native one (#33).
+
 ### Changed
 
 - `#[non_exhaustive]`: the option records `Av1EncoderOptions`, `StillOptions` and `Av1CodecConfig`; the option enum `StillSpeed`; the encoder output records `EncodedStill`, `EncodedGop`, `EncodedGopYuv`, `GopFrameRecon`, `GopFrameReconYuv`, `EncodedKeyFrame`, `EncodedKeyFrameYuv`, `TemporalLayeredGop`, `TemporalLayeredGopYuv`, `SpatialLayeredGop` and `SpatialLayeredGopYuv`. Code outside the crate builds the option records through their constructors and `with_*` setters and needs a `_ =>` arm when matching `StillSpeed`. `ChromaFormat` (the four AV1 chroma layouts) stays exhaustive; plane containers (`YuvFrame`, `Yuv420Frame`, `SpecFrame`), the §5.12 tile-list syntax records and the `LosslessRegion` rectangle are unchanged.

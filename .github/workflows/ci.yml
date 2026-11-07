@@ -33,3 +33,29 @@ jobs:
       os_matrix: '["windows-latest"]'
       extra_test_args: "--lib"
     secrets: inherit
+  # #33 — bare WebAssembly. `wasm32-unknown-unknown` compiles
+  # `Instant::now()` and `thread::spawn` but traps on them at run time,
+  # so the library check is backed by a run: `wasm-probe/` decodes a
+  # resize + superres stream under a 4-worker budget and encodes a
+  # still under a 4-thread budget, and its digest must equal the
+  # native one (pinned in `wasm-probe/src/lib.rs`, checked natively by
+  # `cargo test` there).
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain + wasm32-unknown-unknown target
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+      - name: Library check (wasm32-unknown-unknown)
+        run: cargo check --target wasm32-unknown-unknown
+      - name: Native digest
+        working-directory: wasm-probe
+        run: cargo test --release
+      - name: Probe build (wasm32-unknown-unknown)
+        working-directory: wasm-probe
+        run: cargo build --release --target wasm32-unknown-unknown
+      - name: Probe run (Node, no imports)
+        working-directory: wasm-probe
+        run: node run.mjs target/wasm32-unknown-unknown/release/oxideav_av1_wasm_probe.wasm

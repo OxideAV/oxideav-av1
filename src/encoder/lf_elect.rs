@@ -538,7 +538,7 @@ pub(crate) fn apply_loop_filter(
             }
         });
     };
-    if g.num_planes > 1 {
+    if g.num_planes > 1 && crate::platform::THREADS_AVAILABLE {
         std::thread::scope(|scope| {
             let h = scope.spawn(|| filter_plane(0, recon_y));
             filter_plane(1, recon_u);
@@ -547,5 +547,9 @@ pub(crate) fn apply_loop_filter(
         });
     } else {
         filter_plane(0, recon_y);
+        if g.num_planes > 1 {
+            filter_plane(1, recon_u);
+            filter_plane(2, recon_v);
+        }
     }
 }

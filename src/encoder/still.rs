@@ -403,7 +403,7 @@ fn encode_intra_yuv(
         StillSpeed::Balanced => crate::encoder::key_frame::SearchLimits::balanced(),
         StillSpeed::Thorough => crate::encoder::key_frame::SearchLimits::default(),
     };
-    search.threads = opts.threads.max(1);
+    search.threads = crate::platform::clamp_threads(opts.threads);
     let extras = KeyExtras {
         tiles,
         delta_q: elections,

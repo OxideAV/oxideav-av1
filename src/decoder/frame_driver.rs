@@ -52,6 +52,7 @@ use crate::frame_header::{
 use crate::inter_pred::get_relative_dist;
 use crate::loop_filter::PlaneBuffer;
 use crate::obu::{ObuIter, ObuType};
+use crate::platform::StageClock;
 use crate::sequence_header::{SequenceHeader, parse_sequence_header};
 use crate::symbol_decoder::SymbolDecoder;
 use crate::uncompressed_header_tail::{
@@ -59,7 +60,7 @@ use crate::uncompressed_header_tail::{
 };
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// r475 — wall time per §7.4 decode stage of the LAST temporal unit
 /// a [`SpecDecodeSession`] decoded (summed over its frames). A
@@ -866,7 +867,7 @@ fn decode_frame_spec_full(
         .tile_info
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    let t0 = Instant::now();
+    let t0 = StageClock::now();
     let tiles = parse_whole_frame_tile_group(ti, tile_group_body, false)?;
     stages.parse += t0.elapsed();
     decode_frame_spec_tiles(seq, fh, &tiles, refs, stages, threads, FrameMode::Full)
@@ -1411,7 +1412,7 @@ fn decode_frame_spec_tiles(
     if pipeline.is_some() {
         walker.ensure_curr_frame_planes(cc.num_planes as usize, sub_x_u8, sub_y_u8);
     }
-    let t_tiles = Instant::now();
+    let t_tiles = StageClock::now();
     // r475 — tile-parallel walk. §5.11 scopes every context, every
     // neighbour availability (`is_inside` is tile-relative), the
     // intra edges, the delta-q / delta-lf / loop-restoration
@@ -1889,7 +1890,7 @@ fn decode_frame_spec_tiles(
     // with both luma levels zero the frame is NOT deblocked at all,
     // even though the §7.14.4 `loop_filter_delta_enabled` ref-delta
     // path could otherwise lift a per-edge strength above zero.
-    let t_deblock = Instant::now();
+    let t_deblock = StageClock::now();
     if let Some(lf) = fh.loop_filter_params.as_ref()
         && lf_active
         && !inloop_done
@@ -1937,7 +1938,7 @@ fn decode_frame_spec_tiles(
     // output (`UpscaledCdefFrame`), so keep the pre-CDEF copy around
     // when restoration is active.
     stages.deblock += t_deblock.elapsed();
-    let t_cdef = Instant::now();
+    let t_cdef = StageClock::now();
     if inloop_done {
         // r481 — every pass already ran behind the walk.
     } else if !superres_active {
@@ -2006,7 +2007,7 @@ fn decode_frame_spec_tiles(
             }
         }
         stages.cdef += t_cdef.elapsed();
-        let t_lr = Instant::now();
+        let t_lr = StageClock::now();
         if lr.uses_lr {
             if threads > 1 {
                 walker.loop_restore_frame_parallel_from_grid(
@@ -2092,7 +2093,7 @@ fn decode_frame_spec_tiles(
         // CDEF output (`plane_bufs` → UpscaledCdefFrame) and the post-
         // deblock copy (`deblocked` → UpscaledCurrFrame), ahead of loop
         // restoration. No-op when `use_superres == 0`.
-        let t_superres = Instant::now();
+        let t_superres = StageClock::now();
         if fs.use_superres && fs.upscaled_width > fs.frame_width {
             let sr_ctx = crate::superres::SuperresFrameContext {
                 use_superres: true,
@@ -2159,7 +2160,7 @@ fn decode_frame_spec_tiles(
         // §7.4 step 5 / §7.17: loop restoration from (UpscaledCurrFrame,
         // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
         // by the tile walk's `read_lr` interleave above.
-        let t_lr = Instant::now();
+        let t_lr = StageClock::now();
         if let Some(mut curr_owned) = deblocked {
             let mut cdef_owned: Vec<Vec<i32>> = plane_bufs.clone();
             let mut curr: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
@@ -2208,7 +2209,7 @@ fn decode_frame_spec_tiles(
     // trim the mi-grid padding down to `UpscaledWidth x FrameHeight`
     // (per-plane subsampled). §7.18.3 film grain then applies to the
     // cropped output planes.
-    let t_ref = Instant::now();
+    let t_ref = StageClock::now();
     for plane in 0..num_planes {
         let (out_w, out_h) = if plane == 0 {
             (fs.upscaled_width, fs.frame_height)
@@ -2285,7 +2286,7 @@ fn decode_frame_spec_tiles(
                 store(plane, b);
             }
             stages.ref_store += t_ref.elapsed();
-            let t_grain = Instant::now();
+            let t_grain = StageClock::now();
             let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
                 bufs.push(PlaneBuffer {
@@ -2304,7 +2305,7 @@ fn decode_frame_spec_tiles(
                 &mut bufs,
             );
             stages.grain += t_grain.elapsed();
-            let t_out = Instant::now();
+            let t_out = StageClock::now();
             let planes: Vec<Vec<u8>> = plane_bufs.into_iter().map(narrow).collect();
             stages.output += t_out.elapsed();
             planes
@@ -2314,7 +2315,7 @@ fn decode_frame_spec_tiles(
             // released as soon as its `u16` store copy and output bytes
             // exist (the peak holds one plane three ways, not all of
             // them).
-            let t_out = Instant::now();
+            let t_out = StageClock::now();
             let mut planes: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
             for (plane, buf) in plane_bufs.into_iter().enumerate() {
                 store(plane, &buf);
@@ -2599,7 +2600,7 @@ impl SpecDecodeSession {
     /// band), byte-identical to the serial decode for any budget.
     /// `0` / `1` = serial.
     pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads.max(1);
+        self.threads = crate::platform::clamp_threads(threads);
     }
 
     /// The worker budget granted through [`Self::set_threads`].
@@ -3095,7 +3096,7 @@ fn decode_temporal_unit_spec(
                     return Err(Error::TileGroupInvalid);
                 }
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                let t_parse = Instant::now();
+                let t_parse = StageClock::now();
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 stages.parse += t_parse.elapsed();
                 check_picture_size(&fh, max_picture_size)?;
@@ -3181,7 +3182,7 @@ fn decode_temporal_unit_spec(
                         .as_ref()
                         .ok_or(Error::PartitionWalkOutOfRange)?;
                 let num_tiles = ti.tile_cols * ti.tile_rows;
-                let t_parse = Instant::now();
+                let t_parse = StageClock::now();
                 let parsed = parse_tile_group_body_with_ti(ti, desc.payload)?;
                 stages.parse += t_parse.elapsed();
                 // §6.10.1: `tg_start` equals the running `TileNum`.
@@ -3218,7 +3219,7 @@ fn decode_temporal_unit_spec(
                 }
                 pending = None;
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                let t_parse = Instant::now();
+                let t_parse = StageClock::now();
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 check_picture_size(&fh, max_picture_size)?;
                 let tg_offset = fh.bits_consumed.div_ceil(8);

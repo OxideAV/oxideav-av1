@@ -866,7 +866,7 @@ pub(crate) fn elect_lr(inp: &LrElectInput<'_>) -> Option<LrPlan> {
             inp.wiener_rounds,
         ))
     };
-    let threads = inp.threads.max(1).min(tasks.len().max(1));
+    let threads = crate::platform::clamp_threads(inp.threads).min(tasks.len().max(1));
     let searched: Vec<Option<UnitSearch>> = if threads <= 1 {
         tasks.iter().map(run).collect()
     } else {

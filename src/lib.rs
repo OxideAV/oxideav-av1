@@ -1548,6 +1548,7 @@ pub mod loop_restoration;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod obu;
+mod platform;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod qmatrix;

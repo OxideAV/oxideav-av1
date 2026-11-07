@@ -2279,6 +2279,16 @@ publishes rows only as its last tile column passes them. The resident
 set grows with the workers (one frame-sized walker and `i32`
 `CurrFrame` per running frame).
 
+## WebAssembly
+
+The decoder and encoder run on `wasm32-unknown-unknown` (no clock, no
+threads): the per-stage decode timings read zero there and every
+worker budget runs serial, with output byte-identical to the native
+build. CI checks the library for that target and runs `wasm-probe/`
+— a resize + superres decode through the registry decoder and a still
+encode, both under a multi-thread budget — under Node, comparing its
+digest with the native one.
+
 ## Module layout
 
 `obu`, `sequence_header`, `frame_header`, `tile_info`,

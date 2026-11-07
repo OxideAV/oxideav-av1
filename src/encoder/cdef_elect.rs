@@ -420,7 +420,7 @@ impl<'a> UnitEngine<'a> {
         units: &[usize],
         f: impl Fn(&Self, usize, &mut Scratch) -> T + Sync,
     ) -> Vec<T> {
-        let threads = self.inp.threads.max(1).min(units.len().max(1));
+        let threads = crate::platform::clamp_threads(self.inp.threads).min(units.len().max(1));
         if threads <= 1 {
             let mut scratch = Scratch::default();
             return units.iter().map(|&k| f(self, k, &mut scratch)).collect();

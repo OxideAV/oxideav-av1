@@ -1,0 +1,35 @@
+# Run-time probe for the bare-WebAssembly target (#33).
+#
+# `wasm32-unknown-unknown` compiles `std::time::Instant::now()` and
+# `std::thread::spawn` but traps on them at run time, so a `cargo
+# check` cannot catch a regression. This package builds a `cdylib`
+# whose one export decodes (through the registry decoder, with a
+# multi-thread budget) and encodes (with a multi-thread budget) a
+# fixture and returns a digest of every output byte; `run.mjs` loads
+# it under Node with no imports and compares the digest with the
+# native one pinned in `src/lib.rs`. CI: the `wasm32` job in
+# `.github/workflows/ci.yml`.
+
+[package]
+name = "oxideav-av1-wasm-probe"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.95"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+oxideav-core = "0.1"
+
+[dependencies.oxideav-av1]
+path = ".."
+
+# Self-contained workspace (same reason as `fuzz/`): the umbrella's
+# `crates/*` member glob must not pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+opt-level = 3

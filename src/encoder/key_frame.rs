@@ -2506,7 +2506,7 @@ fn encode_key_frame_yuv_core(
             sbs: out_sbs,
         })
     };
-    let threads = extras.search.threads.max(1).min(num_tiles as usize);
+    let threads = crate::platform::clamp_threads(extras.search.threads).min(num_tiles as usize);
     crate::encoder::stage_probe::stage("search");
     if threads <= 1 {
         let state = state_opt
@@ -2879,7 +2879,7 @@ fn encode_key_frame_yuv_core(
                 lambda: lambda_for(&recon.qp),
                 max_bits: if cdef_units { 3 } else { 0 },
                 fast: extras.search.cdef_fast,
-                threads: extras.search.threads.max(1),
+                threads: crate::platform::clamp_threads(extras.search.threads),
             })
     {
         let lambda = lambda_for(&recon.qp);
@@ -2977,7 +2977,7 @@ fn encode_key_frame_yuv_core(
                 ssx,
                 ssy,
                 num_planes,
-                extras.search.threads.max(1),
+                crate::platform::clamp_threads(extras.search.threads),
             );
             fh.cdef_params = Some(plan.params);
         }
@@ -3152,7 +3152,7 @@ fn encode_key_frame_yuv_core(
                     disable_cdf_update: fh.disable_cdf_update,
                     use_superres: superres.is_some(),
                     superres_denom: superres.map_or(crate::frame_header::SUPERRES_NUM, |(_, d)| d),
-                    threads: extras.search.threads.max(1),
+                    threads: crate::platform::clamp_threads(extras.search.threads),
                 })
             else {
                 continue;

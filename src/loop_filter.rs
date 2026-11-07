@@ -385,6 +385,7 @@ pub(crate) fn row_windows_mut<'a>(
 /// queue; serial when `threads <= 1`). Each job owns its disjoint
 /// slice of the picture, so the result is the serial result.
 pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    let threads = crate::platform::clamp_threads(threads);
     if threads <= 1 || jobs.len() <= 1 {
         for job in jobs {
             job();
