@@ -712,6 +712,20 @@ pub(crate) fn box_filter(
     box_filter_src(&src, geom, bit_depth, r, eps, pass)
 }
 
+/// §7.17.3 `a2` for `z` in `0..255`: `1` at `z == 0`, else `( ( z <<
+/// SGRPROJ_SGR_BITS ) + ( z / 2 ) ) / ( z + 1 )` — the per-sample
+/// division of the box filter, evaluated once per `z`.
+const SGR_A2_BY_Z: [u16; 255] = {
+    let mut table = [0u16; 255];
+    table[0] = 1;
+    let mut z = 1usize;
+    while z < 255 {
+        table[z] = (((z << SGRPROJ_SGR_BITS) + (z / 2)) / (z + 1)) as u16;
+        z += 1;
+    }
+    table
+};
+
 /// [`box_filter`] from an [`LrSource`].
 pub(crate) fn box_filter_src<S: LrSource>(
     src_view: &S,
@@ -799,6 +813,14 @@ pub(crate) fn box_filter_src<S: LrSource>(
                 col_a[j] += row_a[in_row * aw + j] - row_a[out_row * aw + j];
             }
         }
+        // r487 — the `pass == 0` weights below read `A` / `B` only on
+        // the rows where `( i + dy ) & 1` is set, i.e. the EVEN rows
+        // of these arrays (`ai = i + dy + 1`): the odd rows are never
+        // read, so they are not computed (the sliding sums above
+        // still advance through them).
+        if pass == 0 && ai % 2 == 1 {
+            continue;
+        }
         for aj in 0..aw {
             let a_acc = col_a[aj];
             let b_acc = col_b[aj];
@@ -810,10 +832,13 @@ pub(crate) fn box_filter_src<S: LrSource>(
             // av1-spec p.332 line 18326: z = Round2(p * s, MTABLE_BITS).
             let z = round2_i64(p.saturating_mul(s_div), SGRPROJ_MTABLE_BITS) as i32;
             // av1-spec p.332 lines 18327-18332: piecewise a2.
+            // r487 — by table for `z` in `0..255` (every value a
+            // non-wrapped product reaches); the formula itself only
+            // for a wrapped negative `z`.
             let a2 = if z >= 255 {
                 256
-            } else if z == 0 {
-                1
+            } else if z >= 0 {
+                i32::from(SGR_A2_BY_Z[z as usize])
             } else {
                 ((z << SGRPROJ_SGR_BITS) + (z / 2)) / (z + 1)
             };
@@ -963,38 +988,51 @@ pub(crate) fn wiener_filter_src<S: LrSource>(
         let sy = geom.y as i32 + r as i32 - 3;
         src.source_row(geom.x as i32 - 3, sy, geom, row);
     }
+    if w == 0 || h == 0 {
+        return;
+    }
+    // r487 — both passes accumulate tap by tap across a whole row
+    // (fixed tap count outside, samples inside), so each tap is one
+    // multiply-add over the row with no per-sample branch; the sums
+    // are the §7.17.4 sums in a different order.
     let mut intermediate = vec![0i32; (h + 6) * w];
-    for r in 0..(h + 6) {
-        let wrow = &window[r * sw..(r + 1) * sw];
-        for c in 0..w {
-            let mut s = 0i32;
-            for (t, &hcoef) in hfilter.iter().enumerate() {
-                s += hcoef * wrow[c + t];
+    for (wrow, out) in window
+        .chunks_exact(sw)
+        .zip(intermediate.chunks_exact_mut(w))
+    {
+        for (t, &hcoef) in hfilter.iter().enumerate() {
+            for (o, &sample) in out.iter_mut().zip(&wrow[t..t + w]) {
+                *o += hcoef * sample;
             }
-            let v = round2_i32(s, inter_round0);
-            let clipped = clip3(-offset, limit - offset, v);
-            intermediate[r * w + c] = clipped;
+        }
+        for o in out.iter_mut() {
+            *o = clip3(-offset, limit - offset, round2_i32(*o, inter_round0));
         }
     }
-    // av1-spec p.334 lines 18476-18484: vertical pass writes
-    // `LrFrame[plane][y + r][x + c]`.
     let max_sample = (1i32 << bit_depth) - 1;
     let lr_cols = lr.cols as i32;
     let lr_rows = lr.rows as i32;
+    // The output columns that land inside `lr`.
+    let x0 = geom.x as i32;
+    let c_lo = (-x0).clamp(0, w as i32) as usize;
+    let c_hi = (lr_cols - x0).clamp(c_lo as i32, w as i32) as usize;
+    let mut acc = vec![0i32; w];
     for r in 0..h {
-        for c in 0..w {
-            let mut s = 0i32;
-            for (t, &vcoef) in vfilter.iter().enumerate() {
-                s += vcoef * intermediate[(r + t) * w + c];
+        let dst_y = geom.y as i32 + r as i32 - out_row0;
+        if dst_y < 0 || dst_y >= lr_rows || c_lo == c_hi {
+            continue;
+        }
+        acc.fill(0);
+        for (t, &vcoef) in vfilter.iter().enumerate() {
+            let row = &intermediate[(r + t) * w..(r + t + 1) * w];
+            for (a, &sample) in acc.iter_mut().zip(row) {
+                *a += vcoef * sample;
             }
-            let v = round2_i32(s, inter_round1);
-            let out = clip3(0, max_sample, v);
-            let dst_y = geom.y as i32 + r as i32 - out_row0;
-            let dst_x = geom.x as i32 + c as i32;
-            if dst_y < 0 || dst_y >= lr_rows || dst_x < 0 || dst_x >= lr_cols {
-                continue;
-            }
-            lr.samples[(dst_y as usize) * (lr.cols as usize) + dst_x as usize] = out;
+        }
+        let d0 = (dst_y as usize) * (lr.cols as usize) + (x0 + c_lo as i32) as usize;
+        let dst = &mut lr.samples[d0..d0 + (c_hi - c_lo)];
+        for (d, &a) in dst.iter_mut().zip(&acc[c_lo..c_hi]) {
+            *d = clip3(0, max_sample, round2_i32(a, inter_round1));
         }
     }
 }

@@ -943,6 +943,10 @@ fn convolve_row_w<const W: usize>(k: &[i32; 8], src: &[u16], out: &mut [i32], sh
     let src = &src[..W + 7];
     let mut acc = [1i32 << (shift - 1); W];
     for (t, &kt) in k.iter().enumerate() {
+        // The six- and four-tap filter sets carry zero outer taps.
+        if kt == 0 {
+            continue;
+        }
         for (a, &s) in acc.iter_mut().zip(&src[t..t + W]) {
             *a += kt * i32::from(s);
         }

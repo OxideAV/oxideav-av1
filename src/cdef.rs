@@ -635,40 +635,68 @@ pub(crate) fn cdef_direction_src(
 ) -> (i32, i32) {
     // av1-spec p.321 lines 17747-17751: zero-init `partial[8][15]` and
     // `cost[8]`.
-    let mut partial = [[0i32; 15]; 8];
     let mut cost = [0i32; 8];
     let x0 = (c as i32) << MI_SIZE_LOG2;
     let y0 = (r as i32) << MI_SIZE_LOG2;
     let shift = ctx.bit_depth as i32 - 8;
-    // av1-spec p.321 lines 17756-17768: per-pixel projection-sum
-    // accumulator across the 8×8 luma block.
     let inside = x0 >= 0
         && y0 >= 0
         && x0 + 8 <= plane0.plane_cols as i32
         && y0 + 8 <= plane0.plane_rows as i32;
-    for i in 0..8i32 {
-        for j in 0..8i32 {
-            // r475 — the clamps are the identity for an interior block.
-            let raw = if inside {
-                plane0.at((y0 + i) as usize, (x0 + j) as usize)
-            } else {
-                let sx = (x0 + j).clamp(0, plane0.plane_cols as i32 - 1) as usize;
-                let sy = (y0 + i).clamp(0, plane0.plane_rows as i32 - 1) as usize;
-                plane0.at(sy, sx)
-            };
-            let x = (raw >> shift) - 128;
-            partial[0][(i + j) as usize] += x;
-            partial[1][(i + j / 2) as usize] += x;
-            partial[2][i as usize] += x;
-            partial[3][(3 + i - j / 2) as usize] += x;
-            partial[4][(7 + i - j) as usize] += x;
-            partial[5][(3 - i / 2 + j) as usize] += x;
-            partial[6][j as usize] += x;
-            partial[7][(i / 2 + j) as usize] += x;
+    // r487 — the block is read once into `x = ( CurrFrame >> ( BitDepth
+    // - 8 ) ) - 128` rows (8-bit-range values, so 16-bit lanes), and
+    // each `partial[ d ][ .. ]` accumulation of §7.15.2 becomes the
+    // addition of a fixed-width run at a row-dependent offset:
+    //   partial[ 0 ][ i + j ]          — the row at offset `i`
+    //   partial[ 4 ][ 7 + i - j ]      — the reversed row at offset `i`
+    //   partial[ 1 ][ i + j / 2 ]      — the pair sums at offset `i`
+    //   partial[ 3 ][ 3 + i - j / 2 ]  — the reversed pair sums at `i`
+    //   partial[ 5 ][ 3 - i / 2 + j ]  — the row at offset `3 - i / 2`
+    //   partial[ 7 ][ i / 2 + j ]      — the row at offset `i / 2`
+    //   partial[ 2 ][ i ]              — the row total
+    //   partial[ 6 ][ j ]              — the row, at offset 0
+    // The sums are the spec's sums in a different order.
+    let mut acc = [[0i16; 16]; 8];
+    #[inline(always)]
+    fn add_run<const N: usize>(dst: &mut [i16; 16], at: usize, run: &[i16; N]) {
+        let d: &mut [i16; N] = (&mut dst[at..at + N]).try_into().expect("run fits");
+        for j in 0..N {
+            d[j] += run[j];
         }
     }
-    // av1-spec p.322 lines 17769-17774: directions 2 (vertical) and 6
-    // (horizontal) — sum of squares, normalised by Div_Table[8].
+    for i in 0..8usize {
+        let mut row = [0i16; 8];
+        if inside {
+            let base = (y0 as usize + i - plane0.row0) * plane0.cols + x0 as usize;
+            let run: &[i32; 8] = plane0.samples[base..base + 8]
+                .try_into()
+                .expect("8-wide run");
+            for j in 0..8 {
+                row[j] = ((run[j] >> shift) - 128) as i16;
+            }
+        } else {
+            for (j, slot) in row.iter_mut().enumerate() {
+                let sx = (x0 + j as i32).clamp(0, plane0.plane_cols as i32 - 1) as usize;
+                let sy = (y0 + i as i32).clamp(0, plane0.plane_rows as i32 - 1) as usize;
+                *slot = ((plane0.at(sy, sx) >> shift) - 128) as i16;
+            }
+        }
+        let mut reversed = row;
+        reversed.reverse();
+        let pairs: [i16; 4] = core::array::from_fn(|k| row[2 * k] + row[2 * k + 1]);
+        let mut pairs_reversed = pairs;
+        pairs_reversed.reverse();
+        add_run(&mut acc[0], i, &row);
+        add_run(&mut acc[4], i, &reversed);
+        add_run(&mut acc[1], i, &pairs);
+        add_run(&mut acc[3], i, &pairs_reversed);
+        add_run(&mut acc[5], 3 - i / 2, &row);
+        add_run(&mut acc[7], i / 2, &row);
+        add_run(&mut acc[6], 0, &row);
+        acc[2][i] = row.iter().sum();
+    }
+    let partial: [[i32; 15]; 8] =
+        core::array::from_fn(|d| core::array::from_fn(|k| i32::from(acc[d][k])));
     for &v in &partial[2][..8] {
         cost[2] += v * v;
     }
@@ -953,33 +981,47 @@ fn cdef_filter_rows<const W: usize>(
     (y0, x0, h, src_cols, dst_cols): (usize, usize, usize, usize, usize),
     taps: &[CdefTap; 12],
 ) {
+    // r487 — 16-bit lanes. Every quantity of the §7.15.3 sample
+    // process fits: samples are below `1 << BitDepth` (at most 4095),
+    // a difference is within ±4095, a `constrain` result is bounded
+    // by its strength (at most `15 << 4` primary, `4 << 4`
+    // secondary), and the twelve weighted terms sum to at most
+    // `12 * 240 + 12 * 64 = 3648` in magnitude. The eight samples of
+    // a row are one 128-bit vector instead of two.
+    #[inline(always)]
+    fn narrow<const W: usize>(run: &[i32]) -> [i16; W] {
+        let run: &[i32; W] = run.try_into().expect("W-wide run");
+        core::array::from_fn(|j| run[j] as i16)
+    }
     for i in 0..h {
         let row0 = (y0 + i) * src_cols + x0;
-        let centre: [i32; W] = src[row0..row0 + W].try_into().expect("W-wide run");
+        let centre: [i16; W] = narrow(&src[row0..row0 + W]);
         let drow = i * dst_cols + x0;
-        let mut sum = [0i32; W];
+        let mut sum = [0i16; W];
         let mut max_v = centre;
         let mut min_v = centre;
         for tap in taps {
             let start = (row0 as isize + tap.offset) as usize;
-            let tap_row: [i32; W] = src[start..start + W].try_into().expect("W-wide run");
-            let (weight, strength, adj) = (tap.weight, tap.strength, tap.adj);
+            let tap_row: [i16; W] = narrow(&src[start..start + W]);
+            let (weight, strength) = (tap.weight as i16, tap.strength as i16);
+            // A shift of 15 already clears every 12-bit magnitude.
+            let adj = tap.adj.min(15);
             for j in 0..W {
                 let p_val = tap_row[j];
-                let diff = p_val - centre[j];
-                let abs_diff = diff.abs();
-                let v = abs_diff.min((strength - (abs_diff >> adj)).max(0));
-                let sgn = diff >> 31;
-                sum[j] += weight * ((v ^ sgn) - sgn);
+                let diff = p_val.wrapping_sub(centre[j]);
+                let abs_diff = diff.wrapping_abs();
+                let v = abs_diff.min(strength.wrapping_sub(abs_diff >> adj).max(0));
+                let sgn = diff >> 15;
+                sum[j] = sum[j].wrapping_add(weight.wrapping_mul((v ^ sgn).wrapping_sub(sgn)));
                 max_v[j] = max_v[j].max(p_val);
                 min_v[j] = min_v[j].min(p_val);
             }
         }
-        let out_row = &mut dst[drow..drow + W];
+        let out_row: &mut [i32; W] = (&mut dst[drow..drow + W]).try_into().expect("W-wide run");
         for j in 0..W {
             let s = sum[j];
-            let delta = (8 + s - i32::from(s < 0)) >> 4;
-            out_row[j] = clip3(min_v[j], max_v[j], centre[j] + delta);
+            let delta = (8 + s + (s >> 15)) >> 4;
+            out_row[j] = i32::from((centre[j] + delta).max(min_v[j]).min(max_v[j]));
         }
     }
 }
@@ -1062,6 +1104,227 @@ mod tests {
             cdef_uv_pri_strength: [0; CDEF_MAX_STRENGTHS],
             cdef_uv_sec_strength: [0; CDEF_MAX_STRENGTHS],
             short_circuited: false,
+        }
+    }
+
+    /// Deterministic sample source for the kernel equivalence tests.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// r487 — the lane-wise interior filter rows against the §7.15.3
+    /// sample process written out per sample with [`constrain`]: every
+    /// direction, both tap parities, 8 / 10 / 12-bit strengths and
+    /// dampings, luma (8×8) and 4:2:0 chroma (4×4) blocks, on noise
+    /// spanning the whole sample range.
+    #[test]
+    fn interior_filter_rows_match_the_per_sample_process() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        for bit_depth in [8u8, 10, 12] {
+            let shift = i32::from(bit_depth) - 8;
+            let max = (1i32 << bit_depth) - 1;
+            for (plane, sub) in [(0u8, 0u8), (1, 1)] {
+                let (rows, cols) = (32u32 >> sub, 32u32 >> sub);
+                for trial in 0..160u32 {
+                    let mut s: Vec<i32> = (0..rows * cols)
+                        .map(|_| {
+                            let v = xorshift(&mut state);
+                            // Mix of full-range noise and gentle texture.
+                            if trial % 2 == 0 {
+                                (v % (max as u64 + 1)) as i32
+                            } else {
+                                (max / 2 + (v % 64) as i32 - 32).clamp(0, max)
+                            }
+                        })
+                        .collect();
+                    let mut d = s.clone();
+                    let pri_str = ((xorshift(&mut state) % 16) as i32) << shift;
+                    let sec_raw = (xorshift(&mut state) % 4) as i32;
+                    let sec_str = (if sec_raw == 3 { 4 } else { sec_raw }) << shift;
+                    let damping = 3 + (xorshift(&mut state) % 4) as i32 + shift;
+                    let dir = (xorshift(&mut state) % 8) as i32;
+                    let params = make_params(3);
+                    let ctx = CdefFrameContext {
+                        mi_rows: 8,
+                        mi_cols: 8,
+                        num_planes: 3,
+                        bit_depth,
+                        subsampling_x: sub,
+                        subsampling_y: sub,
+                        cdef_params: &params,
+                        cdef_idx: &|_, _| 0,
+                        skip: &|_, _| false,
+                    };
+                    // Block (r, c) = (2, 2): interior on every plane.
+                    let (r, c) = (2u32, 2u32);
+                    let src_buf = PlaneBuffer {
+                        rows,
+                        cols,
+                        samples: &mut s,
+                    };
+                    let mut dst_buf = PlaneBuffer {
+                        rows,
+                        cols,
+                        samples: &mut d,
+                    };
+                    let src = CdefSrc::of(&src_buf);
+                    cdef_filter_block_src(
+                        &ctx,
+                        &src,
+                        &mut dst_buf,
+                        0,
+                        plane,
+                        r,
+                        c,
+                        pri_str,
+                        sec_str,
+                        damping,
+                        dir,
+                    );
+                    if pri_str == 0 && sec_str == 0 {
+                        continue;
+                    }
+                    let (x0, y0) = ((c * 4) >> sub, (r * 4) >> sub);
+                    let n = 8u32 >> sub;
+                    let coeff_shift = shift;
+                    let pri_row = ((pri_str >> coeff_shift) & 1) as usize;
+                    let at = |y: i32, x: i32| src.samples[(y as u32 * cols) as usize + x as usize];
+                    for i in 0..n as i32 {
+                        for j in 0..n as i32 {
+                            let (py, px) = (y0 as i32 + i, x0 as i32 + j);
+                            let x = at(py, px);
+                            let (mut sum, mut lo, mut hi) = (0i32, x, x);
+                            for k in 0..2usize {
+                                for sign in [-1i32, 1] {
+                                    let dp = CDEF_DIRECTIONS[(dir & 7) as usize][k];
+                                    let p = at(py + sign * dp[0], px + sign * dp[1]);
+                                    sum += CDEF_PRI_TAPS[pri_row][k]
+                                        * constrain(p - x, pri_str, damping);
+                                    lo = lo.min(p);
+                                    hi = hi.max(p);
+                                    for d2 in [(dir - 2) & 7, (dir + 2) & 7] {
+                                        let ds = CDEF_DIRECTIONS[d2 as usize][k];
+                                        let q = at(py + sign * ds[0], px + sign * ds[1]);
+                                        sum += CDEF_SEC_TAPS[pri_row][k]
+                                            * constrain(q - x, sec_str, damping);
+                                        lo = lo.min(q);
+                                        hi = hi.max(q);
+                                    }
+                                }
+                            }
+                            let want = clip3(lo, hi, x + ((8 + sum - i32::from(sum < 0)) >> 4));
+                            assert_eq!(
+                                dst_buf.samples[(py as u32 * cols) as usize + px as usize],
+                                want,
+                                "bd={bit_depth} plane={plane} trial={trial} ({i},{j}) \
+                                 pri={pri_str} sec={sec_str} damping={damping} dir={dir}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// r487 — the run-wise direction search against the §7.15.2
+    /// `partial[ ][ ]` accumulation written out per sample.
+    #[test]
+    fn direction_search_matches_the_per_sample_accumulation() {
+        let mut state = 0x0F0F_1234_ABCD_9876u64;
+        for bit_depth in [8u8, 10, 12] {
+            let shift = i32::from(bit_depth) - 8;
+            let max = (1u64 << bit_depth) - 1;
+            for trial in 0..300u32 {
+                let mut s: Vec<i32> = (0..24 * 24)
+                    .map(|k| {
+                        let v = xorshift(&mut state);
+                        match trial % 3 {
+                            0 => (v % (max + 1)) as i32,
+                            // Oriented stripes plus noise.
+                            1 => {
+                                ((((k % 24) * (1 + trial as usize % 5) + (k / 24) * 3) as u64 * 37
+                                    + v % 8)
+                                    % (max + 1)) as i32
+                            }
+                            _ => ((max / 2) as i32 + (v % 16) as i32 - 8).max(0),
+                        }
+                    })
+                    .collect();
+                let params = make_params(3);
+                let ctx = CdefFrameContext {
+                    mi_rows: 6,
+                    mi_cols: 6,
+                    num_planes: 1,
+                    bit_depth,
+                    subsampling_x: 0,
+                    subsampling_y: 0,
+                    cdef_params: &params,
+                    cdef_idx: &|_, _| 0,
+                    skip: &|_, _| false,
+                };
+                let buf = PlaneBuffer {
+                    rows: 24,
+                    cols: 24,
+                    samples: &mut s,
+                };
+                for (r, c) in [(0u32, 0u32), (2, 2), (4, 4), (0, 4)] {
+                    let got = cdef_direction(&ctx, std::slice::from_ref(&buf), r, c);
+                    let mut partial = [[0i32; 15]; 8];
+                    for i in 0..8usize {
+                        for j in 0..8usize {
+                            let x = (buf.samples[(r as usize * 4 + i) * 24 + c as usize * 4 + j]
+                                >> shift)
+                                - 128;
+                            partial[0][i + j] += x;
+                            partial[1][i + j / 2] += x;
+                            partial[2][i] += x;
+                            partial[3][3 + i - j / 2] += x;
+                            partial[4][7 + i - j] += x;
+                            partial[5][3 - i / 2 + j] += x;
+                            partial[6][j] += x;
+                            partial[7][i / 2 + j] += x;
+                        }
+                    }
+                    let mut cost = [0i32; 8];
+                    cost[2] = partial[2][..8].iter().map(|v| v * v).sum();
+                    cost[6] = partial[6][..8].iter().map(|v| v * v).sum();
+                    cost[2] *= DIV_TABLE[8];
+                    cost[6] *= DIV_TABLE[8];
+                    for i in 0..7 {
+                        cost[0] += (partial[0][i] * partial[0][i]
+                            + partial[0][14 - i] * partial[0][14 - i])
+                            * DIV_TABLE[i + 1];
+                        cost[4] += (partial[4][i] * partial[4][i]
+                            + partial[4][14 - i] * partial[4][14 - i])
+                            * DIV_TABLE[i + 1];
+                    }
+                    cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8];
+                    cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8];
+                    for d in [1usize, 3, 5, 7] {
+                        for j in 0..5 {
+                            cost[d] += partial[d][3 + j] * partial[d][3 + j];
+                        }
+                        cost[d] *= DIV_TABLE[8];
+                        for j in 0..3 {
+                            cost[d] += (partial[d][j] * partial[d][j]
+                                + partial[d][10 - j] * partial[d][10 - j])
+                                * DIV_TABLE[2 * j + 2];
+                        }
+                    }
+                    let (mut best, mut y_dir) = (0i32, 0i32);
+                    for (d, &v) in cost.iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            y_dir = d as i32;
+                        }
+                    }
+                    let var = (best - cost[((y_dir + 4) & 7) as usize]) >> 10;
+                    assert_eq!(got, (y_dir, var), "bd={bit_depth} trial={trial} ({r},{c})");
+                }
+            }
         }
     }
 
