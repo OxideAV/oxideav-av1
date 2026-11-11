@@ -2318,6 +2318,127 @@ to `dav1d` (MD5 of all planes) at 16 workers:
 | 1080p, 300 frames, libaom `cpu-used 8`, 2×2 tiles | 55 fps | | 129 | 156 | 178 fps | 135 / 1026 MiB |
 | 2160p, 120 frames, SVT-AV1 preset 8 | 21 fps | | | 96 | 134 fps | 464 / 2790 MiB |
 
+#### Entropy coding and kernel throughput (r487)
+
+Byte-identical work only: every coded byte of the encoder and every
+decoded sample equal 0.1.23 (the digests of each row below agree
+before and after; the conformance corpus pins are unchanged).
+
+What changed, each derived from the spec's process description:
+
+- **§8.2 symbol decoder** — `SymbolValue` and the unread partition
+  bits share one 64-bit register. §8.2.6 step 6, `SymbolValue =
+  paddedData ^ ( ( ( SymbolValue + 1 ) << bits ) - 1 )`, is `(
+  SymbolValue << bits ) | ~paddedData` over the low `bits` bits, so
+  with the partition bits held inverted beneath the value a
+  renormalisation is one shift, the search compares the top 16 bits and
+  `SymbolValue -= cur` subtracts `cur << 48`; the register refills up
+  to seven bytes at a time. CDFs of length 3 / 4 / 5 (the coefficient
+  alphabets) are read at a compile-time length: `cur` strictly
+  decreases with the candidate index, so the search COUNTS the
+  candidates above `SymbolValue` instead of branching, and the §8.3
+  adaptation is a fixed-length select between its two arms.
+- **Symbol writer** — `low` is a byte vector plus a 64-bit window with
+  carry propagation (the earlier form kept one `bool` per bit and
+  rippled every offset through it).
+- **§5.11.39 coefficients** — the writer keeps the running levels in
+  the decoder's padded `u8` layout, so the §8.3.2 neighbour sums need
+  no in-block test and one `coeff_br` context serves a coefficient.
+- **§7.13.2.3 inverse DCT** — the butterfly schedule is recorded once
+  per size and replayed over eight rows, then eight columns, at a time
+  in fixed-width lanes. A magnitude bound propagated through the
+  recorded schedule gives the largest input for which nothing can
+  leave 32 bits; groups under it run in 32-bit lanes, the rest in
+  64-bit lanes, both computing the same integers.
+- **Forward DCT** — the inverse transform's response matrix has
+  mirror-symmetric even columns (equal, on their first half, to the
+  half-size matrix) and antisymmetric odd ones, so the transpose inner
+  products fold: a third of the multiplies at 64 points, the same
+  exact sums.
+- **§7.15 CDEF** — interior filter rows and the direction search in
+  16-bit lanes (every quantity of the sample process fits).
+- **§7.17 restoration** — Wiener passes tap by tap across a row; the
+  self-guided `a2` from a table, the never-read `A` / `B` rows of the
+  first pass not computed.
+- **§5.11.50 palette context** — resolved once per neighbour triple
+  (729 entries) and looked up.
+- Residual merge and intra prediction store row slices and allocate
+  nothing per block.
+
+Each rewrite is pinned by a test against the form it replaces (the
+bit-serial writer, the scalar transform kernels, the dense forward
+inner products, the per-sample CDEF process, the literal palette
+process over every neighbour triple).
+
+One 4032×3024 (12 MP) photograph, `speed = fast` (the default and the
+fastest preset), `base_q_idx = 120` (the default) and `0` (lossless),
+release build, Apple M5 Max. The host was shared with other builds
+for the whole measurement (load average 35–40 on 18 cores), so the
+absolute figures are pessimistic and noisy; "before" (0.1.23) and
+"after" ran interleaved and the table gives the best of 3 (encode) or
+5 (decode) runs of each. The ratio is the robust figure. Decode is
+through the registry decoder on the 8-tile streams the 8-thread
+encodes produced; peak RSS is the whole process (`/usr/bin/time -l`,
+the encoder's includes 52 MiB of source the harness holds).
+
+| Operation | Workers | Wall before → after | Ratio | Peak RSS before → after |
+|---|---|---|---|---|
+| Encode, 8-bit lossy | 1 | 14.62 → 10.69 s | 1.37× | 238 → 234 MiB |
+| | 8 | 3.53 → 2.65 s | 1.33× | 321 → 320 MiB |
+| Encode, 8-bit lossless | 1 | 2.65 → 1.63 s | 1.63× | 388 → 334 MiB |
+| | 8 | 0.84 → 0.73 s | 1.16× | 463 → 407 MiB |
+| Encode, 10-bit lossy | 1 | 5.94 → 4.91 s | 1.21× | 191 → 181 MiB |
+| | 8 | 2.37 → 2.12 s | 1.12× | 254 → 253 MiB |
+| Encode, 10-bit lossless | 1 | 8.03 → 3.85 s | 2.09× | 418 → 325 MiB |
+| | 8 | 1.49 → 1.01 s | 1.47× | 498 → 391 MiB |
+| Decode, 8-bit lossy | 1 | 0.326 → 0.244 s | 1.34× | 171 → 176 MiB |
+| | 8 | 0.089 → 0.075 s | 1.19× | 296 → 296 MiB |
+| Decode, 8-bit lossless | 1 | 0.992 → 0.760 s | 1.31× | 196 → 196 MiB |
+| | 8 | 0.218 → 0.116 s | 1.88× | 303 → 295 MiB |
+| Decode, 10-bit lossy | 1 | 0.354 → 0.270 s | 1.31× | 158 → 156 MiB |
+| | 8 | 0.093 → 0.080 s | 1.16× | 249 → 243 MiB |
+| Decode, 10-bit lossless | 1 | 1.347 → 1.066 s | 1.26× | 195 → 194 MiB |
+| | 8 | 0.447 → 0.208 s | 2.15× | 295 → 281 MiB |
+
+1080p 8-bit 4:2:0 inter decode, one temporal unit per packet through
+the registry decoder (`examples/decode_bench … stream=1`), synthetic
+`testsrc2` content, same host and method (best of 4):
+
+| Clip | Workers | Before → after | Ratio | Peak RSS before → after |
+|---|---|---|---|---|
+| 300 frames, one tile, hierarchical groups (third-party encoder A) | 1 | 67.9 → 93.6 fps | 1.38× | 165 → 165 MiB |
+| | 8 | 339 → 430 fps | 1.27× | 599 → 578 MiB |
+| 120 frames, 2×2 tiles (third-party encoder B) | 1 | 46.6 → 52.1 fps | 1.12× | 146 → 139 MiB |
+| | 8 | 107 → 118 fps | 1.10× | 467 → 481 MiB |
+
+Where the remaining time goes (sampled, one worker):
+
+- **Lossless decode** — still the §5.11.39 walk: the coefficient loop
+  itself 25 % (scan and level bookkeeping, two passes per 4×4 block),
+  symbol reads and renormalisation 30 %, the §8.3.2 base context 8 %,
+  WHT + dequantisation 15 %, intra prediction 5 %.
+- **Lossy decode** — CDEF 30 % (the filter rows narrow each `i32`
+  sample run to 16 bits before they can use the lanes), deblocking
+  17 % (the per-edge table walk more than the filters), inverse
+  transforms 11 %, restoration 4 %, coefficients + symbols 10 %.
+- **Lossy 8-bit encode** — no single kernel any more: symbol pricing
+  14 % (the counting writer, its CDF adaptation and the palette
+  colour-map pricing — every palette candidate is priced by writing
+  its whole map, a search-side cost; 10-bit pictures, where the
+  palette election is closed, encode twice as fast), intra prediction
+  and mode screening 15 %, the restoration election 10 %, forward
+  transforms 9 %, price-scope snapshots 5 %, the CDEF election 4 %.
+- **Lossless encode** — the coefficient writer 21 %, symbol writes
+  21 %, directional intra prediction 8 %, per-block allocation 6 %.
+- **1080p inter decode** — the §7.11.3.4 convolution 15 %, inverse
+  transforms 7 %, CDEF 9 %, coefficients + symbols 20 %.
+
+Still open: `CurrFrame` and the in-loop kernels work on `i32` samples
+(`PlaneBuffer<i32>`); 8-bit / 16-bit sample planes would halve or
+quarter the resident frame set and let the CDEF, deblocking and
+convolution lanes load samples without narrowing — the largest
+remaining kernel win, and a change that touches every stage.
+
 ## WebAssembly
 
 The decoder and encoder run on `wasm32-unknown-unknown` (no clock, no
