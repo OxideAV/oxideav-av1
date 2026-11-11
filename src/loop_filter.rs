@@ -855,10 +855,12 @@ pub fn loop_filter_rows_window_table(
             let x_p = (x >> sub_x) as i32;
             let tx_sz = tx_row[(scol >> sub_x) as usize] as usize;
             // §7.14.2 isTxEdge.
+            // Transform sides are powers of two: the multiple test is
+            // a mask (no division per 4×4 column).
             let is_tx_edge = if pass == 0 {
-                (x_p as usize).is_multiple_of(crate::cdf::TX_WIDTH[tx_sz])
+                (x_p as usize) & (crate::cdf::TX_WIDTH[tx_sz] - 1) == 0
             } else {
-                (y_p as usize).is_multiple_of(crate::cdf::TX_HEIGHT[tx_sz])
+                (y_p as usize) & (crate::cdf::TX_HEIGHT[tx_sz] - 1) == 0
             };
             if !is_tx_edge {
                 continue;

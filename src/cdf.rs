@@ -2887,7 +2887,178 @@ pub fn predict_intra_directional(
     if pred.len() < h.saturating_mul(w) {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    if !(0..360).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
+    // §7.11.2.4 defines the process for `0 < pAngle < 270` (the
+    // derivative table is indexed by `270 - pAngle` on the last arm).
+    if !(0..270).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.4 step 5: `dx`.
+    let dx: i32 = if p_angle < 90 {
+        DR_INTRA_DERIVATIVE[p_angle as usize] as i32
+    } else if p_angle < 180 {
+        DR_INTRA_DERIVATIVE[(180 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-9 path.
+    };
+    // §7.11.2.4 step 6: `dy`.
+    let dy: i32 = if (90..180).contains(&p_angle) {
+        DR_INTRA_DERIVATIVE[(p_angle - 90) as usize] as i32
+    } else if p_angle > 180 {
+        DR_INTRA_DERIVATIVE[(270 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-7 path.
+    };
+
+    // r487 — the §7.11.2.4 per-sample formulas regrouped into runs.
+    // `base` advances by `1 << upsample` per sample along a row (zone
+    // 1, and the above-referencing part of zone 2) or along a column
+    // (zone 3), and `shift` is constant along it, so each row / column
+    // is one blend `Round2( a[ k ] * ( 32 - shift ) + a[ k + 1 ] *
+    // shift, 5 )` over a run of the edge, with no per-sample test.
+    // The edge arrays arrive with two leading cells (`AboveRow[ k ]`
+    // is `above_row[ k + 2 ]`); a read outside them is the same error
+    // the per-sample form reports.
+    let out_of_range = || crate::Error::PartitionWalkOutOfRange;
+    #[inline(always)]
+    fn blend(a0: u16, a1: u16, shift: u32) -> u16 {
+        ((u32::from(a0) * (32 - shift) + u32::from(a1) * shift + 16) >> 5) as u16
+    }
+    // One run along an edge: `out[ n ] = blend( edge[ start + n * step
+    // ], edge[ start + n * step + 1 ] )`; the caller has checked that
+    // `start + ( out.len() - 1 ) * step + 1` is inside `edge`.
+    #[inline(always)]
+    fn blend_run(edge: &[u16], start: usize, step: usize, shift: u32, out: &mut [u16]) {
+        if step == 1 {
+            let src = &edge[start..start + out.len() + 1];
+            for (n, o) in out.iter_mut().enumerate() {
+                *o = blend(src[n], src[n + 1], shift);
+            }
+        } else {
+            for (n, o) in out.iter_mut().enumerate() {
+                *o = blend(edge[start + n * step], edge[start + n * step + 1], shift);
+            }
+        }
+    }
+    // Zone 1 / zone 3 line `line` (a row / a column): `len` samples
+    // from `edge` under derivative `d`, the tail past `maxBase` taking
+    // `edge[ maxBase ]`.
+    let single_edge_line = |edge: &[u16],
+                            upsample: u8,
+                            d: i32,
+                            line: usize,
+                            out: &mut [u16]|
+     -> Result<(), crate::Error> {
+        let up = u32::from(upsample);
+        let step = 1usize << up;
+        let max_base = (w + h - 1) << up;
+        let idx = (line as i32 + 1) * d;
+        let base0 = (idx >> (6 - up)) as usize;
+        let shift = (((idx << up) >> 1) & 0x1F) as u32;
+        let len = out.len();
+        let blended = if base0 >= max_base {
+            0
+        } else {
+            (max_base - base0).div_ceil(step).min(len)
+        };
+        if blended > 0 {
+            if base0 + 2 + (blended - 1) * step + 1 >= edge.len() {
+                return Err(out_of_range());
+            }
+            blend_run(edge, base0 + 2, step, shift, &mut out[..blended]);
+        }
+        if blended < len {
+            let fill = *edge.get(max_base + 2).ok_or_else(out_of_range)?;
+            out[blended..].fill(fill);
+        }
+        Ok(())
+    };
+
+    if p_angle < 90 {
+        // §7.11.2.4 step 7: every row from the above edge.
+        for (i, row) in pred[..h * w].chunks_exact_mut(w).enumerate() {
+            single_edge_line(above_row, upsample_above, dx, i, row)?;
+        }
+    } else if p_angle < 180 {
+        // §7.11.2.4 step 8. Along row `i`, `idxX = ( j << 6 ) - ( i +
+        // 1 ) * dx`, so `baseX = ( j << upsampleAbove ) + c` with `c =
+        // ( -( i + 1 ) * dx ) >> ( 6 - upsampleAbove )` and a shift
+        // that does not depend on `j` (the `j` term is a multiple of
+        // 32 after the halving). `baseX >= -( 1 << upsampleAbove )`
+        // holds from some column `j0` on: those samples are one run of
+        // the above edge; the columns before it read the left edge.
+        let up_a = u32::from(upsample_above);
+        let up_l = u32::from(upsample_left);
+        let step_a = 1usize << up_a;
+        for (i, row) in pred[..h * w].chunks_exact_mut(w).enumerate() {
+            let t = (i as i32 + 1) * dx;
+            let c = (-t) >> (6 - up_a);
+            let shift_x = (((-(t << up_a)) >> 1) & 0x1F) as u32;
+            // Smallest `j` with `( j << up_a ) + c >= -( 1 << up_a )`.
+            let j0 = if up_a == 0 { -1 - c } else { (-1 - c) >> 1 };
+            let j0 = (j0.max(0) as usize).min(w);
+            if j0 < w {
+                // Non-negative by the choice of `j0`.
+                let start = ((j0 as i32) << up_a) + c + 2;
+                debug_assert!(start >= 0);
+                let start = start as usize;
+                if start + (w - 1 - j0) * step_a + 1 >= above_row.len() {
+                    return Err(out_of_range());
+                }
+                blend_run(above_row, start, step_a, shift_x, &mut row[j0..]);
+            }
+            for (j, o) in row[..j0].iter_mut().enumerate() {
+                let idx_y = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                let base_y = idx_y >> (6 - up_l);
+                let shift_y = (((idx_y << up_l) >> 1) & 0x1F) as u32;
+                let at = usize::try_from(base_y + 2).map_err(|_| out_of_range())?;
+                let (Some(&l0), Some(&l1)) = (left_col.get(at), left_col.get(at + 1)) else {
+                    return Err(out_of_range());
+                };
+                *o = blend(l0, l1, shift_y);
+            }
+        }
+    } else {
+        // §7.11.2.4 step 9: every column from the left edge.
+        let mut column = [0u16; 64];
+        let column = &mut column[..h];
+        for j in 0..w {
+            single_edge_line(left_col, upsample_left, dy, j, column)?;
+            for (i, &v) in column.iter().enumerate() {
+                pred[i * w + j] = v;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The §7.11.2.4 directional process sample by sample (the spec's own
+/// loop nest) — the model [`predict_intra_directional`]'s run-wise
+/// form is tested against.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn predict_intra_directional_literal(
+    w: usize,
+    h: usize,
+    p_angle: i32,
+    upsample_above: u8,
+    upsample_left: u8,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w == 0 || h == 0 || w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if upsample_above > 1 || upsample_left > 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // §7.11.2.4 defines the process for `0 < pAngle < 270` (the
+    // derivative table is indexed by `270 - pAngle` on the last arm).
+    if !(0..270).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
@@ -41468,6 +41639,82 @@ mod tests {
             }
         }
         assert_eq!(PALETTE_COLOR_HASH_MULTIPLIERS, [1, 2, 2]);
+    }
+
+    /// r487 — the run-wise directional predictor equals the per-sample
+    /// process: every block size, every angle in `1..270` (the two
+    /// axis angles are rejected by both), both upsampling flags on
+    /// both edges, on random edges — and with the edge arrays cut
+    /// short, where both must report the same out-of-range error.
+    #[test]
+    fn directional_prediction_runs_match_the_per_sample_process() {
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let sides = [4usize, 8, 16, 32, 64];
+        let mut compared = 0usize;
+        let mut errors = 0usize;
+        for &w in &sides {
+            for &h in &sides {
+                let full = 2 * (w + h) + 2;
+                for p_angle in 1..270 {
+                    if p_angle == 90 || p_angle == 180 {
+                        continue;
+                    }
+                    for flags in 0..4u8 {
+                        let (up_a, up_l) = (flags & 1, flags >> 1);
+                        // Full-length edges, then edges cut to a random
+                        // shorter length.
+                        for cut in [false, true] {
+                            let (la, ll) = if cut {
+                                (
+                                    3 + (next() as usize) % (full - 2),
+                                    3 + (next() as usize) % (full - 2),
+                                )
+                            } else {
+                                (full, full)
+                            };
+                            let above: Vec<u16> = (0..la).map(|_| (next() % 4096) as u16).collect();
+                            let left: Vec<u16> = (0..ll).map(|_| (next() % 4096) as u16).collect();
+                            let mut got = vec![0u16; w * h];
+                            let mut want = vec![0u16; w * h];
+                            let r_got = predict_intra_directional(
+                                w, h, p_angle, up_a, up_l, &above, &left, &mut got,
+                            );
+                            let r_want = predict_intra_directional_literal(
+                                w, h, p_angle, up_a, up_l, &above, &left, &mut want,
+                            );
+                            assert_eq!(
+                                r_got.is_ok(),
+                                r_want.is_ok(),
+                                "{w}x{h} angle {p_angle} up {up_a}/{up_l} edges {la}/{ll}"
+                            );
+                            if r_want.is_ok() {
+                                assert_eq!(
+                                    got, want,
+                                    "{w}x{h} angle {p_angle} up {up_a}/{up_l} edges {la}/{ll}"
+                                );
+                                compared += 1;
+                            } else {
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 30_000 && errors > 1_000, "{compared} / {errors}");
+        // Angles at and past 270 are outside the process: an error,
+        // not an out-of-table read.
+        let (a, l) = (vec![0u16; 20], vec![0u16; 20]);
+        for p_angle in [270, 271, 300, 359] {
+            let mut pred = [0u16; 16];
+            assert!(predict_intra_directional(4, 4, p_angle, 0, 0, &a, &l, &mut pred).is_err());
+        }
     }
 
     /// r487 — the closed form of §5.11.50 equals the literal process
