@@ -1455,11 +1455,12 @@ pub(crate) fn encode_key_frame_yuv_full(
     // padded extent too), coded under the TRUE extent
     // (`KeyExtras::coded_size` — sequence maximum, §5.9.5
     // `frame_size`, §7.17 restoration geometry, IVF header), and the
-    // returned reconstruction is cropped back. The layered-stream /
-    // §5.9.8 superres / per-segment-demand arms keep the aligned
-    // contract (they carry their own extent bookkeeping).
-    if extras.seq_override.is_some()
-        || extras.superres.is_some()
+    // returned reconstruction is cropped back. The §5.9.8 superres /
+    // per-segment-demand arms keep the aligned contract (they carry
+    // their own extent bookkeeping); r487 — a layered stream's shared
+    // sequence header (`seq_override`) rides the padded path (its
+    // budget is checked against the coded extent).
+    if extras.superres.is_some()
         || extras.superres_source.is_some()
         || extras.superres_gate
         || exact_mask.is_some()
@@ -1967,8 +1968,8 @@ fn encode_key_frame_yuv_core(
         // sequence header (its dimension budget must cover this
         // frame).
         Some(shared) => {
-            if input.width > shared.max_frame_width_minus_1 + 1
-                || input.height > shared.max_frame_height_minus_1 + 1
+            if coded_w > shared.max_frame_width_minus_1 + 1
+                || coded_h > shared.max_frame_height_minus_1 + 1
             {
                 return Err(Error::PartitionWalkOutOfRange);
             }

@@ -77,9 +77,11 @@ impl ChromaFormat {
 /// sample must lie in `[0, (1 << bit_depth) - 1]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YuvFrame {
-    /// Luma width in pixels (multiple of 8).
+    /// Luma width in pixels (any extent on the still / KEY / GOP /
+    /// layered entries; the §5.9.8 superres and exactness-demand arms
+    /// take multiples of 8).
     pub width: u32,
-    /// Luma height in pixels (multiple of 8).
+    /// Luma height in pixels (see [`Self::width`]).
     pub height: u32,
     /// §5.5.2 `BitDepth`: 8, 10 or 12.
     pub bit_depth: u8,

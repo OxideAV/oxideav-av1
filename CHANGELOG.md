@@ -4,6 +4,12 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Multi-frame encoders on picture extents that are not multiples of 8. `encode_gop_yuv*`, the B-pyramid / adaptive drivers, the temporal ladder, the spatial-layer drivers (independent, inter-layer, spatial × temporal) all rejected such pictures (`PartitionWalkOutOfRange`) while the still / KEY entries coded them. Inter frames now pad the source to the §5.9.5 mi grid, code the true `frame_size`, replicate every reference plane out from its true extent (the §7.11.3.3 reference-fetch clamp), derive the §7.11.3.3 scale factors / §6.8.2 bounds / §7.17 restoration geometry from the true extents, and return the reconstruction cropped. A layered stream's shared sequence header now rides the padded KEY path too. Pinned by `tests/off_grid_extents.rs` (this crate's decoder + a black-box decoder).
+- The framework (registry) encoder refused extents off the 8-sample grid at construction although both of its arms (still, all-intra KEY) code any extent.
+- The adaptive mini-GOP motion probe indexed out of bounds on pictures narrower than 12 samples (a negative overlap bound wrapped).
+
 ## [0.1.23](https://github.com/OxideAV/oxideav-av1/compare/v0.1.22...v0.1.23) - 2026-11-07
 
 ### Other

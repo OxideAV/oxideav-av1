@@ -839,6 +839,7 @@ impl PyramidSession {
                         superres: None,
                         superres_source: None,
                         ref_dims: Vec::new(),
+                        coded_size: None,
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
@@ -1330,13 +1331,14 @@ fn mc_mad(prev: &[u16], cur: &[u16], w: usize, h: usize) -> f64 {
     let mut best = f64::INFINITY;
     for dy in -3i32..=3 {
         for dx in -3i32..=3 {
-            let y0 = dy.max(0) as usize;
-            let y1 = (h as i32 + dy.min(0)) as usize;
-            let x0 = dx.max(0) as usize;
-            let x1 = (w as i32 + dx.min(0)) as usize;
+            // Signed bounds first: on a plane narrower than the shift
+            // the overlap is empty (a negative end must not wrap).
+            let (y0, y1) = (dy.max(0), h as i32 + dy.min(0));
+            let (x0, x1) = (dx.max(0), w as i32 + dx.min(0));
             if y1 <= y0 || x1 <= x0 {
                 continue;
             }
+            let (y0, y1, x0, x1) = (y0 as usize, y1 as usize, x0 as usize, x1 as usize);
             let mut sum = 0u64;
             for i in y0..y1 {
                 let pi = (i as i32 - dy) as usize;

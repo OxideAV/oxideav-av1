@@ -2061,7 +2061,22 @@ mi grid internally (the decoder reconstructs every mi block in full,
 so the encoder's reconstruction and neighbour mirror span the padded
 extent), coded under its TRUE `frame_size` / sequence maximum / §7.17
 restoration geometry, and the returned reconstruction is cropped back
-(chroma at the rounded-up `(w + ss_x) >> ss_x` extent). The per-axis
+(chroma at the rounded-up `(w + ss_x) >> ss_x` extent). r487: the
+same holds on every multi-frame entry — the plain GOP, the B-pyramid
+and adaptive mini-GOP drivers, the temporal ladder, spatial layers
+with and without inter-layer prediction and the spatial × temporal
+product (layers may mix on-grid and off-grid extents) — where each
+reference plane is additionally replicated out from its TRUE extent
+(§7.11.3.3 clamps every reference fetch to the reference's last
+column / row; the §7.11.3.3 scale factors and the §6.8.2 bounds use
+the true extents), and on the framework (registry) encoder, whose
+construction-time probe used to demand multiples of 8 the encode never
+needed. `tests/off_grid_extents.rs` runs odd / ×2 / ×4 / one-axis /
+sub-mi-block extents × 8- and 10-bit 4:2:0 / 4:4:4 (plus 4:2:2 and
+monochrome on the plain GOP) through this crate's decoder and a
+black-box decoder. The §5.9.8 superres elections and the
+exactness-demand rectangles stay on-grid arms (an off-grid GOP simply
+does not arm them). The per-axis
 ceiling is `KEY_FRAME_MAX_DIM = 16384` (Annex A level 6.x
 `MaxHSize`). Odd-extent stills decode byte-identical through two
 independent black-box reference decoders, and wrapped into AVIF by a

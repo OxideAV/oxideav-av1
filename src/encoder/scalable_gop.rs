@@ -367,6 +367,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             superres: None,
             superres_source: None,
             ref_dims: Vec::new(),
+            coded_size: None,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -743,7 +744,9 @@ fn encode_spatial_layered_core(
             if f.width != w || f.height != h || f.bit_depth != bit_depth || f.format != format {
                 return Err(Error::PartitionWalkOutOfRange);
             }
-            f.validate()?;
+            // r487 — any extent: the per-frame drivers pad to the
+            // §5.9.5 mi grid and code the true extent.
+            f.validate_any_extent()?;
         }
     }
     let (top_w, top_h) = (layers[s_count - 1][0].width, layers[s_count - 1][0].height);
@@ -1098,6 +1101,7 @@ fn encode_spatial_layered_core(
                 superres: None,
                 superres_source: None,
                 ref_dims: il_ref_dims,
+                coded_size: None,
             };
             // r456 — per-temporal-layer quantiser offset (anchors
             // finest, leaves coarsest; inert on the pure spatial

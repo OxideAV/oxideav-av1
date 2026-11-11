@@ -13,8 +13,11 @@
 //! * Any §6.4.1 (bit depth, chroma format) pairing ([`YuvFrame`] —
 //!   8 / 10 / 12-bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome; the
 //!   historical [`Yuv420Frame`] entries widen into the same core),
-//!   dimensions per the KEY-frame rules (multiples of 8 in
-//!   `[8, KEY_FRAME_MAX_DIM]`). Under 4:2:2 the §5.11.38
+//!   any extent in `[1, KEY_FRAME_MAX_DIM]` per axis (r487: a picture
+//!   off the 8-sample grid is padded to the §5.9.5 mi grid, coded
+//!   under its true `frame_size`, and every reference plane is
+//!   replicated out from its true extent — the §7.11.3.3 fetch
+//!   clamp). Under 4:2:2 the §5.11.38
 //!   admissibility rule bars the tall partition shapes from the RD
 //!   ladder.
 //! * P-frame header: `error_resilient_mode = 1` (forcing
@@ -2116,6 +2119,7 @@ fn gop_order_hints(p_index: u32, order_hint_bits: u8) -> crate::cdf::FrameInterO
 /// generic frame encoder ([`encode_inter_frame_generic`]): the §5.9.2
 /// header fields that vary per pyramid role, the §7.20 slot state,
 /// and the RD ladder.
+#[derive(Clone)]
 pub(crate) struct InterFrameConfig<'a> {
     /// §5.9.2 `order_hint` — the frame's DISPLAY position.
     pub order_hint: u32,
@@ -2345,6 +2349,15 @@ pub(crate) struct InterFrameConfig<'a> {
     /// reference at the frame's extent (or the superres upscaled
     /// extent). Each reference must satisfy the §6.8.2 bounds.
     pub ref_dims: Vec<(u32, u32)>,
+    /// r487 — the CODED picture extent when `input` (and every
+    /// reference plane) is the §5.9.5 mi-grid-padded copy of a
+    /// picture whose extent is not a multiple of 8: the §5.9.5
+    /// `frame_size`, the §7.11.3.3 scale factors, the §6.8.2
+    /// reference bounds and the §7.17 restoration geometry carry THIS
+    /// extent while every plane buffer / RD walk runs at the padded
+    /// one. Set by [`encode_inter_frame_generic_gm`]; callers leave
+    /// it `None`.
+    pub coded_size: Option<(u32, u32)>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2739,6 +2752,7 @@ fn p_frame_config_primary<'a>(
         superres: None,
         superres_source: None,
         ref_dims: Vec::new(),
+        coded_size: None,
     }
 }
 
@@ -3023,7 +3037,122 @@ pub(crate) fn encode_inter_frame_generic_gm(
     ),
     Error,
 > {
+    let off_grid = |w: u32, h: u32| !w.is_multiple_of(8) || !h.is_multiple_of(8);
+    if cfg.coded_size.is_some()
+        || (!off_grid(input.width, input.height)
+            && !cfg.ref_dims.iter().any(|&(w, h)| off_grid(w, h)))
+    {
+        return encode_inter_frame_aligned(
+            input,
+            seq,
+            base_q_idx,
+            cfg,
+            alt_q,
+            mf_store,
+            model,
+            global_motion,
+        );
+    }
+    // r487 — ANY extent. §5.9.5 codes the true `FrameWidth` /
+    // `FrameHeight` and derives the mi grid by rounding up to 8
+    // samples; the decoder reconstructs every mi block in full, and
+    // §7.11.3.3 clamps every reference fetch to the reference's TRUE
+    // last column / row. So: the source is replicated out to the mi
+    // grid, every reference plane is replicated out from its true
+    // extent (replication IS that clamp, for any reader that clamps
+    // at the padded edge instead), the frame is coded under the true
+    // extent ([`InterFrameConfig::coded_size`]) and the returned
+    // reconstruction is cropped back. The §5.9.8 superres and
+    // exactness-demand arms keep the aligned contract.
+    input.validate_any_extent()?;
+    if cfg.superres.is_some() || cfg.superres_source.is_some() || cfg.exact_mask.is_some() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let ref_dims: Vec<(u32, u32)> = if cfg.ref_dims.is_empty() {
+        vec![(input.width, input.height); cfg.refs.len()]
+    } else {
+        cfg.ref_dims.clone()
+    };
+    if ref_dims.len() != cfg.refs.len() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let mut padded_refs: Vec<GopFrameReconYuv> = Vec::with_capacity(cfg.refs.len());
+    for (r, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
+        let view = YuvFrame {
+            width: rw,
+            height: rh,
+            bit_depth: input.bit_depth,
+            format: input.format,
+            y: r.y.clone(),
+            u: r.u.clone(),
+            v: r.v.clone(),
+        };
+        view.validate_any_extent()?;
+        let p = view.padded_to_mi_grid();
+        padded_refs.push(GopFrameReconYuv {
+            y: p.y,
+            u: p.u,
+            v: p.v,
+        });
+    }
+    let padded = input.padded_to_mi_grid();
+    let mut pcfg = cfg.clone();
+    pcfg.refs = padded_refs.iter().collect();
+    pcfg.ref_dims = ref_dims;
+    pcfg.coded_size = Some((input.width, input.height));
+    let (obus, mut rc, mf, carry, aux) = encode_inter_frame_aligned(
+        &padded,
+        seq,
+        base_q_idx,
+        &pcfg,
+        alt_q,
+        mf_store,
+        model,
+        global_motion,
+    )?;
+    let crop = |src: &[u16], sw: u32, w: u32, h: u32| -> Vec<u16> {
+        let (sw, w, h) = (sw as usize, w as usize, h as usize);
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            out.extend_from_slice(&src[y * sw..y * sw + w]);
+        }
+        out
+    };
+    rc.y = crop(&rc.y, padded.width, input.width, input.height);
+    if input.format != crate::encoder::yuv_frame::ChromaFormat::Monochrome {
+        let (cw, ch) = (input.chroma_width(), input.chroma_height());
+        rc.u = crop(&rc.u, padded.chroma_width(), cw, ch);
+        rc.v = crop(&rc.v, padded.chroma_width(), cw, ch);
+    }
+    Ok((obus, rc, mf, carry, aux))
+}
+
+/// The mi-grid-aligned core behind [`encode_inter_frame_generic_gm`]:
+/// `input` and every reference plane sit at a multiple of 8 per axis
+/// (padded copies under [`InterFrameConfig::coded_size`]).
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_frame_aligned(
+    input: &YuvFrame,
+    seq: &SequenceHeader,
+    base_q_idx: u8,
+    cfg: &InterFrameConfig<'_>,
+    alt_q: &[i16],
+    mf_store: &[SavedMotionField; 8],
+    model: RateModel,
+    global_motion: bool,
+) -> Result<
+    (
+        Vec<ObuFrame>,
+        GopFrameReconYuv,
+        SavedMotionField,
+        RefSlotCarry,
+        InterFrameAux,
+    ),
+    Error,
+> {
     input.validate()?;
+    // r487 — the coded (true) extent vs the padded plane extent.
+    let (coded_w, coded_h) = cfg.coded_size.unwrap_or((input.width, input.height));
     // r423 — a primary-reference election requires the §7.20 carry of
     // the elected slot and a valid ordinal (`0..7`).
     if cfg.primary_ref_frame != PRIMARY_REF_NONE
@@ -3106,25 +3235,29 @@ pub(crate) fn encode_inter_frame_generic_gm(
     }
     for (reference, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
         let (rw, rh) = (rw as usize, rh as usize);
+        // r487 — the plane buffers span the reference's mi grid (its
+        // extent rounded up to 8 samples).
+        let (pw, ph) = ((rw + 7) & !7, (rh + 7) & !7);
         // Monochrome references carry EMPTY chroma planes (the frame's
         // own `chroma_width()` / `chroma_height()` are 0 there).
         let (rcw, rch) = if mono {
             (0, 0)
         } else {
             (
-                (rw + usize::from(ssx)) >> ssx,
-                (rh + usize::from(ssy)) >> ssy,
+                (pw + usize::from(ssx)) >> ssx,
+                (ph + usize::from(ssy)) >> ssy,
             )
         };
+        let (cw, ch) = (coded_w as usize, coded_h as usize);
         if rw == 0
             || rh == 0
-            || reference.y.len() != rw * rh
+            || reference.y.len() != pw * ph
             || reference.u.len() != rcw * rch
             || reference.v.len() != rcw * rch
-            || 2 * width < rw
-            || 2 * height < rh
-            || width > 16 * rw
-            || height > 16 * rh
+            || 2 * cw < rw
+            || 2 * ch < rh
+            || cw > 16 * rw
+            || ch > 16 * rh
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -3134,11 +3267,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let mut scaled_per_ref = [false; 7];
     for (r, flag) in scaled_per_ref.iter_mut().enumerate() {
         let (rw, rh) = ref_dims[cfg.slot_to_plane[cfg.ref_frame_idx[r] as usize]];
-        *flag = crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32);
+        *flag = crate::encoder::superres_elect::is_scaled(rw, rh, coded_w, coded_h);
     }
     let any_scaled = scaled_per_ref.iter().any(|&f| f);
 
-    let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
+    let mut fh = build_inter_frame_fh(seq, coded_w, coded_h, base_q_idx, cfg, alt_q);
     // r427 — the §5.11.46 palette election inside inter frames stays
     // 8-bit-4:2:0-scoped, like the KEY driver.
     fh.allow_screen_content_tools = fh.allow_screen_content_tools
@@ -3651,6 +3784,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 mi_cols,
                 width,
                 height,
+                (coded_w, coded_h),
                 &ref_dims,
                 ip.clone(),
                 base_q_idx,
@@ -4680,6 +4814,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
         } else {
             (width, chroma_w, input)
         };
+    // r487 — the §7.17 geometry runs on the coded extent (the
+    // upscaled one on the superres arm, which is always on the grid).
+    let lr_frame_w = if cfg.superres.is_some() {
+        lr_w
+    } else {
+        coded_w as usize
+    };
     let mut lr_elected = false;
     if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
         let price_cdfs = start_cdfs_for(fh.primary_ref_frame);
@@ -4740,8 +4881,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     lambda,
                     price_cdfs: &price_cdfs,
                     disable_cdf_update: fh.disable_cdf_update,
-                    frame_width: lr_w,
-                    frame_height: height,
+                    frame_width: lr_frame_w,
+                    frame_height: coded_h as usize,
                     sgr_step: 1,
                     unit_shift,
                     use_superres: cfg.superres.is_some(),
@@ -4803,8 +4944,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 num_planes,
                 mi_rows,
                 mi_cols,
-                lr_w,
-                height,
+                lr_frame_w,
+                coded_h as usize,
             );
             debug_assert_eq!(
                 applied_d, plan.d,
@@ -5064,7 +5205,10 @@ struct PSearchCtx {
     mi_rows: u32,
     mi_cols: u32,
     luma_w: u32,
-    luma_h: u32,
+    /// r487 — the §5.9.5 coded `FrameWidth` / `FrameHeight` (equal to
+    /// the plane extent unless the picture is off the 8-sample grid).
+    coded_w: u32,
+    coded_h: u32,
     /// r456 — per-[`Self::ref_planes`] LUMA extents
     /// (`RefUpscaledWidth` / `RefFrameHeight` per §7.11.3.3); equal to
     /// `(luma_w, luma_h)` off the scaled arms (superres inter frames,
@@ -5247,6 +5391,7 @@ impl PSearchCtx {
             mi_cols,
             width,
             height,
+            (width as u32, height as u32),
             &[(width as u32, height as u32); 2],
             ip,
             base_q_idx,
@@ -5274,6 +5419,7 @@ impl PSearchCtx {
         mi_cols: u32,
         width: usize,
         height: usize,
+        coded: (u32, u32),
         ref_dims: &[(u32, u32)],
         ip: SyntaxInterFrameParams,
         base_q_idx: u8,
@@ -5324,7 +5470,7 @@ impl PSearchCtx {
         }
         let scaled_of = |plane: usize| -> bool {
             let (rw, rh) = ref_dims[plane];
-            crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32)
+            crate::encoder::superres_elect::is_scaled(rw, rh, coded.0, coded.1)
         };
         let search_planes: Vec<Option<Vec<u16>>> = refs
             .iter()
@@ -5332,13 +5478,32 @@ impl PSearchCtx {
             .map(|(plane, r)| {
                 scaled_of(plane).then(|| {
                     let (rw, rh) = ref_dims[plane];
-                    crate::encoder::superres_elect::resample_plane_bilinear(
-                        &r.y,
-                        rw as usize,
-                        rh as usize,
-                        width,
-                        height,
-                    )
+                    let (rw, rh) = (rw as usize, rh as usize);
+                    let (cw, ch) = (coded.0 as usize, coded.1 as usize);
+                    let stride = (rw + 7) & !7;
+                    if stride == rw && cw == width && ch == height {
+                        return crate::encoder::superres_elect::resample_plane_bilinear(
+                            &r.y, rw, rh, width, height,
+                        );
+                    }
+                    // r487 — off-grid extents: resample the TRUE
+                    // reference extent onto the TRUE coded extent,
+                    // then replicate out to the padded search plane.
+                    let mut tight = Vec::with_capacity(rw * rh);
+                    for y in 0..rh {
+                        tight.extend_from_slice(&r.y[y * stride..y * stride + rw]);
+                    }
+                    let rs = crate::encoder::superres_elect::resample_plane_bilinear(
+                        &tight, rw, rh, cw, ch,
+                    );
+                    let mut out = vec![0u16; width * height];
+                    for y in 0..height {
+                        let sy = y.min(ch - 1);
+                        for x in 0..width {
+                            out[y * width + x] = rs[sy * cw + x.min(cw - 1)];
+                        }
+                    }
+                    out
                 })
             })
             .collect();
@@ -5350,7 +5515,8 @@ impl PSearchCtx {
             mi_rows,
             mi_cols,
             luma_w: width as u32,
-            luma_h: height as u32,
+            coded_w: coded.0,
+            coded_h: coded.1,
             ref_dims: ref_dims.to_vec(),
             search_planes,
             bit_depth,
@@ -6225,7 +6391,8 @@ impl PSearchCtx {
         // Field-split borrows: the grid views borrow the mode-info
         // vectors immutably while the plane contexts borrow the
         // scratch planes mutably.
-        let (luma_w, luma_h) = (self.luma_w, self.luma_h);
+        let luma_w = self.luma_w;
+        let (coded_w, coded_h) = (self.coded_w, self.coded_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
@@ -6327,8 +6494,8 @@ impl PSearchCtx {
                 subsampling_x: 0,
                 subsampling_y: 0,
                 frame_store: &store_y,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s0,
                 curr_stride: luma_w as usize,
             },
@@ -6337,8 +6504,8 @@ impl PSearchCtx {
                 subsampling_x: ssx,
                 subsampling_y: ssy,
                 frame_store: &store_u,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s1,
                 curr_stride: (luma_w as usize) >> ssx,
             },
@@ -6347,8 +6514,8 @@ impl PSearchCtx {
                 subsampling_x: ssx,
                 subsampling_y: ssy,
                 frame_store: &store_v,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s2,
                 curr_stride: (luma_w as usize) >> ssx,
             },
@@ -6382,7 +6549,8 @@ fn make_store<'a>(
             plane: &ref_planes[idx][plane],
             // r456 — the reference's OWN plane stride and extents
             // (§7.11.3.3 `RefUpscaledWidth` / `RefFrameHeight`).
-            stride: ((rw + u32::from(ssx)) >> ssx) as usize,
+            // r487 — plane buffers span the reference's mi grid.
+            stride: ((((rw + 7) & !7) + u32::from(ssx)) >> ssx) as usize,
             upscaled_width: rw,
             width: rw,
             height: rh,
@@ -10821,6 +10989,7 @@ mod tests {
             mi_cols,
             (mi_cols * 4) as usize,
             (mi_rows * 4) as usize,
+            (mi_cols * 4, mi_rows * 4),
             &[(mi_cols * 4, mi_rows * 4); 2],
             ip,
             base_q_idx,

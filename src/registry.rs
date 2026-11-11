@@ -788,11 +788,14 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         CoreError::invalid(format!("oxideav-av1: unsupported pixel format {pf:?}"))
     })?;
     let opts = Av1EncoderOptions::from_params(params)?;
-    // Probe the geometry the same way the encoder will (the r410 shape
-    // rules) so a bad size fails at construction, not at the first
-    // frame.
+    // Probe the geometry the same way the encoder will so a bad size
+    // fails at construction, not at the first frame. r487 — both
+    // arms of this encoder (the still and the all-intra KEY) code any
+    // extent (the picture is padded to the §5.9.5 mi grid and the
+    // true `frame_size` is coded), so the probe is the any-extent
+    // one; it used to demand multiples of 8 the encode never needed.
     YuvFrame::filled(width, height, bit_depth, format, 0)
-        .validate()
+        .validate_any_extent()
         .map_err(|e| CoreError::invalid(format!("oxideav-av1: unsupported geometry: {e}")))?;
     // The av1C fields follow from the pairing + size alone (the tool
     // gates the encoder opens do not appear in the record).
@@ -1156,6 +1159,68 @@ mod tests {
             .expect("decodes");
             assert_eq!(frames.len(), 1);
         }
+    }
+
+    /// r487 — the framework encoder takes any extent on both arms
+    /// (the still and the all-intra KEY), like the direct entries it
+    /// wraps: the packet equals the direct encode and decodes to its
+    /// reconstruction at the true extent. Zero and over-budget extents
+    /// still fail at construction.
+    #[test]
+    fn framework_encoder_takes_extents_off_the_mi_grid() {
+        for (w, h, pf) in [
+            (33u32, 17u32, PixelFormat::Yuv420P),
+            (34, 18, PixelFormat::Yuv420P10Le),
+            (36, 20, PixelFormat::Yuv444P),
+            (5, 9, PixelFormat::Gray8),
+        ] {
+            for still in ["true", "false"] {
+                let mut params = video_params(w, h, pf);
+                params.options.insert("still", still);
+                params.options.insert("quality", "70");
+                let mut enc = make_encoder(&params)
+                    .unwrap_or_else(|e| panic!("{w}x{h} {pf:?} still={still}: {e}"));
+                let (frame, yuv) = textured_frame(w, h, pf);
+                enc.send_frame(&CoreFrame::Video(frame)).expect("frame");
+                let pkt = enc.receive_packet().expect("packet");
+                let opts = Av1EncoderOptions::from_params(&params).unwrap();
+                let direct = if still == "true" {
+                    encode_still_yuv(&yuv, &opts.still_options(1))
+                } else {
+                    encode_key_frame_yuv_with_options(&yuv, &opts.still_options(1))
+                }
+                .expect("direct encode");
+                assert_eq!(direct.temporal_unit_bytes, pkt.data);
+                let mut dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                dparams.extradata = enc.output_params().extradata.clone();
+                let mut dec = make_decoder(&dparams).expect("decoder");
+                dec.send_packet(&pkt).expect("decodes");
+                let mut out = dec.receive_frame().expect("frame");
+                if matches!(out, CoreFrame::StreamParams(_)) {
+                    out = dec.receive_frame().expect("frame after stream params");
+                }
+                let CoreFrame::Video(out) = out else {
+                    panic!("video frame expected");
+                };
+                let bps = if opts_bit_depth(pf) > 8 { 2 } else { 1 };
+                let mut got = Vec::new();
+                for y in 0..h as usize {
+                    let row = &out.planes[0].data[y * out.planes[0].stride..][..w as usize * bps];
+                    if bps == 2 {
+                        got.extend(row.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])));
+                    } else {
+                        got.extend(row.iter().map(|&b| u16::from(b)));
+                    }
+                }
+                assert_eq!(got, direct.recon_y, "{w}x{h} {pf:?} still={still}");
+            }
+        }
+        assert!(make_encoder(&video_params(0, 16, PixelFormat::Yuv420P)).is_err());
+        assert!(make_encoder(&video_params(16, 70000, PixelFormat::Yuv420P)).is_err());
+    }
+
+    fn opts_bit_depth(pf: PixelFormat) -> u8 {
+        pixel_format_layout(pf).expect("supported").0
     }
 
     #[test]
