@@ -4,6 +4,18 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.24](https://github.com/OxideAV/oxideav-av1/compare/v0.1.23...v0.1.24) - 2026-11-11
+
+### Other
+
+- README, CHANGELOG: directional-prediction unit; final r487 tables as medians
+- intra prediction: directional predictor over edge runs; deblocking tx-edge test by mask
+- README, CHANGELOG: r487 entropy-coding and kernel throughput
+- in-loop filters: 16-bit CDEF lanes, row-wise Wiener taps, table-driven self-guided a2
+- lane-parallel inverse DCT schedule, folded forward DCT
+- entropy coding and reconstruction: register-based symbol decoder, windowed symbol writer, fixed-length CDF paths
+- multi-frame entry points take picture extents off the 8-sample grid
+
 ### Changed
 
 - Throughput, output unchanged (every still / video digest and every coded byte equal to 0.1.23):
