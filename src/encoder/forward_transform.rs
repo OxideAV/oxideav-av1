@@ -260,10 +260,96 @@ fn inverse_dct_matrix(n: u32) -> &'static [i64] {
     })
 }
 
+/// r487 — the response matrices re-packed for the folded evaluation
+/// of [`forward_dct_n`].
+///
+/// The §7.13.2.3 inverse DCT of size `S` ends in the butterfly
+/// `out[ i ] = e[ i ] + o[ i ]`, `out[ S - 1 - i ] = e[ i ] - o[ i ]`
+/// (`i < S / 2`), where `e` is the size-`S / 2` inverse DCT of the
+/// even-index coefficients and `o` depends on the odd-index ones only.
+/// For a single-coefficient probe that makes the response column `k`
+///
+/// * mirror-symmetric for even `k` and mirror-antisymmetric for odd
+///   `k` — exactly, the butterfly being integer adds — and
+/// * for even `k`, equal on its first half to column `k / 2` of the
+///   size-`S / 2` matrix.
+///
+/// So the inner products split: the odd coefficients need only the
+/// half-length difference vector `x[ i ] - x[ S - 1 - i ]`, and the
+/// even coefficients are the size-`S / 2` forward transform of the
+/// sum vector `x[ i ] + x[ S - 1 - i ]`, recursively down to the
+/// dense 4-point matrix. Every accumulator holds the same exact
+/// integer as the dense inner product (the sums are regrouped, never
+/// rounded), so the rounded outputs are identical;
+/// `tests::folded_dct_matches_the_dense_inner_products` checks both
+/// structural facts on the probed matrices and the outputs against
+/// the dense form.
+struct FoldedDct {
+    /// `odd[ m ]` (for sizes `S = 8 << m`): row `q`, `S / 2` entries —
+    /// the first half of response column `2 * q + 1`.
+    odd: [Vec<i64>; 4],
+    /// The same rows as 32-bit values (every response entry is far
+    /// inside the range).
+    odd_narrow: [Vec<i32>; 4],
+    /// Per level, the largest difference magnitude for which every
+    /// odd-row inner product (plus its rounding offset) stays inside
+    /// a signed 32-bit accumulator: `( 2^31 - 1 - 2048 ) / max_q
+    /// sum_i | odd[ q ][ i ] |`.
+    narrow_limit: [i64; 4],
+    /// The dense 4-point matrix, column-major (`base[ i + 4 * k ]`).
+    base: [i64; 16],
+}
+
+fn folded_dct() -> &'static FoldedDct {
+    static CELL: OnceLock<FoldedDct> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let odd = core::array::from_fn(|m| {
+            let n = m as u32 + 3;
+            let size = 1usize << n;
+            let half = size / 2;
+            let full = inverse_dct_matrix(n);
+            let mut packed = vec![0i64; half * half];
+            for q in 0..half {
+                for i in 0..half {
+                    packed[q * half + i] = full[i + size * (2 * q + 1)];
+                }
+            }
+            packed
+        });
+        let odd: [Vec<i64>; 4] = odd;
+        let odd_narrow = core::array::from_fn(|m| {
+            odd[m]
+                .iter()
+                .map(|&v| i32::try_from(v).expect("response entry fits 32 bits"))
+                .collect()
+        });
+        let narrow_limit = core::array::from_fn(|m| {
+            let half = 4usize << m;
+            let worst = odd[m]
+                .chunks_exact(half)
+                .map(|row| row.iter().map(|v| v.abs()).sum::<i64>())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            (i64::from(i32::MAX) - 2048) / worst
+        });
+        let mut base = [0i64; 16];
+        base.copy_from_slice(inverse_dct_matrix(2));
+        FoldedDct {
+            odd,
+            odd_narrow,
+            narrow_limit,
+            base,
+        }
+    })
+}
+
 /// Forward 1D DCT-II for length `N = 1 << n`, `n in 2..=6`. The
 /// algebraic transpose of [`crate::transform::inverse_dct`] for the
-/// same `n`. Reads `N` spatial values from `t[0..N]` and writes `N`
-/// DCT-II coefficients back into the same slots.
+/// same `n`: `out[ k ] = Round2( sum_i M_inv[ i ][ k ] * x[ i ], 12 )`,
+/// evaluated through the folded form (see [`FoldedDct`]). Reads `N`
+/// spatial values from `t[0..N]` and writes `N` DCT-II coefficients
+/// back into the same slots.
 ///
 /// # Panics
 ///
@@ -278,18 +364,52 @@ fn forward_dct_n(t: &mut [i64], n: u32) {
         t.len() >= nn,
         "oxideav-av1 forward_dct_n: buffer too short for length {nn}"
     );
-    let m = inverse_dct_matrix(n);
-    // x = copy of the input slots.
+    let folded = folded_dct();
+    // `x[ ..size ]`: the running sum vector (the input at the top).
     let mut x = [0i64; 64];
     x[..nn].copy_from_slice(&t[..nn]);
-    for k in 0..nn {
-        // Output coefficient k = inner product of x with column k of
-        // M_inv. Column k of M_inv is `m[i + nn * k]` for i in 0..nn.
-        let mut acc: i64 = 0;
-        for i in 0..nn {
-            acc += m[i + nn * k] * x[i];
+    let mut diff = [0i64; 32];
+    let mut size = nn;
+    // Output stride of the current level: its coefficient `j` is the
+    // top-level coefficient `stride * j`.
+    let mut stride = 1usize;
+    while size > 4 {
+        let half = size / 2;
+        for i in 0..half {
+            let (a, b) = (x[i], x[size - 1 - i]);
+            x[i] = a + b;
+            diff[i] = a - b;
         }
-        t[k] = round2(acc, 12);
+        let level = size.trailing_zeros() as usize - 3;
+        let d = &diff[..half];
+        let largest = d.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        if largest <= folded.narrow_limit[level] as u64 {
+            // Every inner product fits 32 bits (see `narrow_limit`):
+            // the same integers in half-width lanes.
+            let mut narrow = [0i32; 32];
+            for (n, &v) in narrow.iter_mut().zip(d) {
+                *n = v as i32;
+            }
+            let dn = &narrow[..half];
+            for (q, row) in folded.odd_narrow[level].chunks_exact(half).enumerate() {
+                let acc: i32 = row.iter().zip(dn).map(|(m, v)| m * v).sum();
+                t[stride * (2 * q + 1)] = i64::from((acc + 2048) >> 12);
+            }
+        } else {
+            for (q, row) in folded.odd[level].chunks_exact(half).enumerate() {
+                let mut acc: i64 = 0;
+                for (m, v) in row.iter().zip(d) {
+                    acc += m * v;
+                }
+                t[stride * (2 * q + 1)] = round2(acc, 12);
+            }
+        }
+        size = half;
+        stride *= 2;
+    }
+    for (k, column) in folded.base.as_chunks::<4>().0.iter().enumerate() {
+        let acc: i64 = column.iter().zip(&x[..4]).map(|(m, v)| m * v).sum();
+        t[stride * k] = round2(acc, 12);
     }
 }
 
@@ -437,6 +557,61 @@ pub fn forward_dct_64x64(input: &[i64]) -> Vec<i64> {
 mod tests {
     use super::*;
     use crate::transform::{butterfly_b, butterfly_h, inverse_dct_permute};
+
+    /// r487 — the folded forward DCT against the dense inner products
+    /// it regroups: the two structural facts it relies on hold on the
+    /// probed matrices (mirror (anti)symmetry of every response
+    /// column; even columns restricted to their first half are the
+    /// half-size matrix), and the outputs are identical on random
+    /// inputs across the whole residual / intermediate magnitude
+    /// range at every size.
+    #[test]
+    fn folded_dct_matches_the_dense_inner_products() {
+        for n in 3..=6u32 {
+            let size = 1usize << n;
+            let full = inverse_dct_matrix(n);
+            let half_m = inverse_dct_matrix(n - 1);
+            for k in 0..size {
+                for i in 0..size / 2 {
+                    let (a, b) = (full[i + size * k], full[size - 1 - i + size * k]);
+                    if k % 2 == 0 {
+                        assert_eq!(a, b, "n={n} column {k} row {i}: not symmetric");
+                        assert_eq!(
+                            a,
+                            half_m[i + (size / 2) * (k / 2)],
+                            "n={n} column {k} row {i}: not the half-size column"
+                        );
+                    } else {
+                        assert_eq!(a, -b, "n={n} column {k} row {i}: not antisymmetric");
+                    }
+                }
+            }
+        }
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in 2..=6u32 {
+            let size = 1usize << n;
+            let m = inverse_dct_matrix(n);
+            for round in 0..400 {
+                let bits = 1 + (round % 40) as u32;
+                let x: Vec<i64> = (0..size).map(|_| (next() as i64) >> (64 - bits)).collect();
+                let mut got = x.clone();
+                forward_dct_n(&mut got, n);
+                for k in 0..size {
+                    let mut acc: i64 = 0;
+                    for i in 0..size {
+                        acc += m[i + size * k] * x[i];
+                    }
+                    assert_eq!(got[k], round2(acc, 12), "n={n} round {round} k={k}");
+                }
+            }
+        }
+    }
 
     /// Re-derive the inverse §7.13.2.3 4-point kernel inline as a
     /// reference for the matrix-transpose check.
