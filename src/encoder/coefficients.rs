@@ -84,8 +84,8 @@ use crate::Error;
 use crate::cdf::{
     BR_CDF_SIZE, COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS,
     NUM_BASE_LEVELS, PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TX_SIZE_SQR_UP,
-    TX_SIZES, TX_SIZES_ALL, TX_WIDTH, TX_WIDTH_LOG2, TXB_SKIP_CONTEXTS, TileCdfContext, get_br_ctx,
-    get_coeff_base_ctx, get_coeff_base_eob_ctx,
+    TX_SIZES, TX_SIZES_ALL, TX_WIDTH, TX_WIDTH_LOG2, TXB_SKIP_CONTEXTS, TileCdfContext,
+    get_coeff_base_eob_ctx,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 
@@ -450,9 +450,9 @@ pub fn write_dc_sign(
     }
     let ptype = (plane > 0) as usize;
     let cdf = cdfs
-        .dc_sign_cdf(ptype, ctx)
+        .dc_sign_row(ptype, ctx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    writer.write_symbol(dc_sign as u32, cdf)
+    writer.write_symbol_sized(dc_sign as u32, cdf)
 }
 
 /// `coeff_base_eob` writer per §5.11.39 line 60 (av1-spec p.91) and
@@ -507,9 +507,9 @@ pub fn write_coeff_base_eob(
         return Err(Error::PartitionWalkOutOfRange);
     }
     let cdf = cdfs
-        .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)
+        .coeff_base_eob_row(tx_sz_ctx, ptype, ctx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    writer.write_symbol(sym as u32, cdf)
+    writer.write_symbol_sized(sym as u32, cdf)
 }
 
 /// `coeff_base` writer per §5.11.39 line 63 (av1-spec p.91) and §8.3.2
@@ -563,9 +563,9 @@ pub fn write_coeff_base(
         return Err(Error::PartitionWalkOutOfRange);
     }
     let cdf = cdfs
-        .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
+        .coeff_base_row(tx_sz_ctx, ptype, ctx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    writer.write_symbol(sym as u32, cdf)
+    writer.write_symbol_sized(sym as u32, cdf)
 }
 
 /// `coeff_br` writer per §5.11.39 lines 65-70 (av1-spec p.91) and
@@ -631,9 +631,9 @@ pub fn write_coeff_br(
         return Err(Error::PartitionWalkOutOfRange);
     }
     let cdf = cdfs
-        .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
+        .coeff_br_row(tx_sz_ctx, ptype, ctx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    writer.write_symbol(sym as u32, cdf)
+    writer.write_symbol_sized(sym as u32, cdf)
 }
 
 /// `golomb` magnitude-tail writer per §5.11.39 lines 84-93 (av1-spec
@@ -953,6 +953,11 @@ pub fn write_coefficients(
     )
 }
 
+/// Padded running-level cells kept on the stack by
+/// [`write_coefficients_gate_open`]: every transform block up to 8×8
+/// (`( 8 + LEVELS_PAD )²`).
+const SMALL_LEVELS: usize = (8 + crate::cdf::LEVELS_PAD) * (8 + crate::cdf::LEVELS_PAD);
+
 /// §5.11.39 `coeffs()` write side — the gate-open body (everything
 /// **after** the `all_zero` S() write): the `eob_pt_*` / `eob_extra` /
 /// `eob_extra_bit` emission, the reverse-scan `coeff_base{_eob}` +
@@ -1043,7 +1048,25 @@ pub fn write_coefficients_gate_open(
     // Running magnitude buffer — mirrors the decoder's `Quant[]` state
     // as the reverse scan populates it. The §8.3.2 ctx helpers walk
     // this same buffer on both sides.
-    let mut running: Vec<i32> = vec![0i32; tx_w * tx_h];
+    // r487 — the running levels live in the padded `u8` layout the
+    // decoder's reverse scan uses (`LEVELS_PAD` zero columns / rows
+    // past the right / bottom edge stand in for the §8.3.2 in-block
+    // tests): every level is at most 15 here (the Golomb remainder is
+    // coded by the forward pass), so the §8.3.2 magnitude sums over
+    // it equal the sums over `Quant[]`. Small blocks use a stack
+    // buffer.
+    let adj = crate::cdf::ADJUSTED_TX_SIZE[tx_size];
+    let bwl = crate::cdf::TX_WIDTH_LOG2[adj];
+    let lstride = (1usize << bwl) + crate::cdf::LEVELS_PAD;
+    let levels_len = (crate::cdf::TX_HEIGHT[adj] + crate::cdf::LEVELS_PAD) * lstride;
+    let mut small = [0u8; SMALL_LEVELS];
+    let mut large: Vec<u8> = Vec::new();
+    let levels: &mut [u8] = if levels_len <= SMALL_LEVELS {
+        &mut small[..levels_len]
+    } else {
+        large.resize(levels_len, 0);
+        &mut large
+    };
 
     let threshold_post_br: u32 = (NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1) as u32; // = 15
     let threshold_golomb: u32 = (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as u32; // = 14
@@ -1080,11 +1103,16 @@ pub fn write_coefficients_gate_open(
             // §8.3.2 ctx derivations against the running magnitude
             // buffer (zero-filled at entry; populated by prior reverse-
             // scan iterations).
+            let row = pos >> bwl;
+            let lpos = row * lstride + (pos - (row << bwl));
             if is_eob {
-                let ctx = get_coeff_base_eob_ctx(&running, tx_size, tx_class, pos, c as usize);
+                // The end-of-block context reads no neighbour.
+                let ctx = get_coeff_base_eob_ctx(&[], tx_size, tx_class, pos, c as usize);
                 write_coeff_base_eob(writer, cdfs, base_sym, tx_sz_ctx, ptype, ctx)?;
             } else {
-                let ctx = get_coeff_base_ctx(&running, tx_size, tx_class, pos, c as usize, false);
+                let ctx = crate::cdf::coeff_base_ctx_from_levels(
+                    levels, lstride, lpos, tx_size, tx_class, pos, bwl,
+                );
                 write_coeff_base(writer, cdfs, base_sym, tx_sz_ctx, ptype, ctx)?;
             }
 
@@ -1101,12 +1129,16 @@ pub fn write_coefficients_gate_open(
             if level as usize > NUM_BASE_LEVELS {
                 let br_iters: u32 = (COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) as u32;
                 let br_step: u32 = (BR_CDF_SIZE - 1) as u32; // = 3
+                // `Quant[]` does not change inside this loop (the
+                // level lands after it), so one context serves every
+                // `coeff_br` of the coefficient.
+                let br_ctx =
+                    crate::cdf::br_ctx_from_levels(levels, lstride, lpos, tx_class, pos, bwl);
                 for _ in 0..br_iters {
                     // remaining magnitude to encode in the chain.
                     let residue = coded_mag - level;
                     let sym: u8 = core::cmp::min(residue, br_step) as u8;
-                    let ctx = get_br_ctx(&running, tx_size, tx_class, pos);
-                    write_coeff_br(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)?;
+                    write_coeff_br(writer, cdfs, sym, tx_sz_ctx, ptype, br_ctx)?;
                     level += sym as u32;
                     if (sym as usize) < BR_CDF_SIZE - 1 {
                         break;
@@ -1116,7 +1148,7 @@ pub fn write_coefficients_gate_open(
 
             // §5.11.39 line 71: stamp the post-chain magnitude into the
             // running buffer so subsequent iterations' ctx scans see it.
-            running[pos] = level as i32;
+            levels[lpos] = level as u8;
             c -= 1;
         }
     }

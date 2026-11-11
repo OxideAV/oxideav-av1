@@ -74,19 +74,28 @@ pub struct SymbolDecoder<'a> {
     bytes: &'a [u8],
     /// `sz` of §8.2.2.
     sz: usize,
-    /// r481 — the partition bits not yet consumed, MSB-first: the top
-    /// `window_bits` bits of `window` are the next bits `f()` would
-    /// return. Bits past the partition's `8 * sz` (the §8.2.6 padding
-    /// once `SymbolMaxBits` runs out) read as zero.
-    window: u64,
-    window_bits: u32,
-    /// The next partition byte to load into `window`.
+    /// r487 — `SymbolValue` and the partition bits behind it in one
+    /// register. §8.2.6 step 6, `SymbolValue = paddedData ^ ( ( (
+    /// SymbolValue + 1 ) << bits ) - 1 )`, is `( SymbolValue << bits )
+    /// | ~paddedData` over the low `bits` bits: the value is shifted
+    /// up and the INVERTED partition bits enter below it. So the
+    /// top 16 bits of `value_reg` are `SymbolValue` and the bits beneath
+    /// are the next partition bits, inverted, already in place — a
+    /// renormalisation is one left shift, the §8.2.6 comparison reads
+    /// the top 16 bits, and `SymbolValue -= cur` subtracts `cur <<
+    /// 48`. Bits past the partition's `8 * sz` (the §8.2.2 padding
+    /// zeros) enter as ones.
+    value_reg: u64,
+    /// Partition bits loaded into `value_reg` beneath the 16-bit value
+    /// field (`0..=48`); negative while the value field's own low
+    /// bits are still to be loaded (only between a shift and the
+    /// refill that follows it).
+    reserve_bits: i32,
+    /// The next partition byte to load into `value_reg`.
     next_byte: usize,
     /// `sz` exceeds the buffer: a renormalization reaching past the
     /// buffer fails as `f()` would (checked only then).
     short: bool,
-    /// `SymbolValue` — §8.2.2 / §8.2.4.
-    value: u32,
     /// `SymbolRange` — §8.2.2 / §8.2.4. Always in `(1 << 8) ..= (1 << 15)`.
     range: u32,
     /// `SymbolMaxBits` — §8.2.2 / §8.2.4. May go negative (signed) once
@@ -118,17 +127,18 @@ impl<'a> SymbolDecoder<'a> {
         sz: usize,
         disable_cdf_update: bool,
     ) -> Result<Self, Error> {
-        let mut reader = BitReader::new(bytes);
-
         // numBits = Min(sz * 8, 15)
         let num_bits = core::cmp::min(sz.saturating_mul(8), 15) as u32;
-        // buf = f(numBits)
-        let buf = reader.f(num_bits)? as u32;
-        let consumed = reader.position();
+        // buf = f(numBits) — the read itself (and its failure on a
+        // buffer shorter than `numBits`) is `f()`'s; the value comes
+        // in through the register below.
+        BitReader::new(bytes).f(num_bits)?;
         // paddedBuf = buf << (15 - numBits)
-        let padded_buf = buf << (15 - num_bits);
         // SymbolValue = ((1 << 15) - 1) ^ paddedBuf
-        let value = ((1u32 << 15) - 1) ^ padded_buf;
+        //   — a zero bit followed by the first 15 partition bits
+        //   inverted (ones past the partition): exactly what the
+        //   register holds in its top 16 bits after the first refill
+        //   from `reserve_bits = -15`.
         // SymbolRange = 1 << 15
         let range = 1u32 << 15;
         // SymbolMaxBits = 8 * sz - 15
@@ -137,37 +147,61 @@ impl<'a> SymbolDecoder<'a> {
         let mut d = Self {
             bytes,
             sz,
-            window: 0,
-            window_bits: 0,
-            next_byte: consumed / 8,
+            value_reg: 0,
+            reserve_bits: -15,
+            next_byte: 0,
             short: sz > bytes.len(),
-            value,
             range,
             max_bits,
             disable_cdf_update,
         };
-        // Position the window at bit `consumed` of the partition.
         d.refill();
-        let skip = (consumed % 8) as u32;
-        d.window <<= skip;
-        d.window_bits -= skip;
         Ok(d)
     }
 
-    /// Top the window up to at least 57 bits (zeros past the
-    /// partition).
-    #[inline]
+    /// Load partition bytes (inverted; `0xFF` past the partition)
+    /// beneath the bits already in `value_reg` until at least 41 spare bits
+    /// sit under the value field.
+    #[inline(always)]
     fn refill(&mut self) {
-        while self.window_bits <= 56 {
-            let byte = if self.next_byte < self.sz {
-                self.bytes.get(self.next_byte).copied().unwrap_or(0)
+        let end = self.sz.min(self.bytes.len());
+        if let Some(chunk) = self
+            .bytes
+            .get(self.next_byte..end)
+            .and_then(|rest| rest.first_chunk::<8>())
+        {
+            // Whole bytes that fit under the loaded bits: 1..=7.
+            let n = (48 - self.reserve_bits) >> 3;
+            let word = !u64::from_be_bytes(*chunk);
+            self.value_reg |= (word >> (64 - 8 * n)) << (48 - self.reserve_bits - 8 * n);
+            self.reserve_bits += 8 * n;
+            self.next_byte += n as usize;
+            return;
+        }
+        self.refill_near_end(end);
+    }
+
+    /// [`Self::refill`] within eight bytes of the partition's end (and
+    /// past it): one byte at a time.
+    #[cold]
+    #[inline(never)]
+    fn refill_near_end(&mut self, end: usize) {
+        while self.reserve_bits <= 40 {
+            let byte = if self.next_byte < end {
+                self.bytes[self.next_byte]
             } else {
                 0
             };
-            self.window |= u64::from(byte) << (56 - self.window_bits);
-            self.window_bits += 8;
+            self.value_reg |= u64::from(!byte) << (40 - self.reserve_bits);
+            self.reserve_bits += 8;
             self.next_byte += 1;
         }
+    }
+
+    /// `SymbolValue` — the top 16 bits of the register.
+    #[inline]
+    fn value(&self) -> u32 {
+        (self.value_reg >> 48) as u32
     }
 
     /// The §8.2 bit position indicator: the partition bits `f()` has
@@ -188,7 +222,7 @@ impl<'a> SymbolDecoder<'a> {
     /// `SymbolValue` accessor (§8.2.4 state) — for tests / debugging.
     #[cfg(test)]
     pub(crate) fn symbol_value(&self) -> u32 {
-        self.value
+        self.value()
     }
 
     /// `SymbolRange` accessor (§8.2.4 state) — for tests / debugging.
@@ -215,6 +249,59 @@ impl<'a> SymbolDecoder<'a> {
     ///
     /// Returns the decoded `symbol` in `0..N`.
     pub fn read_symbol(&mut self, cdf: &mut [u16]) -> Result<u32, Error> {
+        // r487 — the alphabets the coefficient and flag syntax reads
+        // most (N = 2, 3, 4) run with the search and the §8.3 update
+        // at a compile-time length.
+        match cdf.len() {
+            3 => self.read_symbol_sized::<3>(cdf.try_into().expect("length matched")),
+            4 => self.read_symbol_sized::<4>(cdf.try_into().expect("length matched")),
+            5 => self.read_symbol_sized::<5>(cdf.try_into().expect("length matched")),
+            _ => self.read_symbol_any(cdf),
+        }
+    }
+
+    /// [`Self::read_symbol`] over a CDF array of compile-time length
+    /// `L = N + 1`.
+    #[inline]
+    pub(crate) fn read_symbol_sized<const L: usize>(
+        &mut self,
+        cdf: &mut [u16; L],
+    ) -> Result<u32, Error> {
+        let n = (L - 1) as u32;
+        let value = self.value();
+        let r8 = self.range >> 8;
+        // §8.2.6 search without a data-dependent branch: `cur( s )`
+        // strictly decreases in `s` (the CDF is non-decreasing and the
+        // `EC_MIN_PROB` term drops by 4 per step), so the loop's exit
+        // index is the number of candidates with `SymbolValue < cur`.
+        // `bound[ s + 1 ] = cur( s )`, `bound[ 0 ] = SymbolRange`; the
+        // last candidate's `cur` is never compared (the loop ends
+        // there regardless).
+        let mut bound = [0u32; L];
+        bound[0] = self.range;
+        let mut symbol: u32 = 0;
+        for s in 0..L - 1 {
+            let f = (1u32 << 15) - u32::from(cdf[s]);
+            let cur = ((r8 * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (n - s as u32 - 1);
+            bound[s + 1] = cur;
+            if s + 2 < L {
+                symbol += u32::from(value < cur);
+            }
+        }
+        let prev = bound[symbol as usize % L];
+        let cur = bound[(symbol as usize + 1) % L];
+        self.range = prev - cur;
+        self.value_reg = self.value_reg.wrapping_sub(u64::from(cur) << 48);
+        self.renormalize()?;
+        if !self.disable_cdf_update {
+            adapt_cdf(cdf, symbol, n);
+        }
+        Ok(symbol)
+    }
+
+    /// [`Self::read_symbol`] at a run-time alphabet size.
+    fn read_symbol_any(&mut self, cdf: &mut [u16]) -> Result<u32, Error> {
         // N = number of possible symbol values = cdf.len() - 1.
         let n = cdf.len() as u32 - 1;
         debug_assert!(n >= 1, "§8.2.6: N must be greater than 1");
@@ -229,6 +316,7 @@ impl<'a> SymbolDecoder<'a> {
         //   } while ( SymbolValue < cur )
         // `cdf[N - 1] == 1 << 15` makes the last candidate's `cur` zero,
         // so the search ends by `symbol = N - 1`.
+        let value = self.value();
         let r8 = self.range >> 8;
         let mut prev = self.range;
         let mut cur;
@@ -237,7 +325,7 @@ impl<'a> SymbolDecoder<'a> {
             let f = (1u32 << 15) - u32::from(cdf[symbol as usize]);
             cur = ((r8 * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
                 + EC_MIN_PROB * (n - symbol - 1);
-            if self.value >= cur || symbol + 1 >= n {
+            if value >= cur || symbol + 1 >= n {
                 break;
             }
             prev = cur;
@@ -247,7 +335,7 @@ impl<'a> SymbolDecoder<'a> {
         // SymbolRange = prev - cur
         self.range = prev - cur;
         // SymbolValue = SymbolValue - cur
-        self.value -= cur;
+        self.value_reg = self.value_reg.wrapping_sub(u64::from(cur) << 48);
 
         // Renormalisation (§8.2.6 ordered steps 1..7).
         self.renormalize()?;
@@ -270,36 +358,32 @@ impl<'a> SymbolDecoder<'a> {
     /// arithmetic bug that drives the state out of range surfaces as
     /// [`Error::SymbolStateInvariantBroken`] instead of leaving the
     /// decoder in an undefined state.
-    #[inline]
+    #[inline(always)]
     fn renormalize(&mut self) -> Result<(), Error> {
-        // 1. bits = 15 - FloorLog2(SymbolRange)
-        let bits = 15 - floor_log2(self.range);
+        // 1. bits = 15 - FloorLog2(SymbolRange)   (`SymbolRange` is a
+        //    non-zero 16-bit value: 16 ..= 31 leading zeros)
+        let bits = self.range.leading_zeros().saturating_sub(16).min(16);
         // 2. SymbolRange = SymbolRange << bits
         self.range <<= bits;
         // 3. numBits = Min(bits, Max(0, SymbolMaxBits))
-        // 4. newData = f(numBits): the partition's next bits — read
-        //    through the window, which holds zeros past `8 * sz`, so
-        // 5. paddedData = newData << (bits - numBits) is simply the
-        //    window's next `bits` bits. (A partition running past the
-        //    end of the buffer fails as `f()` would.)
+        // 4. newData = f(numBits)
+        // 5. paddedData = newData << (bits - numBits)
+        // 6. SymbolValue = paddedData ^ (((SymbolValue + 1) << bits) - 1)
+        //    — one shift of the register: the next `bits` partition
+        //    bits (ones past `8 * sz`) are already in place beneath
+        //    the value, inverted. (A partition running past the end
+        //    of the buffer fails as `f()` would.)
         if self.short {
             let num_bits = core::cmp::min(i64::from(bits), self.max_bits.max(0)) as usize;
             if num_bits > 0 && self.bits_consumed() + num_bits > self.bytes.len() * 8 {
                 return Err(Error::UnexpectedEnd);
             }
         }
-        if self.window_bits < bits {
+        self.value_reg <<= bits;
+        self.reserve_bits -= bits as i32;
+        if self.reserve_bits < 0 {
             self.refill();
         }
-        let padded_data = if bits == 0 {
-            0
-        } else {
-            (self.window >> (64 - bits)) as u32
-        };
-        self.window <<= bits;
-        self.window_bits -= bits;
-        // 6. SymbolValue = paddedData ^ (((SymbolValue + 1) << bits) - 1)
-        self.value = padded_data ^ (((self.value + 1) << bits) - 1);
         // 7. SymbolMaxBits = SymbolMaxBits - bits
         self.max_bits -= i64::from(bits);
 
@@ -328,12 +412,18 @@ impl<'a> SymbolDecoder<'a> {
     /// [`Error::SymbolStateInvariantBroken`] rather than allowing the
     /// decoder to continue from an undefined state.
     fn check_post_renorm_invariants(&self) -> Result<(), Error> {
+        Self::check_state_invariants(self.value(), self.range)
+    }
+
+    /// The two §8.2.6 invariants over an explicit `(SymbolValue,
+    /// SymbolRange)` pair.
+    fn check_state_invariants(value: u32, range: u32) -> Result<(), Error> {
         const SYMBOL_RANGE_MIN: u32 = 1 << 15; // 32768
         const SYMBOL_RANGE_MAX: u32 = (1 << 16) - 1; // 65535
-        if self.range < SYMBOL_RANGE_MIN || self.range > SYMBOL_RANGE_MAX {
+        if !(SYMBOL_RANGE_MIN..=SYMBOL_RANGE_MAX).contains(&range) {
             return Err(Error::SymbolStateInvariantBroken);
         }
-        if self.value >= self.range {
+        if value >= range {
             return Err(Error::SymbolStateInvariantBroken);
         }
         Ok(())
@@ -354,9 +444,9 @@ impl<'a> SymbolDecoder<'a> {
         // array is discarded).
         let cur0 = (((self.range >> 8) * ((1u32 << 14) >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
             + EC_MIN_PROB;
-        let symbol = if self.value >= cur0 {
+        let symbol = if self.value() >= cur0 {
             self.range -= cur0;
-            self.value -= cur0;
+            self.value_reg = self.value_reg.wrapping_sub(u64::from(cur0) << 48);
             0
         } else {
             self.range = cur0;
@@ -567,19 +657,53 @@ impl<'a> SymbolDecoder<'a> {
 /// ```
 #[inline]
 pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
-    let count = u32::from(cdf[n as usize]);
-    let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
-
-    // `tmp` is 0 below `symbol` (so `cdf[i] -= cdf[i] >> rate`; a zero
-    // entry stays zero either way) and `1 << 15` from `symbol` on (no
-    // entry exceeds it, so `cdf[i] += ((1 << 15) - cdf[i]) >> rate`).
-    let split = (symbol as usize).min((n - 1) as usize);
-    let (below, above) = cdf[..(n - 1) as usize].split_at_mut(split);
-    for c in below {
-        *c -= *c >> rate;
+    match cdf.len() {
+        3 => adapt_cdf::<3>(cdf.try_into().expect("length matched"), symbol, n),
+        4 => adapt_cdf::<4>(cdf.try_into().expect("length matched"), symbol, n),
+        5 => adapt_cdf::<5>(cdf.try_into().expect("length matched"), symbol, n),
+        _ => adapt_cdf_slice(cdf, symbol, n),
     }
-    for c in above {
-        *c += ((1u16 << 15) - *c) >> rate;
+}
+
+/// The §8.3 rate: `3 + ( cdf[N] > 15 ) + ( cdf[N] > 31 ) + Min(
+/// FloorLog2( N ), 2 )`.
+#[inline]
+fn adaptation_rate(count: u32, n: u32) -> u32 {
+    3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2)
+}
+
+/// One §8.3 entry step. `tmp` is 0 for entries below `symbol` (`cdf[i]
+/// -= cdf[i] >> rate`; a zero entry stays zero either way) and `1 <<
+/// 15` from `symbol` on (no entry exceeds it, so `cdf[i] += ( ( 1 <<
+/// 15 ) - cdf[i] ) >> rate`). Both arms are computed and one is
+/// selected, so a run of entries has no data-dependent branch.
+#[inline(always)]
+fn adapt_entry(c: u16, below: bool, rate: u32) -> u16 {
+    let down = c - (c >> rate);
+    let up = c + (((1u16 << 15) - c.min(1 << 15)) >> rate);
+    if below { down } else { up }
+}
+
+/// §8.3 over a CDF array of compile-time length `L = N + 1` (`n` is
+/// passed for the rate; `n == L - 1`).
+#[inline]
+pub(crate) fn adapt_cdf<const L: usize>(cdf: &mut [u16; L], symbol: u32, n: u32) {
+    let count = u32::from(cdf[L - 1]);
+    let rate = adaptation_rate(count, n);
+    for (i, c) in cdf[..L - 2].iter_mut().enumerate() {
+        *c = adapt_entry(*c, (i as u32) < symbol, rate);
+    }
+    // cdf[N] += (cdf[N] < 32)
+    cdf[L - 1] = (count + u32::from(count < 32)) as u16;
+}
+
+/// §8.3 at a run-time alphabet size.
+#[inline]
+fn adapt_cdf_slice(cdf: &mut [u16], symbol: u32, n: u32) {
+    let count = u32::from(cdf[n as usize]);
+    let rate = adaptation_rate(count, n);
+    for (i, c) in cdf[..(n - 1) as usize].iter_mut().enumerate() {
+        *c = adapt_entry(*c, (i as u32) < symbol, rate);
     }
     // cdf[N] += (cdf[N] < 32)
     if count < 32 {
@@ -591,6 +715,7 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
 /// ([`crate::encoder::symbol_writer::SymbolWriter`]) — the §8.3 update is
 /// shared between encode and decode, so both sides apply the exact same
 /// adaptation rule to the same CDF arrays.
+#[inline]
 pub(crate) fn update_cdf_for_encoder(cdf: &mut [u16], symbol: u32, n: u32) {
     update_cdf(cdf, symbol, n);
 }
@@ -934,39 +1059,24 @@ mod tests {
     /// `value >= range`).
     #[test]
     fn invariant_check_returns_error_on_each_violation() {
+        let check = SymbolDecoder::check_state_invariants;
         // In-range: 32768 <= range, value < range.
-        let bytes = [0x00u8, 0x00u8];
-        let mut d = SymbolDecoder::init_symbol(&bytes, 2, true).unwrap();
-        d.value = 1;
-        d.range = 1 << 15;
-        assert!(d.check_post_renorm_invariants().is_ok());
-
+        assert!(check(1, 1 << 15).is_ok());
         // Boundary OK: range = 65535, value = 65534.
-        d.value = 65534;
-        d.range = 65535;
-        assert!(d.check_post_renorm_invariants().is_ok());
-
+        assert!(check(65534, 65535).is_ok());
         // range below 32768.
-        d.value = 0;
-        d.range = (1 << 15) - 1;
         assert_eq!(
-            d.check_post_renorm_invariants().unwrap_err(),
+            check(0, (1 << 15) - 1).unwrap_err(),
             Error::SymbolStateInvariantBroken
         );
-
         // range above 65535.
-        d.value = 0;
-        d.range = (1 << 16) + 1;
         assert_eq!(
-            d.check_post_renorm_invariants().unwrap_err(),
+            check(0, (1 << 16) + 1).unwrap_err(),
             Error::SymbolStateInvariantBroken
         );
-
         // value >= range.
-        d.value = 1 << 15;
-        d.range = 1 << 15;
         assert_eq!(
-            d.check_post_renorm_invariants().unwrap_err(),
+            check(1 << 15, 1 << 15).unwrap_err(),
             Error::SymbolStateInvariantBroken
         );
     }

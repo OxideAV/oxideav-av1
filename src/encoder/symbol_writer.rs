@@ -44,27 +44,16 @@
 //! encoder's recorded `[low, low + range)` symbol interval for every
 //! decoded symbol.
 //!
-//! Because the bit-width of `low` grows linearly with the symbol count,
-//! we represent it as a `Vec<bool>` of MSB-first bits with explicit
-//! big-integer addition; correct, simple, and bounded by the test
-//! sizes (a few hundred symbols at <16 bits per renorm step ⇒ a few
-//! KB at worst).
-//!
-//! ## What this module does *not* implement yet
-//!
-//! * `read_literal` / `NS` / `decode_subexp_bool` inverses — they
-//!   compose §8.2.3's boolean encode the same way the decoder side
-//!   composes `read_bool`. Future arcs add them on top of the
-//!   primitives below.
-//! * Tile-payload framing (`init_symbol(sz)` / `exit_symbol()`'s
-//!   trailing-bit sanity check) — the §5.11 `tile_group_obu` writer
-//!   will wrap this with the `tile_size_minus_1` size field and the
-//!   §5.3.4 trailer.
-//! * Byte-level flushing during encode — the current implementation
-//!   keeps the entire accumulated `low` in memory until
-//!   [`Self::finish`]. This is bounded for tile-payload sizes that
-//!   fit comfortably in RAM. A future arc that needs to encode
-//!   multi-megabyte tiles can add the standard carry-buffer flush.
+//! `low` grows by `bits` per renormalisation. r487: it is kept as a
+//! byte vector (the high-order part, already moved out) plus a 64-bit
+//! window holding the low-order bits — `low = done · 2^window_bits +
+//! window`. A symbol adds its offset (below `2^16`) into the window; a
+//! carry out of the window's top increments the byte vector from its
+//! last byte upwards (a run of `0xFF` bytes rolls over to `0x00`), and
+//! a renormalisation shifts the window left, spilling whole bytes off
+//! its top once it passes 48 bits. The bytes produced equal the
+//! bit-serial big-integer formulation's (kept as the test-side model,
+//! `tests::BitSerialModel`) for every symbol sequence.
 
 use crate::Error;
 
@@ -72,6 +61,12 @@ use crate::Error;
 /// arithmetic coding (§3, symbol-table constant; value 6). Same as
 /// [`crate::symbol_decoder`].
 const EC_PROB_SHIFT: u32 = 6;
+
+/// The window is cut back to `16..=23` valid bits once it holds more
+/// than this many: a renormalisation adds at most 15, so the window
+/// never passes 63 bits and an added offset (below `2^16`) never
+/// wraps the `u64`.
+const WINDOW_SPILL_BITS: u32 = 48;
 
 /// `EC_MIN_PROB` — minimum probability assigned to each symbol during
 /// arithmetic coding (§3, symbol-table constant; value 4). Same as
@@ -147,11 +142,18 @@ pub(crate) fn recenter(r: i64, v: i64) -> i64 {
 /// follow the §8.2.3 "fresh CDF per call" pattern and are unaffected.
 #[derive(Debug, Clone)]
 pub struct SymbolWriter {
-    /// Accumulated `low` value as MSB-first bits. The length of the
-    /// vector grows by `15` at init and by `bits` per renorm step; the
-    /// bit at index 0 is the most significant bit of the final encoded
-    /// bytestream.
-    low_bits: Vec<bool>,
+    /// The high-order bytes of `low` that have left the window, most
+    /// significant first — the head of the final bytestream, still
+    /// subject to carries from the window.
+    done: Vec<u8>,
+    /// The low-order `window_bits` bits of `low` (`low = done ·
+    /// 2^window_bits + window`). Bits above `window_bits` are zero
+    /// between operations.
+    window: u64,
+    /// Valid bits in [`Self::window`]: 15 at construction, grown by
+    /// each renormalisation, cut back to `16..=23` whenever it passes
+    /// [`WINDOW_SPILL_BITS`]. Never below 15 on an emitting writer.
+    window_bits: u32,
     /// Width of the current sub-interval. Kept in `[1, 1 << 16]`
     /// transiently and renormalised back to `[1 << 15, 1 << 16]`
     /// before each symbol write completes.
@@ -170,8 +172,8 @@ pub struct SymbolWriter {
     count_only: bool,
     /// Total §8.2.6 renormalisation bits accumulated since
     /// construction (`bits = 15 - FloorLog2(range)` summed over every
-    /// symbol write). In emit mode this equals
-    /// `low_bits.len() - 15`.
+    /// symbol write). In emit mode this equals the bit length of
+    /// `low` minus the 15 seed bits.
     renorm_bits: u64,
     /// `256·frac(log2(range))` at construction — the fractional-bit
     /// anchor [`Self::cost_bits256`] subtracts the current value
@@ -188,7 +190,9 @@ impl SymbolWriter {
         Self {
             // The initial `low = 0` in 15-bit precision (matching the
             // §8.2.2 `SymbolRange = 1 << 15` initial window).
-            low_bits: vec![false; 15],
+            done: Vec::new(),
+            window: 0,
+            window_bits: 15,
             range: 1 << 15,
             disable_cdf_update,
             count_only: false,
@@ -214,7 +218,9 @@ impl SymbolWriter {
             "counting writer seeded outside the §8.2.6 range window"
         );
         Self {
-            low_bits: Vec::new(),
+            done: Vec::new(),
+            window: 0,
+            window_bits: 0,
             range,
             disable_cdf_update,
             count_only: true,
@@ -270,7 +276,37 @@ impl SymbolWriter {
         let n = cdf.len() as u32 - 1;
         debug_assert!(n >= 1, "§8.2.6: N must be greater than 1");
         debug_assert!(symbol < n, "symbol {symbol} out of range for N={n}");
+        self.narrow_to_symbol(symbol, cdf, n)?;
+        // §8.3 CDF update — identical to the decoder side. Skipped when
+        // the frame header's `disable_cdf_update` was set.
+        if !self.disable_cdf_update {
+            crate::symbol_decoder::update_cdf_for_encoder(cdf, symbol, n);
+        }
+        Ok(())
+    }
 
+    /// [`Self::write_symbol`] over a CDF array of compile-time length
+    /// `L = N + 1` (the same bits and the same adaptation; the §8.3
+    /// update runs at a fixed length).
+    #[inline]
+    pub(crate) fn write_symbol_sized<const L: usize>(
+        &mut self,
+        symbol: u32,
+        cdf: &mut [u16; L],
+    ) -> Result<(), Error> {
+        let n = (L - 1) as u32;
+        debug_assert!(symbol < n, "symbol {symbol} out of range for N={n}");
+        self.narrow_to_symbol(symbol, &cdf[..], n)?;
+        if !self.disable_cdf_update {
+            crate::symbol_decoder::adapt_cdf(cdf, symbol, n);
+        }
+        Ok(())
+    }
+
+    /// The §8.2.6 interval step of one symbol write (everything but
+    /// the §8.3 adaptation).
+    #[inline(always)]
+    fn narrow_to_symbol(&mut self, symbol: u32, cdf: &[u16], n: u32) -> Result<(), Error> {
         // §8.2.6: compute the boundary points of the symbol's
         // sub-interval the decoder would land in. For symbol s the
         // decoder's `cur(s)` is the lower edge of the post-decode value
@@ -291,22 +327,10 @@ impl SymbolWriter {
         let offset = self.range - prev;
         self.range = prev - cur;
         debug_assert!(self.range >= 1, "§8.2.6 produced a zero-width sub-interval");
-        if !self.count_only {
-            self.add_to_low(offset);
-        }
-
         // §8.2.6 renormalisation: shift `low` and `range` left by
         // `bits = 15 - FloorLog2(range)` so the new `range >= (1 <<
-        // 15)`. The shift on `low_bits` is just appending `bits` zero
-        // bits.
-        let bits = 15 - floor_log2(self.range);
-        self.range <<= bits;
-        self.renorm_bits += u64::from(bits);
-        if !self.count_only {
-            for _ in 0..bits {
-                self.low_bits.push(false);
-            }
-        }
+        // 15)`.
+        self.advance(offset);
 
         // §8.2.6 post-renorm invariant — the encoder's `range` is in
         // exactly the same `[32768, 65535]` window the decoder's
@@ -318,15 +342,7 @@ impl SymbolWriter {
         // here would indicate either a caller-supplied CDF that does
         // not obey the §8.2.6 contract (`cdf[N-1] != 1 << 15`,
         // out-of-order entries) or an internal precision bug.
-        Self::check_range_invariant(self.range)?;
-
-        // §8.3 CDF update — identical to the decoder side. Skipped when
-        // the frame header's `disable_cdf_update` was set.
-        if !self.disable_cdf_update {
-            crate::symbol_decoder::update_cdf_for_encoder(cdf, symbol, n);
-        }
-
-        Ok(())
+        Self::check_range_invariant(self.range)
     }
 
     /// Verify the §8.2.6 post-renormalisation range invariant
@@ -355,8 +371,77 @@ impl SymbolWriter {
     /// is reconstructed per call, exactly as on the decoder side, so
     /// the §8.3 update has no observable effect.
     pub fn write_bool(&mut self, bit: u32) -> Result<(), Error> {
-        let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
-        self.write_symbol(bit, &mut cdf)
+        // §8.2.6 over `[ 1 << 14, 1 << 15, 0 ]` evaluated directly:
+        // `cur( 0 ) = ( ( SymbolRange >> 8 ) * ( ( 1 << 14 ) >> 6 )
+        // >> 1 ) + EC_MIN_PROB`, `cur( 1 ) = 0`. Symbol 0 owns
+        // `[cur( 0 ), SymbolRange)` (offset 0 in `u` space), symbol 1
+        // owns `[0, cur( 0 ))`.
+        let cur0 = (((self.range >> 8) * ((1u32 << 14) >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+            + EC_MIN_PROB;
+        debug_assert!(bit <= 1, "write_bool takes 0 or 1");
+        let offset = if bit == 0 {
+            self.range -= cur0;
+            0
+        } else {
+            let off = self.range - cur0;
+            self.range = cur0;
+            off
+        };
+        self.advance(offset);
+        Self::check_range_invariant(self.range)
+    }
+
+    /// The shared tail of every symbol write: add the symbol's
+    /// `offset` into `low` (emitting writers only), then renormalise
+    /// `range` back into `[1 << 15, 1 << 16)` and shift `low` by the
+    /// same bit count.
+    #[inline]
+    fn advance(&mut self, offset: u32) {
+        // `bits = 15 - FloorLog2( range )`: a non-zero 16-bit range has
+        // 16 ..= 31 leading zeros. (A zero range — a CDF that breaks
+        // the §8.2.6 contract — stays zero and fails the range check.)
+        let bits = self.range.leading_zeros().saturating_sub(16).min(15);
+        self.range <<= bits;
+        self.renorm_bits += u64::from(bits);
+        if self.count_only {
+            return;
+        }
+        // `window < 2^window_bits <= 2^63` and `offset < 2^16`: the
+        // sum cannot wrap the `u64`; a carry shows as a bit at
+        // `window_bits`.
+        self.window += u64::from(offset);
+        if self.window >> self.window_bits != 0 {
+            self.window &= (1u64 << self.window_bits) - 1;
+            self.carry_into_done();
+        }
+        self.window <<= bits;
+        self.window_bits += bits;
+        if self.window_bits > WINDOW_SPILL_BITS {
+            while self.window_bits >= 24 {
+                self.window_bits -= 8;
+                self.done.push((self.window >> self.window_bits) as u8);
+            }
+            self.window &= (1u64 << self.window_bits) - 1;
+        }
+    }
+
+    /// Add one at the least significant byte of [`Self::done`],
+    /// rippling through trailing `0xFF` bytes. The interval invariant
+    /// `low + range <= 2^len` (the mirror of the decoder's
+    /// `SymbolValue < SymbolRange`) keeps the carry from leaving the
+    /// most significant byte.
+    #[cold]
+    fn carry_into_done(&mut self) {
+        for byte in self.done.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                return;
+            }
+        }
+        debug_assert!(
+            false,
+            "`low + offset` overflowed the §8.2.6 interval invariant"
+        );
     }
 
     /// `write_literal( n, value )` — inverse of §8.2.5
@@ -534,35 +619,6 @@ impl SymbolWriter {
         cur
     }
 
-    /// Add `offset` to `low` (treated as a big-endian MSB-first
-    /// integer). The addition happens at the *least significant* bit
-    /// of `low_bits` and carries propagate up through the vector. If
-    /// the carry escapes past the most significant bit, we prepend a
-    /// new `true` bit — but this only happens when `low + offset >= 2
-    /// ^ low_bits.len()`, which the per-symbol invariant `low +
-    /// range <= 2 ^ low_bits.len()` (mirroring the decoder's
-    /// `SymbolValue` invariant) keeps from ever triggering. We assert
-    /// instead of `insert(0, true)` so a future bug shows up as a
-    /// loud test failure rather than a silently-mis-aligned
-    /// bitstream.
-    fn add_to_low(&mut self, offset: u32) {
-        let mut carry: u64 = u64::from(offset);
-        // Walk from LSB (last bit) to MSB (first bit).
-        for i in (0..self.low_bits.len()).rev() {
-            if carry == 0 {
-                break;
-            }
-            let bit_val: u64 = if self.low_bits[i] { 1 } else { 0 };
-            let sum = bit_val + (carry & 1);
-            self.low_bits[i] = (sum & 1) != 0;
-            carry = (carry >> 1) + (sum >> 1);
-        }
-        debug_assert!(
-            carry == 0,
-            "`low + offset` overflowed the §8.2.6 interval invariant"
-        );
-    }
-
     /// Flush the encoder and return the encoded byte sequence, with
     /// the §8.2.4-conformant termination (r409).
     ///
@@ -594,45 +650,41 @@ impl SymbolWriter {
             !self.count_only,
             "a counting (rate-twin) writer has no bytestream to flush"
         );
-        let n = self.low_bits.len();
-        debug_assert!(n >= 15, "init seeds 15 bits; finish sees at least those");
-        if n >= 15 {
+        debug_assert!(
+            self.window_bits >= 15,
+            "init seeds 15 bits; finish sees at least those"
+        );
+        if self.window_bits >= 15 {
             // Value of the last 15 bits of `low`.
-            let mut r: u32 = 0;
-            for &b in &self.low_bits[n - 15..] {
-                r = (r << 1) | u32::from(b);
-            }
+            let r = (self.window & 0x7FFF) as u32;
             // Adjust to the unique in-interval value with last-15-bits
             // == `1 << 14`. `offset = (2^14 - r) mod 2^15 < 2^15 <=
             // range`, so `low + offset` stays inside `[low, low +
             // range)` and never overflows the bit grid.
             let offset = ((1u32 << 14).wrapping_sub(r)) & 0x7FFF;
             debug_assert!(offset < self.range, "termination offset exceeds range");
-            if offset != 0 {
-                self.add_to_low(offset);
+            self.window += u64::from(offset);
+            if self.window >> self.window_bits != 0 {
+                self.window &= (1u64 << self.window_bits) - 1;
+                self.carry_into_done();
             }
             debug_assert!(
-                self.low_bits[n - 15] && self.low_bits[n - 14..].iter().all(|&b| !b),
+                self.window & 0x7FFF == 1 << 14,
                 "post-adjust low must end in the §8.2.4 trailing pattern"
             );
             // Drop the 14 trailing zeros — they are reconstituted by
             // the decoder's zero-fill and by the byte padding below.
-            self.low_bits.truncate(n - 14);
+            self.window >>= 14;
+            self.window_bits -= 14;
         }
-        let mut out = Vec::with_capacity(self.low_bits.len().div_ceil(8));
-        let mut cur: u8 = 0;
-        let mut bits_in_cur: u32 = 0;
-        for b in self.low_bits {
-            cur |= (b as u8) << (7 - bits_in_cur);
-            bits_in_cur += 1;
-            if bits_in_cur == 8 {
-                out.push(cur);
-                cur = 0;
-                bits_in_cur = 0;
-            }
+        let mut out = self.done;
+        out.reserve(self.window_bits.div_ceil(8) as usize);
+        while self.window_bits >= 8 {
+            self.window_bits -= 8;
+            out.push((self.window >> self.window_bits) as u8);
         }
-        if bits_in_cur != 0 {
-            out.push(cur);
+        if self.window_bits != 0 {
+            out.push(((self.window << (8 - self.window_bits)) & 0xFF) as u8);
         }
         out
     }
@@ -642,6 +694,135 @@ impl SymbolWriter {
 mod tests {
     use super::*;
     use crate::symbol_decoder::SymbolDecoder;
+
+    /// The bit-serial big-integer formulation of the writer (`low` as
+    /// one MSB-first bit per element, offsets added with an explicit
+    /// ripple carry, a renormalisation appending zero bits) — the
+    /// model the windowed writer must match byte for byte.
+    struct BitSerialModel {
+        low_bits: Vec<bool>,
+        range: u32,
+    }
+
+    impl BitSerialModel {
+        fn new() -> Self {
+            Self {
+                low_bits: vec![false; 15],
+                range: 1 << 15,
+            }
+        }
+
+        fn add_to_low(&mut self, offset: u32) {
+            let mut carry = u64::from(offset);
+            for i in (0..self.low_bits.len()).rev() {
+                if carry == 0 {
+                    break;
+                }
+                let sum = u64::from(self.low_bits[i]) + (carry & 1);
+                self.low_bits[i] = (sum & 1) != 0;
+                carry = (carry >> 1) + (sum >> 1);
+            }
+            assert_eq!(carry, 0);
+        }
+
+        fn write_symbol(&mut self, symbol: u32, cdf: &mut [u16]) {
+            let n = cdf.len() as u32 - 1;
+            let cur_of = |range: u32, s: u32| {
+                let f = (1u32 << 15) - u32::from(cdf[s as usize]);
+                (((range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                    + EC_MIN_PROB * (n - s - 1)
+            };
+            let cur = cur_of(self.range, symbol);
+            let prev = if symbol == 0 {
+                self.range
+            } else {
+                cur_of(self.range, symbol - 1)
+            };
+            let offset = self.range - prev;
+            self.range = prev - cur;
+            self.add_to_low(offset);
+            let bits = 15 - floor_log2(self.range);
+            self.range <<= bits;
+            for _ in 0..bits {
+                self.low_bits.push(false);
+            }
+            crate::symbol_decoder::update_cdf_for_encoder(cdf, symbol, n);
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            let n = self.low_bits.len();
+            let mut r: u32 = 0;
+            for &b in &self.low_bits[n - 15..] {
+                r = (r << 1) | u32::from(b);
+            }
+            let offset = ((1u32 << 14).wrapping_sub(r)) & 0x7FFF;
+            self.add_to_low(offset);
+            self.low_bits.truncate(n - 14);
+            let mut out = Vec::new();
+            for chunk in self.low_bits.chunks(8) {
+                let mut byte = 0u8;
+                for (i, &b) in chunk.iter().enumerate() {
+                    byte |= u8::from(b) << (7 - i);
+                }
+                out.push(byte);
+            }
+            out
+        }
+    }
+
+    /// r487 — the windowed writer equals the bit-serial model on
+    /// random symbol / boolean mixes of every length class, including
+    /// carry runs through `0xFF` bytes (skewed CDFs that keep `low`
+    /// near the top of its interval) and every finish alignment.
+    #[test]
+    fn windowed_writer_matches_bit_serial_model() {
+        let mut x: u32 = 0x9E37_79B9;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let cdf_sets: [&[u16]; 4] = [
+            &[16384, 32768, 0],
+            &[32000, 32768, 0],
+            &[200, 400, 32768, 0],
+            &[3000, 7000, 12000, 16000, 20000, 24000, 28000, 32768, 0],
+        ];
+        for len in (0..200).chain([1000, 5000, 20000]) {
+            for mode in 0..3u32 {
+                let mut w = SymbolWriter::new(false);
+                let mut m = BitSerialModel::new();
+                let mut cw: Vec<Vec<u16>> = cdf_sets.iter().map(|c| c.to_vec()).collect();
+                let mut cm = cw.clone();
+                for _ in 0..len {
+                    let v = next();
+                    let k = (v % 5) as usize;
+                    if k == 4 {
+                        let bit = (v >> 8) & 1;
+                        w.write_bool(bit).unwrap();
+                        m.write_symbol(bit, &mut [1 << 14, 1 << 15, 0]);
+                    } else {
+                        let n = cw[k].len() as u32 - 1;
+                        // mode 1 leans on the last symbol (offset near
+                        // the full range → long carry chains), mode 2
+                        // on the first.
+                        let s = match mode {
+                            0 => (v >> 8) % n,
+                            1 if (v >> 8) % 8 != 0 => n - 1,
+                            2 if (v >> 8) % 8 != 0 => 0,
+                            _ => (v >> 12) % n,
+                        };
+                        w.write_symbol(s, &mut cw[k]).unwrap();
+                        m.write_symbol(s, &mut cm[k]);
+                    }
+                    assert_eq!(w.range(), m.range);
+                }
+                assert_eq!(cw, cm);
+                assert_eq!(w.finish(), m.finish(), "len {len} mode {mode}");
+            }
+        }
+    }
 
     /// r409 §8.2.4 termination: the emitted tile payload ends with the
     /// OBU trailing-bits pattern — scanning from the end, the padding
@@ -1194,7 +1375,10 @@ mod tests {
         );
         // The emitting writer's bit accumulation is 15 seed bits plus
         // one per renorm bit — the two books must agree exactly.
-        assert_eq!(emit.low_bits.len() as u64, 15 + emit.renorm_bits);
+        assert_eq!(
+            8 * emit.done.len() as u64 + u64::from(emit.window_bits),
+            15 + emit.renorm_bits
+        );
     }
 
     /// Seeding a counting twin from a mid-stream emitting writer's

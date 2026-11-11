@@ -67,9 +67,9 @@ use crate::cdf::{
     SWITCHABLE, TileCdfContext, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
     WEDGE_TYPES, ZERO_MV_CONTEXTS, block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx,
     cfl_alpha_v_ctx, comp_group_idx_ctx, comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx,
-    compound_mode_ctx, count_refs, get_palette_color_context, interintra_ctx, interp_filter_ctx,
-    is_directional, is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave,
-    palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits,
+    compound_mode_ctx, count_refs, interintra_ctx, interp_filter_ctx, is_directional,
+    is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave, palette_uv_mode_ctx,
+    palette_y_mode_ctx, ref_count_ctx, wedge_bits,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 
@@ -2940,55 +2940,40 @@ pub fn write_palette_tokens_plane(
     // top-left sample is coded as a non-symmetric literal.
     writer.write_ns(palette_size as u32, color_map[0] as u32)?;
 
-    // Working map — the reader's `ColorMap` reconstruction, rebuilt
-    // sample by sample so each §5.11.50 context derivation observes
-    // exactly the state the reader's derivation observes (unwalked
-    // cells hold the same `0` pre-fill the reader's buffer holds).
-    let mut work = vec![0u8; block_height * stride];
-    work[0] = color_map[0];
-
-    // §5.11.49 anti-diagonal walk over the on-screen rectangle.
+    // r487 — the §5.11.49 wavefront reads only neighbours the walk has
+    // already coded (left / above-left / above lie on the two previous
+    // anti-diagonals), and a coded cell of the decoder's `ColorMapY`
+    // equals the caller's `color_map` cell, so the neighbours are read
+    // straight from `color_map` (each was range-checked when it was
+    // coded) and the §5.11.50 outcome comes from the per-triple table.
+    let table = crate::cdf::palette_neighbour_table();
     for i in 1..(onscreen_height + onscreen_width - 1) {
         let j_hi = core::cmp::min(i, onscreen_width - 1);
         let j_lo = i.saturating_sub(onscreen_height - 1);
-        let mut j = j_hi;
-        loop {
-            let r = i - j;
-            let c = j;
-
-            let desired = color_map[r * stride + c];
+        for c in (j_lo..=j_hi).rev() {
+            let r = i - c;
+            let at = r * stride + c;
+            let desired = color_map[at];
             if (desired as usize) >= palette_size {
                 return Err(Error::InvalidPaletteWalkArgs);
             }
-
-            // §5.11.50 colour context + `ColorOrder` permutation from
-            // the working map (already-walked neighbours only).
-            let pcc = get_palette_color_context(&work, stride, r, c, palette_size)
-                .ok_or(Error::InvalidPaletteWalkArgs)?;
-            let ctx = palette_color_ctx(pcc.color_context_hash)
-                .ok_or(Error::PaletteColorContextUnmapped)?;
-
-            // §5.11.49: the reader maps `palette_color_idx` through
-            // `ColorOrder`; the writer inverts the permutation.
-            let idx = pcc
-                .color_order
-                .iter()
-                .take(palette_size)
-                .position(|&v| v == desired)
-                .ok_or(Error::InvalidPaletteWalkArgs)?;
+            let left = (c > 0).then(|| color_map[at - 1]);
+            let above = (r > 0).then(|| color_map[at - stride]);
+            let above_left = (r > 0 && c > 0).then(|| color_map[at - stride - 1]);
+            let entry = &table[crate::cdf::palette_neighbour_key(left, above_left, above)];
+            let ctx = usize::from(entry.ctx.ok_or(Error::PaletteColorContextUnmapped)?);
+            // ColorOrder is a permutation of `0..PALETTE_COLORS` whose
+            // first `palette_size` slots hold exactly the colours
+            // below `palette_size` (the scored colours are in range),
+            // so the rank of an in-range colour is below it too.
+            let idx = entry.rank[usize::from(desired) & 7];
 
             let cdf = match plane {
                 PalettePlane::Y => cdfs.palette_y_color_cdf(palette_size, ctx),
                 PalettePlane::Uv => cdfs.palette_uv_color_cdf(palette_size, ctx),
             }
             .ok_or(Error::InvalidPaletteWalkArgs)?;
-            writer.write_symbol(idx as u32, cdf)?;
-            work[r * stride + c] = desired;
-
-            if j == j_lo {
-                break;
-            }
-            j -= 1;
+            writer.write_symbol(u32::from(idx), cdf)?;
         }
     }
 

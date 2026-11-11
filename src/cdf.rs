@@ -10654,6 +10654,67 @@ impl TileCdfContext {
         }
     }
 
+    // -----------------------------------------------------------------
+    // r487 — the coefficient-syntax rows at their array type (the same
+    // rows and the same range checks as the slice selectors), for the
+    // compile-time-length symbol reads of the §5.11.39 walk.
+    // -----------------------------------------------------------------
+
+    #[inline]
+    pub(crate) fn eob_extra_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 3]> {
+        self.eob_extra
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn dc_sign_row(&mut self, ptype: usize, ctx: usize) -> Option<&mut [u16; 3]> {
+        self.dc_sign.get_mut(ptype)?.get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn coeff_base_eob_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 4]> {
+        self.coeff_base_eob
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn coeff_base_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 5]> {
+        self.coeff_base
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    /// `tx_sz_ctx` clamps at `TX_32X32` per the §8.3.2 selector.
+    #[inline]
+    pub(crate) fn coeff_br_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; BR_CDF_SIZE + 1]> {
+        self.coeff_br[tx_sz_ctx.min(3)].get_mut(ptype)?.get_mut(ctx)
+    }
+
     /// §8.3.2 `dc_sign`: the cdf is `TileDcSignCdf[ ptype ][ ctx ]`, where
     /// `ctx` is the `dc_sign` context (`0..DC_SIGN_CONTEXTS`). Returns
     /// `None` for an out-of-range index.
@@ -11563,6 +11624,87 @@ pub fn palette_color_context_from_neighbors(
         return None;
     }
 
+    // r487 — every caller inside the tile walk hands in neighbour
+    // indices below `n`, and for those the §5.11.50 result does not
+    // depend on `n`: only the (at most three) scored colours move, to
+    // the front, and the hash sums their scores. So the process is
+    // resolved once per neighbour triple (`palette_neighbour_table`)
+    // and looked up here; a triple with an index at or above `n` takes
+    // the literal process.
+    let in_range = |nb: Option<u8>| nb.is_none_or(|c| usize::from(c) < n);
+    if in_range(left) && in_range(above_left) && in_range(above) {
+        let entry = &palette_neighbour_table()[palette_neighbour_key(left, above_left, above)];
+        return Some(PaletteColorContext {
+            color_order: entry.color_order,
+            color_context_hash: usize::from(entry.color_context_hash),
+        });
+    }
+    palette_color_context_literal(left, above_left, above, n)
+}
+
+/// One resolved §5.11.50 outcome (see [`palette_neighbour_table`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaletteNeighbourEntry {
+    /// `ColorOrder[ ]`.
+    pub color_order: [u8; PALETTE_COLORS],
+    /// The inverse permutation: `rank[ ColorOrder[ i ] ] = i` — the
+    /// `palette_color_idx` symbol that selects a given colour.
+    pub rank: [u8; PALETTE_COLORS],
+    /// `ColorContextHash`.
+    pub color_context_hash: u8,
+    /// `Palette_Color_Context[ ColorContextHash ]`, `None` on the
+    /// spec's `-1` sentinels.
+    pub ctx: Option<u8>,
+}
+
+/// Index of a neighbour triple in [`palette_neighbour_table`]: each
+/// neighbour is one base-9 digit (0 = unavailable, `c + 1` = colour
+/// index `c`).
+#[inline]
+pub(crate) fn palette_neighbour_key(
+    left: Option<u8>,
+    above_left: Option<u8>,
+    above: Option<u8>,
+) -> usize {
+    let digit = |nb: Option<u8>| nb.map_or(0, |c| usize::from(c.min(7)) + 1);
+    (digit(left) * 9 + digit(above_left)) * 9 + digit(above)
+}
+
+/// The §5.11.50 process evaluated once for every neighbour triple
+/// with indices in `0..PALETTE_COLORS` (729 entries), by the literal
+/// process at `n = PALETTE_COLORS`.
+pub(crate) fn palette_neighbour_table() -> &'static [PaletteNeighbourEntry; 729] {
+    static TABLE: std::sync::OnceLock<[PaletteNeighbourEntry; 729]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let nb = |digit: usize| (digit > 0).then(|| (digit - 1) as u8);
+        core::array::from_fn(|key| {
+            let (l, al, a) = (nb(key / 81), nb(key / 9 % 9), nb(key % 9));
+            let pcc = palette_color_context_literal(l, al, a, PALETTE_COLORS)
+                .expect("in-range neighbours");
+            let mut rank = [0u8; PALETTE_COLORS];
+            for (i, &c) in pcc.color_order.iter().enumerate() {
+                rank[usize::from(c)] = i as u8;
+            }
+            PaletteNeighbourEntry {
+                color_order: pcc.color_order,
+                rank,
+                color_context_hash: pcc.color_context_hash as u8,
+                ctx: palette_color_ctx(pcc.color_context_hash).map(|c| c as u8),
+            }
+        })
+    })
+}
+
+/// The §5.11.50 process step for step (score array, partial selection
+/// sort): the general arm of [`palette_color_context_from_neighbors`]
+/// (a neighbour index at or above `n`) and the model its closed form
+/// is tested against.
+fn palette_color_context_literal(
+    left: Option<u8>,
+    above_left: Option<u8>,
+    above: Option<u8>,
+    n: usize,
+) -> Option<PaletteColorContext> {
     // §5.11.50: scores[i] = 0; ColorOrder[i] = i  for i in 0..PALETTE_COLORS.
     let mut scores = [0u32; PALETTE_COLORS];
     let mut color_order = [0u8; PALETTE_COLORS];
@@ -13674,7 +13816,7 @@ pub(crate) fn dequantize_step1_into(
     let h = TX_HEIGHT[tx_size];
     let tw = core::cmp::min(32, w);
     let th = core::cmp::min(32, h);
-    let dq_denom = dequant_denom(tx_size);
+    let dq_shift = dequant_denom(tx_size).trailing_zeros();
     let clip_min: i64 = -(1i64 << (7 + quant.bit_depth as u32));
     let clip_max: i64 = (1i64 << (7 + quant.bit_depth as u32)) - 1;
     let dc_q_val = get_dc_quant(quant, plane, segment_id) as i64;
@@ -13706,8 +13848,11 @@ pub(crate) fn dequantize_step1_into(
             // `w × h` array the §7.13.3 inverse transform consumes
             // (cells past 32 stay zero per its i/j < 32 gate).
             let dq = (quant_levels[i * tw + j] as i64) * q2;
-            let sign: i64 = if dq < 0 { -1 } else { 1 };
-            let dq2 = sign * ((dq.unsigned_abs() & 0xFF_FFFF) as i64) / dq_denom;
+            // `sign * ( ( |dq| & 0xFFFFFF ) / dqDenom )`: the divisor
+            // is 1, 2 or 4 and the dividend non-negative, so the
+            // truncating division is a right shift of the magnitude.
+            let magnitude = ((dq.unsigned_abs() & 0xFF_FFFF) as i64) >> dq_shift;
+            let dq2 = if dq < 0 { -magnitude } else { magnitude };
             dequant[i * w + j] = dq2.clamp(clip_min, clip_max);
         }
     }
@@ -14719,16 +14864,45 @@ pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) ->
     }
 }
 
+/// Cells of one §7.11.2 edge buffer at the largest block: two guard
+/// cells plus `2 * ( w + h )` with `w = h = 64`.
+const INTRA_EDGE_CELLS: usize = 2 * (64 + 64) + 2;
+
+thread_local! {
+    /// r487 — per-thread §7.11.2 prediction block, reused across
+    /// blocks so intra prediction allocates nothing per call.
+    static INTRA_PRED_SCRATCH: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The thread's prediction buffer on loan; handed back on drop (a
+/// nested loan simply starts from an empty buffer).
+struct IntraPredScratch(Vec<u16>);
+
+impl IntraPredScratch {
+    fn take() -> Self {
+        Self(INTRA_PRED_SCRATCH.take())
+    }
+}
+
+impl Drop for IntraPredScratch {
+    fn drop(&mut self) {
+        // `try_with`: a drop during thread teardown just frees it.
+        let buf = core::mem::take(&mut self.0);
+        let _ = INTRA_PRED_SCRATCH.try_with(|cell| cell.replace(buf));
+    }
+}
+
 /// r481 — padding (columns right of / rows below the transform block)
 /// of the coefficient-context level copy: the largest §8.3.2
 /// neighbour offset.
-const LEVELS_PAD: usize = 4;
+pub(crate) const LEVELS_PAD: usize = 4;
 
 /// r481 — [`get_coeff_base_ctx`] (`isEob == 0`) over the padded level
 /// copy: `levels[ lpos ]` is position `pos` (row `pos >> bwl`), rows
 /// `stride` apart. Same value for every input.
-#[inline]
-fn coeff_base_ctx_from_levels(
+#[inline(always)]
+pub(crate) fn coeff_base_ctx_from_levels(
     levels: &[u8],
     stride: usize,
     lpos: usize,
@@ -14758,8 +14932,8 @@ fn coeff_base_ctx_from_levels(
 
 /// r481 — [`get_br_ctx`] over the padded level copy (levels stored
 /// clamped to `COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 = 15`).
-#[inline]
-fn br_ctx_from_levels(
+#[inline(always)]
+pub(crate) fn br_ctx_from_levels(
     levels: &[u8],
     stride: usize,
     lpos: usize,
@@ -17520,7 +17694,8 @@ impl PartitionWalker {
             let idx = (yy as usize) * (buf_cols as usize) + (xx as usize);
             buf.samples[idx] as u16
         };
-        let Some(pred) = Self::intra_predict_block_samples(
+        let mut scratch = IntraPredScratch::take();
+        if !Self::intra_predict_block_samples(
             &read,
             max_x,
             max_y,
@@ -17541,15 +17716,28 @@ impl PartitionWalker {
             // the normal mode dispatch exactly as before the r417
             // core extraction.
             filter_intra_mode.filter(|_| plane == 0),
-        ) else {
+            &mut scratch.0,
+        ) {
             return;
-        };
+        }
+        let pred: &[u16] = &scratch.0;
 
         let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
             return;
         };
         let cols_buf = buf.cols;
         let rows_buf = buf.rows;
+        // r487 — a block wholly inside the plane buffer: row copies.
+        if start_y + h as u32 <= rows_buf && start_x + w as u32 <= cols_buf && pred.len() >= w * h {
+            let cols_u = cols_buf as usize;
+            for (i, src) in pred.chunks_exact(w).take(h).enumerate() {
+                let d0 = (start_y as usize + i) * cols_u + start_x as usize;
+                for (d, &p) in buf.samples[d0..d0 + w].iter_mut().zip(src) {
+                    *d = i32::from(p);
+                }
+            }
+            return;
+        }
         // r408: a §5.11.35 TU legally overhangs the mi-padded grid;
         // §7.11.5 CfL reads the overhung luma samples back (spec
         // CurrFrame is unbounded), so plane-0 out-of-buffer cells go
@@ -17615,7 +17803,8 @@ impl PartitionWalker {
     ) {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
-        let Some(pred) = Self::intra_predict_block_samples(
+        let mut scratch = IntraPredScratch::take();
+        if !Self::intra_predict_block_samples(
             neigh,
             max_x,
             max_y,
@@ -17632,9 +17821,11 @@ impl PartitionWalker {
             enable_intra_edge_filter,
             filter_type,
             filter_intra_mode,
-        ) else {
+            &mut scratch.0,
+        ) {
             return;
-        };
+        }
+        let pred: &[u16] = &scratch.0;
         for i in 0..h as u32 {
             let dst_y = start_y + i;
             if dst_y > max_y {
@@ -17683,14 +17874,15 @@ impl PartitionWalker {
         enable_intra_edge_filter: bool,
         filter_type: u8,
         filter_intra_mode: Option<usize>,
-    ) -> Option<Vec<u16>> {
+        pred: &mut Vec<u16>,
+    ) -> bool {
         if mode >= INTRA_MODES {
-            return None;
+            return false;
         }
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         if w == 0 || h == 0 || w > 64 || h > 64 {
-            return None;
+            return false;
         }
         let log2_w = w.trailing_zeros();
         let log2_h = h.trailing_zeros();
@@ -17730,7 +17922,11 @@ impl PartitionWalker {
         // room. The un-upsampled directional / DC / smooth / PAETH
         // arms only read offsets `1 .. span + 1`.
         let ext_cap = 2 * span + 2;
-        let mut above_ext = vec![0u16; ext_cap];
+        // r487 — edge buffers on the stack (`2 * ( 64 + 64 ) + 2` cells
+        // at most), the prediction block in the caller's reused
+        // buffer: no allocation per predicted block.
+        let mut above_store = [0u16; INTRA_EDGE_CELLS];
+        let above_ext: &mut [u16] = &mut above_store[..ext_cap];
         above_ext[0] = corner;
         above_ext[1] = corner;
         if !have_above && have_left {
@@ -17751,7 +17947,8 @@ impl PartitionWalker {
             }
         }
 
-        let mut left_ext = vec![0u16; ext_cap];
+        let mut left_store = [0u16; INTRA_EDGE_CELLS];
+        let left_ext: &mut [u16] = &mut left_store[..ext_cap];
         left_ext[0] = corner;
         left_ext[1] = corner;
         if !have_left && have_above {
@@ -17808,7 +18005,7 @@ impl PartitionWalker {
                     let num_px = (w.min((max_x - start_x + 1) as usize))
                         + (if p_angle < 90 { h } else { 0 })
                         + 1;
-                    let _ = intra_edge_filter(num_px, strength, &mut above_ext);
+                    let _ = intra_edge_filter(num_px, strength, above_ext);
                 }
                 // §7.11.2.4 step-4 left-edge filter (haveLeft == 1).
                 if have_left {
@@ -17817,19 +18014,19 @@ impl PartitionWalker {
                     let num_px = (h.min((max_y - start_y + 1) as usize))
                         + (if p_angle > 180 { w } else { 0 })
                         + 1;
-                    let _ = intra_edge_filter(num_px, strength, &mut left_ext);
+                    let _ = intra_edge_filter(num_px, strength, left_ext);
                 }
                 // §7.11.2.4 step-4 above-edge upsample selection + apply.
                 upsample_above = intra_edge_upsample_selection(w, h, filter_type, p_angle - 90);
                 if upsample_above == 1 {
                     let num_px = w + (if p_angle < 90 { h } else { 0 });
-                    let _ = intra_edge_upsample(num_px, bit_depth, &mut above_ext);
+                    let _ = intra_edge_upsample(num_px, bit_depth, above_ext);
                 }
                 // §7.11.2.4 step-4 left-edge upsample selection + apply.
                 upsample_left = intra_edge_upsample_selection(w, h, filter_type, p_angle - 180);
                 if upsample_left == 1 {
                     let num_px = h + (if p_angle > 180 { w } else { 0 });
-                    let _ = intra_edge_upsample(num_px, bit_depth, &mut left_ext);
+                    let _ = intra_edge_upsample(num_px, bit_depth, left_ext);
                 }
             }
         }
@@ -17837,7 +18034,9 @@ impl PartitionWalker {
         let above_row = &above_ext[2..2 + span];
         let left_col = &left_ext[2..2 + span];
 
-        let mut pred = vec![0u16; w * h];
+        pred.clear();
+        pred.resize(w * h, 0);
+        let pred: &mut [u16] = pred.as_mut_slice();
         // §7.11.2.1 first dispatch arm: `plane == 0 && use_filter_intra`
         // ⇒ the §7.11.2.3 recursive intra prediction process, fed the
         // head-extended `above_ext` / `left_ext` (corner at offset 1).
@@ -17845,8 +18044,8 @@ impl PartitionWalker {
         // `Block_Width[MiSize] <= 32 && Block_Height[MiSize] <= 32`
         // reader constraint, so `w`/`h` are always within the
         // `[4, 32]` recursive-kernel domain (`w >= 4 && h >= 2`).
-        let ok = if let Some(fim) = filter_intra_mode {
-            predict_intra_recursive(w, h, fim, bit_depth, &above_ext, &left_ext, &mut pred).is_ok()
+        if let Some(fim) = filter_intra_mode {
+            predict_intra_recursive(w, h, fim, bit_depth, above_ext, left_ext, pred).is_ok()
         } else {
             match mode {
                 DC_PRED => predict_intra_dc_pred(
@@ -17859,51 +18058,41 @@ impl PartitionWalker {
                     bit_depth,
                     above_row,
                     left_col,
-                    &mut pred,
+                    pred,
                 )
                 .is_ok(),
                 // §7.11.2.4 steps 10/11 — the exact-90/180 degenerate
                 // copies (angle_delta == 0). A non-zero delta makes
                 // V_PRED / H_PRED fully directional (see below).
-                V_PRED if angle_delta == 0 => {
-                    predict_intra_v_pred(w, h, above_row, &mut pred).is_ok()
-                }
-                H_PRED if angle_delta == 0 => {
-                    predict_intra_h_pred(w, h, left_col, &mut pred).is_ok()
-                }
+                V_PRED if angle_delta == 0 => predict_intra_v_pred(w, h, above_row, pred).is_ok(),
+                H_PRED if angle_delta == 0 => predict_intra_h_pred(w, h, left_col, pred).is_ok(),
                 m if (V_PRED..=D67_PRED).contains(&m) => predict_intra_directional(
                     w,
                     h,
                     MODE_TO_ANGLE[m] + angle_delta * ANGLE_STEP,
                     upsample_above,
                     upsample_left,
-                    &above_ext,
-                    &left_ext,
-                    &mut pred,
+                    above_ext,
+                    left_ext,
+                    pred,
                 )
                 .is_ok(),
                 SMOOTH_PRED => {
-                    predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
+                    predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, pred)
                         .is_ok()
                 }
                 SMOOTH_V_PRED => {
-                    predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred)
-                        .is_ok()
+                    predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, pred).is_ok()
                 }
                 SMOOTH_H_PRED => {
-                    predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred)
-                        .is_ok()
+                    predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, pred).is_ok()
                 }
                 PAETH_PRED => {
-                    predict_intra_paeth_pred(w, h, above_row, left_col, corner, &mut pred).is_ok()
+                    predict_intra_paeth_pred(w, h, above_row, left_col, corner, pred).is_ok()
                 }
                 _ => false,
             }
-        };
-        if !ok {
-            return None;
         }
-        Some(pred)
     }
 
     /// §7.11.5 predict-chroma-from-luma process (av1-spec p.287) — the
@@ -18113,6 +18302,33 @@ impl PartitionWalker {
         let cols_buf = buf.cols;
         let rows_buf = buf.rows;
         let max = (1i32 << bit_depth) - 1;
+        // r487 — a block wholly inside the plane buffer (every block
+        // but the frame-edge overhangs): one row slice at a time, the
+        // flips resolved per row, no per-sample bounds or overhang
+        // test. The residual is first clamped to ±2^20 — beyond
+        // `max + 1` in magnitude the `Clip1` result is already
+        // decided — so the sum runs in 32-bit lanes.
+        if start_y + h <= rows_buf && start_x + w <= cols_buf {
+            const RESIDUAL_BOUND: i64 = 1 << 20;
+            let (wu, hu, cols_u) = (w as usize, h as usize, cols_buf as usize);
+            for (i, src) in residual.chunks_exact(wu).enumerate() {
+                let yy = if flip_ud { hu - 1 - i } else { i };
+                let d0 = (start_y as usize + yy) * cols_u + start_x as usize;
+                let dst = &mut buf.samples[d0..d0 + wu];
+                if flip_lr {
+                    for (d, &r) in dst.iter_mut().rev().zip(src) {
+                        let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
+                        *d = d.saturating_add(r).max(0).min(max);
+                    }
+                } else {
+                    for (d, &r) in dst.iter_mut().zip(src) {
+                        let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
+                        *d = d.saturating_add(r).max(0).min(max);
+                    }
+                }
+            }
+            return;
+        }
         // r408: plane-0 out-of-buffer cells merge into the §7.11.5
         // [`LumaOverhang`] side store (`(dst_y, dst_x, residual)`
         // gathered here, applied after the plane borrow ends).
@@ -31345,9 +31561,9 @@ impl PartitionWalker {
             // §8.3.2 `eob_extra`: ctx = `eobPt - 3`.
             let extra_ctx = (eob_pt - 3) as usize;
             let cdf = cdfs
-                .eob_extra_cdf(tx_sz_ctx, ptype, extra_ctx)
+                .eob_extra_row(tx_sz_ctx, ptype, extra_ctx)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            let eob_extra = decoder.read_symbol(cdf)?;
+            let eob_extra = decoder.read_symbol_sized(cdf)?;
             debug_assert!(
                 eob_extra <= 1,
                 "S() over Default_Eob_Extra_Cdf yields 0 or 1"
@@ -31363,7 +31579,7 @@ impl PartitionWalker {
             let mut i: i32 = 1;
             while i < upper {
                 eob_shift = upper - 1 - i;
-                let eob_extra_bit = decoder.read_literal(1)?;
+                let eob_extra_bit = decoder.read_bool()?;
                 if eob_extra_bit != 0 {
                     eob += 1u32 << eob_shift;
                 }
@@ -31415,12 +31631,12 @@ impl PartitionWalker {
                     // SIG_COEF_CONTEXTS_EOB - SIG_COEF_CONTEXTS).
                     let ctx = get_coeff_base_eob_ctx(quant, tx_size, tx_class, pos, c as usize);
                     let cdf = cdfs
-                        .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)
+                        .coeff_base_eob_row(tx_sz_ctx, ptype, ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                     // §5.11.39 line 60: `level = coeff_base_eob + 1`
                     // (the §9.4 alphabet is 3 values: 0, 1, 2 → levels
                     // 1, 2, 3).
-                    let sym = decoder.read_symbol(cdf)?;
+                    let sym = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(sym <= 2, "S() over Default_Coeff_Base_Eob_Cdf yields 0..=2");
                     level = sym + 1;
                 } else {
@@ -31430,11 +31646,11 @@ impl PartitionWalker {
                         levels, stride, lpos, tx_size, tx_class, pos, bwl,
                     );
                     let cdf = cdfs
-                        .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
+                        .coeff_base_row(tx_sz_ctx, ptype, ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                     // §5.11.39 line 63: `level = coeff_base` (the §9.4
                     // alphabet is 4 values: 0, 1, 2, 3 → levels 0, 1, 2, 3).
-                    let sym = decoder.read_symbol(cdf)?;
+                    let sym = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(sym <= 3, "S() over Default_Coeff_Base_Cdf yields 0..=3");
                     level = sym;
                 }
@@ -31452,9 +31668,9 @@ impl PartitionWalker {
                     for _ in 0..br_iters {
                         let ctx = br_ctx;
                         let cdf = cdfs
-                            .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
+                            .coeff_br_row(tx_sz_ctx, ptype, ctx)
                             .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-                        let coeff_br = decoder.read_symbol(cdf)?;
+                        let coeff_br = decoder.read_symbol_sized(cdf)?;
                         debug_assert!(
                             (coeff_br as usize) < BR_CDF_SIZE,
                             "S() over Default_Coeff_Br_Cdf yields 0..BR_CDF_SIZE"
@@ -31488,13 +31704,13 @@ impl PartitionWalker {
                 if c == 0 {
                     // §8.3.2 `dc_sign`: ctx from caller.
                     let cdf = cdfs
-                        .dc_sign_cdf(ptype, dc_sign_ctx)
+                        .dc_sign_row(ptype, dc_sign_ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-                    let dc_sign = decoder.read_symbol(cdf)?;
+                    let dc_sign = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(dc_sign <= 1, "S() over Default_Dc_Sign_Cdf yields 0 or 1");
                     dc_sign
                 } else {
-                    decoder.read_literal(1)?
+                    decoder.read_bool()?
                 }
             } else {
                 0
@@ -31522,7 +31738,7 @@ impl PartitionWalker {
                     if length > 30 {
                         return Err(crate::Error::GolombLengthOverflow);
                     }
-                    let bit = decoder.read_literal(1)?;
+                    let bit = decoder.read_bool()?;
                     if bit != 0 {
                         break;
                     }
@@ -31532,7 +31748,7 @@ impl PartitionWalker {
                 let mut x: u32 = 1;
                 let mut i: i32 = length as i32 - 2;
                 while i >= 0 {
-                    let bit = decoder.read_literal(1)?;
+                    let bit = decoder.read_bool()?;
                     x = (x << 1) | bit;
                     i -= 1;
                 }
@@ -41252,6 +41468,31 @@ mod tests {
             }
         }
         assert_eq!(PALETTE_COLOR_HASH_MULTIPLIERS, [1, 2, 2]);
+    }
+
+    /// r487 — the closed form of §5.11.50 equals the literal process
+    /// (score array + partial selection sort) for EVERY neighbour
+    /// triple (absent, or any index `0..PALETTE_COLORS` — including
+    /// indices at or above `n`, which take the literal arm) at every
+    /// palette size.
+    #[test]
+    fn palette_color_context_closed_form_is_exhaustively_literal() {
+        let options: Vec<Option<u8>> = core::iter::once(None)
+            .chain((0..PALETTE_COLORS as u8).map(Some))
+            .collect();
+        for n in 2..=PALETTE_COLORS {
+            for &l in &options {
+                for &al in &options {
+                    for &a in &options {
+                        assert_eq!(
+                            palette_color_context_from_neighbors(l, al, a, n),
+                            palette_color_context_literal(l, al, a, n),
+                            "n={n} left={l:?} above_left={al:?} above={a:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// §5.11.50 `get_palette_color_context` — spec example: every
@@ -61850,6 +62091,38 @@ mod tests {
         // touched; cell (32, 0) sits outside `tw = 32, th = 32` so
         // it stays at zero (Quant is zero there anyway).
         assert_eq!(dequant.len(), 64 * 64);
+    }
+
+    /// r487 — the `dqDenom` division as a shift of the magnitude: for
+    /// every divisor (1 / 2 / 4) and both signs the result is the
+    /// truncating division `sign * ( ( |dq| & 0xFFFFFF ) / dqDenom )`,
+    /// including odd magnitudes (truncation toward zero, not floor).
+    #[test]
+    fn dequantize_step1_division_truncates_toward_zero() {
+        for (tx, denom) in [(TX_4X4, 1i64), (TX_32X32, 2), (TX_64X64, 4)] {
+            for base_q_idx in [1u8, 37, 120, 255] {
+                let q = QuantizerParams::neutral(base_q_idx, 8);
+                let (w, h) = (TX_WIDTH[tx], TX_HEIGHT[tx]);
+                let (tw, th) = (w.min(32), h.min(32));
+                let mut levels = vec![0i32; tw * th];
+                for (k, level) in levels.iter_mut().enumerate() {
+                    let mag = (k as i32 * 7 + 1) % 23;
+                    *level = if k % 2 == 0 { mag } else { -mag };
+                }
+                let dequant = dequantize_step1(&levels, tx, 0, 0, DCT_DCT, 15, &q);
+                let dc_q = i64::from(get_dc_quant(&q, 0, 0));
+                let ac_q = i64::from(get_ac_quant(&q, 0, 0));
+                for i in 0..th {
+                    for j in 0..tw {
+                        let qv = if i == 0 && j == 0 { dc_q } else { ac_q };
+                        let dq = i64::from(levels[i * tw + j]) * qv;
+                        let sign = if dq < 0 { -1 } else { 1 };
+                        let want = (sign * ((dq.abs() & 0xFF_FFFF) / denom)).clamp(-32768, 32767);
+                        assert_eq!(dequant[i * w + j], want, "tx={tx} q={base_q_idx} ({i},{j})");
+                    }
+                }
+            }
+        }
     }
 
     /// `dequantize_step1` clip per §7.12.3 step-1 line f:
