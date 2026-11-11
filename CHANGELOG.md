@@ -17,9 +17,11 @@ All notable changes to `oxideav-av1` are recorded here.
   - Reconstruction: residual merge and intra prediction store a row slice at a time for blocks inside the plane; intra prediction allocates nothing per block.
   - Palette: the §5.11.50 colour context is resolved once per neighbour triple (729 entries) and looked up; the token writer reads coded neighbours in place.
   - Dequantisation divides by `dqDenom` with a shift of the magnitude.
+  - Directional intra prediction (§7.11.2.4) blends whole edge runs per row / column instead of testing every sample; the deblocking edge walk tests transform edges with a mask instead of a division.
 
 ### Fixed
 
+- `predict_intra_directional` indexed past the derivative table (a panic) for a `pAngle` of 270 or more; such angles are outside the §7.11.2.4 process and now return the out-of-range error. No stream reaches them (the block walk derives `pAngle` from a mode and a clamped delta).
 - Multi-frame encoders on picture extents that are not multiples of 8. `encode_gop_yuv*`, the B-pyramid / adaptive drivers, the temporal ladder, the spatial-layer drivers (independent, inter-layer, spatial × temporal) all rejected such pictures (`PartitionWalkOutOfRange`) while the still / KEY entries coded them. Inter frames now pad the source to the §5.9.5 mi grid, code the true `frame_size`, replicate every reference plane out from its true extent (the §7.11.3.3 reference-fetch clamp), derive the §7.11.3.3 scale factors / §6.8.2 bounds / §7.17 restoration geometry from the true extents, and return the reconstruction cropped. A layered stream's shared sequence header now rides the padded KEY path too. Pinned by `tests/off_grid_extents.rs` (this crate's decoder + a black-box decoder).
 - The framework (registry) encoder refused extents off the 8-sample grid at construction although both of its arms (still, all-intra KEY) code any extent.
 - The adaptive mini-GOP motion probe indexed out of bounds on pictures narrower than 12 samples (a negative overlap bound wrapped).

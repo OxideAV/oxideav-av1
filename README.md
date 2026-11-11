@@ -2362,54 +2362,63 @@ What changed, each derived from the spec's process description:
   first pass not computed.
 - **§5.11.50 palette context** — resolved once per neighbour triple
   (729 entries) and looked up.
+- **§7.11.2.4 directional prediction** — `base` advances by a fixed
+  step along a row (or a column) and `shift` is constant along it, so
+  each row / column is one blend over a run of the edge.
 - Residual merge and intra prediction store row slices and allocate
   nothing per block.
 
 Each rewrite is pinned by a test against the form it replaces (the
 bit-serial writer, the scalar transform kernels, the dense forward
 inner products, the per-sample CDEF process, the literal palette
-process over every neighbour triple).
+process over every neighbour triple, the per-sample directional
+predictor over every size, angle and upsampling flag).
 
 One 4032×3024 (12 MP) photograph, `speed = fast` (the default and the
 fastest preset), `base_q_idx = 120` (the default) and `0` (lossless),
-release build, Apple M5 Max. The host was shared with other builds
-for the whole measurement (load average 35–40 on 18 cores), so the
-absolute figures are pessimistic and noisy; "before" (0.1.23) and
-"after" ran interleaved and the table gives the best of 3 (encode) or
-5 (decode) runs of each. The ratio is the robust figure. Decode is
-through the registry decoder on the 8-tile streams the 8-thread
-encodes produced; peak RSS is the whole process (`/usr/bin/time -l`,
-the encoder's includes 52 MiB of source the harness holds).
+release build, Apple M5 Max (18 cores) on a host shared with other
+jobs (load average 5–7 during the runs). "Before" (0.1.23) and
+"after" ran interleaved; every figure is the MEDIAN of 3 (encode), 5
+(still decode) or 4 (video) runs. Decode is through the registry
+decoder on the 8-tile streams the 8-thread encodes produced; peak RSS
+is the whole process (`/usr/bin/time -l`; the encoder's includes
+52 MiB of source the harness holds).
 
 | Operation | Workers | Wall before → after | Ratio | Peak RSS before → after |
 |---|---|---|---|---|
-| Encode, 8-bit lossy | 1 | 14.62 → 10.69 s | 1.37× | 238 → 234 MiB |
-| | 8 | 3.53 → 2.65 s | 1.33× | 321 → 320 MiB |
-| Encode, 8-bit lossless | 1 | 2.65 → 1.63 s | 1.63× | 388 → 334 MiB |
-| | 8 | 0.84 → 0.73 s | 1.16× | 463 → 407 MiB |
-| Encode, 10-bit lossy | 1 | 5.94 → 4.91 s | 1.21× | 191 → 181 MiB |
-| | 8 | 2.37 → 2.12 s | 1.12× | 254 → 253 MiB |
-| Encode, 10-bit lossless | 1 | 8.03 → 3.85 s | 2.09× | 418 → 325 MiB |
-| | 8 | 1.49 → 1.01 s | 1.47× | 498 → 391 MiB |
-| Decode, 8-bit lossy | 1 | 0.326 → 0.244 s | 1.34× | 171 → 176 MiB |
-| | 8 | 0.089 → 0.075 s | 1.19× | 296 → 296 MiB |
-| Decode, 8-bit lossless | 1 | 0.992 → 0.760 s | 1.31× | 196 → 196 MiB |
-| | 8 | 0.218 → 0.116 s | 1.88× | 303 → 295 MiB |
-| Decode, 10-bit lossy | 1 | 0.354 → 0.270 s | 1.31× | 158 → 156 MiB |
-| | 8 | 0.093 → 0.080 s | 1.16× | 249 → 243 MiB |
-| Decode, 10-bit lossless | 1 | 1.347 → 1.066 s | 1.26× | 195 → 194 MiB |
-| | 8 | 0.447 → 0.208 s | 2.15× | 295 → 281 MiB |
+| Encode, 8-bit lossy | 1 | 11.52 → 7.72 s | 1.49× | 225 → 222 MiB |
+| | 8 | 2.76 → 2.25 s | 1.23× | 318 → 306 MiB |
+| Encode, 8-bit lossless | 1 | 2.36 → 1.39 s | 1.70× | 385 → 331 MiB |
+| | 8 | 0.78 → 0.68 s | 1.15× | 456 → 402 MiB |
+| Encode, 10-bit lossy | 1 | 4.50 → 3.79 s | 1.19× | 173 → 171 MiB |
+| | 8 | 1.42 → 1.30 s | 1.09× | 244 → 234 MiB |
+| Encode, 10-bit lossless | 1 | 3.04 → 1.52 s | 1.99× | 409 → 321 MiB |
+| | 8 | 0.79 → 0.64 s | 1.23× | 478 → 370 MiB |
+| Decode, 8-bit lossy | 1 | 0.241 → 0.181 s | 1.33× | 160 → 160 MiB |
+| | 8 | 0.062 → 0.051 s | 1.22× | 278 → 276 MiB |
+| Decode, 8-bit lossless | 1 | 0.785 → 0.568 s | 1.38× | 178 → 178 MiB |
+| | 8 | 0.197 → 0.099 s | 1.99× | 296 → 294 MiB |
+| Decode, 10-bit lossy | 1 | 0.253 → 0.188 s | 1.35× | 137 → 137 MiB |
+| | 8 | 0.065 → 0.054 s | 1.20× | 238 → 230 MiB |
+| Decode, 10-bit lossless | 1 | 1.044 → 0.791 s | 1.32× | 172 → 172 MiB |
+| | 8 | 0.221 → 0.137 s | 1.61× | 263 → 256 MiB |
 
 1080p 8-bit 4:2:0 inter decode, one temporal unit per packet through
 the registry decoder (`examples/decode_bench … stream=1`), synthetic
-`testsrc2` content, same host and method (best of 4):
+`testsrc2` content, same host and method:
 
 | Clip | Workers | Before → after | Ratio | Peak RSS before → after |
 |---|---|---|---|---|
-| 300 frames, one tile, hierarchical groups (third-party encoder A) | 1 | 67.9 → 93.6 fps | 1.38× | 165 → 165 MiB |
-| | 8 | 339 → 430 fps | 1.27× | 599 → 578 MiB |
-| 120 frames, 2×2 tiles (third-party encoder B) | 1 | 46.6 → 52.1 fps | 1.12× | 146 → 139 MiB |
-| | 8 | 107 → 118 fps | 1.10× | 467 → 481 MiB |
+| 300 frames, one tile, hierarchical groups (third-party encoder A) | 1 | 75.0 → 93.6 fps | 1.25× | 121 → 128 MiB |
+| | 8 | 365 → 471 fps | 1.29× | 579 → 539 MiB |
+| 120 frames, 2×2 tiles (third-party encoder B) | 1 | 53.1 → 56.2 fps | 1.06× | 105 → 121 MiB |
+| | 8 | 145 → 154 fps | 1.06× | 567 → 626 MiB |
+
+The resident set is unchanged by design (the sample planes are still
+`i32`); the encoder's lossless peak drops because the symbol writer no
+longer holds one byte per coded bit. The video figures vary by about
+±20 MiB between identical runs (allocator reuse and, when threaded,
+how many frames happen to be in flight).
 
 Where the remaining time goes (sampled, one worker):
 
