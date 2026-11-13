@@ -620,8 +620,8 @@ fn pyramid_svc_ctx_update_fixture_staging() {
     // Full-interleave expected output (per instant: layer 0 then 1).
     let mut yuv: Vec<u8> = Vec::new();
     for i in 0..5 {
-        for s in 0..2 {
-            let rc = &svc.layer_recons[s][i];
+        for layer in svc.layer_recons.iter().take(2) {
+            let rc = &layer[i];
             yuv.extend_from_slice(&rc.y);
             yuv.extend_from_slice(&rc.u);
             yuv.extend_from_slice(&rc.v);

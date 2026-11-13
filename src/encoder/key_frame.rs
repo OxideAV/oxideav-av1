@@ -2161,9 +2161,12 @@ fn encode_key_frame_yuv_core(
             return Err(Error::PartitionWalkOutOfRange);
         }
         qp.using_qmatrix = true;
-        for plane in 0..3 {
-            for seg in 0..crate::uncompressed_header_tail::MAX_SEGMENTS {
-                qp.seg_qm_level[plane][seg] = lvl;
+        for row in qp.seg_qm_level.iter_mut().take(3) {
+            for slot in row
+                .iter_mut()
+                .take(crate::uncompressed_header_tail::MAX_SEGMENTS)
+            {
+                *slot = lvl;
             }
         }
         if let Some(q) = fh.quantization_params.as_mut() {
@@ -5630,12 +5633,7 @@ pub(crate) fn intrabc_dv_valid(
     }
     let gradient = 1 + INTRABC_DELAY_SB64; // + use_128x128_superblock = 0
     let wf_offset = gradient * (active_sb_row - src_sb_row);
-    if src_sb_row > active_sb_row
-        || src_sb64_col >= active_sb64_col - INTRABC_DELAY_SB64 + wf_offset
-    {
-        return false;
-    }
-    true
+    src_sb_row <= active_sb_row && src_sb64_col < active_sb64_col - INTRABC_DELAY_SB64 + wf_offset
 }
 
 /// Frame-level §5.9.20 gate heuristic — `true` iff a provable

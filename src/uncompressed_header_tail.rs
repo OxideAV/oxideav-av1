@@ -1997,8 +1997,8 @@ pub(crate) fn read_film_grain_params(
 
     let num_pos_luma = 2 * usize::from(fg.ar_coeff_lag) * (usize::from(fg.ar_coeff_lag) + 1);
     let num_pos_chroma = if fg.num_y_points > 0 {
-        for i in 0..num_pos_luma {
-            fg.ar_coeffs_y_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_y_plus_128[..num_pos_luma] {
+            *coeff = br.f(8)? as u8;
         }
         num_pos_luma + 1
     } else {
@@ -2006,13 +2006,13 @@ pub(crate) fn read_film_grain_params(
     };
 
     if fg.chroma_scaling_from_luma || fg.num_cb_points > 0 {
-        for i in 0..num_pos_chroma {
-            fg.ar_coeffs_cb_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_cb_plus_128[..num_pos_chroma] {
+            *coeff = br.f(8)? as u8;
         }
     }
     if fg.chroma_scaling_from_luma || fg.num_cr_points > 0 {
-        for i in 0..num_pos_chroma {
-            fg.ar_coeffs_cr_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_cr_plus_128[..num_pos_chroma] {
+            *coeff = br.f(8)? as u8;
         }
     }
 
@@ -2585,10 +2585,10 @@ mod tests {
         assert!(s.segment_feature_active[0][SEG_LVL_ALT_Q]);
         assert_eq!(s.segment_feature_data[0][SEG_LVL_ALT_Q], -50);
         // All other features inactive.
-        for i in 0..MAX_SEGMENTS {
-            for j in 0..SEG_LVL_MAX {
+        for (i, features) in s.segment_feature_active.iter().enumerate() {
+            for (j, &active) in features.iter().enumerate() {
                 if (i, j) != (0, SEG_LVL_ALT_Q) {
-                    assert!(!s.segment_feature_active[i][j]);
+                    assert!(!active);
                 }
             }
         }
@@ -3517,8 +3517,8 @@ mod tests {
         // the identity initialiser persist for [2] / [5].
         let one = 1i32 << WARPEDMODEL_PREC_BITS;
         assert_eq!(gm.gm_params[LAST_FRAME], [0, 0, one, 0, 0, one]);
-        for r in (LAST_FRAME + 1)..=ALTREF_FRAME {
-            assert_eq!(gm.gm_type[r], WarpModelType::Identity);
+        for ty in &gm.gm_type[(LAST_FRAME + 1)..=ALTREF_FRAME] {
+            assert_eq!(*ty, WarpModelType::Identity);
         }
     }
 

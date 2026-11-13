@@ -1584,21 +1584,21 @@ fn encode_film_grain_params(
     bw.write_bits(2, u64::from(fg.ar_coeff_lag));
     let num_pos_luma = 2 * usize::from(fg.ar_coeff_lag) * (usize::from(fg.ar_coeff_lag) + 1);
     let num_pos_chroma = if fg.num_y_points > 0 {
-        for i in 0..num_pos_luma {
-            bw.write_bits(8, u64::from(fg.ar_coeffs_y_plus_128[i]));
+        for &coeff in &fg.ar_coeffs_y_plus_128[..num_pos_luma] {
+            bw.write_bits(8, u64::from(coeff));
         }
         num_pos_luma + 1
     } else {
         num_pos_luma
     };
     if fg.chroma_scaling_from_luma || fg.num_cb_points > 0 {
-        for i in 0..num_pos_chroma {
-            bw.write_bits(8, u64::from(fg.ar_coeffs_cb_plus_128[i]));
+        for &coeff in &fg.ar_coeffs_cb_plus_128[..num_pos_chroma] {
+            bw.write_bits(8, u64::from(coeff));
         }
     }
     if fg.chroma_scaling_from_luma || fg.num_cr_points > 0 {
-        for i in 0..num_pos_chroma {
-            bw.write_bits(8, u64::from(fg.ar_coeffs_cr_plus_128[i]));
+        for &coeff in &fg.ar_coeffs_cr_plus_128[..num_pos_chroma] {
+            bw.write_bits(8, u64::from(coeff));
         }
     }
     bw.write_bits(2, u64::from(fg.ar_coeff_shift - 6));

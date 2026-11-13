@@ -170,8 +170,8 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     let mut walker = walker_n(16);
     let mut cdfs = TileCdfContext::new_from_defaults();
     let rigged_skip = force_binary_cdf(0);
-    for ctx_idx in 0..SKIP_CONTEXTS {
-        cdfs.skip[ctx_idx] = rigged_skip;
+    for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+        *slot = rigged_skip;
     }
     let bytes = [0u8; 16];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -1662,8 +1662,8 @@ fn read_block_tx_size_tx_mode_select_depth_zero_keeps_max_rect() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1706,8 +1706,8 @@ fn read_block_tx_size_tx_mode_select_depth_one_splits_once() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1743,8 +1743,8 @@ fn read_block_tx_size_tx_mode_select_depth_two_splits_twice() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1901,8 +1901,8 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 16];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();

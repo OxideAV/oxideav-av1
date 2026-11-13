@@ -4043,12 +4043,12 @@ fn encode_inter_frame_aligned(
         for &lvl in &qm_arm_levels {
             let mut qp_m = qp;
             qp_m.using_qmatrix = true;
-            for plane in 0..3 {
-                for (seg, &ll) in seg_ll.iter().enumerate() {
+            for plane_levels in qp_m.seg_qm_level.iter_mut() {
+                for (level, &ll) in plane_levels.iter_mut().zip(seg_ll.iter()) {
                     // §5.9.2: a lossless segment's `SegQMLevel` is the
                     // no-QM sentinel 15; every other segment carries
                     // the coded `qm_y` / `qm_u` / `qm_v`.
-                    qp_m.seg_qm_level[plane][seg] = if ll { 15 } else { lvl };
+                    *level = if ll { 15 } else { lvl };
                 }
             }
             let mut params_m = params.clone();
@@ -8620,6 +8620,9 @@ fn encode_inter_leaf_residual(
         2 + u32::from(recon.subsampling_x),
         2 + u32::from(recon.subsampling_y),
     );
+    // `plane` is the spec's plane subscript: it selects the scratch
+    // prediction, the reconstruction plane and the coefficient contexts.
+    #[allow(clippy::needless_range_loop)]
     for plane in 1..usize::from(recon.num_planes) {
         if !has_chroma {
             break;
@@ -10968,9 +10971,7 @@ mod tests {
             current_order_hint: 1,
             order_hints_by_ref: [0, 0, 0, 0, 0, 2, 2, 2],
         };
-        for r in 5..=7usize {
-            ip.ref_frame_sign_bias[r] = 1;
-        }
+        ip.ref_frame_sign_bias[5..=7].fill(1);
         ip.skip_mode_present = skip_mode;
         ip.skip_mode_frame = [1, 5];
         let mut slot_to_plane = [0usize; 8];

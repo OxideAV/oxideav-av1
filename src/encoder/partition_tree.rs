@@ -2899,8 +2899,8 @@ fn write_block_syntax_inter_frame(
         // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)` on every
         // consulted list.
         let list_count: usize = if is_compound { 2 } else { 1 };
-        for i in 0..list_count {
-            if ib.mv[i][0].unsigned_abs() >= (1 << 14) || ib.mv[i][1].unsigned_abs() >= (1 << 14) {
+        for mv in &ib.mv[..list_count] {
+            if mv[0].unsigned_abs() >= (1 << 14) || mv[1].unsigned_abs() >= (1 << 14) {
                 return Err(Error::PartitionWalkOutOfRange);
             }
         }

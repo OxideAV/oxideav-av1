@@ -25856,7 +25856,12 @@ impl PartitionWalker {
             "frameLfCount cannot exceed FRAME_LF_COUNT = 4"
         );
 
-        for i in 0..frame_lf_count {
+        for (i, delta_lf) in self
+            .current_delta_lf
+            .iter_mut()
+            .enumerate()
+            .take(frame_lf_count)
+        {
             // delta_lf_abs                                          S()
             // §8.3.2: the cdf is given by TileDeltaLFCdf (single-LF)
             // or TileDeltaLFMultiCdf[ i ] (multi-LF).
@@ -25893,8 +25898,8 @@ impl PartitionWalker {
                 //   DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res))
                 let shift = delta_lf_res as u32;
                 let scaled = reduced.wrapping_shl(shift);
-                let pre_clip = self.current_delta_lf[i].wrapping_add(scaled);
-                self.current_delta_lf[i] = pre_clip.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
+                let pre_clip = delta_lf.wrapping_add(scaled);
+                *delta_lf = pre_clip.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
             }
         }
 
@@ -28997,7 +29002,6 @@ impl PartitionWalker {
     /// [`Self::find_warp_samples`] for the rationale (the consumer
     /// lives in a downstream arc and the data is recoverable from the
     /// walker grids).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn add_sample(
         &self,
@@ -36251,8 +36255,8 @@ impl PartitionWalker {
 
         // 15: WeightStack[0..numNearest] += REF_CAT_LEVEL.
         if num_nearest > 0 {
-            for idx in 0..num_nearest as usize {
-                state.weight_stack[idx] = state.weight_stack[idx].saturating_add(REF_CAT_LEVEL);
+            for weight in state.weight_stack.iter_mut().take(num_nearest as usize) {
+                *weight = weight.saturating_add(REF_CAT_LEVEL);
             }
         }
 
@@ -37066,11 +37070,12 @@ impl PartitionWalker {
                         cand_mv[1] = -cand_mv[1];
                     }
                     let mut found_idx = state.num_mv_found as usize;
-                    for idx in 0..state.num_mv_found as usize {
-                        if state.ref_stack_mv[idx][0] == cand_mv {
-                            found_idx = idx;
-                            break;
-                        }
+                    let found = state.num_mv_found as usize;
+                    if let Some(idx) = state.ref_stack_mv[..found]
+                        .iter()
+                        .position(|slot| slot[0] == cand_mv)
+                    {
+                        found_idx = idx;
                     }
                     if found_idx == state.num_mv_found as usize
                         && (state.num_mv_found as usize) < MAX_REF_MV_STACK_SIZE
@@ -37270,11 +37275,12 @@ impl PartitionWalker {
 
             // §7.10.2.6 dedupe loop — match only on list 0.
             let mut found_idx: Option<usize> = None;
-            for idx in 0..state.num_mv_found as usize {
-                if state.ref_stack_mv[idx][0] == cand_mv {
-                    found_idx = Some(idx);
-                    break;
-                }
+            let found = state.num_mv_found as usize;
+            if let Some(idx) = state.ref_stack_mv[..found]
+                .iter()
+                .position(|slot| slot[0] == cand_mv)
+            {
+                found_idx = Some(idx);
             }
             if let Some(idx) = found_idx {
                 state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
@@ -37326,11 +37332,12 @@ impl PartitionWalker {
 
             // §7.10.2.6 dedupe across both lists.
             let mut found_idx: Option<usize> = None;
-            for idx in 0..state.num_mv_found as usize {
-                if state.ref_stack_mv[idx][0] == cand0 && state.ref_stack_mv[idx][1] == cand1 {
-                    found_idx = Some(idx);
-                    break;
-                }
+            let found = state.num_mv_found as usize;
+            if let Some(idx) = state.ref_stack_mv[..found]
+                .iter()
+                .position(|slot| slot[0] == cand0 && slot[1] == cand1)
+            {
+                found_idx = Some(idx);
             }
             if let Some(idx) = found_idx {
                 state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
@@ -47627,8 +47634,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Override partition_w16[ctx=0] to force PARTITION_NONE (idx 0).
         let rigged = force_partition_cdf_w(PARTITION_NONE, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47654,8 +47661,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47694,8 +47701,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47721,8 +47728,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_4, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47750,8 +47757,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_4, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47779,8 +47786,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_A, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47812,8 +47819,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_B, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47847,13 +47854,13 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Top-level BLOCK_16X16 → PARTITION_SPLIT.
         let rigged_w16 = force_partition_cdf_w(PARTITION_SPLIT, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged_w16);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged_w16);
         }
         // Each BLOCK_8X8 child → PARTITION_NONE (W8 row has 5 symbols).
         let rigged_w8 = force_partition_cdf_w(PARTITION_NONE, 4);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w8[ctx_idx].copy_from_slice(&rigged_w8);
+        for slot in cdfs.partition_w8.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged_w8);
         }
         let bytes = [0u8; 64];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
@@ -47891,8 +47898,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -48128,8 +48135,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every Skip ctx row to select symbol 0.
         let rigged = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48153,8 +48160,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48551,8 +48558,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(0);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48577,8 +48584,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48720,8 +48727,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49462,8 +49469,8 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -49501,8 +49508,8 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -49565,8 +49572,8 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -50891,8 +50898,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50927,8 +50934,8 @@ mod tests {
         let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50979,8 +50986,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // ctx 0 drives symbol 1. ctx 1, 2, 3 would drive symbol 0.
         cdfs.is_inter[0] = force_is_inter_cdf(1);
-        for ctx_idx in 1..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = force_is_inter_cdf(0);
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS).skip(1) {
+            *slot = force_is_inter_cdf(0);
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51063,8 +51070,8 @@ mod tests {
         // Therefore ctx at (3, 5) = 3.
         let rigged_3 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 3 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 3 {
                 rigged_3
             } else {
                 rigged_others
@@ -51135,8 +51142,8 @@ mod tests {
         //     = 1
         let rigged_1 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 1 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 1 {
                 rigged_1
             } else {
                 rigged_others
@@ -51207,8 +51214,8 @@ mod tests {
         // = 2.
         let rigged_2 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 2 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 2 {
                 rigged_2
             } else {
                 rigged_others
@@ -51251,8 +51258,8 @@ mod tests {
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51420,8 +51427,8 @@ mod tests {
         // Rig every ctx row to force symbol 5; the prior call is the
         // non-skip path so we need a CDF that delivers diff = 5.
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51461,8 +51468,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 3.
         let rigged = force_segment_id_cdf(3);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51502,8 +51509,8 @@ mod tests {
         // Rig every ctx row to force symbol 5 while the frame's
         // §5.9.14 derivation says LastActiveSegId = 4.
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51524,8 +51531,8 @@ mod tests {
         // (pred = 0 at the origin ⇒ neg_deinterleave(5, 0, 6) = 5).
         let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs2.segment_id[ctx_idx] = rigged;
+        for slot in cdfs2.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let mut dec2 = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let sid = walker2
@@ -51727,8 +51734,8 @@ mod tests {
         // sid = 0 — that doesn't work for our "all neighbours = 4"
         // setup. Use the non-skip path with rigged CDF.
         let rigged4 = force_segment_id_cdf(4);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged4;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged4;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -51779,8 +51786,8 @@ mod tests {
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -51993,8 +52000,8 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(3);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -52038,8 +52045,8 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -52228,8 +52235,8 @@ mod tests {
         // short-circuits via its caller-passed gates and reads zero
         // bits. Forcing symbol 0 means `skip = 0`.
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -52312,13 +52319,13 @@ mod tests {
         // Rig the §5.11.9 segment_id cdf to force diff = 2 on every
         // ctx; pred = 0 at frame origin ⇒ segment_id = 2.
         let rigged_seg = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged_seg;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged_seg;
         }
         // Rig §5.11.11 skip cdf to force symbol 1 (skip = 1).
         let rigged_skip = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -52384,8 +52391,8 @@ mod tests {
 
         // Rig §5.11.11 skip cdf to force symbol 1.
         let rigged_skip = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -52592,8 +52599,8 @@ mod tests {
         // sub_size != sbSize anyway so they would too, but this
         // keeps the path explicit).
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
         // Rig delta_q cdf to force symbol 0 (no escape, no sign bit
         // ⇒ delta_q_abs = 0 ⇒ CurrentQIndex unchanged).
@@ -52746,8 +52753,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
         let bytes = [0u8; 8];
         let lossless_array = [false; MAX_SEGMENTS];
@@ -53064,9 +53071,9 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every (abovemode, leftmode) ctx pair to select symbol 0.
         let rigged = force_intra_frame_y_mode_cdf(0);
-        for a in 0..INTRA_MODE_CONTEXTS {
-            for l in 0..INTRA_MODE_CONTEXTS {
-                cdfs.intra_frame_y_mode[a][l] = rigged;
+        for row in cdfs.intra_frame_y_mode.iter_mut().take(INTRA_MODE_CONTEXTS) {
+            for slot in row.iter_mut().take(INTRA_MODE_CONTEXTS) {
+                *slot = rigged;
             }
         }
         let bytes = [0u8; 8];
@@ -53106,9 +53113,9 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_intra_frame_y_mode_cdf(12);
-        for a in 0..INTRA_MODE_CONTEXTS {
-            for l in 0..INTRA_MODE_CONTEXTS {
-                cdfs.intra_frame_y_mode[a][l] = rigged;
+        for row in cdfs.intra_frame_y_mode.iter_mut().take(INTRA_MODE_CONTEXTS) {
+            for slot in row.iter_mut().take(INTRA_MODE_CONTEXTS) {
+                *slot = rigged;
             }
         }
         let bytes = [0u8; 8];
@@ -53548,8 +53555,12 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force `seg_id_predicted = 1`.
         let rigged = force_binary_cdf(1);
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            cdfs.segment_id_predicted[ctx_idx] = rigged;
+        for slot in cdfs
+            .segment_id_predicted
+            .iter_mut()
+            .take(SEGMENT_ID_PREDICTED_CONTEXTS)
+        {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -53613,8 +53624,12 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig seg_id_predicted to `0`.
         let rigged_pred = force_binary_cdf(0);
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            cdfs.segment_id_predicted[ctx_idx] = rigged_pred;
+        for slot in cdfs
+            .segment_id_predicted
+            .iter_mut()
+            .take(SEGMENT_ID_PREDICTED_CONTEXTS)
+        {
+            *slot = rigged_pred;
         }
         // Poison context arrays so the explicit `0` write is visible.
         for slot in walker.above_seg_pred_context.iter_mut() {
@@ -53686,8 +53701,8 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         // Poison context arrays — should remain poisoned (no spec
         // write on this arm).
@@ -53856,8 +53871,8 @@ mod tests {
     #[test]
     fn default_segment_id_predicted_cdf_layout() {
         let ctx = TileCdfContext::new_from_defaults();
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            assert_eq!(ctx.segment_id_predicted[ctx_idx], [16384, 32768, 0]);
+        for cdf in ctx.segment_id_predicted.iter() {
+            assert_eq!(*cdf, [16384, 32768, 0]);
         }
     }
 
@@ -53871,8 +53886,8 @@ mod tests {
             let row = ctx.segment_id_predicted_cdf(i);
             row[0] = (10_000u16 + i as u16).wrapping_add(0);
         }
-        for i in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            assert_eq!(ctx.segment_id_predicted[i][0], 10_000u16 + i as u16);
+        for (i, cdf) in ctx.segment_id_predicted.iter().enumerate() {
+            assert_eq!(cdf[0], 10_000u16 + i as u16);
         }
     }
 
@@ -58050,11 +58065,11 @@ mod tests {
         // §7.10.2.12 extra-search compound fill still emits the two
         // global-MV slots. The temporal sample dropped its candidate
         // because slot 1's grid cell carries the sentinel.
-        for idx in 0..res.num_mv_found as usize {
+        for slot in res.ref_stack_mv.iter().take(res.num_mv_found as usize) {
             // No temporal candidate (which would have been [40, -32]
             // on slot [0]); only the global-MV fill (= [0, 0] in the
             // identity-warp test fixture).
-            assert_ne!(res.ref_stack_mv[idx][0], [40, -32]);
+            assert_ne!(slot[0], [40, -32]);
         }
     }
 
@@ -61056,9 +61071,9 @@ mod tests {
         let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every txb_skip ctx row to select symbol 1 (all_zero = 1).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 4];
@@ -61112,9 +61127,9 @@ mod tests {
         let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 (first read; sym-0 wins from value=32767).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         // The remaining CDFs stay at the §9.4 defaults; the §8.2.6
@@ -61178,9 +61193,9 @@ mod tests {
         let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 across all rows.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         // Snapshot the row that will be consulted (TX_4X4 has txSzCtx=0,
@@ -61364,9 +61379,9 @@ mod tests {
         for tx in &[TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64] {
             let mut cdfs = TileCdfContext::new_from_defaults();
             // Force txb_skip to symbol 1 (gate closed — quickest path).
-            for sz in 0..TX_SIZES {
-                for ctx in 0..TXB_SKIP_CONTEXTS {
-                    cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+                for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                    *slot = rig_cdf::<3>(1);
                 }
             }
             let bytes = [0u8; 8];
@@ -61438,9 +61453,9 @@ mod tests {
         let scan_ok: Vec<u16> = (0..512u16).collect();
         let mut quant_ok = vec![0i32; 16 * 64];
         // Force all_zero to short-circuit so we don't depend on EOB tables.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes2 = [0u8; 8];
@@ -61710,9 +61725,9 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 1 for every TU.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 16];
@@ -62108,9 +62123,9 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 0 for every TU
         // (cascade fires; eob >= 1).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         let bytes = [0u8; 16];
@@ -62564,9 +62579,13 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the §8.3.2 intra_tx_type CDF to return symbol 0
         // (= IDTX after inversion) deterministically.
-        for sqr in 0..INTRA_TX_TYPE_SET1_SIZES {
-            for d in 0..INTRA_MODES {
-                cdfs.intra_tx_type_set1[sqr][d] = rig_cdf::<8>(0);
+        for row in cdfs
+            .intra_tx_type_set1
+            .iter_mut()
+            .take(INTRA_TX_TYPE_SET1_SIZES)
+        {
+            for slot in row.iter_mut().take(INTRA_MODES) {
+                *slot = rig_cdf::<8>(0);
             }
         }
         let bytes = [0u8; 16];
@@ -62699,8 +62718,8 @@ mod tests {
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force `all_zero == 1` for every TU at TX_4X4.
-        for ctx in 0..TXB_SKIP_CONTEXTS {
-            cdfs.txb_skip[0][ctx] = rig_cdf::<3>(1);
+        for slot in cdfs.txb_skip[0].iter_mut().take(TXB_SKIP_CONTEXTS) {
+            *slot = rig_cdf::<3>(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -63704,9 +63723,9 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() = 1 ⇒ eob = 0 per TU.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 16];

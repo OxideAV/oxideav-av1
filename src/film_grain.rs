@@ -911,9 +911,9 @@ mod tests {
     fn scaling_lookup_zero_num_points_is_zero_table() {
         let fg = FilmGrainParams::reset();
         let lut = scaling_lookup_init(&fg, 3);
-        for plane in 0..3 {
-            for x in 0..256 {
-                assert_eq!(lut.tables[plane][x], 0);
+        for table in &lut.tables {
+            for &entry in &table[..256] {
+                assert_eq!(entry, 0);
             }
         }
     }
@@ -949,8 +949,8 @@ mod tests {
         fg.point_y_value[1] = 255;
         fg.point_y_scaling[1] = 200;
         let lut = scaling_lookup_init(&fg, 1);
-        for x in 0..32 {
-            assert_eq!(lut.tables[0][x], 64, "left plateau at {}", x);
+        for (x, &entry) in lut.tables[0][..32].iter().enumerate() {
+            assert_eq!(entry, 64, "left plateau at {}", x);
         }
         assert_eq!(lut.tables[0][255], 200);
     }

@@ -829,8 +829,8 @@ fn r444_fixture_staging() {
         // Full-point decode order: layer 0 then layer 1 per instant.
         let mut yuv: Vec<u8> = Vec::new();
         for i in 0..3 {
-            for s in 0..2 {
-                let rc = &enc.layer_recons[s][i];
+            for layer in enc.layer_recons.iter().take(2) {
+                let rc = &layer[i];
                 yuv.extend_from_slice(&rc.y);
                 yuv.extend_from_slice(&rc.u);
                 yuv.extend_from_slice(&rc.v);
@@ -839,8 +839,7 @@ fn r444_fixture_staging() {
         std::fs::write(root.join("svc-96-192-q180-superres.yuv"), &yuv).expect("write yuv");
         // Base-layer (operating point 1) expected output.
         let mut yuv1: Vec<u8> = Vec::new();
-        for i in 0..3 {
-            let rc = &enc.layer_recons[0][i];
+        for rc in enc.layer_recons[0].iter().take(3) {
             yuv1.extend_from_slice(&rc.y);
             yuv1.extend_from_slice(&rc.u);
             yuv1.extend_from_slice(&rc.v);

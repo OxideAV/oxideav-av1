@@ -244,8 +244,8 @@ fn spatial_fixture_staging() {
     // The interleaved full-stream expectation (decode order).
     let mut full: Vec<u8> = Vec::new();
     for i in 0..4 {
-        for s in 0..2 {
-            let rc = &enc.layer_recons[s][i];
+        for layer in enc.layer_recons.iter().take(2) {
+            let rc = &layer[i];
             full.extend_from_slice(&rc.y);
             full.extend_from_slice(&rc.u);
             full.extend_from_slice(&rc.v);
@@ -497,8 +497,8 @@ fn spatial_per_layer_tiles_fixture_staging() {
     }
     let mut full: Vec<u8> = Vec::new();
     for i in 0..4 {
-        for s in 0..2 {
-            let rc = &enc.layer_recons[s][i];
+        for layer in enc.layer_recons.iter().take(2) {
+            let rc = &layer[i];
             full.extend_from_slice(&rc.y);
             full.extend_from_slice(&rc.u);
             full.extend_from_slice(&rc.v);
