@@ -4,6 +4,14 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.25](https://github.com/OxideAV/oxideav-av1/compare/v0.1.24...v0.1.25) - 2026-11-13
+
+### Other
+
+- README, CHANGELOG: r488 16-bit sample planes, memory and throughput tables
+- 16-bit sample planes; in-loop kernels generic over the sample type
+- iterator forms for the index-only loops newer toolchains reject
+
 ### Changed
 
 - Decoder memory, output unchanged (every still / video digest and every coded byte equal to 0.1.24):
