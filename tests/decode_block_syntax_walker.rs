@@ -950,7 +950,13 @@ fn extract_curr_planes(walker: &PartitionWalker) -> Vec<(u32, u32, Vec<i32>)> {
     (0..3)
         .map(|p| {
             let (rows, cols) = walker.curr_frame_dims(p).unwrap();
-            (rows, cols, walker.curr_frame(p).unwrap().to_vec())
+            let samples = walker
+                .curr_frame(p)
+                .unwrap()
+                .iter()
+                .map(|&v| i32::from(v))
+                .collect();
+            (rows, cols, samples)
         })
         .collect()
 }
@@ -3676,12 +3682,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
     // window verbatim into CurrFrame[0].
     let (rows, cols) = walker.curr_frame_dims(0).unwrap();
     assert_eq!((rows, cols), (8, 8));
-    let got: Vec<u16> = walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect();
+    let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
     assert_eq!(
         got, refp,
         "two-pass inter decode: zero-MV MC must copy the reference 8×8 window into CurrFrame[0]"
@@ -3797,12 +3798,7 @@ fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
     // the MC pixels.
     let (rows, cols) = walker.curr_frame_dims(0).unwrap();
     assert_eq!((rows, cols), (8, 8));
-    let got: Vec<u16> = walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect();
+    let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
     assert_eq!(
         got, refp,
         "in-walk §5.11.33 prediction: zero-MV MC must copy the reference window into CurrFrame[0]"
@@ -4058,12 +4054,7 @@ fn decode_inter_intra_then_frame_walk(ii_mode: usize, ref_fill: u16) -> Vec<u16>
         .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
         .expect("frame-scope inter-intra reconstruction from the decoded grids");
 
-    walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect()
+    walker.curr_frame(0).unwrap().to_vec()
 }
 
 /// r359 end-to-end: the §5.11.33 frame-walk bridge dispatches a real

@@ -110,22 +110,72 @@ pub const SEG_LVL_ALT_LF_Y_V: usize = 1;
 // §7.14.1 / §7.14.2 — public top-level surface.
 // =====================================================================
 
+/// Storage type of one plane sample. Every sample a plane holds is
+/// post-`Clip1` (`0 ..= (1 << BitDepth) - 1`), so it fits 8 bits on
+/// 8-bit streams and 16 bits on every stream; the kernels widen to
+/// `i32` on load, compute exactly as the spec's process does, and
+/// narrow the (again post-`Clip1`) result on store. `i32` storage is
+/// the identity and keeps the widest callers unchanged.
+pub trait Sample:
+    Copy + Default + PartialEq + Eq + std::fmt::Debug + Send + Sync + 'static
+{
+    /// The sample as the `i32` the decoding process computes with.
+    fn widen(self) -> i32;
+    /// Store an in-range (post-`Clip1`) value.
+    fn narrow(v: i32) -> Self;
+}
+
+impl Sample for i32 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self
+    }
+    #[inline(always)]
+    fn narrow(v: i32) -> Self {
+        v
+    }
+}
+
+impl Sample for u16 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        i32::from(self)
+    }
+    #[inline(always)]
+    fn narrow(v: i32) -> Self {
+        debug_assert!((0..=i32::from(u16::MAX)).contains(&v));
+        v as u16
+    }
+}
+
+impl Sample for u8 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        i32::from(self)
+    }
+    #[inline(always)]
+    fn narrow(v: i32) -> Self {
+        debug_assert!((0..=i32::from(u8::MAX)).contains(&v));
+        v as u8
+    }
+}
+
 /// Mutable view of a single plane's `CurrFrame[plane]` sample buffer.
 ///
-/// The `samples` slice is row-major `rows * cols` `i32` post-`Clip1`
+/// The `samples` slice is row-major `rows * cols` [`Sample`] post-`Clip1`
 /// per av1-spec §7.12.3 step-3 — same shape produced by
 /// [`crate::PartitionWalker`] for the lazy per-plane buffers.
 #[derive(Debug)]
-pub struct PlaneBuffer<'a> {
+pub struct PlaneBuffer<'a, S: Sample = i32> {
     /// Per-plane row count: `(mi_rows * MI_SIZE) >> sub_y`.
     pub rows: u32,
     /// Per-plane column count: `(mi_cols * MI_SIZE) >> sub_x`.
     pub cols: u32,
     /// `rows * cols` row-major sample buffer.
-    pub samples: &'a mut [i32],
+    pub samples: &'a mut [S],
 }
 
-impl PlaneBuffer<'_> {
+impl<S: Sample> PlaneBuffer<'_, S> {
     /// Bounds-checked load — returns `0` for out-of-bounds reads. The
     /// §7.14.6 filter mask process never indexes outside the on-screen
     /// region (the §7.14.2 `onScreen` gate prevents it), but a few
@@ -137,7 +187,7 @@ impl PlaneBuffer<'_> {
     fn get(&self, y: i32, x: i32) -> i32 {
         let yc = y.clamp(0, self.rows as i32 - 1) as usize;
         let xc = x.clamp(0, self.cols as i32 - 1) as usize;
-        self.samples[yc * (self.cols as usize) + xc]
+        self.samples[yc * (self.cols as usize) + xc].widen()
     }
 
     /// Bounds-checked store — silently drops out-of-bounds writes.
@@ -164,7 +214,7 @@ impl PlaneBuffer<'_> {
             return;
         }
         let idx = (y as usize) * (self.cols as usize) + (x as usize);
-        self.samples[idx] = v;
+        self.samples[idx] = S::narrow(v);
     }
 }
 
@@ -278,7 +328,10 @@ impl std::fmt::Debug for LoopFilterFrameContext<'_> {
 /// actually move.
 ///
 /// Modifies the per-plane buffers in place.
-pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBuffer<'_>]) {
+pub fn loop_filter_frame<S: Sample>(
+    ctx: &LoopFilterFrameContext<'_>,
+    planes: &mut [PlaneBuffer<'_, S>],
+) {
     loop_filter_rows(ctx, planes, 0, ctx.mi_rows);
 }
 
@@ -287,9 +340,9 @@ pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBu
 /// the whole range this IS the frame process; on a band it is the
 /// encoder's level-election probe (the band's first horizontal edge
 /// reads samples above the band as the band left them).
-pub fn loop_filter_rows(
+pub fn loop_filter_rows<S: Sample>(
     ctx: &LoopFilterFrameContext<'_>,
-    planes: &mut [PlaneBuffer<'_>],
+    planes: &mut [PlaneBuffer<'_, S>],
     mi_row_start: u32,
     mi_row_end: u32,
 ) {
@@ -333,11 +386,11 @@ pub fn loop_filter_rows(
 /// spec's samples. A pass-1 band needs its 7-row skirts in the
 /// window; a pass-0 band needs none.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn loop_filter_rows_window(
+pub(crate) fn loop_filter_rows_window<S: Sample>(
     ctx: &LoopFilterFrameContext<'_>,
     plane: u8,
     pass: u8,
-    window: &mut PlaneBuffer<'_>,
+    window: &mut PlaneBuffer<'_, S>,
     window_row0: u32,
     mi_row_start: u32,
     mi_row_end: u32,
@@ -362,11 +415,11 @@ pub(crate) fn loop_filter_rows_window(
 
 /// r475 — split a row-major plane into disjoint mutable row windows
 /// `[ start, end )` (sorted, non-overlapping, in plane rows).
-pub(crate) fn row_windows_mut<'a>(
-    samples: &'a mut [i32],
+pub(crate) fn row_windows_mut<'a, T>(
+    samples: &'a mut [T],
     cols: usize,
     ranges: &[(usize, usize)],
-) -> Vec<&'a mut [i32]> {
+) -> Vec<&'a mut [T]> {
     let mut out = Vec::with_capacity(ranges.len());
     let mut rest = samples;
     let mut consumed = 0usize;
@@ -418,9 +471,9 @@ pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + '
 /// boundaries (filtering horizontally), `1` for horizontal boundaries
 /// (filtering vertically). `row` and `col` are in 4×4-block luma
 /// coordinates.
-pub fn loop_filter_edge(
+pub fn loop_filter_edge<S: Sample>(
     ctx: &LoopFilterFrameContext<'_>,
-    planes: &mut [PlaneBuffer<'_>],
+    planes: &mut [PlaneBuffer<'_, S>],
     plane: u8,
     pass: u8,
     row: u32,
@@ -437,9 +490,9 @@ pub fn loop_filter_edge(
 /// holds (`0` for the whole plane). The §7.14.2 gates run in frame
 /// coordinates; only the sample addressing is shifted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn loop_filter_edge_in(
+pub(crate) fn loop_filter_edge_in<S: Sample>(
     ctx: &LoopFilterFrameContext<'_>,
-    plane_buf: &mut PlaneBuffer<'_>,
+    plane_buf: &mut PlaneBuffer<'_, S>,
     plane: u8,
     pass: u8,
     row: u32,
@@ -794,11 +847,11 @@ impl LfEdgeTable {
 /// from the table instead of re-derived per edge.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn loop_filter_rows_window_table(
+pub fn loop_filter_rows_window_table<S: Sample>(
     t: &LfEdgeTable,
     plane: u8,
     pass: u8,
-    window: &mut PlaneBuffer<'_>,
+    window: &mut PlaneBuffer<'_, S>,
     window_row0: u32,
     mi_row_start: u32,
     mi_row_end: u32,
@@ -967,8 +1020,8 @@ const LANES: usize = MI_SIZE;
 /// [`sample_filtering`] line by line.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn filter_edge4(
-    s: &mut [i32],
+fn filter_edge4<S: Sample>(
+    s: &mut [S],
     q0: usize,
     along: usize,
     across: usize,
@@ -990,7 +1043,7 @@ fn filter_edge4(
     for (k, tap) in tp.iter_mut().enumerate().take(7 + reach).skip(7 - reach) {
         for (l, v) in tap.iter_mut().enumerate() {
             let line = q0 + l * along;
-            *v = s[line + k * across - 7 * across];
+            *v = s[line + k * across - 7 * across].widen();
         }
     }
     let at = |i: i32| tp[(i + 7) as usize];
@@ -1123,7 +1176,7 @@ fn filter_edge4(
     let last = (7 + reach).min(13);
     for (l, line_q0) in (0..LANES).map(|l| (l, q0 + l * along)) {
         for (k, tap) in out.iter().enumerate().take(last).skip(first) {
-            s[line_q0 + k * across - 7 * across] = tap[l];
+            s[line_q0 + k * across - 7 * across] = S::narrow(tap[l]);
         }
     }
 }
@@ -1285,8 +1338,8 @@ pub fn adaptive_filter_strength_selection(
 /// [`narrow_filter`] or [`wide_filter`] per the resulting masks and
 /// `filter_size`.
 #[allow(clippy::too_many_arguments)]
-pub fn sample_filtering(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn sample_filtering<S: Sample>(
+    plane_buf: &mut PlaneBuffer<'_, S>,
     x: i32,
     y: i32,
     plane: u8,
@@ -1346,8 +1399,8 @@ pub struct FilterMaskOutput {
 /// from samples around `(x, y)` on `plane`. av1-spec p.314-315.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
-pub fn filter_mask(
-    plane_buf: &PlaneBuffer<'_>,
+pub fn filter_mask<S: Sample>(
+    plane_buf: &PlaneBuffer<'_, S>,
     x: i32,
     y: i32,
     plane: u8,
@@ -1379,7 +1432,7 @@ pub fn filter_mask(
             let stride = (dx + dy * plane_buf.cols as i32) as usize;
             let first = 7 - reach as usize;
             for k in 0..(2 * reach) as usize {
-                taps[first + k] = plane_buf.samples[base + k * stride];
+                taps[first + k] = plane_buf.samples[base + k * stride].widen();
             }
         }
         _ => {
@@ -1460,8 +1513,8 @@ pub fn filter_mask(
 /// §7.14.6.3 — Modify up to two samples each side of the boundary at
 /// `(x, y)`. `hev_mask == false` widens the modify window from one
 /// to two on each side.
-pub fn narrow_filter(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn narrow_filter<S: Sample>(
+    plane_buf: &mut PlaneBuffer<'_, S>,
     x: i32,
     y: i32,
     dx: i32,
@@ -1506,8 +1559,8 @@ pub fn narrow_filter(
 /// §7.14.6.4 — Apply the 6/8/14-tap low-pass filter centred at the
 /// boundary. `log2_size ∈ {3, 4}`.
 #[allow(clippy::too_many_arguments)]
-pub fn wide_filter(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn wide_filter<S: Sample>(
+    plane_buf: &mut PlaneBuffer<'_, S>,
     x: i32,
     y: i32,
     plane: u8,
@@ -1538,7 +1591,7 @@ pub fn wide_filter(
     match (base, end) {
         (Some(base), Some(_)) => {
             for (k, slot) in taps.iter_mut().take((2 * n + 2) as usize).enumerate() {
-                *slot = plane_buf.samples[base + k * stride];
+                *slot = plane_buf.samples[base + k * stride].widen();
             }
         }
         _ => {
@@ -1576,7 +1629,7 @@ pub fn wide_filter(
     if let (Some(base), Some(_)) = (base, end) {
         let first = base + stride;
         for (idx, _) in (-n..n).enumerate() {
-            plane_buf.samples[first + idx * stride] = f[idx];
+            plane_buf.samples[first + idx * stride] = S::narrow(f[idx]);
         }
     } else {
         for (idx, i) in (-n..n).enumerate() {

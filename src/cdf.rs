@@ -16786,12 +16786,13 @@ pub struct PartitionWalker {
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
 /// samples)` triple. The flat `samples` buffer is row-major with
-/// `rows * cols` `i32` entries.
+/// `rows * cols` 16-bit entries (every stored sample is post-`Clip1`,
+/// at most `(1 << BitDepth) - 1 <= 4095`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CurrFramePlane {
     rows: u32,
     cols: u32,
-    samples: Vec<i32>,
+    samples: Vec<u16>,
 }
 
 /// r408 — §7.11.5 luma TU-overhang store. The spec's `CurrFrame[ 0 ]`
@@ -17662,13 +17663,13 @@ impl PartitionWalker {
     ///
     /// Indexed `samples()[ y * cols + x ]` against the `(rows, cols)`
     /// pair returned by [`Self::curr_frame_dims`]. Sample values are
-    /// `i32` post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
+    /// 16-bit post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
     /// the `BitDepth` the §7.12.3 step-3 merge was driven with).
     ///
     /// `plane` is `0` (Y), `1` (Cb), `2` (Cr); out-of-range `plane`
     /// returns `None`.
     #[must_use]
-    pub fn curr_frame(&self, plane: usize) -> Option<&[i32]> {
+    pub fn curr_frame(&self, plane: usize) -> Option<&[u16]> {
         self.curr_frame
             .get(plane)
             .and_then(|p| p.as_ref().map(|cp| cp.samples.as_slice()))
@@ -17679,9 +17680,9 @@ impl PartitionWalker {
     /// §7.16 / §7.17 in-loop passes operate on caller-owned buffers
     /// and nothing in the walker reads `CurrFrame` after the walk, so
     /// the frame driver takes ownership instead of copying the
-    /// full-frame `i32` buffer. Returns `(rows, cols, samples)`; the
+    /// full-frame buffer. Returns `(rows, cols, samples)`; the
     /// plane's slot is left unallocated (as before the first merge).
-    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<i32>)> {
+    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<u16>)> {
         self.curr_frame
             .get_mut(plane)
             .and_then(|p| p.take())
@@ -17749,7 +17750,7 @@ impl PartitionWalker {
             return;
         }
         let len = (rows as usize).saturating_mul(cols as usize);
-        let mut samples: Vec<i32> = Vec::new();
+        let mut samples: Vec<u16> = Vec::new();
         if samples.try_reserve_exact(len).is_err() {
             return;
         }
@@ -17863,7 +17864,7 @@ impl PartitionWalker {
 
         let read = |yy: u32, xx: u32| -> u16 {
             let idx = (yy as usize) * (buf_cols as usize) + (xx as usize);
-            buf.samples[idx] as u16
+            buf.samples[idx]
         };
         let mut scratch = IntraPredScratch::take();
         if !Self::intra_predict_block_samples(
@@ -17903,9 +17904,7 @@ impl PartitionWalker {
             let cols_u = cols_buf as usize;
             for (i, src) in pred.chunks_exact(w).take(h).enumerate() {
                 let d0 = (start_y as usize + i) * cols_u + start_x as usize;
-                for (d, &p) in buf.samples[d0..d0 + w].iter_mut().zip(src) {
-                    *d = i32::from(p);
-                }
+                buf.samples[d0..d0 + w].copy_from_slice(src);
             }
             return;
         }
@@ -17925,7 +17924,7 @@ impl PartitionWalker {
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+                buf.samples[idx] = pred[(i as usize) * w + (j as usize)];
             }
         }
         for (y, x, v) in overhang {
@@ -18398,7 +18397,7 @@ impl PartitionWalker {
                 let dc = buf.samples[idx] as i64;
                 let l_ij = l[(i as usize) * w + (j as usize)];
                 let scaled = round2_signed((alpha as i64) * (l_ij - luma_avg), 6);
-                buf.samples[idx] = (dc + scaled).clamp(0, max_val) as i32;
+                buf.samples[idx] = (dc + scaled).clamp(0, max_val) as u16;
             }
         }
     }
@@ -18489,12 +18488,12 @@ impl PartitionWalker {
                 if flip_lr {
                     for (d, &r) in dst.iter_mut().rev().zip(src) {
                         let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
-                        *d = d.saturating_add(r).max(0).min(max);
+                        *d = i32::from(*d).saturating_add(r).max(0).min(max) as u16;
                     }
                 } else {
                     for (d, &r) in dst.iter_mut().zip(src) {
                         let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
-                        *d = d.saturating_add(r).max(0).min(max);
+                        *d = i32::from(*d).saturating_add(r).max(0).min(max) as u16;
                     }
                 }
             }
@@ -18533,7 +18532,7 @@ impl PartitionWalker {
                 } else {
                     sum as i32
                 };
-                buf.samples[idx] = clipped;
+                buf.samples[idx] = clipped as u16;
             }
         }
         for (y, x, res) in overhang {
@@ -18623,7 +18622,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().copied());
             mirrors.push((spec.plane, mirror, cols, rows));
         }
         // Build the per-plane reconstruction contexts over the mirrors.
@@ -18666,7 +18665,7 @@ impl PartitionWalker {
         for (p, mirror, _cols, _rows) in &mirrors {
             if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = src;
                 }
             }
         }
@@ -18751,7 +18750,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref translational reconstruction; the final
         // stitch overwrites the `w × h` footprint at `(x, y)`.
@@ -18779,7 +18778,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
         Ok(())
@@ -18855,7 +18854,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref warped reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18884,7 +18883,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
         Ok(())
@@ -18964,7 +18963,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref OBMC reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18993,7 +18992,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
         Ok(())
@@ -19089,7 +19088,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().copied());
 
         // §7.11.3.12 DIFFWTD persistent luma-grid mask — for a single
         // (luma) bridge call the mask buffer is `w × h`. The driver fills
@@ -19135,7 +19134,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
         Ok(())
@@ -19273,7 +19272,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().copied());
 
             // The DIFFWTD arm receives the *shared* luma-grid mask; the
             // `plane == 0` call fills it, the chroma calls read it
@@ -19309,7 +19308,7 @@ impl PartitionWalker {
 
             if let Some(cp) = self.curr_frame[plane].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = src;
                 }
             }
         }
@@ -19424,7 +19423,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().copied());
 
             crate::reconstruct_inter_block(
                 mode_info,
@@ -19448,7 +19447,7 @@ impl PartitionWalker {
 
             if let Some(cp) = self.curr_frame[plane].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = src;
                 }
             }
         }
@@ -19632,9 +19631,8 @@ impl PartitionWalker {
                     for i in 0..copy_h {
                         let dst_row = (start_y as usize + i) * buf_cols + start_x as usize;
                         let src_row = i * w;
-                        for j in 0..copy_w {
-                            cp.samples[dst_row + j] = pred[src_row + j] as i32;
-                        }
+                        cp.samples[dst_row..dst_row + copy_w]
+                            .copy_from_slice(&pred[src_row..src_row + copy_w]);
                     }
                 }
                 x += step_x;
@@ -19729,7 +19727,7 @@ impl PartitionWalker {
             let dst = (start_y as usize + i) * buf_cols + start_x as usize;
             let src = i * w;
             for j in 0..copy_w {
-                cp.samples[dst + j] = pred[src + j] as i32;
+                cp.samples[dst + j] = pred[src + j] as u16;
             }
         }
         Ok(())
@@ -19966,7 +19964,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().copied());
             mirrors.push((spec.plane, mirror, buf_cols));
         }
 
@@ -20024,7 +20022,7 @@ impl PartitionWalker {
         for (p, mirror, _cols) in &mirrors {
             if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = src;
                 }
             }
         }
@@ -20059,10 +20057,8 @@ impl PartitionWalker {
     /// sample list is not retained); wiring it is the warped-motion
     /// follow-up.
     ///
-    /// The §7.11.3 drivers operate on `u16` planes while the walker's
-    /// `CurrFrame` is post-`Clip1` `i32`; the leaf's plane rect is
-    /// mirrored through [`Self::inter_pred_scratch`] in both directions
-    /// (lossless).
+    /// The §7.11.3 drivers write straight into the walker's 16-bit
+    /// `CurrFrame` planes.
     pub fn predict_inter_leaf_from_walk(
         &mut self,
         mi_row: u32,
@@ -20081,14 +20077,9 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
-        // Per-plane leaf rect: `(base, w, h)` in plane samples, clipped
-        // to the plane's mi-grid extent — the §5.11.33 write region.
+        // Per visited plane: its `CurrFrame` index and row stride.
         struct LeafRect {
             plane: usize,
-            x0: usize,
-            y0: usize,
-            w: usize,
-            h: usize,
             stride: usize,
         }
         let mut rects: Vec<LeafRect> = Vec::with_capacity(pixels.plane_refs.len());
@@ -20105,39 +20096,12 @@ impl PartitionWalker {
             let rows = ((mi_rows * (MI_SIZE as u32)) >> sub_y) as usize;
             let cols = ((mi_cols * (MI_SIZE as u32)) >> sub_x) as usize;
             self.ensure_curr_frame_plane(p, rows as u32, cols as u32);
-            // Size the scratch mirror once per plane (stale samples
-            // outside the synced rect are never read).
-            if self.inter_pred_scratch[p].len() != rows * cols {
-                self.inter_pred_scratch[p].resize(rows * cols, 0);
-            }
-            let plane_sz = get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
+            get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            let x0 = ((mi_col >> sub_x) as usize) * MI_SIZE;
-            let y0 = ((mi_row >> sub_y) as usize) * MI_SIZE;
-            let w = (num_4x4_blocks_wide(plane_sz) * 4).min(cols.saturating_sub(x0));
-            let h = (num_4x4_blocks_high(plane_sz) * 4).min(rows.saturating_sub(y0));
             rects.push(LeafRect {
                 plane: p,
-                x0,
-                y0,
-                w,
-                h,
                 stride: cols,
             });
-        }
-
-        // Mirror the leaf rects `i32 → u16` into the scratch planes.
-        for r in &rects {
-            let Some(cp) = self.curr_frame[r.plane].as_ref() else {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            let scratch = &mut self.inter_pred_scratch[r.plane];
-            for y in r.y0..r.y0 + r.h {
-                let row = y * r.stride + r.x0..y * r.stride + r.x0 + r.w;
-                for (d, &s) in scratch[row.clone()].iter_mut().zip(&cp.samples[row]) {
-                    *d = s as u16;
-                }
-            }
         }
 
         // §5.9.24 global-motion tables in the [`crate::GridWarpContext`]
@@ -20186,7 +20150,8 @@ impl PartitionWalker {
 
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
-        // plane contexts borrow `inter_pred_scratch` mutably.
+        // plane contexts borrow the `CurrFrame` planes mutably (the
+        // §7.11.3.1 process writes its prediction straight into them).
         {
             if self.walk_avail_u.len() < cells || self.walk_avail_l.len() < cells {
                 return Err(crate::Error::PartitionWalkOutOfRange);
@@ -20232,13 +20197,17 @@ impl PartitionWalker {
                     avail_l: &self.walk_avail_l,
                 }),
             };
-            let mut scratch_iter = self.inter_pred_scratch.iter_mut();
+            let mut scratch_iter = self.curr_frame.iter_mut();
             let (s0, s1, s2) = (
                 scratch_iter.next().unwrap(),
                 scratch_iter.next().unwrap(),
                 scratch_iter.next().unwrap(),
             );
-            let mut slots: [Option<&mut Vec<u16>>; 3] = [Some(s0), Some(s1), Some(s2)];
+            let mut slots: [Option<&mut Vec<u16>>; 3] = [
+                s0.as_mut().map(|cp| &mut cp.samples),
+                s1.as_mut().map(|cp| &mut cp.samples),
+                s2.as_mut().map(|cp| &mut cp.samples),
+            ];
             let mut planes: Vec<crate::PlaneReconContext<'_>> =
                 Vec::with_capacity(pixels.plane_refs.len());
             for (i, (spec, rect)) in pixels.plane_refs.iter().zip(rects.iter()).enumerate() {
@@ -20268,19 +20237,6 @@ impl PartitionWalker {
             )?;
         }
 
-        // Mirror the leaf rects back `u16 → i32`.
-        for r in &rects {
-            let scratch = &self.inter_pred_scratch[r.plane];
-            let Some(cp) = self.curr_frame[r.plane].as_mut() else {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            for y in r.y0..r.y0 + r.h {
-                let row = y * r.stride + r.x0..y * r.stride + r.x0 + r.w;
-                for (d, &s) in cp.samples[row.clone()].iter_mut().zip(&scratch[row]) {
-                    *d = i32::from(s);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -20428,7 +20384,7 @@ impl PartitionWalker {
                 for xx in x0..=x1 {
                     // `CurrFrame` samples are post-Clip1 (`0..=clip_max`),
                     // so the u16 narrowing is lossless.
-                    win.push(cp.samples[row + xx as usize] as u16);
+                    win.push(cp.samples[row + xx as usize]);
                 }
             }
             let mut pred = vec![0i32; w * h];
@@ -20475,7 +20431,7 @@ impl PartitionWalker {
                     if tx < 0 || tx > last_x {
                         continue;
                     }
-                    cp.samples[out_row + tx as usize] = pred[i * w + j].clamp(0, clip_max);
+                    cp.samples[out_row + tx as usize] = pred[i * w + j].clamp(0, clip_max) as u16;
                 }
             }
         }
@@ -21452,15 +21408,15 @@ impl PartitionWalker {
     /// order, so the buffers here are at the un-upscaled
     /// `(MiRows * MI_SIZE) >> subY` × `(MiCols * MI_SIZE) >> subX` extent.
     #[allow(clippy::too_many_arguments)]
-    pub fn cdef_frame_from_idx(
+    pub fn cdef_frame_from_idx<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         self.with_cdef_ctx(
             cdef_params,
@@ -21474,14 +21430,14 @@ impl PartitionWalker {
 
     /// r475 — [`Self::cdef_frame_from_idx`] in place over the
     /// deblocked planes ([`crate::cdef::cdef_frame_in_place`]).
-    pub(crate) fn cdef_frame_in_place_from_idx(
+    pub(crate) fn cdef_frame_in_place_from_idx<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         self.with_cdef_ctx(
             cdef_params,
@@ -21502,14 +21458,14 @@ impl PartitionWalker {
     /// the bands concurrently, each into its own row window. Byte-
     /// identical to the serial filter.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cdef_frame_parallel_from_idx(
+    pub(crate) fn cdef_frame_parallel_from_idx<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
         threads: usize,
     ) {
         use crate::cdef::{CdefSrc, cdef_band_in_place};
@@ -21541,10 +21497,10 @@ impl PartitionWalker {
             (((r * MI_SIZE as u32) >> sub_y) as usize).min(dims[plane].0)
         };
         // Unfiltered rows `[ by0 - 2, by0 )` of the next wave's first band.
-        let mut carry: Vec<Vec<i32>> = vec![Vec::new(); num_planes];
+        let mut carry: Vec<Vec<S>> = vec![Vec::new(); num_planes];
         for wave in bands.chunks(threads.max(1)) {
             // Copy phase: source windows per (band, plane).
-            let mut windows: Vec<Vec<(Vec<i32>, usize)>> = Vec::with_capacity(wave.len());
+            let mut windows: Vec<Vec<(Vec<S>, usize)>> = Vec::with_capacity(wave.len());
             for (k, &(r0, r1)) in wave.iter().enumerate() {
                 let mut per_plane = Vec::with_capacity(num_planes);
                 for (plane, pb) in planes.iter().enumerate().take(num_planes) {
@@ -21552,7 +21508,7 @@ impl PartitionWalker {
                     let (by0, by1) = (plane_rows(plane, r0), plane_rows(plane, r1));
                     let new0 = by0.saturating_sub(HALO);
                     let new1 = (by1 + HALO).min(rows);
-                    let mut win: Vec<i32> = Vec::with_capacity((new1 - new0) * cols);
+                    let mut win: Vec<S> = Vec::with_capacity((new1 - new0) * cols);
                     if k == 0 && by0 >= HALO && !carry[plane].is_empty() {
                         win.extend_from_slice(&carry[plane]);
                         win.extend_from_slice(&pb.samples[by0 * cols..new1 * cols]);
@@ -21574,7 +21530,7 @@ impl PartitionWalker {
                 }
             }
             // Filter phase: disjoint band windows per plane.
-            let mut per_plane_windows: Vec<Vec<&mut [i32]>> = Vec::with_capacity(num_planes);
+            let mut per_plane_windows: Vec<Vec<&mut [S]>> = Vec::with_capacity(num_planes);
             let mut per_plane_row0: Vec<Vec<usize>> = Vec::with_capacity(num_planes);
             for (plane, pb) in planes.iter_mut().enumerate().take(num_planes) {
                 let cols = dims[plane].1;
@@ -21586,7 +21542,7 @@ impl PartitionWalker {
                 per_plane_windows.push(row_windows_mut(pb.samples, cols, &ranges));
             }
             // Transpose into per-band plane sets.
-            let mut band_sets: Vec<Vec<&mut [i32]>> = (0..wave.len()).map(|_| Vec::new()).collect();
+            let mut band_sets: Vec<Vec<&mut [S]>> = (0..wave.len()).map(|_| Vec::new()).collect();
             for plane_wins in per_plane_windows.into_iter() {
                 for (k, w) in plane_wins.into_iter().enumerate() {
                     band_sets[k].push(w);
@@ -21613,7 +21569,7 @@ impl PartitionWalker {
                         });
                     }
                     let mut dst_row0 = [0usize; 3];
-                    let mut dsts: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                    let mut dsts: Vec<PlaneBuffer<'_, S>> = Vec::with_capacity(num_planes);
                     for (plane, win) in set.into_iter().enumerate() {
                         let cols = dims[plane].1;
                         dst_row0[plane] = per_plane_row0[plane][k];
@@ -21686,7 +21642,7 @@ impl PartitionWalker {
     /// re-emitted with the §5.11.56 literals that make the walker's
     /// own grid carry the same ids.
     #[allow(clippy::too_many_arguments)]
-    pub fn cdef_frame_with_unit_grid(
+    pub fn cdef_frame_with_unit_grid<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         unit_idx: &[i8],
@@ -21694,8 +21650,8 @@ impl PartitionWalker {
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         use crate::cdef::{CdefFrameContext, cdef_frame};
         let sb_cols = self.mi_cols.div_ceil(16);
@@ -21768,7 +21724,7 @@ impl PartitionWalker {
     /// selection. `delta_lf_multi` selects the §7.14.4 slot indexing (single
     /// `DeltaLFs[..][0]` vs the per-`(plane, pass)` multi-slot read).
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_filter_frame_from_grid(
+    pub fn loop_filter_frame_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -21779,7 +21735,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         self.loop_filter_rows_from_grid(
             lf_params,
@@ -21802,7 +21758,7 @@ impl PartitionWalker {
     /// [`crate::loop_filter::loop_filter_rows`]).
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_filter_rows_from_grid(
+    pub fn loop_filter_rows_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -21813,7 +21769,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
@@ -21847,7 +21803,7 @@ impl PartitionWalker {
     /// The closure-driven reference of [`Self::loop_filter_rows_from_grid`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_filter_rows_from_grid_reference(
+    pub fn loop_filter_rows_from_grid_reference<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -21858,7 +21814,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
@@ -21952,9 +21908,9 @@ impl PartitionWalker {
     pub(crate) fn with_curr_frame_planes<R>(
         &mut self,
         num_planes: usize,
-        f: impl FnOnce(&Self, &mut [crate::loop_filter::PlaneBuffer<'_>]) -> R,
+        f: impl FnOnce(&Self, &mut [crate::loop_filter::PlaneBuffer<'_, u16>]) -> R,
     ) -> R {
-        let mut taken: Vec<(u32, u32, Vec<i32>)> = (0..num_planes.min(3))
+        let mut taken: Vec<(u32, u32, Vec<u16>)> = (0..num_planes.min(3))
             .map_while(|p| {
                 self.curr_frame[p]
                     .as_mut()
@@ -21962,7 +21918,7 @@ impl PartitionWalker {
             })
             .collect();
         let out = {
-            let mut bufs: Vec<crate::loop_filter::PlaneBuffer<'_>> = taken
+            let mut bufs: Vec<crate::loop_filter::PlaneBuffer<'_, u16>> = taken
                 .iter_mut()
                 .map(|(rows, cols, samples)| crate::loop_filter::PlaneBuffer {
                     rows: *rows,
@@ -22107,7 +22063,7 @@ impl PartitionWalker {
     /// the windows of concurrently filtered bands never overlap. Byte-
     /// identical to the serial filter.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_filter_frame_parallel_from_grid(
+    pub(crate) fn loop_filter_frame_parallel_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -22118,7 +22074,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
         threads: usize,
     ) {
         use crate::loop_filter::{
@@ -22162,7 +22118,7 @@ impl PartitionWalker {
                 }
                 r = r1;
             }
-            let run_phase = |pb: &mut PlaneBuffer<'_>, pass: u8, parity: Option<usize>| {
+            let run_phase = |pb: &mut PlaneBuffer<'_, S>, pass: u8, parity: Option<usize>| {
                 let selected: Vec<(u32, u32, usize, usize)> = bands
                     .iter()
                     .enumerate()
@@ -22223,7 +22179,7 @@ impl PartitionWalker {
     /// runs its trials and its final filter through this on band
     /// windows instead of frame-sized `i32` copies.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_filter_pass_window_from_grid(
+    pub(crate) fn loop_filter_pass_window_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -22236,7 +22192,7 @@ impl PartitionWalker {
         frame_height: u32,
         plane: u8,
         pass: u8,
-        window: &mut crate::loop_filter::PlaneBuffer<'_>,
+        window: &mut crate::loop_filter::PlaneBuffer<'_, S>,
         window_row0: u32,
         mi_row_start: u32,
         mi_row_end: u32,
@@ -22438,7 +22394,7 @@ impl PartitionWalker {
     /// `UpscaledCurrFrame`, consulted by §7.17.6 for the cropped
     /// above/below-stripe neighbour lines.
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_restore_frame_from_grid(
+    pub fn loop_restore_frame_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -22449,9 +22405,9 @@ impl PartitionWalker {
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        curr_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         self.with_lr_ctx(
             lr_params,
@@ -22478,7 +22434,7 @@ impl PartitionWalker {
     /// CDEF output with the captured pre-CDEF stripe-boundary rows
     /// ([`crate::loop_restoration::loop_restoration_frame_in_place`]).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_restore_frame_in_place_from_grid(
+    pub(crate) fn loop_restore_frame_in_place_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -22489,8 +22445,8 @@ impl PartitionWalker {
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
-        boundary: &[crate::loop_restoration::StripeBoundaryRows],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows<S>],
     ) {
         self.with_lr_ctx(
             lr_params,
@@ -22514,7 +22470,7 @@ impl PartitionWalker {
     /// concurrently, each from its own copy into its own row window.
     /// Byte-identical to the serial filter.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_restore_frame_parallel_from_grid(
+    pub(crate) fn loop_restore_frame_parallel_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -22525,8 +22481,8 @@ impl PartitionWalker {
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
-        boundary: &[crate::loop_restoration::StripeBoundaryRows],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows<S>],
         threads: usize,
     ) {
         use crate::loop_filter::{PlaneBuffer, row_windows_mut, run_jobs};
@@ -23252,13 +23208,27 @@ impl PartitionWalker {
         w4: u32,
         h4: u32,
     ) -> EncoderStampSnapshot {
+        self.snapshot_encoder_stamp_rect_wh_reusing(mi_row, mi_col, w4, h4, None)
+    }
+
+    /// [`Self::snapshot_encoder_stamp_rect_wh`] into the buffers of a
+    /// snapshot that is no longer needed (`recycled`), so a capture in
+    /// a pricing loop allocates nothing once the buffers have grown.
+    pub(crate) fn snapshot_encoder_stamp_rect_wh_reusing(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+        recycled: Option<EncoderStampSnapshot>,
+    ) -> EncoderStampSnapshot {
         let r1 = (mi_row + h4).min(self.mi_rows);
         let c1 = (mi_col + w4).min(self.mi_cols);
         let rows = r1.saturating_sub(mi_row);
         let cols = c1.saturating_sub(mi_col);
         let cells = (rows as usize) * (cols as usize);
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
-        let mut snap = EncoderStampSnapshot {
+        let mut snap = recycled.unwrap_or_else(|| EncoderStampSnapshot {
             mi_row,
             mi_col,
             rows,
@@ -23287,7 +23257,32 @@ impl PartitionWalker {
             interintra_modes: Vec::with_capacity(cells),
             wedge_interintras: Vec::with_capacity(cells),
             interintra_wedge_indices: Vec::with_capacity(cells),
-        };
+        });
+        (snap.mi_row, snap.mi_col, snap.rows, snap.cols) = (mi_row, mi_col, rows, cols);
+        snap.mi_sizes.clear();
+        snap.skips.clear();
+        snap.skip_modes.clear();
+        snap.segment_ids.clear();
+        snap.y_modes.clear();
+        snap.is_inters.clear();
+        snap.tx_sizes.clear();
+        snap.inter_tx_sizes.clear();
+        snap.motion_modes.clear();
+        snap.ref_frames.clear();
+        snap.interp_filters.clear();
+        snap.mvs.clear();
+        snap.delta_lfs.clear();
+        snap.palette_sizes.clear();
+        snap.palette_colors.clear();
+        snap.comp_group_idxs.clear();
+        snap.compound_idxs.clear();
+        snap.compound_types.clear();
+        snap.compound_wedge_indices.clear();
+        snap.compound_wedge_signs.clear();
+        snap.compound_mask_types.clear();
+        snap.interintra_modes.clear();
+        snap.wedge_interintras.clear();
+        snap.interintra_wedge_indices.clear();
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
                 let cell = (rr * self.mi_cols + cc) as usize;
@@ -23471,7 +23466,11 @@ impl PartitionWalker {
     /// row is inside the scope), the §5.11.9 segment-prediction
     /// context spans, and the §5.11.2 `CurrentQIndex` /
     /// `DeltaLF[]` / `ReadDeltas` scalars.
-    pub(crate) fn snapshot_price_scope(
+    ///
+    /// The capture reuses the buffers of a snapshot that is no longer
+    /// needed (`recycled`) when there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn snapshot_price_scope_reusing(
         &self,
         mi_row: u32,
         mi_col: u32,
@@ -23479,12 +23478,41 @@ impl PartitionWalker {
         h4: u32,
         subsampling_x: u8,
         subsampling_y: u8,
+        recycled: Option<PriceScopeSnapshot>,
     ) -> PriceScopeSnapshot {
-        let stamp = self.snapshot_encoder_stamp_rect_wh(mi_row, mi_col, w4, h4);
+        let (
+            old_stamp,
+            mut tx_types,
+            mut cdef,
+            mut above_ctx,
+            mut left_ctx,
+            mut above_seg,
+            mut left_seg,
+        ) = match recycled {
+            Some(r) => (
+                Some(r.stamp),
+                r.tx_types,
+                r.cdef,
+                r.above_ctx,
+                r.left_ctx,
+                r.above_seg,
+                r.left_seg,
+            ),
+            None => (
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        let stamp = self.snapshot_encoder_stamp_rect_wh_reusing(mi_row, mi_col, w4, h4, old_stamp);
         let r1 = (mi_row + h4).min(self.mi_rows);
         let c1 = (mi_col + w4).min(self.mi_cols);
-        let mut tx_types =
-            Vec::with_capacity(((r1 - mi_row.min(r1)) * (c1 - mi_col.min(c1))) as usize);
+        tx_types.clear();
+        tx_types.reserve(((r1 - mi_row.min(r1)) * (c1 - mi_col.min(c1))) as usize);
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
                 tx_types.push(self.tx_types[(rr * self.mi_cols + cc) as usize]);
@@ -23492,7 +23520,7 @@ impl PartitionWalker {
         }
         let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
         let mask: u32 = !(cdef_size4 - 1);
-        let mut cdef = Vec::new();
+        cdef.clear();
         let mut i = mi_row & mask;
         while i < mi_row + h4 && i < self.mi_rows {
             let mut j = mi_col & mask;
@@ -23503,8 +23531,8 @@ impl PartitionWalker {
             }
             i += cdef_size4;
         }
-        let mut above_ctx = Vec::new();
-        let mut left_ctx = Vec::new();
+        above_ctx.clear();
+        left_ctx.clear();
         let mut spans = [(0usize, 0usize, 0usize, 0usize); 3];
         for (plane, span) in spans.iter_mut().enumerate() {
             let (ssx, ssy) = if plane == 0 {
@@ -23537,6 +23565,10 @@ impl PartitionWalker {
         let seg_c1 = c1 as usize;
         let seg_r0 = mi_row.min(self.mi_rows) as usize;
         let seg_r1 = r1 as usize;
+        above_seg.clear();
+        above_seg.extend_from_slice(&self.above_seg_pred_context[seg_c0..seg_c1.max(seg_c0)]);
+        left_seg.clear();
+        left_seg.extend_from_slice(&self.left_seg_pred_context[seg_r0..seg_r1.max(seg_r0)]);
         PriceScopeSnapshot {
             stamp,
             tx_types,
@@ -23546,8 +23578,8 @@ impl PartitionWalker {
             left_ctx,
             seg_cols: (seg_c0, seg_c1),
             seg_rows: (seg_r0, seg_r1),
-            above_seg: self.above_seg_pred_context[seg_c0..seg_c1.max(seg_c0)].to_vec(),
-            left_seg: self.left_seg_pred_context[seg_r0..seg_r1.max(seg_r0)].to_vec(),
+            above_seg,
+            left_seg,
             current_q_index: self.current_q_index,
             current_delta_lf: self.current_delta_lf,
             read_deltas_pending: self.read_deltas_pending,
@@ -42154,13 +42186,13 @@ mod tests {
         if let Some(p) = walker.curr_frame[0].as_mut() {
             for y in 0..16u32 {
                 for x in 0..16u32 {
-                    p.samples[(y * 16 + x) as usize] = (10 * y + x) as i32;
+                    p.samples[(y * 16 + x) as usize] = (10 * y + x) as u16;
                 }
             }
         }
         let dc_base = 70i32;
         if let Some(p) = walker.curr_frame[1].as_mut() {
-            p.samples.iter_mut().for_each(|s| *s = dc_base);
+            p.samples.iter_mut().for_each(|s| *s = dc_base as u16);
         }
         walker.max_luma_w = 16;
         walker.max_luma_h = 16;
@@ -42199,7 +42231,7 @@ mod tests {
                 let scaled = round2_signed((alpha as i64) * (l[i][j] - luma_avg), 6);
                 let expected = ((dc_base as i64) + scaled).clamp(0, 255) as i32;
                 assert_eq!(
-                    chroma[i * 8 + j],
+                    i32::from(chroma[i * 8 + j]),
                     expected,
                     "CfL sample ({i},{j}) must match the §7.11.5 formula"
                 );
@@ -62866,7 +62898,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[i * 16 + j],
+                    i32::from(buf[i * 16 + j]),
                     (i * 4 + j + 1) as i32,
                     "DCT_DCT identity write at ({i}, {j})",
                 );
@@ -62938,7 +62970,7 @@ mod tests {
         {
             let buf = walker.curr_frame[0].as_mut().unwrap();
             for j in 0..4 {
-                buf.samples[3 * 16 + j] = (10 * (j + 1)) as i32;
+                buf.samples[3 * 16 + j] = (10 * (j + 1)) as u16;
             }
         }
         walker.predict_intra_into_curr_frame(
@@ -62949,7 +62981,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[(4 + i) * 16 + j],
+                    i32::from(buf[(4 + i) * 16 + j]),
                     (10 * (j + 1)) as i32,
                     "V_PRED column copy at row {i} col {j}",
                 );
@@ -62974,7 +63006,7 @@ mod tests {
         {
             let buf = walker.curr_frame[0].as_mut().unwrap();
             for i in 0..4 {
-                buf.samples[i * 16 + 3] = (10 * (i + 1)) as i32;
+                buf.samples[i * 16 + 3] = (10 * (i + 1)) as u16;
             }
         }
         walker.predict_intra_into_curr_frame(
@@ -62985,7 +63017,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[i * 16 + (4 + j)],
+                    i32::from(buf[i * 16 + (4 + j)]),
                     (10 * (i + 1)) as i32,
                     "H_PRED row copy at row {i} col {j}",
                 );
@@ -63041,14 +63073,19 @@ mod tests {
                     let buf = walker.curr_frame[0].as_mut().unwrap();
                     for y in 0..32usize {
                         for x in 0..32usize {
-                            buf.samples[y * 32 + x] = i32::from(fill(y, x));
+                            buf.samples[y * 32 + x] = fill(y, x);
                         }
                     }
                 }
                 walker.predict_intra_into_curr_frame(
                     0, sx, sy, tx_sz, mode, delta, 8, 0, 0, true, true, true, false, true, 1, fim,
                 );
-                let walked: Vec<i32> = walker.curr_frame(0).unwrap().to_vec();
+                let walked: Vec<i32> = walker
+                    .curr_frame(0)
+                    .unwrap()
+                    .iter()
+                    .map(|&v| i32::from(v))
+                    .collect();
 
                 let mut out = vec![0u16; 32 * 32];
                 let neigh = |y: u32, x: u32| -> u16 { fill(y as usize, x as usize) };
@@ -63354,7 +63391,7 @@ mod tests {
             // 0..8 (w + h = 8) with a rising ramp the 2x upsample's
             // 4-tap interpolation visibly re-samples.
             for j in 0..8usize {
-                buf.samples[3 * 16 + j] = (30 * j) as i32;
+                buf.samples[3 * 16 + j] = (30 * j) as u16;
             }
         };
         let mut walker_off = PartitionWalker::new(4, 4, geom).unwrap();
@@ -63479,7 +63516,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (10 + (3 - r)) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "FLIPADST_DCT row-flip at dst ({r}, {c}): expect src row {} = {expected}",
                     3 - r,
@@ -63515,7 +63552,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (10 + (3 - c)) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "H_FLIPADST col-flip at dst ({r}, {c}): expect src col {} = {expected}",
                     3 - c,
@@ -63548,7 +63585,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (15 - 4 * r - c) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "FLIPADST_FLIPADST 180° at ({r}, {c})"
                 );
@@ -64547,7 +64584,7 @@ mod tests {
             let cp = walker.curr_frame[0].as_mut().unwrap();
             assert_eq!(cp.samples.len(), curr_w * curr_h);
             for (dst, &src) in cp.samples.iter_mut().zip(seed.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
 
@@ -64573,12 +64610,7 @@ mod tests {
         // The walker's CurrFrame[0] now holds the §7.11.3.14-blended
         // result, matching the per-block oracle, and differing from the
         // seed (the blend actually modified the plane).
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct inter-intra pixels identically to the per-block driver"
@@ -64804,12 +64836,7 @@ mod tests {
         // stitch, matching the per-block oracle over the 8×8 footprint.
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct single-ref pixels identically to the per-block driver"
@@ -64954,12 +64981,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the frame bridge must reconstruct the single-ref inter leaf's pixels \
@@ -65319,12 +65341,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (frame_h as u32, frame_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the frame bridge must reconstruct each leaf with its own decoded sub-pel MV, \
@@ -65431,12 +65448,7 @@ mod tests {
             walker
                 .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
                 .expect("frame-scope OBMC reconstruction");
-            walker
-                .curr_frame(0)
-                .unwrap()
-                .iter()
-                .map(|&s| s as u16)
-                .collect()
+            walker.curr_frame(0).unwrap().to_vec()
         };
 
         let got_obmc = build(false);
@@ -65817,12 +65829,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker warp bridge must reconstruct warped pixels identically to the per-block driver"
@@ -66109,7 +66116,7 @@ mod tests {
         let mut got = vec![0u16; curr_w * curr_h];
         for i in 0..curr_h {
             for j in 0..curr_w {
-                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)];
             }
         }
         assert_eq!(
@@ -66382,7 +66389,7 @@ mod tests {
         let mut got = vec![0u16; curr_w * curr_h];
         for i in 0..curr_h {
             for j in 0..curr_w {
-                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)];
             }
         }
         assert_eq!(
@@ -66537,7 +66544,7 @@ mod tests {
         let mut got = vec![0u16; cw * ch];
         for i in 0..ch {
             for j in 0..cw {
-                got[i * cw + j] = plane[(4 + i) * cols as usize + (4 + j)] as u16;
+                got[i * cw + j] = plane[(4 + i) * cols as usize + (4 + j)];
             }
         }
         assert_eq!(
@@ -66680,12 +66687,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct compound pixels identically to the per-block driver"
@@ -67044,24 +67046,9 @@ mod tests {
             )
             .expect("walker multi-plane compound reconstruction");
 
-        let got_y: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cb: Vec<u16> = walker
-            .curr_frame(1)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cr: Vec<u16> = walker
-            .curr_frame(2)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got_y: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
+        let got_cb: Vec<u16> = walker.curr_frame(1).unwrap().to_vec();
+        let got_cr: Vec<u16> = walker.curr_frame(2).unwrap().to_vec();
         assert_eq!(got_y, oy, "Y plane must match the shared-mask oracle");
         assert_eq!(got_cb, ocb, "Cb plane must match the shared-mask oracle");
         assert_eq!(got_cr, ocr, "Cr plane must match the shared-mask oracle");
@@ -67424,24 +67411,9 @@ mod tests {
             )
             .expect("walker multi-plane single-ref reconstruction");
 
-        let got_y: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cb: Vec<u16> = walker
-            .curr_frame(1)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cr: Vec<u16> = walker
-            .curr_frame(2)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got_y: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
+        let got_cb: Vec<u16> = walker.curr_frame(1).unwrap().to_vec();
+        let got_cr: Vec<u16> = walker.curr_frame(2).unwrap().to_vec();
         assert_eq!(got_y, oy, "Y plane must match the per-block oracle");
         assert_eq!(got_cb, ocb, "Cb plane must match the per-block oracle");
         assert_eq!(got_cr, ocr, "Cr plane must match the per-block oracle");
@@ -67462,12 +67434,7 @@ mod tests {
                 EIGHTTAP,
             )
             .expect("luma-only multi-plane single-ref reconstruction");
-        let luma_only: Vec<u16> = wluma
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let luma_only: Vec<u16> = wluma.curr_frame(0).unwrap().to_vec();
         assert_eq!(luma_only, oy, "luma-only Y plane must match the oracle");
         assert!(
             wluma.curr_frame(1).is_none(),
@@ -67772,7 +67739,11 @@ mod tests {
         for i in 0..4usize {
             for j in 0..4usize {
                 let idx = map.data[i * 4 + j] as usize;
-                assert_eq!(cf[i * cols + j], pal[idx], "({i},{j}) must be palette[map]");
+                assert_eq!(
+                    i32::from(cf[i * cols + j]),
+                    pal[idx],
+                    "({i},{j}) must be palette[map]"
+                );
             }
         }
         // Samples outside the 4×4 block stay zero.
@@ -67820,7 +67791,7 @@ mod tests {
             for j in 0..8usize {
                 let idx = map.data[i * map.stride + j] as usize;
                 assert_eq!(
-                    cf[i * cols + j],
+                    i32::from(cf[i * cols + j]),
                     pal[idx],
                     "({i},{j}) palette sample after 2×2 TU tiling"
                 );
@@ -67861,7 +67832,7 @@ mod tests {
         for i in 0..4usize {
             for j in 0..4usize {
                 let idx = map.data[i * 4 + j] as usize;
-                assert_eq!(cf[i * cols as usize + j], pal[idx]);
+                assert_eq!(i32::from(cf[i * cols as usize + j]), pal[idx]);
             }
         }
     }

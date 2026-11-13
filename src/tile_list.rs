@@ -301,7 +301,7 @@ struct AnchorPlanes {
 
 /// One decoded camera tile: per-plane §7.3.2 `OutY`/`OutU`/`OutV`
 /// buffers plus their `(width, height)` extents.
-type CameraTilePlanes = (Vec<Vec<i32>>, Vec<(u32, u32)>);
+type CameraTilePlanes = (Vec<Vec<u16>>, Vec<(u32, u32)>);
 
 fn anchor_planes(
     anchor: &SpecFrame,
@@ -602,7 +602,7 @@ fn decode_camera_tile(
     let h = (geometry.mi_row_end - geometry.mi_row_start) * 4;
     let x0 = geometry.mi_col_start * 4;
     let y0 = geometry.mi_row_start * 4;
-    let mut out_planes: Vec<Vec<i32>> = Vec::with_capacity(num_planes);
+    let mut out_planes: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
     let mut out_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
     for plane in 0..num_planes {
         let src = walker.curr_frame(plane).ok_or(Error::TileListInvalid)?;
@@ -622,7 +622,7 @@ fn decode_camera_tile(
         if py0 + ph > rows || px0 + pw > cols {
             return Err(Error::TileListInvalid);
         }
-        let mut buf = vec![0i32; (pw as usize) * (ph as usize)];
+        let mut buf = vec![0u16; (pw as usize) * (ph as usize)];
         for y in 0..ph as usize {
             let src_row = (py0 as usize + y) * cols as usize + px0 as usize;
             buf[y * pw as usize..(y + 1) * pw as usize]
@@ -683,9 +683,9 @@ pub fn decode_tile_list(
             (output_w >> sub_x, output_h >> sub_y)
         });
     }
-    let mut out_planes: Vec<Vec<i32>> = out_dims
+    let mut out_planes: Vec<Vec<u16>> = out_dims
         .iter()
-        .map(|&(w, h)| vec![0i32; (w as usize) * (h as usize)])
+        .map(|&(w, h)| vec![0u16; (w as usize) * (h as usize)])
         .collect();
 
     // Anchor conversions are cached per distinct index (a tile list
@@ -726,16 +726,16 @@ pub fn decode_tile_list(
 
     // §7.3.1: "The bitdepth of each output sample is given by
     // BitDepth" — the same output layout contract as [`SpecFrame`].
-    let max_val: i32 = (1 << cc.bit_depth) - 1;
+    let max_val: u16 = ((1u32 << cc.bit_depth) - 1) as u16;
     let planes: Vec<Vec<u8>> = out_planes
         .into_iter()
         .map(|buf| {
             if cc.bit_depth == 8 {
-                buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
+                buf.into_iter().map(|v| v.min(255) as u8).collect()
             } else {
                 let mut out = Vec::with_capacity(buf.len() * 2);
                 for v in buf {
-                    out.extend_from_slice(&(v.clamp(0, max_val) as u16).to_le_bytes());
+                    out.extend_from_slice(&v.min(max_val).to_le_bytes());
                 }
                 out
             }

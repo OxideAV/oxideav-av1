@@ -70,13 +70,13 @@ struct LrStage<'a> {
     params: &'a LrParams,
     /// Per plane: the stripes carrying restoration (lazily built).
     stripes: Option<Vec<Vec<PlaneStripe>>>,
-    boundary: Vec<StripeBoundaryRows>,
+    boundary: Vec<StripeBoundaryRows<u16>>,
     plane_end_y: Vec<i32>,
     /// Per plane: its stripe-boundary count.
     boundaries: Vec<usize>,
     /// Stripe count (over every plane).
     stripe_count: usize,
-    copy: Vec<i32>,
+    copy: Vec<u16>,
 }
 
 /// The in-loop passes and §7.20 store of one frame, advanced as its
@@ -91,7 +91,7 @@ pub(super) struct InLoopPipeline<'a> {
     frame_height: u32,
     upscaled_width: u32,
     lf: Option<LfStage>,
-    cdef: Option<(&'a CdefParams, CdefInPlace)>,
+    cdef: Option<(&'a CdefParams, CdefInPlace<u16>)>,
     lr: Option<LrStage<'a>>,
     /// Mi rows walked / through §7.14 pass 0 / pass 1 / §7.15.
     walked: u32,
@@ -150,7 +150,7 @@ impl<'a> InLoopPipeline<'a> {
                 .iter()
                 .enumerate()
                 .map(|(p, &end)| {
-                    StripeBoundaryRows::boundary_count(end, if p == 0 { 0 } else { sub_y })
+                    StripeBoundaryRows::<u16>::boundary_count(end, if p == 0 { 0 } else { sub_y })
                 })
                 .collect();
             LrStage {
@@ -222,7 +222,11 @@ impl<'a> InLoopPipeline<'a> {
         if plane == 0 { 0 } else { u32::from(self.sub_y) }
     }
 
-    fn run(&mut self, w: &PartitionWalker, planes: &mut [PlaneBuffer<'_>]) -> Result<(), Error> {
+    fn run(
+        &mut self,
+        w: &PartitionWalker,
+        planes: &mut [PlaneBuffer<'_, u16>],
+    ) -> Result<(), Error> {
         if planes.len() < self.num_planes {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -394,7 +398,7 @@ impl<'a> InLoopPipeline<'a> {
         Ok(())
     }
 
-    fn deblock_rows(&self, planes: &mut [PlaneBuffer<'_>], pass: u8, r0: u32, r1: u32) {
+    fn deblock_rows(&self, planes: &mut [PlaneBuffer<'_, u16>], pass: u8, r0: u32, r1: u32) {
         let Some(lf) = self.lf.as_ref() else {
             return;
         };
@@ -405,7 +409,7 @@ impl<'a> InLoopPipeline<'a> {
 
     /// Copy the rows `[ stored, final_rows )` (cropped) into the store
     /// and publish them.
-    fn store(&mut self, planes: &[PlaneBuffer<'_>], final_rows: u32) {
+    fn store(&mut self, planes: &[PlaneBuffer<'_, u16>], final_rows: u32) {
         // Below the frame's last luma row unless everything is final:
         // `published >> subY` must not claim the last chroma row of an
         // odd-height frame before it is.
@@ -438,9 +442,7 @@ impl<'a> InLoopPipeline<'a> {
             let pw = pw as usize;
             let dst = self.writer.rows_mut(p, y0, y1);
             for (y, row) in (y0..y1).zip(dst.chunks_exact_mut(pw)) {
-                for (d, &v) in row.iter_mut().zip(&src.samples[y * cols..y * cols + pw]) {
-                    *d = v.max(0) as u16;
-                }
+                row.copy_from_slice(&src.samples[y * cols..y * cols + pw]);
             }
         }
         self.stored = final_rows;

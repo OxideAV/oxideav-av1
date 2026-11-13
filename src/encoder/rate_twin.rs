@@ -94,6 +94,9 @@ struct TwinInner {
     cdfs: TileCdfContext,
     state: PartitionSyntaxWriter,
     range: u32,
+    /// The last pricing scope, kept for its buffers (a candidate's
+    /// capture then allocates nothing).
+    spare_scope: Option<WriterScopeSnapshot>,
 }
 
 /// r460 — a frozen block-scoped branch of a [`RateTwin`]: the writer
@@ -119,6 +122,7 @@ impl RateTwin {
                 cdfs: cdfs.clone(),
                 state: state.clone(),
                 range: writer.range(),
+                spare_scope: None,
             }),
             disable_cdf_update: writer.disable_cdf_update(),
         }
@@ -239,12 +243,13 @@ impl RateTwin {
     ) -> Result<u64, Error> {
         let mut g = self.inner.borrow_mut();
         let g = &mut *g;
-        let scope = g.state.snapshot_price_scope(
+        let scope = g.state.snapshot_price_scope_reusing(
             r,
             c,
             NUM_4X4_BLOCKS_WIDE[b_size] as u32,
             NUM_4X4_BLOCKS_HIGH[b_size] as u32,
             params,
+            g.spare_scope.take(),
         );
         let cdfs = g.cdfs.clone();
         let mut w = SymbolWriter::new_counting(self.disable_cdf_update, g.range);
@@ -259,6 +264,7 @@ impl RateTwin {
             params,
         );
         g.state.restore_price_scope(&scope);
+        g.spare_scope = Some(scope);
         g.cdfs = cdfs;
         res?;
         Ok(w.cost_bits256())
@@ -484,12 +490,13 @@ impl TuFork<'_> {
         // nothing block-level (the fork's origin scope still covers
         // the block for the drop-time rollback). A 64×64 leaf priced
         // 256 cells × every grid per candidate before.
-        let scope = g.state.snapshot_price_scope(
+        let scope = g.state.snapshot_price_scope_reusing(
             ctx.mi_row + y,
             ctx.mi_col + x,
             (crate::cdf::TX_WIDTH[tx_sz] / 4) as u32,
             (crate::cdf::TX_HEIGHT[tx_sz] / 4) as u32,
             ctx.params,
+            g.spare_scope.take(),
         );
         let cdfs = g.cdfs.clone();
         let mut w = SymbolWriter::new_counting(self.twin.disable_cdf_update, g.range);
@@ -511,6 +518,7 @@ impl TuFork<'_> {
             ctx.is_inter,
         );
         g.state.restore_price_scope(&scope);
+        g.spare_scope = Some(scope);
         g.cdfs = cdfs;
         res?;
         Ok(w.cost_bits256())

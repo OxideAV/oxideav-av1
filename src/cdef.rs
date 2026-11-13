@@ -53,7 +53,7 @@
 //!   reference loop here mirrors the spec's per-sample formulation.
 
 use crate::cdf::{MI_SIZE, MI_SIZE_LOG2};
-use crate::loop_filter::PlaneBuffer;
+use crate::loop_filter::{PlaneBuffer, Sample};
 use crate::uncompressed_header_tail::CdefParams;
 
 // =====================================================================
@@ -161,17 +161,17 @@ impl std::fmt::Debug for CdefFrameContext<'_> {
 /// `CdefAvailable` test is taken against. A window must cover every
 /// row inside that bound the block's taps reach (the block ± 2).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CdefSrc<'a> {
-    pub samples: &'a [i32],
+pub(crate) struct CdefSrc<'a, S: Sample = i32> {
+    pub samples: &'a [S],
     pub cols: usize,
     pub row0: usize,
     pub plane_rows: usize,
     pub plane_cols: usize,
 }
 
-impl<'a> CdefSrc<'a> {
+impl<'a, S: Sample> CdefSrc<'a, S> {
     /// The whole-plane view of `p`.
-    fn of(p: &'a PlaneBuffer<'_>) -> Self {
+    fn of(p: &'a PlaneBuffer<'_, S>) -> Self {
         Self {
             samples: p.samples,
             cols: p.cols as usize,
@@ -185,7 +185,7 @@ impl<'a> CdefSrc<'a> {
     /// position.
     #[inline(always)]
     fn at(&self, y: usize, x: usize) -> i32 {
-        self.samples[(y - self.row0) * self.cols + x]
+        self.samples[(y - self.row0) * self.cols + x].widen()
     }
 }
 
@@ -212,10 +212,10 @@ const CDEF_MASK_4: u32 = !(CDEF_SIZE_4 - 1);
 /// `dst_planes` is `CdefFrame[plane]` (written in place). Both have
 /// the same `(rows, cols)` shape per the spec's `CdefFrame =
 /// CurrFrame.clone(); ...` initialisation.
-pub fn cdef_frame(
+pub fn cdef_frame<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, S>],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
 ) {
     let num_planes = ctx
         .num_planes
@@ -247,11 +247,14 @@ pub fn cdef_frame(
 /// the writes. Every sample is computed from the same inputs as
 /// [`cdef_frame`] — byte-identical — without the frame-sized source
 /// copy (73 MiB at 12 MP 4:2:0).
-pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer<'_>]) {
+pub fn cdef_frame_in_place<S: Sample>(
+    ctx: &CdefFrameContext<'_>,
+    planes: &mut [PlaneBuffer<'_, S>],
+) {
     let mut stepper = CdefInPlace::new();
     let mut band_r = 0u32;
     while band_r < ctx.mi_rows {
-        let band_r1 = (band_r + CdefInPlace::BAND_MI).min(ctx.mi_rows);
+        let band_r1 = (band_r + CdefInPlace::<S>::BAND_MI).min(ctx.mi_rows);
         stepper.band(ctx, planes, band_r, band_r1);
         band_r = band_r1;
     }
@@ -264,13 +267,13 @@ pub fn cdef_frame_in_place(ctx: &CdefFrameContext<'_>, planes: &mut [PlaneBuffer
 /// deblocked samples when it runs, and nothing else may write the
 /// band's rows or the two rows below it before the next band runs.
 #[derive(Debug, Default)]
-pub(crate) struct CdefInPlace {
-    windows: Vec<Vec<i32>>,
+pub(crate) struct CdefInPlace<S: Sample = i32> {
+    windows: Vec<Vec<S>>,
     /// Per plane: the frame rows the window currently holds.
     win_rows: Vec<(usize, usize)>,
 }
 
-impl CdefInPlace {
+impl<S: Sample> CdefInPlace<S> {
     /// Band height in mi rows (64 luma rows, the §7.15 filter-block
     /// row).
     pub(crate) const BAND_MI: u32 = 16;
@@ -284,7 +287,7 @@ impl CdefInPlace {
     pub(crate) fn band(
         &mut self,
         ctx: &CdefFrameContext<'_>,
-        planes: &mut [PlaneBuffer<'_>],
+        planes: &mut [PlaneBuffer<'_, S>],
         band_r: u32,
         band_r1: u32,
     ) {
@@ -354,10 +357,10 @@ impl CdefInPlace {
 /// band's own row windows with `dst_row0[ plane ]` their first plane
 /// row). The copy step is the identity in place; `idx < 0` and the
 /// all-skip block leave the samples as they are.
-pub(crate) fn cdef_band_in_place(
+pub(crate) fn cdef_band_in_place<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    srcs: &[Option<CdefSrc<'_>>; 3],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    srcs: &[Option<CdefSrc<'_, S>>; 3],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     dst_row0: [usize; 3],
     r0: u32,
     r1: u32,
@@ -406,10 +409,10 @@ pub(crate) fn cdef_band_in_place(
 /// `(r, c)` is in 4×4-block luma coordinates; the block spans
 /// `(r..r+2, c..c+2)` (4×4 cells) and `(r*MI_SIZE..r*MI_SIZE+8,
 /// c*MI_SIZE..c*MI_SIZE+8)` (luma samples).
-pub fn cdef_block(
+pub fn cdef_block<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, S>],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -463,10 +466,10 @@ pub fn cdef_block(
 /// Runs no copy and no skip test — the caller has already established
 /// the block is filtered (`idx >= 0`, not all-skip).
 #[allow(clippy::too_many_arguments)]
-pub fn cdef_block_dir(
+pub fn cdef_block_dir<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, S>],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -485,10 +488,10 @@ pub fn cdef_block_dir(
 /// that may be row windows (`dst_row0[ plane ]` = the plane row at
 /// their row 0).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cdef_block_dir_src(
+pub(crate) fn cdef_block_dir_src<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    srcs: &[Option<CdefSrc<'_>>; 3],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    srcs: &[Option<CdefSrc<'_, S>>; 3],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     dst_row0: [usize; 3],
     num_planes: u8,
     r: u32,
@@ -568,9 +571,9 @@ pub(crate) fn cdef_block_dir_src(
 /// §7.15.1 copy-loop helper — av1-spec p.319 lines 17631-17651.
 /// Copies the 8×8 (post-subsampling) block from `src_planes[plane]`
 /// into `dst_planes[plane]`.
-fn cdef_copy_plane(
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+fn cdef_copy_plane<S: Sample>(
+    src_planes: &[PlaneBuffer<'_, S>],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     plane: u8,
     r: u32,
     c: u32,
@@ -614,9 +617,9 @@ fn cdef_copy_plane(
 ///   [`CDEF_DIRECTIONS`]).
 /// * `var` — `(bestCost - cost[(yDir + 4) & 7]) >> 10`, a measure of
 ///   direction confidence consumed by §7.15.1 line 17683.
-pub fn cdef_direction(
+pub fn cdef_direction<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, S>],
     r: u32,
     c: u32,
 ) -> (i32, i32) {
@@ -627,9 +630,9 @@ pub fn cdef_direction(
 }
 
 /// [`cdef_direction`] over a [`CdefSrc`] luma view.
-pub(crate) fn cdef_direction_src(
+pub(crate) fn cdef_direction_src<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    plane0: &CdefSrc<'_>,
+    plane0: &CdefSrc<'_, S>,
     r: u32,
     c: u32,
 ) -> (i32, i32) {
@@ -668,11 +671,11 @@ pub(crate) fn cdef_direction_src(
         let mut row = [0i16; 8];
         if inside {
             let base = (y0 as usize + i - plane0.row0) * plane0.cols + x0 as usize;
-            let run: &[i32; 8] = plane0.samples[base..base + 8]
+            let run: &[S; 8] = plane0.samples[base..base + 8]
                 .try_into()
                 .expect("8-wide run");
             for j in 0..8 {
-                row[j] = ((run[j] >> shift) - 128) as i16;
+                row[j] = ((run[j].widen() >> shift) - 128) as i16;
             }
         } else {
             for (j, slot) in row.iter_mut().enumerate() {
@@ -760,10 +763,10 @@ pub(crate) fn cdef_direction_src(
 /// `min` / `max` track the min/max of the neighbour samples actually
 /// consulted.
 #[allow(clippy::too_many_arguments)]
-pub fn cdef_filter_block(
+pub fn cdef_filter_block<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, S>],
+    dst_planes: &mut [PlaneBuffer<'_, S>],
     plane: u8,
     r: u32,
     c: u32,
@@ -787,10 +790,10 @@ pub fn cdef_filter_block(
 /// buffer that may be a row window of the plane (`dst_row0` = the
 /// plane row at `dst.samples[ 0 ]`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cdef_filter_block_src(
+pub(crate) fn cdef_filter_block_src<S: Sample>(
     ctx: &CdefFrameContext<'_>,
-    src: &CdefSrc<'_>,
-    dst: &mut PlaneBuffer<'_>,
+    src: &CdefSrc<'_, S>,
+    dst: &mut PlaneBuffer<'_, S>,
     dst_row0: usize,
     plane: u8,
     r: u32,
@@ -891,9 +894,9 @@ pub(crate) fn cdef_filter_block_src(
         let drow0 = (y0 as usize - dst_row0) * dst_cols;
         let dst_rows = &mut dst.samples[drow0..];
         if w == 8 {
-            cdef_filter_rows::<8>(src.samples, dst_rows, geom, &taps);
+            cdef_filter_rows::<8, S>(src.samples, dst_rows, geom, &taps);
         } else {
-            cdef_filter_rows::<4>(src.samples, dst_rows, geom, &taps);
+            cdef_filter_rows::<4, S>(src.samples, dst_rows, geom, &taps);
         }
         return;
     }
@@ -945,7 +948,7 @@ pub(crate) fn cdef_filter_block_src(
             // av1-spec p.324 line 17892.
             let delta = (8 + sum - i32::from(sum < 0)) >> 4;
             let out = clip3(min_v, max_v, x + delta);
-            dst.samples[(py as usize - dst_row0) * dst_cols + (px as usize)] = out;
+            dst.samples[(py as usize - dst_row0) * dst_cols + (px as usize)] = S::narrow(out);
         }
     }
 }
@@ -975,9 +978,9 @@ struct CdefTap {
 /// arm — it still widens the envelope, as the spec's `CdefAvailable`
 /// path does. Integer sums in any order are the spec's sums.
 #[inline(always)]
-fn cdef_filter_rows<const W: usize>(
-    src: &[i32],
-    dst: &mut [i32],
+fn cdef_filter_rows<const W: usize, S: Sample>(
+    src: &[S],
+    dst: &mut [S],
     (y0, x0, h, src_cols, dst_cols): (usize, usize, usize, usize, usize),
     taps: &[CdefTap; 12],
 ) {
@@ -989,9 +992,9 @@ fn cdef_filter_rows<const W: usize>(
     // `12 * 240 + 12 * 64 = 3648` in magnitude. The eight samples of
     // a row are one 128-bit vector instead of two.
     #[inline(always)]
-    fn narrow<const W: usize>(run: &[i32]) -> [i16; W] {
-        let run: &[i32; W] = run.try_into().expect("W-wide run");
-        core::array::from_fn(|j| run[j] as i16)
+    fn narrow<const W: usize, S: Sample>(run: &[S]) -> [i16; W] {
+        let run: &[S; W] = run.try_into().expect("W-wide run");
+        core::array::from_fn(|j| run[j].widen() as i16)
     }
     for i in 0..h {
         let row0 = (y0 + i) * src_cols + x0;
@@ -1017,11 +1020,11 @@ fn cdef_filter_rows<const W: usize>(
                 min_v[j] = min_v[j].min(p_val);
             }
         }
-        let out_row: &mut [i32; W] = (&mut dst[drow..drow + W]).try_into().expect("W-wide run");
+        let out_row: &mut [S; W] = (&mut dst[drow..drow + W]).try_into().expect("W-wide run");
         for j in 0..W {
             let s = sum[j];
             let delta = (8 + s + (s >> 15)) >> 4;
-            out_row[j] = i32::from((centre[j] + delta).max(min_v[j]).min(max_v[j]));
+            out_row[j] = S::narrow(i32::from((centre[j] + delta).max(min_v[j]).min(max_v[j])));
         }
     }
 }

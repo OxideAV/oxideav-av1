@@ -1536,14 +1536,30 @@ impl PartitionSyntaxWriter {
         h4: u32,
         params: &SyntaxFrameParams,
     ) -> WriterScopeSnapshot {
+        self.snapshot_price_scope_reusing(mi_row, mi_col, w4, h4, params, None)
+    }
+
+    /// [`Self::snapshot_price_scope`] into the buffers of a snapshot
+    /// that is no longer needed (`recycled`): a pricing loop that hands
+    /// its last scope back allocates nothing per candidate.
+    pub(crate) fn snapshot_price_scope_reusing(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+        params: &SyntaxFrameParams,
+        recycled: Option<WriterScopeSnapshot>,
+    ) -> WriterScopeSnapshot {
         WriterScopeSnapshot {
-            mirror: self.mirror.snapshot_price_scope(
+            mirror: self.mirror.snapshot_price_scope_reusing(
                 mi_row,
                 mi_col,
                 w4,
                 h4,
                 params.subsampling_x,
                 params.subsampling_y,
+                recycled.map(|r| r.mirror),
             ),
             write_deltas_pending: self.write_deltas_pending,
         }
