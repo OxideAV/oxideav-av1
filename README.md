@@ -2442,11 +2442,94 @@ Where the remaining time goes (sampled, one worker):
 - **1080p inter decode** — the §7.11.3.4 convolution 15 %, inverse
   transforms 7 %, CDEF 9 %, coefficients + symbols 20 %.
 
-Still open: `CurrFrame` and the in-loop kernels work on `i32` samples
-(`PlaneBuffer<i32>`); 8-bit / 16-bit sample planes would halve or
-quarter the resident frame set and let the CDEF, deblocking and
-convolution lanes load samples without narrowing — the largest
-remaining kernel win, and a change that touches every stage.
+(The `i32` sample planes this section ends on were replaced in r488,
+below.)
+
+#### 16-bit sample planes (r488)
+
+Byte-identical work only: every decoded sample and every coded byte
+equal 0.1.24 (the digests of each row below agree before and after;
+the conformance corpus pins are unchanged).
+
+- **`CurrFrame` is 16 bits per sample.** A stored sample is always
+  post-`Clip1` (`0 ..= (1 << BitDepth) - 1`, at most 4095), so the
+  frame being decoded no longer needs `i32` cells: the block walk
+  (prediction, the §7.12.3 residual merge, palette, CfL), the tile
+  merge, every in-loop stage, the film-grain copy and the §7.3
+  tile-list output run on `u16` planes, and the §7.20 reference store
+  (already `u16`) is a plain row copy. Wider values exist only inside
+  the kernels that compute them.
+- **In-loop kernels generic over the storage type.** `loop_filter`,
+  `cdef`, `loop_restoration`, `superres` and `film_grain` take
+  `PlaneBuffer<'_, S>` with `S: Sample` (`u8`, `u16`, `i32`): load
+  widens to the `i32` the spec's process computes with, store narrows
+  the clipped result. The CDEF filter rows and the direction search
+  fill their 16-bit lanes straight from the plane (no per-run
+  narrowing), the deblocking edge kernel gathers its taps once, and
+  the restoration kernels read through the stripe source as before.
+  The encoder's elections keep calling the same kernels on their own
+  planes.
+- **No prediction scratch.** Inter prediction used to mirror each
+  leaf into a second full-frame `u16` copy of every plane and back;
+  with a 16-bit `CurrFrame` the §7.11.3 process writes its leaf in
+  place.
+- **Encoder price scopes** reuse the previous scope's buffers
+  (30.7 M → 25.8 M allocations on the 12 MP lossy encode below; the
+  wall clock is within the noise).
+
+Same pictures, clips, host and method as the r487 tables (Apple M5
+Max, release build, "before" = 0.1.24 and "after" interleaved on a
+host shared with other jobs; MEDIAN of 5 still decodes, 3 video
+decodes, 3 encodes; peak RSS is the whole process). The wall-clock
+columns moved with the host load between the two rounds — compare
+within a row.
+
+| Operation | Workers | Wall before → after | Peak RSS before → after |
+|---|---|---|---|
+| Decode 12 MP, 8-bit lossy | 1 | 0.197 → 0.180 s | 160 → 124 MiB |
+| | 8 | 0.076 → 0.065 s | 281 → 205 MiB |
+| Decode 12 MP, 8-bit lossless | 1 | 0.846 → 0.851 s | 178 → 143 MiB |
+| | 8 | 0.179 → 0.187 s | 287 → 219 MiB |
+| Decode 12 MP, 10-bit lossy | 1 | 0.201 → 0.188 s | 137 → 100 MiB |
+| | 8 | 0.086 → 0.065 s | 248 → 162 MiB |
+| Decode 12 MP, 10-bit lossless | 1 | 1.065 → 1.139 s | 172 → 137 MiB |
+| | 8 | 0.273 → 0.266 s | 260 → 189 MiB |
+| 1080p, 300 frames, one tile | 1 | 55.3 → 58.7 fps | 133 → 120 MiB |
+| | 8 | 205 → 216 fps | 570 → 385 MiB |
+| | 16 | 458 → 485 fps | 917 → 711 MiB |
+| 1080p, 120 frames, 2×2 tiles | 1 | 57.5 → 63.2 fps | 100 → 94 MiB |
+| | 8 | 123 → 125 fps | 510 → 365 MiB |
+| | 16 | 130 → 135 fps | 757 → 546 MiB |
+| Encode 12 MP, 8-bit lossy | 1 | 9.82 → 9.66 s | 222 → 220 MiB |
+| | 8 | 3.30 → 2.31 s | 317 → 318 MiB |
+| Encode 12 MP, 8-bit lossless | 1 | 2.09 → 2.11 s | 343 → 340 MiB |
+| | 8 | 0.93 → 0.85 s | 403 → 408 MiB |
+| Encode 12 MP, 10-bit lossy | 1 | 4.66 → 4.69 s | 184 → 181 MiB |
+| | 8 | 1.51 → 1.50 s | 239 → 236 MiB |
+| Encode 12 MP, 10-bit lossless | 1 | 1.82 → 1.67 s | 323 → 330 MiB |
+| | 8 | 1.00 → 0.99 s | 383 → 382 MiB |
+
+The decoder's own high-water mark (counting allocator) on the
+one-tile clip at 16 workers went from 736 to 543 MiB. The encoder is
+unchanged in time and memory this round (its planes were already
+16-bit; the 8-worker lossy row is host noise), and so is lossless
+decode time (bound by the coefficient walk, not by sample storage).
+
+Where the time goes now (sampled, one worker; the encoder sampled
+before the price-scope change): 12 MP lossy still —
+CDEF filter 28 %, deblocking 13 %, inverse transforms 10 %, symbol
+reads 9 %; 1080p inter (2×2-tile clip) — deblocking 18 % plus 4 % for
+its edge table, the §7.11.3.4 convolution 18 %, coefficients +
+symbols 14 %, CDEF 5 %; 12 MP lossy encode — symbol pricing 22 %
+(counting writer + CDF adaptation), palette colour-map pricing 11 %,
+forward DCT 11 %, price-scope snapshot / restore 8 %.
+
+Still open: 8-bit storage for 8-bit streams (the kernels already
+accept `u8`; the walker and the reference store are fixed at 16
+bits), a deblocking pass that decides filter lengths per edge run
+before filtering, the encoder's per-candidate CDF-context copy and
+per-mode prediction buffers, and the frame-parallel residue of the
+2×2-tile clip (8 → 16 workers gains 8 %).
 
 ## WebAssembly
 

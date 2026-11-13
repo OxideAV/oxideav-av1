@@ -4,6 +4,15 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Decoder memory, output unchanged (every still / video digest and every coded byte equal to 0.1.24):
+  - `CurrFrame` is stored as 16-bit samples (it was `i32`): the block walk, the tile merge, the §7.14 / §7.15 / §7.16 / §7.17 in-loop stages, the §7.18.3 grain copy and the §7.3 tile-list output all run on `u16` planes, and the §7.20 store is a plain copy. A 12 MP 4:2:0 still decodes in 124 MiB instead of 160 MiB (8-bit, one worker) and 162 MiB instead of 248 MiB (10-bit, 8 workers); 1080p video at 8 workers peaks at about 385 MiB instead of 570 MiB, at 16 workers 711 MiB instead of 917 MiB.
+  - The in-loop kernels (`loop_filter`, `cdef`, `loop_restoration`, `superres`, `film_grain`) are generic over the plane's storage type (`loop_filter::Sample`, implemented for `u8`, `u16` and `i32`; `PlaneBuffer<'a, S = i32>`): they widen on load, compute exactly the spec's process, and narrow the post-`Clip1` result on store. The CDEF filter and direction search load their 16-bit lanes straight from the 16-bit plane.
+  - Inter prediction writes its leaf straight into `CurrFrame`; the walker's full-frame prediction scratch (one more copy of every plane per frame in flight, plus two leaf copies per block) is gone.
+- Encoder: the rate twin's per-candidate price scope reuses the buffers of the previous one (about 30 allocations less per priced candidate — 16 % of all allocations of a 12 MP lossy encode). Coded bytes unchanged.
+- Internal (`#[doc(hidden)]`) signatures: `PartitionWalker::curr_frame` returns `&[u16]`.
+
 ## [0.1.24](https://github.com/OxideAV/oxideav-av1/compare/v0.1.23...v0.1.24) - 2026-11-11
 
 ### Other
