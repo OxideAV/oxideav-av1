@@ -4,6 +4,21 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.25](https://github.com/OxideAV/oxideav-av1/compare/v0.1.24...v0.1.25) - 2026-11-15
+
+### Other
+
+- tile workers come out of the session's thread budget
+- framework encoder: inter coding through the registry (gop / effort options)
+- one rate twin per tile in the bounded inter search
+- tile-threaded inter search under GopOptions::threads
+- inter tile-parallel opt-out for the memory-lean serial tile walk
+- one parse per frame, tile-parallel inter frames, film-grain opt-out
+- bounded inter search with a GopEffort ladder (encode_gop_yuv_with_options)
+- README, CHANGELOG: r488 16-bit sample planes, memory and throughput tables
+- 16-bit sample planes; in-loop kernels generic over the sample type
+- iterator forms for the index-only loops newer toolchains reject
+
 ### Added
 
 - Encoder: `encode_gop_yuv_with_options` with `GopOptions` (`base_q_idx`, `effort`, `threads`, the §5.9.15 uniform tile layout) and the `GopEffort` ladder (`Fastest` / `Fast` / `Balanced` — the default — / `Thorough` / `Best`). `Best` is the exhaustive search `encode_gop_yuv_with_q` has always run (byte-identical); the four bounded levels are a new inter search:
