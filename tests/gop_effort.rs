@@ -225,14 +225,50 @@ fn bounded_efforts_are_lossless_at_q0() {
 }
 
 #[test]
-fn bounded_efforts_code_multi_tile_layouts() {
-    let frames = gop(192, 144, 8, ChromaFormat::Yuv420, 4);
-    for &effort in BOUNDED {
-        let opts = GopOptions::new(110)
-            .with_effort(effort)
-            .with_tiles_log2(1, 1);
-        encode(&format!("tiles {effort:?}"), &frames, &opts);
+fn tiles_and_threads_do_not_change_the_stream() {
+    for (w, h, fmt, tiles) in [
+        (192u32, 144u32, ChromaFormat::Yuv420, (1u32, 1u32)),
+        (320, 128, ChromaFormat::Yuv420, (2, 1)),
+        (200, 136, ChromaFormat::Yuv444, (1, 1)),
+    ] {
+        let frames = gop(w, h, 8, fmt, 4);
+        for &effort in BOUNDED {
+            let base = GopOptions::new(110)
+                .with_effort(effort)
+                .with_tiles_log2(tiles.0, tiles.1);
+            assert_eq!(base.threads, 1, "serial is the default");
+            let tag = format!("{w}x{h} {fmt:?} tiles {tiles:?} {effort:?}");
+            let serial = encode(&tag, &frames, &base);
+            for threads in [2usize, 3, 8] {
+                let par = encode_gop_yuv_with_options(&frames, &base.with_threads(threads))
+                    .unwrap_or_else(|e| panic!("{tag} threads={threads}: {e:?}"));
+                assert!(
+                    par.ivf_bytes == serial.ivf_bytes,
+                    "{tag}: the stream differs at threads={threads}"
+                );
+                for (a, b) in par.recon.iter().zip(&serial.recon) {
+                    assert!(
+                        a.y == b.y && a.u == b.u && a.v == b.v,
+                        "{tag}: the reconstruction differs at threads={threads}"
+                    );
+                }
+            }
+        }
     }
+}
+
+#[test]
+fn a_thread_budget_is_inert_on_one_tile_and_at_best_effort() {
+    let frames = gop(96, 64, 8, ChromaFormat::Yuv420, 3);
+    let one = GopOptions::new(100);
+    let serial = encode_gop_yuv_with_options(&frames, &one).expect("serial");
+    let budget = encode_gop_yuv_with_options(&frames, &one.with_threads(8)).expect("budget");
+    assert!(serial.ivf_bytes == budget.ivf_bytes);
+    let small = gop(64, 48, 8, ChromaFormat::Yuv420, 2);
+    let best = GopOptions::new(90).with_effort(GopEffort::Best);
+    let a = encode_gop_yuv_with_options(&small, &best).expect("best");
+    let b = encode_gop_yuv_with_options(&small, &best.with_threads(4)).expect("best threads");
+    assert!(a.ivf_bytes == b.ivf_bytes);
 }
 
 #[test]

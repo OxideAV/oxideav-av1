@@ -8,11 +8,14 @@
 //! ```text
 //! cargo run --release --example gop_bench -- --raw seq.yuv --size 320x240 \
 //!     [--frames 8] [--q 120] [--effort fastest|fast|balanced|thorough|best|intra] \
-//!     [--threads N] [--repeat N] [--out seq.ivf]
+//!     [--threads N] [--tiles CxR] [--repeat N] [--out seq.ivf]
 //! ```
 //!
 //! `--effort intra` codes every frame as its own KEY frame through the
 //! still-picture `fast` preset (the all-intra comparison point).
+//! `--tiles CxR` sets the §5.9.15 uniform layout (`TileColsLog2` x
+//! `TileRowsLog2`); the bounded efforts search its tiles on `--threads`
+//! workers and produce the same stream at every budget.
 
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::encoder::{
@@ -45,6 +48,7 @@ fn main() {
     let mut threads = 1usize;
     let mut repeat = 1usize;
     let mut out: Option<String> = None;
+    let mut tiles = (0u32, 0u32);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().expect("option value");
@@ -59,6 +63,11 @@ fn main() {
             "--q" => q = val().parse().expect("--q 0..=255"),
             "--effort" => effort = val(),
             "--threads" => threads = val().parse().expect("--threads N"),
+            "--tiles" => {
+                let v = val();
+                let (c, r) = v.split_once('x').expect("--tiles COLSLOG2xROWSLOG2");
+                tiles = (c.parse().expect("cols log2"), r.parse().expect("rows log2"));
+            }
             "--repeat" => repeat = val().parse().expect("--repeat N"),
             "--out" => out = Some(val()),
             other => panic!("unknown argument {other:?}"),
@@ -110,7 +119,10 @@ fn main() {
                 "best" => GopEffort::Best,
                 other => panic!("unknown effort {other:?}"),
             };
-            let opts = GopOptions::new(q).with_effort(e);
+            let opts = GopOptions::new(q)
+                .with_effort(e)
+                .with_threads(threads)
+                .with_tiles_log2(tiles.0, tiles.1);
             let g = encode_gop_yuv_with_options(&frames, &opts).expect("gop");
             (g.ivf_bytes, g.recon.into_iter().map(|r| r.y).collect())
         };

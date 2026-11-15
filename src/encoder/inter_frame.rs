@@ -1209,12 +1209,12 @@ pub enum GopEffort {
     /// eighth-pel, compound-average trials over the two references,
     /// the whole inter transform-type set and one transform split
     /// level per leaf, and the intra arm trialled on every unsettled
-    /// node.
+    /// node; the KEY frame on the still-picture `Balanced` ladders.
     #[default]
     Balanced,
     /// `Balanced` with tighter early-termination thresholds, global
     /// motion estimation, the full CDEF sweep and the loop-restoration
-    /// election; the KEY frame on the still-picture `Balanced` ladders.
+    /// election.
     Thorough,
     /// The exhaustive pre-r489 search ([`encode_gop_yuv_with_q`]):
     /// every partition shape down to 4×4, every reference / compound /
@@ -1232,6 +1232,13 @@ pub struct GopOptions {
     pub base_q_idx: u8,
     /// Search effort (default [`GopEffort::Balanced`]).
     pub effort: GopEffort,
+    /// Worker threads granted to the encoder (`1` = serial, the
+    /// default). The bounded efforts search the tiles of an inter
+    /// frame `threads`-wide on a multi-tile layout (see
+    /// [`GopOptions::with_tiles_log2`]) and stitch them in tile order:
+    /// the stream is identical at every budget. One tile, or
+    /// [`GopEffort::Best`], runs serial whatever the budget.
+    pub threads: usize,
     /// §5.9.15 `TileColsLog2` of the uniform tile layout coded on every
     /// frame (`0` = one column).
     pub tile_cols_log2: u32,
@@ -1240,12 +1247,14 @@ pub struct GopOptions {
 }
 
 impl GopOptions {
-    /// Default-effort, single-tile options at `base_q_idx`.
+    /// Default-effort, single-thread, single-tile options at
+    /// `base_q_idx`.
     #[must_use]
     pub fn new(base_q_idx: u8) -> Self {
         Self {
             base_q_idx,
             effort: GopEffort::default(),
+            threads: 1,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
         }
@@ -1255,6 +1264,13 @@ impl GopOptions {
     #[must_use]
     pub fn with_effort(mut self, effort: GopEffort) -> Self {
         self.effort = effort;
+        self
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
         self
     }
 
@@ -1276,6 +1292,8 @@ pub(crate) struct InterLimits {
     /// `false` = the pre-r489 exhaustive search on every ladder; the
     /// remaining fields are then inert.
     pub bounded: bool,
+    /// Tile-search threads of the bounded search (`1` = serial).
+    pub threads: usize,
     /// Smallest square leaf the partition walk descends to.
     pub min_leaf: usize,
     /// Integer-pel search window per axis (luma samples).
@@ -1327,6 +1345,7 @@ impl InterLimits {
     pub(crate) const fn exhaustive() -> Self {
         Self {
             bounded: false,
+            threads: 1,
             min_leaf: BLOCK_4X4,
             search_range: SEARCH_RANGE,
             subpel_ring8: true,
@@ -1351,6 +1370,7 @@ impl InterLimits {
     pub(crate) fn for_effort(effort: GopEffort) -> Self {
         let fastest = Self {
             bounded: true,
+            threads: 1,
             min_leaf: BLOCK_8X8,
             search_range: 32,
             subpel_ring8: false,
@@ -1415,7 +1435,8 @@ pub fn encode_gop_yuv_with_options(
     frames: &[YuvFrame],
     opts: &GopOptions,
 ) -> Result<EncodedGopYuv, Error> {
-    let limits = InterLimits::for_effort(opts.effort);
+    let mut limits = InterLimits::for_effort(opts.effort);
+    limits.threads = crate::platform::clamp_threads(opts.threads);
     let tuning = gop_tuning_for(opts, &limits);
     if !limits.bounded {
         return encode_gop_yuv_seg_extras_tuned(
@@ -2090,10 +2111,18 @@ fn encode_gop_yuv_core_fg(
             superres_gate: sr_inter_armed,
             // r489 — the bounded efforts code the KEY frame on the
             // still-picture production ladders.
-            search: match limits {
-                l if !l.bounded => crate::encoder::key_frame::SearchLimits::default(),
-                l if l.intra_always => crate::encoder::key_frame::SearchLimits::balanced(),
-                _ => crate::encoder::key_frame::SearchLimits::fast(),
+            search: {
+                let mut search = match limits {
+                    l if !l.bounded => crate::encoder::key_frame::SearchLimits::default(),
+                    l if l.intra_always => crate::encoder::key_frame::SearchLimits::balanced(),
+                    _ => crate::encoder::key_frame::SearchLimits::fast(),
+                };
+                // The KEY frame's tiles ride the same budget (stitched
+                // in tile order — the stream is the serial one's).
+                if limits.bounded {
+                    search.threads = limits.threads;
+                }
+                search
             },
             ..crate::encoder::key_frame::KeyExtras::default()
         },
@@ -4072,6 +4101,10 @@ fn encode_inter_frame_aligned(
         trees: Vec<SyntaxNode>,
         recon: Box<ReconState>,
         ictx: Box<PSearchCtx>,
+        /// r489 — the tiles this arm searched, in search order (every
+        /// tile, unless the arm is one worker's share of a
+        /// tile-threaded search).
+        tiles_done: Vec<usize>,
     }
 
     // One full search + tile write under `arm_params` (and, when
@@ -4086,8 +4119,14 @@ fn encode_inter_frame_aligned(
     // arm-invariant).
     let fh_sct = fh.allow_screen_content_tools;
     let fh_disable_cdf_update = fh.disable_cdf_update;
-    let run_arm =
-        |arm_params: &SyntaxFrameParams, plan: Option<&[i32]>| -> Result<FrameArm, Error> {
+    // r489 — `share = Some((worker, workers))` searches only the tiles
+    // `t` with `t % workers == worker` (one worker's share of a
+    // tile-threaded search; the shares are stitched below).
+    let run_arm = |arm_params: &SyntaxFrameParams,
+                   plan: Option<&[i32]>,
+                   share: Option<(usize, usize)>|
+     -> Result<FrameArm, Error> {
+        {
             let mut recon = Box::new(ReconState {
                 y: vec![0u16; width * height],
                 u: vec![0u16; chroma_w * chroma_h],
@@ -4190,7 +4229,12 @@ fn encode_inter_frame_aligned(
             let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
             let mut all_cdfs: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
             let sb_cols_frame = mi_cols.div_ceil(16);
-            for (geo, origins) in tile_plan.iter() {
+            let mut tiles_done: Vec<usize> = Vec::new();
+            for (tile_num, (geo, origins)) in tile_plan.iter().enumerate() {
+                if share.is_some_and(|(worker, workers)| tile_num % workers != worker) {
+                    continue;
+                }
+                tiles_done.push(tile_num);
                 // §5.11.2 per-tile re-scope on BOTH mirrors (the write
                 // driver and the search context — §7.10.2 walker plus its
                 // precomputed availability grids), plus the pixel path's
@@ -4291,7 +4335,13 @@ fn encode_inter_frame_aligned(
                 payloads.push(writer.finish());
                 all_cdfs.push(cdfs);
             }
-            let body = assemble(&payloads)?;
+            // A share's tile body is assembled once the shares are
+            // stitched.
+            let body = if share.is_some() {
+                Vec::new()
+            } else {
+                assemble(&payloads)?
+            };
             Ok(FrameArm {
                 payloads,
                 tile: body,
@@ -4300,8 +4350,10 @@ fn encode_inter_frame_aligned(
                 trees,
                 recon,
                 ictx,
+                tiles_done,
             })
-        };
+        }
+    };
 
     // r428 — §5.9.17 delta-q election by EXACT realized bytes +
     // masking-weighted distortion: both arms are complete frame
@@ -4318,7 +4370,108 @@ fn encode_inter_frame_aligned(
     // curve — the frame quantiser IS the λ-matched point), so the
     // weighted objective is what makes delta-q a real tool; the A/B
     // harness reports the resulting plain-PSNR/bytes trade honestly.
-    let mut arm = run_arm(&params, None)?;
+    // r489 — the bounded search runs the tiles of a multi-tile frame
+    // on the granted workers: each searches its share of the tiles on
+    // its own search state (a tile reads nothing another tile of the
+    // frame writes — §5.11.2 scopes every context and availability to
+    // the tile, and the references are earlier frames), then the
+    // shares are stitched: reconstruction and motion-vector mirror by
+    // tile rectangle, trees in tile order, and the write state rebuilt
+    // by one write pass over the stitched trees — the same pass that
+    // produces the frame's bytes, so the stream is the serial one's.
+    let tile_workers = if cfg.limits.bounded {
+        cfg.limits.threads.min(num_tiles as usize)
+    } else {
+        1
+    };
+    let mut arm = if tile_workers > 1 {
+        let shares: Vec<Result<FrameArm, Error>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..tile_workers)
+                .map(|worker| {
+                    let (run_arm, params) = (&run_arm, &params);
+                    scope.spawn(move || run_arm(params, None, Some((worker, tile_workers))))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        let mut shares: Vec<FrameArm> = shares.into_iter().collect::<Result<_, _>>()?;
+        let mut main = shares.remove(0);
+        let mut tile_trees: Vec<Vec<SyntaxNode>> = (0..num_tiles).map(|_| Vec::new()).collect();
+        let mut take = |part: &mut FrameArm| {
+            let mut trees = std::mem::take(&mut part.trees).into_iter();
+            for &t in &part.tiles_done {
+                tile_trees[t] = trees.by_ref().take(tile_plan[t].1.len()).collect();
+            }
+        };
+        take(&mut main);
+        for part in shares.iter_mut() {
+            take(part);
+            for &t in &part.tiles_done {
+                let (geo, origins) = &tile_plan[t];
+                for &(sb_r, sb_c) in origins {
+                    let snap = save_region(&part.recon, sb_r, sb_c, 16);
+                    restore_region(&mut main.recon, sb_r, sb_c, &snap);
+                }
+                let stamps = part.ictx.mirror.snapshot_encoder_stamp_rect_wh(
+                    geo.mi_row_start,
+                    geo.mi_col_start,
+                    geo.mi_col_end - geo.mi_col_start,
+                    geo.mi_row_end - geo.mi_row_start,
+                );
+                main.ictx.mirror.restore_encoder_stamp_rect(&stamps);
+            }
+        }
+        drop(shares);
+        let mut state = PartitionSyntaxWriter::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
+        let mut all_cdfs: Vec<Box<TileCdfContext>> = Vec::with_capacity(num_tiles as usize);
+        let mut trees: Vec<SyntaxNode> = Vec::new();
+        for ((geo, origins), tile) in tile_plan.iter().zip(tile_trees) {
+            if !state.begin_tile(*geo) || tile.len() != origins.len() {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let mut writer = SymbolWriter::new(fh_disable_cdf_update);
+            let mut cdfs: Box<TileCdfContext> = frame_start_cdfs.clone();
+            for (tree, &(sb_r, sb_c)) in tile.iter().zip(origins) {
+                state.arm_read_deltas();
+                write_partition_tree_syntax(
+                    &mut writer,
+                    &mut cdfs,
+                    &mut state,
+                    tree,
+                    sb_r,
+                    sb_c,
+                    BLOCK_64X64,
+                    &params,
+                )?;
+            }
+            payloads.push(writer.finish());
+            all_cdfs.push(cdfs);
+            trees.extend(tile);
+        }
+        main.tile = assemble(&payloads)?;
+        main.payloads = payloads;
+        main.all_cdfs = all_cdfs;
+        main.state = state;
+        main.trees = trees;
+        main.tiles_done = (0..num_tiles as usize).collect();
+        main
+    } else {
+        run_arm(&params, None, None)?
+    };
 
     // r439 — §5.9.12 quantizer-matrix election by EXACT realized
     // bytes + distortion: on a lossy frame with real high-frequency
@@ -4411,7 +4564,7 @@ fn encode_inter_frame_aligned(
             }
             let mut params_m = params.clone();
             params_m.quant = qp_m;
-            let cand = run_arm(&params_m, None)?;
+            let cand = run_arm(&params_m, None, None)?;
             let mut fh_m = fh.clone();
             if let Some(q) = fh_m.quantization_params.as_mut() {
                 q.using_qmatrix = true;
@@ -4460,7 +4613,7 @@ fn encode_inter_frame_aligned(
         params_d.read_deltas = true;
         params_d.delta_q_res = DELTA_Q_RES;
         params_d.quant = qp_d;
-        let cand = run_arm(&params_d, Some(plan))?;
+        let cand = run_arm(&params_d, Some(plan), None)?;
         let mut fh_d = fh.clone();
         fh_d.delta_q_params = Some(crate::uncompressed_header_tail::DeltaQParams {
             delta_q_present: true,
@@ -4570,6 +4723,7 @@ fn encode_inter_frame_aligned(
         mut trees,
         mut recon,
         ictx,
+        tiles_done: _,
     } = arm;
 
     // r431 — replay the committed trees across the tile plan under
@@ -5012,7 +5166,11 @@ fn encode_inter_frame_aligned(
                 } else {
                     None
                 },
-                threads: 1,
+                threads: if cfg.limits.bounded {
+                    cfg.limits.threads
+                } else {
+                    1
+                },
             })
     {
         let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
@@ -6166,6 +6324,12 @@ impl PSearchCtx {
     /// [`PartitionSyntaxWriter::begin_tile`].
     fn begin_tile(&mut self, geometry: TileGeometry) {
         self.mirror.begin_tile(geometry);
+        // r489 — the search hints are tile-local, like every context
+        // the tile reads: a tile searched on its own worker starts
+        // from the same (empty) hints as in the serial walk.
+        for plane in self.mv_hint.iter_mut() {
+            plane.fill([0, 0]);
+        }
         for r in 0..self.mi_rows {
             for c in 0..self.mi_cols {
                 let i = (r * self.mi_cols + c) as usize;

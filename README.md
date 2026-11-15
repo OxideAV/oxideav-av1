@@ -2611,7 +2611,22 @@ over the exhaustive search, at about 1 % of its time. Not in the
 bounded search: rectangular and 4×4 partitions, masked / inter-intra
 compounds, OBMC and warped motion, switchable filters, the skip-mode
 leaf (its election at this encoder's λ costs more than it saves once
-it stops the partition descent — measured), a tile-threaded search.
+it stops the partition descent — measured).
+
+**Encoder threading for inter frames.** Under `GopOptions::threads`
+(serial by default) the bounded efforts search the tiles of a
+multi-tile frame on workers: each worker searches its share of the
+tiles on its own search state — a tile reads nothing another tile of
+its frame writes — and the shares are stitched (reconstruction and
+motion-vector mirror by tile rectangle, trees in tile order, the write
+state rebuilt by the one write pass that produces the bytes). The KEY
+frame's tile search and the CDEF election ride the same budget. The
+stream is identical at every budget (`tests/gop_effort.rs`). 8 frames
+of 1280×720 `testsrc2`, `Balanced`, q 120, 4×2 tiles (`gop_bench …
+--tiles 2x1 --threads N`), medians of five: 4.5 s at 1 thread, 2.6 s
+at 2, 2.0 s at 4, 1.4 s at 8 (85 646 B, 43.04 dB at each). What still
+runs serial per frame: the stitch's write pass, the CDEF
+application, and the frame chain itself.
 
 **Decoder — one parse per frame.** Under a worker budget a referenced
 frame walks its syntax first (so the next frame's walk can start from
