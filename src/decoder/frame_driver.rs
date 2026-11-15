@@ -200,6 +200,10 @@ struct SpecRefState {
     /// r489 — the session's inter tile-parallel opt-out (see
     /// [`SpecDecodeSession::set_inter_tile_parallel`]).
     serial_inter_tiles: bool,
+    /// r489 — the session's worker-turn gate when this frame decodes
+    /// on a frame worker (see [`tile_walk_workers`]); `None` for a
+    /// frame decoded in line.
+    tile_turns: Option<Arc<Gate>>,
     /// r453 — `Arc`-shared: §7.20 stores the SAME immutable payload
     /// into every slot `refresh_frame_flags` selects (and the §7.21
     /// show-existing re-store copies a stored one wholesale), so an
@@ -285,7 +289,7 @@ struct SessionRefs {
     /// session's opt-out; `false` is the conformant output).
     skip_grain: bool,
     /// r489 — reconstruct the tiles of an inter frame one after the
-    /// other even under a worker budget (the memory-lean setting).
+    /// other even under a worker budget.
     serial_inter_tiles: bool,
 }
 
@@ -313,6 +317,7 @@ impl SessionRefs {
             slots,
             skip_grain: self.skip_grain,
             serial_inter_tiles: self.serial_inter_tiles,
+            tile_turns: None,
         })
     }
 }
@@ -361,6 +366,72 @@ impl Gate {
         let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
         *n -= 1;
         self.changed.notify_all();
+    }
+
+    /// Enter without waiting: `false` when `limit` are inside.
+    fn try_enter(&self, limit: usize) -> bool {
+        let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
+        if *n >= limit.max(1) {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+}
+
+/// r489 — the worker turns a frame's tile walk holds beyond the
+/// frame's own (see [`tile_walk_workers`]); returned when dropped.
+struct TileTurns {
+    gate: Option<Arc<Gate>>,
+    held: usize,
+}
+
+impl Drop for TileTurns {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.gate {
+            for _ in 0..self.held {
+                gate.leave();
+            }
+        }
+    }
+}
+
+/// r489 — how many workers a frame may walk its tiles on, inside the
+/// session's budget. A frame decoded in line (no frame workers) has
+/// the whole budget. A frame decoding on a frame worker already holds
+/// one turn of the budget; it takes — without waiting — as many of the
+/// turns that are free right now as it has further tiles, and walks on
+/// `1 + taken` workers, so the frames in flight never run more than
+/// `threads` threads between them. The turns are taken only once the
+/// frame's references are all decoding (each holds its own turn until
+/// it is done), so holding them can stall no frame this one waits on.
+fn tile_walk_workers(
+    refs: Option<&SpecRefState>,
+    threads: usize,
+    tiles: usize,
+) -> (usize, TileTurns) {
+    let want = threads.min(tiles).max(1);
+    match refs.and_then(|r| r.tile_turns.as_ref()) {
+        Some(gate) => {
+            let mut held = 0usize;
+            while 1 + held < want && gate.try_enter(threads) {
+                held += 1;
+            }
+            (
+                1 + held,
+                TileTurns {
+                    gate: Some(Arc::clone(gate)),
+                    held,
+                },
+            )
+        }
+        None => (
+            want,
+            TileTurns {
+                gate: None,
+                held: 0,
+            },
+        ),
     }
 }
 
@@ -561,7 +632,8 @@ fn decode_or_defer(
         let running = Arc::clone(&jobs.running);
         let job = move || -> Result<SpecFrame, Error> {
             let mut guard = guard;
-            let result = reads.resolve(mask).and_then(|snapshot| {
+            let result = reads.resolve(mask).and_then(|mut snapshot| {
+                snapshot.tile_turns = Some(Arc::clone(&running));
                 let mut st = DecodeStageTimings::default();
                 let cell = guard
                     .cell
@@ -1640,7 +1712,7 @@ fn decode_frame_spec_tiles(
         threads > 1 && tiles.len() > 1 && fh.frame_is_intra && !fh.allow_intrabc && !is_inter_frame;
     if tile_parallel {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let worker_count = threads.min(tiles.len());
+        let (worker_count, _tile_turns) = tile_walk_workers(refs, threads, tiles.len());
         let next = AtomicUsize::new(0);
         let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
         let tapes_ref = tapes.as_ref();
@@ -1792,14 +1864,28 @@ fn decode_frame_spec_tiles(
     // is in. Only what a tile reads from OUTSIDE its own rectangle
     // matters for equality with the serial walk, and that is all
     // frame-start state, so the frame is bit-identical at any budget.
-    let inter_tile_parallel = threads > 1
+    let inter_tile_candidate = threads > 1
         && tiles.len() > 1
         && is_inter_frame
         && !parse_only
         && !refs.is_some_and(|r| r.serial_inter_tiles);
+    // The workers this frame may use right now (one = the frame's own
+    // turn: the serial walk below, with no second walk state).
+    let (inter_tile_workers, inter_tile_turns) = if inter_tile_candidate {
+        tile_walk_workers(refs, threads, tiles.len())
+    } else {
+        (
+            1,
+            TileTurns {
+                gate: None,
+                held: 0,
+            },
+        )
+    };
+    let inter_tile_parallel = inter_tile_candidate && inter_tile_workers > 1;
     if inter_tile_parallel {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let worker_count = threads.min(tiles.len());
+        let worker_count = inter_tile_workers;
         let next = AtomicUsize::new(0);
         let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
         let tapes_ref = tapes.as_ref();
@@ -2033,6 +2119,8 @@ fn decode_frame_spec_tiles(
             end_cdfs = Some(Box::new(cdfs));
         }
     }
+    // The tile walk is over: its extra worker turns go back.
+    drop(inter_tile_turns);
     let end_cdfs = end_cdfs.unwrap_or(frame_start_cdfs);
     stages.tiles += t_tiles.elapsed();
 
@@ -2894,14 +2982,13 @@ impl SpecDecodeSession {
     }
 
     /// r489 — tile-parallel reconstruction of INTER frames under the
-    /// worker budget. `true` (the default) is the faster setting: each
-    /// tile worker of a frame owns a frame-scope walk state, so a
-    /// multi-tile inter stream holds up to `threads` of them per frame
-    /// in flight (at 1080p with eight tiles and eight workers the
-    /// resident set roughly triples). `false` reconstructs the tiles
-    /// of an inter frame one after the other — the frame-level and
-    /// in-loop-filter parallelism stay — for the smaller footprint.
-    /// The decoded samples are identical either way.
+    /// worker budget. `true` (the default) is the faster setting: a
+    /// multi-tile inter frame walks its tiles on the worker turns that
+    /// are free when its reconstruction starts, each tile worker on a
+    /// frame-scope walk state of its own. `false` reconstructs the
+    /// tiles of an inter frame one after the other on the frame's one
+    /// walk state — the frame-level and in-loop-filter parallelism
+    /// stay. The decoded samples are identical either way.
     pub fn set_inter_tile_parallel(&mut self, parallel: bool) {
         self.refs.serial_inter_tiles = !parallel;
     }

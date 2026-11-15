@@ -2535,8 +2535,8 @@ per-mode prediction buffers, and the frame-parallel residue of the
 
 **Encoder — `encode_gop_yuv_with_options` / `GopEffort`.** The KEY + P
 GOP encoder had one speed: exhaustive. A sample of it on 8 frames of
-320×240 (`testsrc2`, `base_q_idx` 120, 99.9 s) shows where the time
-went. By structure: every square node from 64×64 down to 4×4 codes an
+320×240 (`testsrc2`, `base_q_idx` 120, 92 s on a quiet machine) shows
+where the time went. By structure: every square node from 64×64 down to 4×4 codes an
 inter leaf, an intra leaf, eight rectangular / T / strip shapes and
 the recursive split; every inter leaf scans a 9×9 step-4 grid over ±16
 plus a 7×7 refinement per reference (about 130 block SSDs, each sample
@@ -2577,10 +2577,10 @@ blends, 5 % transforms.
 - **Frames** code a fixed `EIGHTTAP` filter and no motion-mode /
   skip-mode symbols, and are searched once.
 
-Apple M-series, release build, one thread, medians of five (the
-machine was shared with other builds: across the round the default
-level measured between 0.6 s and 1.2 s on the first clip, the table
-is the quietest reading); `cargo run --release --example gop_bench -- --raw
+Apple M-series, release build, one thread, medians of five in one
+quiet session (the exhaustive row is one run; on the same machine
+shared with a dozen other builds the default level measured up to
+1.2 s and the exhaustive encoder 99.9 s); `cargo run --release --example gop_bench -- --raw
 <clip>.yuv --size WxH --frames 8 --q Q --effort E`; clips from `ffmpeg
 -f lavfi -i testsrc2=…` / `mandelbrot=…` / `testsrc2,noise=alls=6`.
 Every stream decodes to the encoder's reconstruction in this crate's
@@ -2588,18 +2588,18 @@ decoder and in a black-box decoder process.
 
 | 8 frames | effort | time | bytes | luma PSNR |
 |---|---|---|---|---|
-| `testsrc2` 320×240, q 120 | all-intra (`StillSpeed::Fast`) | 0.42 s | 16 549 | 45.55 dB |
-| | `Fastest` | 0.15 s | 12 315 | 44.19 dB |
-| | `Fast` | 0.20 s | 11 609 | 45.26 dB |
-| | `Balanced` (default) | 0.61 s | 10 523 | 44.42 dB |
-| | `Thorough` | 1.48 s | 10 372 | 44.63 dB |
-| | `Best` (the pre-r489 encoder) | 99.9 s | 4 972 | 39.55 dB |
-| `mandelbrot` zoom 320×240, q 90 | all-intra | 0.46 s | 93 963 | 41.69 dB |
-| | `Fastest` / `Fast` | 0.15 s / 0.32 s | 33 041 / 31 359 | 41.03 / 41.80 dB |
-| | `Balanced` / `Thorough` | 0.76 s / 1.60 s | 27 415 / 27 475 | 41.52 / 41.61 dB |
-| noisy `testsrc2` 352×288, q 90 | all-intra | 0.58 s | 68 084 | 38.32 dB |
-| | `Fastest` / `Fast` | 0.52 s / 0.76 s | 50 245 / 43 039 | 37.90 / 38.27 dB |
-| | `Balanced` / `Thorough` | 1.58 s / 2.65 s | 33 159 / 32 851 | 38.12 / 38.14 dB |
+| `testsrc2` 320×240, q 120 | all-intra (`StillSpeed::Fast`) | 0.36 s | 16 549 | 45.55 dB |
+| | `Fastest` | 0.14 s | 12 315 | 44.19 dB |
+| | `Fast` | 0.19 s | 11 609 | 45.26 dB |
+| | `Balanced` (default) | 0.56 s | 10 523 | 44.42 dB |
+| | `Thorough` | 1.37 s | 10 372 | 44.63 dB |
+| | `Best` (the pre-r489 encoder) | 91.8 s | 4 972 | 39.55 dB |
+| `mandelbrot` zoom 320×240, q 90 | all-intra | 0.47 s | 93 963 | 41.69 dB |
+| | `Fastest` / `Fast` | 0.15 s / 0.33 s | 33 041 / 31 359 | 41.03 / 41.80 dB |
+| | `Balanced` / `Thorough` | 0.75 s / 1.62 s | 27 415 / 27 475 | 41.52 / 41.61 dB |
+| noisy `testsrc2` 352×288, q 90 | all-intra | 0.59 s | 68 084 | 38.32 dB |
+| | `Fastest` / `Fast` | 0.51 s / 0.76 s | 50 245 / 43 039 | 37.90 / 38.27 dB |
+| | `Balanced` / `Thorough` | 1.59 s / 2.62 s | 33 159 / 32 851 | 38.12 / 38.14 dB |
 
 The exhaustive encoder lands on a different operating point at the
 same `base_q_idx` (its exact-priced skip-mode and residual elections
@@ -2625,8 +2625,8 @@ state rebuilt by the one write pass that produces the bytes). The KEY
 frame's tile search and the CDEF election ride the same budget. The
 stream is identical at every budget (`tests/gop_effort.rs`). 8 frames
 of 1280×720 `testsrc2`, `Balanced`, q 120, 4×2 tiles (`gop_bench …
---tiles 2x1 --threads N`), medians of five: 2.8 s at 1 thread, 1.8 s
-at 2, 1.4 s at 4, 1.0 s at 8 (85 646 B, 43.04 dB at each). What still
+--tiles 2x1 --threads N`), medians of five: 2.73 s at 1 thread,
+1.79 s at 2, 1.45 s at 4, 1.03 s at 8 (85 646 B, 43.04 dB at each). What still
 runs serial per frame: the stitch's write pass, the CDEF
 application, and the frame chain itself.
 
@@ -2646,47 +2646,59 @@ its end CDFs, motion field and segment map) and then walks again to
 reconstruct. The second walk decoded every symbol a second time. The
 syntax walk now records the value of every symbol and bool it reads —
 one byte each — and the reconstruction walk replays that tape: no
-arithmetic decoding and no CDF adaptation the second time round.
+arithmetic decoding and no CDF adaptation the second time round (the
+one-tile row of the table below is this change alone).
 
 **Decoder — tile-parallel inter frames.** Intra tiles already decoded
 on tile-sized walkers in parallel; inter tiles did not, because the
-inter arms read frame-level state at frame positions. Each worker now
-owns one frame-scope walker, walks the tiles it draws on it (tiles
+inter arms read frame-level state at frame positions. Each tile worker
+now owns one frame-scope walker, walks the tiles it draws on it (tiles
 write disjoint rectangles), and the frame walker imports each finished
 rectangle (mode-info grids, samples, restoration units); the in-loop
 filters advance, and the §7.20 rows publish, as each tile row
-completes. Output is identical at every budget (`tests/
-decode_inter_tiles.rs`: 2×2 / 4×2 layouts, 4:2:0 / 4:4:4, with CDEF
-and loop restoration, 1 / 2 / 3 / 4 / 8 workers through the registry
-decoder and a direct session). The same work fixed a latent
-frame-parallel fault: a leaf whose vector reaches above the frame
-clamps every read to the top rows but waited for none of them, so the
-first such leaf of a frame could read a reference before its first
-rows were published (decode error, never wrong pixels).
+completes. The workers come out of the session's budget: a frame
+decoding on a frame worker holds one turn and takes — without waiting
+— only the turns that are free at that moment, so frames and tiles
+together never run more than the granted threads (a frame that finds
+no free turn walks its tiles serially, on no second walker). Output is
+identical at every budget (`tests/decode_inter_tiles.rs`: 2×2 / 4×2
+layouts, 4:2:0 / 4:4:4, with CDEF and loop restoration, 1 / 2 / 3 / 4
+/ 8 workers through the registry decoder and a direct session). The
+same work fixed a latent frame-parallel fault: a leaf whose vector
+reaches above the frame clamps every read to the top rows but waited
+for none of them, so the first such leaf of a frame could read a
+reference before its first rows were published (decode error, never
+wrong pixels).
 
 1080p, 120 frames, a black-box encoder at its preset 8 (`testsrc2`),
 one temporal unit per packet through the registry decoder
 (`examples/decode_bench <clip> threads=N stream=1 mode=registry`),
-frames per second, median of five runs each on a machine shared with
-other builds; the digests of all planes agree before / after and
-across budgets. One worker takes neither path (no syntax-only walk, no
-tile threads) and is unchanged.
+frames per second, median of five runs, before and after measured in
+the same quiet session; the digests of all planes agree before / after
+and across budgets.
 
-| Clip | 2 workers | 4 | 8 |
-|---|---|---|---|
-| random-access GOP, one tile | 133.7 → 138.4 | 232.3 → 244.4 | 358.3 → 386.9 |
-| random-access GOP, 2×2 tiles | 139.6 → 147.1 | 239.8 → 302.1 | 359.1 → 381.4 |
-| low-delay GOP, 4×2 tiles | 113.8 → 135.1 | 162.0 → 196.8 | 162.9 → 213.9 |
+| Clip | 1 worker | 2 | 4 | 8 |
+|---|---|---|---|---|
+| random-access GOP, one tile | 109.5 → 108.5 | 199.6 → 206.4 | 316.7 → 320.7 | 471.3 → 492.2 |
+| random-access GOP, 2×2 tiles | 114.9 → 113.4 | 187.1 → 211.0 | 339.8 → 338.4 | 484.3 → 492.5 |
+| low-delay GOP, 4×2 tiles | 97.2 → 96.6 | 170.3 → 184.7 | 237.3 → 258.8 | 237.5 → 262.1 |
 
-The trade is memory: a frame-scope walker per tile worker per frame in
-flight. On the low-delay 4×2 clip the peak resident set goes from 252
-to 506 MiB at 4 workers and from 426 to 1 227 MiB at 8 (live
-allocations 156 → 334 MiB and 227 → 886 MiB). The faster behaviour is
-the default; `SpecDecodeSession::set_inter_tile_parallel(false)`
-(registry decoder option `inter_tile_parallel=false`) keeps the serial
-tile walk of inter frames — and the earlier footprint — with the same
-samples. A tile-origin offset for the inter arms would let inter tiles
-walk on tile-sized state, as intra tiles do, and remove the trade.
+One worker takes neither path (no syntax-only walk, no tile threads).
+The gains are modest because the frame level already spends the
+budget: with frames on every turn there are few free ones for tiles,
+and a turn is held by a frame even while it waits for reference rows.
+A first version that gave every frame `threads` tile workers on top of
+the frame workers measured 231 / 448 / 562 fps on the 2×2 clip and
+199 / 308 / 326 fps on the low-delay clip — by running several times
+the granted thread count (and tripling the resident set), which the
+threading policy rules out. The headroom it shows is real, though: a
+turn that is released while its frame waits on a reference would let
+the tile workers of the frame being waited on use it within the
+budget. Peak resident set on the low-delay clip is unchanged (232 →
+217 MiB at 4 workers, 345 → 339 MiB at 8).
+`SpecDecodeSession::set_inter_tile_parallel(false)` (registry decoder
+option `inter_tile_parallel=false`) keeps the serial tile walk of
+inter frames with the same samples.
 
 **Decoder — film-grain opt-out.** `SpecDecodeSession::set_film_grain(
 false)` (registry decoder option `film_grain=false`) outputs frames
