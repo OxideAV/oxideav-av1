@@ -2630,6 +2630,16 @@ at 2, 1.4 s at 4, 1.0 s at 8 (85 646 B, 43.04 dB at each). What still
 runs serial per frame: the stitch's write pass, the CDEF
 application, and the frame chain itself.
 
+**Through the framework.** The registry encoder used to code every
+frame as a KEY frame. Options `gop = N` (`1..=64`; default `1`, the
+behaviour so far) and `effort` (`fastest` … `best`, default
+`balanced`) switch it to inter coding: it collects `N` frames, codes
+them as one KEY + P group and emits one packet per frame, the first of
+each group flagged as the sync sample (`flush` codes a shorter last
+group). Quality (`q` / `quality` / `lossless`), the colour signalling,
+the tile options and the `ExecutionContext` thread budget apply as on
+the intra modes; every group is an independent coded video sequence.
+
 **Decoder — one parse per frame.** Under a worker budget a referenced
 frame walks its syntax first (so the next frame's walk can start from
 its end CDFs, motion field and segment map) and then walks again to

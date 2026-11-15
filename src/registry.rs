@@ -64,8 +64,9 @@ use oxideav_core::{
 use crate::codec_config::Av1CodecConfig;
 use crate::decoder::{PendingSpecFrame, SpecDecodeSession, SpecFrame};
 use crate::encoder::{
-    ChromaFormat, DEFAULT_STILL_BASE_Q_IDX, StillOptions, StillSpeed, YuvFrame,
-    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx,
+    ChromaFormat, DEFAULT_STILL_BASE_Q_IDX, GopEffort, GopOptions, StillOptions, StillSpeed,
+    YuvFrame, encode_gop_yuv_with_options, encode_key_frame_yuv_with_options, encode_still_yuv,
+    quality_to_base_q_idx,
 };
 use crate::sequence_header::SequenceHeader;
 use oxideav_core::ExecutionContext;
@@ -560,6 +561,8 @@ fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
 /// | `full_range`     | `true` / `false` (§5.5.2 `color_range`) | from the pixel format (`YuvJ*` full) |
 /// | `color_primaries` / `transfer_characteristics` / `matrix_coefficients` | H.273 code points (§5.5.2 colour description; all three or none) | unspecified |
 /// | `threads`        | tile-search threads (`auto` = the [`ExecutionContext`] budget); > 1 derives an automatic tile layout unless `tile_*_log2` are given | `auto` (r464; serial until the caller grants a budget through `set_execution_context`) |
+/// | `gop`            | frames per group of pictures, `1..=64`: `1` = every frame a KEY frame; `N > 1` = one KEY frame followed by `N - 1` inter (P) frames | `1` |
+/// | `effort`         | inter search effort when `gop > 1`: `fastest` / `fast` / `balanced` / `thorough` / `best` ([`GopEffort`]) | `balanced` |
 ///
 /// `still = true` codes every frame as an independent still picture
 /// (`still_picture = 1` + `reduced_still_picture_header = 1`, one
@@ -567,6 +570,16 @@ fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
 /// `still = false` codes every frame as a KEY frame under a full
 /// sequence header repeated per temporal unit (an all-intra AV1
 /// video every packet of which is a sync sample).
+///
+/// r489 — `gop = N > 1` (with `still = false`) codes inter frames: the
+/// encoder collects `N` frames, codes them as one group — a KEY frame
+/// (carrying the sequence header) and `N - 1` P frames predicted from
+/// the frames before them — and emits one packet per frame, the first
+/// flagged as the sync sample. Packets therefore arrive `N` frames at
+/// a time (`receive_packet` reports `NeedMore` in between; `flush`
+/// codes a shorter last group). Every group is an independent coded
+/// video sequence, so any sync sample is a valid seek point. `speed`
+/// plays no part in this mode (`effort` does).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Av1EncoderOptions {
@@ -593,9 +606,25 @@ pub struct Av1EncoderOptions {
     /// explicit `tile_*_log2` was given; only matters when more than
     /// one thread runs).
     pub auto_tiles: bool,
+    /// Frames per group of pictures (`1` = all KEY frames).
+    pub gop: usize,
+    /// Inter search effort of the `gop > 1` mode.
+    pub effort: GopEffort,
 }
 
 impl Av1EncoderOptions {
+    /// Set `gop`.
+    pub fn with_gop(mut self, gop: usize) -> Self {
+        self.gop = gop;
+        self
+    }
+
+    /// Set `effort`.
+    pub fn with_effort(mut self, effort: GopEffort) -> Self {
+        self.effort = effort;
+        self
+    }
+
     /// Set `still`.
     pub fn with_still(mut self, still: bool) -> Self {
         self.still = still;
@@ -672,6 +701,8 @@ impl Av1EncoderOptions {
             color_description: None,
             threads: None,
             auto_tiles: true,
+            gop: 1,
+            effort: GopEffort::default(),
         };
         let mut cicp: [Option<u8>; 3] = [None; 3];
         let mut explicit_tiles = false;
@@ -720,6 +751,22 @@ impl Av1EncoderOptions {
                         Some(v.parse::<usize>().map_err(|_| bad(k, v))?.max(1))
                     }
                 }
+                "gop" => {
+                    o.gop = v.parse().map_err(|_| bad(k, v))?;
+                    if o.gop == 0 || o.gop > crate::encoder::inter_frame::GOP_MAX_FRAMES {
+                        return Err(bad(k, v));
+                    }
+                }
+                "effort" => {
+                    o.effort = match v {
+                        "fastest" => GopEffort::Fastest,
+                        "fast" => GopEffort::Fast,
+                        "balanced" => GopEffort::Balanced,
+                        "thorough" => GopEffort::Thorough,
+                        "best" => GopEffort::Best,
+                        _ => return Err(bad(k, v)),
+                    }
+                }
                 "full_range" => o.full_range = parse_bool(k, v)?,
                 "color_primaries" => cicp[0] = Some(v.parse().map_err(|_| bad(k, v))?),
                 "transfer_characteristics" => cicp[1] = Some(v.parse().map_err(|_| bad(k, v))?),
@@ -748,7 +795,31 @@ impl Av1EncoderOptions {
             o.base_q_idx = 0;
         }
         o.auto_tiles = !explicit_tiles;
+        if o.still && o.gop > 1 {
+            return Err(CoreError::invalid(
+                "oxideav-av1: still = true codes independent pictures; gop must be 1",
+            ));
+        }
         Ok(o)
+    }
+
+    /// The `gop > 1` mode's options at a resolved thread count (the
+    /// tile layout follows the same rule as the intra modes: explicit
+    /// `tile_*_log2`, else derived from the thread count above one
+    /// thread).
+    fn gop_options(&self, budget: usize, width: u32, height: u32) -> GopOptions {
+        let threads = self.threads.unwrap_or(budget).max(1);
+        let (cols, rows) = if self.auto_tiles && threads > 1 {
+            crate::encoder::still::auto_tile_layout(width, height, threads)
+        } else {
+            (self.tile_cols_log2, self.tile_rows_log2)
+        };
+        GopOptions::new(self.base_q_idx)
+            .with_effort(self.effort)
+            .with_threads(threads)
+            .with_tiles_log2(cols, rows)
+            .with_full_range(self.full_range)
+            .with_color_description(self.color_description)
     }
 
     /// The encoder options at a resolved thread count (`budget` = the
@@ -863,11 +934,13 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         queue: std::collections::VecDeque::new(),
         eof: false,
         thread_budget: 1,
+        pending: Vec::new(),
     }))
 }
 
 /// Frame-to-packet wrapper around [`encode_still_yuv`] /
-/// [`encode_key_frame_yuv_with_q`].
+/// [`encode_key_frame_yuv_with_options`] and, in the `gop > 1` mode,
+/// [`encode_gop_yuv_with_options`].
 struct Av1Encoder {
     codec_id: CodecId,
     params: CodecParameters,
@@ -883,6 +956,9 @@ struct Av1Encoder {
     /// r464 — the [`ExecutionContext`] thread budget (serial until
     /// the caller grants one).
     thread_budget: usize,
+    /// r489 — the frames of the group being collected (`gop > 1`),
+    /// with their presentation times.
+    pending: Vec<(YuvFrame, i64)>,
 }
 
 impl std::fmt::Debug for Av1Encoder {
@@ -899,6 +975,30 @@ impl std::fmt::Debug for Av1Encoder {
 }
 
 impl Av1Encoder {
+    /// r489 — code the collected frames as one group (KEY + P frames)
+    /// and queue one packet per frame.
+    fn encode_pending(&mut self) -> CoreResult<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let (frames, pts): (Vec<YuvFrame>, Vec<i64>) = self.pending.drain(..).unzip();
+        let opts = self
+            .opts
+            .gop_options(self.thread_budget, self.width, self.height);
+        let gop = encode_gop_yuv_with_options(&frames, &opts)
+            .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+        for (i, (tu, pts)) in gop.temporal_units.into_iter().zip(pts).enumerate() {
+            self.queue.push_back(
+                Packet::new(0, self.time_base, tu)
+                    .with_pts(pts)
+                    .with_dts(pts)
+                    .with_duration(1)
+                    .with_keyframe(i == 0),
+            );
+        }
+        Ok(())
+    }
+
     /// Lift a framework frame's planes into the encoder's `u16`
     /// representation (little-endian pairs at 10 / 12 bit).
     fn to_yuv(&self, frame: &VideoFrame) -> CoreResult<YuvFrame> {
@@ -986,6 +1086,16 @@ impl Encoder for Av1Encoder {
             }
         };
         let input = self.to_yuv(vf)?;
+        if self.opts.gop > 1 {
+            // r489 — inter mode: collect the group, code it when full.
+            let pts = vf.pts.unwrap_or(self.next_pts);
+            self.next_pts = pts + 1;
+            self.pending.push((input, pts));
+            if self.pending.len() >= self.opts.gop {
+                self.encode_pending()?;
+            }
+            return Ok(());
+        }
         let opts = self.opts.still_options(self.thread_budget);
         let tu = if self.opts.still {
             encode_still_yuv(&input, &opts)
@@ -1020,6 +1130,8 @@ impl Encoder for Av1Encoder {
     }
 
     fn flush(&mut self) -> CoreResult<()> {
+        // r489 — a shorter last group.
+        self.encode_pending()?;
         self.eof = true;
         Ok(())
     }

@@ -1244,6 +1244,13 @@ pub struct GopOptions {
     pub tile_cols_log2: u32,
     /// §5.9.15 `TileRowsLog2` (`0` = one row).
     pub tile_rows_log2: u32,
+    /// §5.5.2 `color_range` — `true` signals full-range samples.
+    /// Signalling only; the coding is unchanged.
+    pub full_range: bool,
+    /// §5.5.2 colour description `(color_primaries,
+    /// transfer_characteristics, matrix_coefficients)` — H.273 code
+    /// points; `None` codes the unspecified triple. Signalling only.
+    pub color_description: Option<(u8, u8, u8)>,
 }
 
 impl GopOptions {
@@ -1257,7 +1264,23 @@ impl GopOptions {
             threads: 1,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
+            full_range: false,
+            color_description: None,
         }
+    }
+
+    /// Set `full_range`.
+    #[must_use]
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Set `color_description`.
+    #[must_use]
+    pub fn with_color_description(mut self, color_description: Option<(u8, u8, u8)>) -> Self {
+        self.color_description = color_description;
+        self
     }
 
     /// Set `effort`.
@@ -1338,6 +1361,11 @@ pub(crate) struct InterLimits {
     pub lr: bool,
     /// Frame-level §5.9.24 global-motion estimation.
     pub global_motion: bool,
+    /// §5.5.2 `color_range` of the sequence header the GOP codes
+    /// (signalling carried with the per-encode knobs).
+    pub full_range: bool,
+    /// §5.5.2 colour description of the sequence header.
+    pub color_description: Option<(u8, u8, u8)>,
 }
 
 impl InterLimits {
@@ -1363,6 +1391,8 @@ impl InterLimits {
             cdef: Some(false),
             lr: true,
             global_motion: true,
+            full_range: false,
+            color_description: None,
         }
     }
 
@@ -1388,6 +1418,8 @@ impl InterLimits {
             cdef: None,
             lr: false,
             global_motion: false,
+            full_range: false,
+            color_description: None,
         };
         let balanced = Self {
             max_refs: 2,
@@ -1437,9 +1469,11 @@ pub fn encode_gop_yuv_with_options(
 ) -> Result<EncodedGopYuv, Error> {
     let mut limits = InterLimits::for_effort(opts.effort);
     limits.threads = crate::platform::clamp_threads(opts.threads);
+    limits.full_range = opts.full_range;
+    limits.color_description = opts.color_description;
     let tuning = gop_tuning_for(opts, &limits);
     if !limits.bounded {
-        return encode_gop_yuv_seg_extras_tuned(
+        return gop_with_grain_election(
             frames,
             opts.base_q_idx,
             &[],
@@ -1447,6 +1481,8 @@ pub fn encode_gop_yuv_with_options(
             false,
             None,
             tuning,
+            None,
+            limits,
         )
         .map(|t| t.gop);
     }
@@ -1593,6 +1629,34 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
     tuning: GopTuning,
     explicit_tiles: Option<(&[u32], &[u32])>,
 ) -> Result<TunedGopYuv, Error> {
+    gop_with_grain_election(
+        frames,
+        base_q_idx,
+        alt_q,
+        regions,
+        auto_detect,
+        extras,
+        tuning,
+        explicit_tiles,
+        InterLimits::exhaustive(),
+    )
+}
+
+/// The body of [`encode_gop_yuv_seg_extras_tuned_layout`] under
+/// explicit per-encode knobs (`limits` carries the search shape and
+/// the sequence header's colour signalling).
+#[allow(clippy::too_many_arguments)]
+fn gop_with_grain_election(
+    frames: &[YuvFrame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+    regions: &[LosslessRegion],
+    auto_detect: bool,
+    extras: Option<&SegExtras>,
+    tuning: GopTuning,
+    explicit_tiles: Option<(&[u32], &[u32])>,
+    limits: InterLimits,
+) -> Result<TunedGopYuv, Error> {
     let plain = encode_gop_yuv_core_fg(
         frames,
         base_q_idx,
@@ -1603,7 +1667,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         tuning,
         explicit_tiles,
         None,
-        InterLimits::exhaustive(),
+        limits,
     )?;
     // r441 — §5.9.30 film-grain election gates: lossy twin-model
     // GOPs of at least two frames (the probe needs a
@@ -1648,7 +1712,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                 tuning,
                 explicit_tiles,
                 Some(fg),
-                InterLimits::exhaustive(),
+                limits,
             )
         },
         |c: &TunedGopYuv| (c.gop.ivf_bytes.len(), c.gop.recon.as_slice()),
@@ -2109,6 +2173,9 @@ fn encode_gop_yuv_core_fg(
             collect_donor_cdfs: donor_armed,
             // r456 — the mid-GOP inter election's sequence gate.
             superres_gate: sr_inter_armed,
+            // r489 — §5.5.2 colour signalling of the sequence header.
+            full_range: limits.full_range,
+            color_description: limits.color_description,
             // r489 — the bounded efforts code the KEY frame on the
             // still-picture production ladders.
             search: {
