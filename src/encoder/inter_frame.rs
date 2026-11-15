@@ -1172,6 +1172,307 @@ pub fn encode_gop_yuv_with_q(frames: &[YuvFrame], base_q_idx: u8) -> Result<Enco
     .map(|t| t.gop)
 }
 
+/// r489 — search effort of the KEY + P GOP encoder
+/// ([`encode_gop_yuv_with_options`]), from the quickest practical
+/// search to the exhaustive one. Every level produces a conformant
+/// stream whose decode equals the encoder's own reconstruction sample
+/// for sample; the levels differ only in how much of the tool space is
+/// searched.
+///
+/// The bounded levels (everything below [`GopEffort::Best`]) share one
+/// search shape: a top-down partition walk down to 8×8 leaves that
+/// stops at a leaf already coded to the quantiser's noise floor and
+/// abandons a split as soon as its children cost more than the leaf;
+/// per leaf, the §7.10.2 stack predictors first, then one
+/// predictor-seeded integer motion search per reference (a shrinking
+/// four-point pattern, not a window scan) with sub-pel refinement
+/// around its winner only; candidates scored on luma; one residual
+/// pass priced by the leaf's real symbol sequence. Their frames code a
+/// fixed interpolation filter and no motion-mode / skip-mode symbols,
+/// and run no second frame search (no delta-q, quantiser-matrix,
+/// superres or film-grain election).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GopEffort {
+    /// One reference per leaf (the previous frame), quarter-pel
+    /// refinement over the four axis neighbours, `DCT_DCT` residuals at
+    /// the largest transform, the intra arm only where the inter
+    /// prediction explains less than the block's own variance, no
+    /// in-loop filter election; the KEY frame on the still-picture
+    /// `Fast` ladders.
+    Fastest,
+    /// `Fastest` plus the second reference (searched only while the
+    /// first leaves the block above the noise floor) and the reduced
+    /// CDEF election.
+    Fast,
+    /// The default: `Fast` plus the eight-point sub-pel ring down to
+    /// eighth-pel, compound-average trials over the two references,
+    /// the whole inter transform-type set and one transform split
+    /// level per leaf, and the intra arm trialled on every unsettled
+    /// node.
+    #[default]
+    Balanced,
+    /// `Balanced` with tighter early-termination thresholds, global
+    /// motion estimation, the full CDEF sweep and the loop-restoration
+    /// election; the KEY frame on the still-picture `Balanced` ladders.
+    Thorough,
+    /// The exhaustive pre-r489 search ([`encode_gop_yuv_with_q`]):
+    /// every partition shape down to 4×4, every reference / compound /
+    /// masked / inter-intra / motion-mode arm with exact bit
+    /// accounting, and every frame-level election. Two to three orders
+    /// of magnitude slower than the default.
+    Best,
+}
+
+/// r489 — options of [`encode_gop_yuv_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GopOptions {
+    /// §5.9.12 `base_q_idx` (0..=255); `0` codes the lossless arm.
+    pub base_q_idx: u8,
+    /// Search effort (default [`GopEffort::Balanced`]).
+    pub effort: GopEffort,
+    /// §5.9.15 `TileColsLog2` of the uniform tile layout coded on every
+    /// frame (`0` = one column).
+    pub tile_cols_log2: u32,
+    /// §5.9.15 `TileRowsLog2` (`0` = one row).
+    pub tile_rows_log2: u32,
+}
+
+impl GopOptions {
+    /// Default-effort, single-tile options at `base_q_idx`.
+    #[must_use]
+    pub fn new(base_q_idx: u8) -> Self {
+        Self {
+            base_q_idx,
+            effort: GopEffort::default(),
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        }
+    }
+
+    /// Set `effort`.
+    #[must_use]
+    pub fn with_effort(mut self, effort: GopEffort) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Set the §5.9.15 uniform tile layout.
+    #[must_use]
+    pub fn with_tiles_log2(mut self, cols_log2: u32, rows_log2: u32) -> Self {
+        self.tile_cols_log2 = cols_log2;
+        self.tile_rows_log2 = rows_log2;
+        self
+    }
+}
+
+/// r489 — search-effort limits on the inter RD ladders. The
+/// [`InterLimits::exhaustive`] shape is the pre-r489 search (every
+/// entry point that does not set limits stays bit-identical); the
+/// [`GopEffort`] presets tighten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InterLimits {
+    /// `false` = the pre-r489 exhaustive search on every ladder; the
+    /// remaining fields are then inert.
+    pub bounded: bool,
+    /// Smallest square leaf the partition walk descends to.
+    pub min_leaf: usize,
+    /// Integer-pel search window per axis (luma samples).
+    pub search_range: i32,
+    /// Sub-pel refinement over the eight-point ring (`false` = the
+    /// four axis neighbours).
+    pub subpel_ring8: bool,
+    /// Refine to eighth-pel where the header allows it.
+    pub eighth_pel: bool,
+    /// Single references searched per leaf at most.
+    pub max_refs: usize,
+    /// Trial COMPOUND_AVERAGE over the ladder pairs.
+    pub compound: bool,
+    /// Trial the §5.11.10 skip-mode leaf.
+    pub skip_mode_trial: bool,
+    /// Trial the three §5.11.26 interpolation filters on the winner
+    /// (`false` = the frame codes a fixed EIGHTTAP).
+    pub filter_trials: bool,
+    /// Search the whole §5.11.48 inter transform-type set per luma TU
+    /// (`false` = `DCT_DCT`).
+    pub tx_full_set: bool,
+    /// §5.11.17 uniform split levels trialled per leaf.
+    pub tx_depth_max: u32,
+    /// AC rounding offset of the residual quantiser, in 1/64 steps.
+    pub quant_round_64: i64,
+    /// Always trial the intra arm (`false` = only where the inter
+    /// prediction explains less than the block's own variance).
+    pub intra_always: bool,
+    /// A leaf whose distortion is at most `samples · step² · k /
+    /// 65536` ends the partition descent (`step` = the luma AC
+    /// quantiser step in 1/8 sample units; `k = 85` is the uniform
+    /// quantiser's noise power).
+    pub split_floor_k64: u32,
+    /// A candidate whose luma prediction error is at most `samples ·
+    /// step² · k / 65536` ends the motion / reference / compound
+    /// search of its leaf.
+    pub good_enough_k64: u32,
+    /// Frame-level §5.9.19 CDEF election: `None` = off, `Some(fast)`
+    /// = on with the reduced sweep when `fast` is set.
+    pub cdef: Option<bool>,
+    /// Frame-level §5.9.20 loop-restoration election.
+    pub lr: bool,
+    /// Frame-level §5.9.24 global-motion estimation.
+    pub global_motion: bool,
+}
+
+impl InterLimits {
+    /// The pre-r489 exhaustive search.
+    pub(crate) const fn exhaustive() -> Self {
+        Self {
+            bounded: false,
+            min_leaf: BLOCK_4X4,
+            search_range: SEARCH_RANGE,
+            subpel_ring8: true,
+            eighth_pel: true,
+            max_refs: usize::MAX,
+            compound: true,
+            skip_mode_trial: true,
+            filter_trials: true,
+            tx_full_set: true,
+            tx_depth_max: MAX_VARTX_DEPTH,
+            quant_round_64: crate::encoder::forward_quantize::QUANT_ROUND_HALF,
+            intra_always: true,
+            split_floor_k64: 0,
+            good_enough_k64: 0,
+            cdef: Some(false),
+            lr: true,
+            global_motion: true,
+        }
+    }
+
+    /// The limits of one [`GopEffort`] level.
+    pub(crate) fn for_effort(effort: GopEffort) -> Self {
+        let fastest = Self {
+            bounded: true,
+            min_leaf: BLOCK_8X8,
+            search_range: 32,
+            subpel_ring8: false,
+            eighth_pel: false,
+            max_refs: 1,
+            compound: false,
+            skip_mode_trial: false,
+            filter_trials: false,
+            tx_full_set: false,
+            tx_depth_max: 0,
+            quant_round_64: 21,
+            intra_always: false,
+            split_floor_k64: 12,
+            good_enough_k64: 6,
+            cdef: None,
+            lr: false,
+            global_motion: false,
+        };
+        let balanced = Self {
+            max_refs: 2,
+            subpel_ring8: true,
+            eighth_pel: true,
+            compound: true,
+            tx_full_set: true,
+            tx_depth_max: 1,
+            intra_always: true,
+            split_floor_k64: 8,
+            cdef: Some(true),
+            ..fastest
+        };
+        match effort {
+            GopEffort::Best => Self::exhaustive(),
+            GopEffort::Fastest => fastest,
+            GopEffort::Fast => Self {
+                max_refs: 2,
+                cdef: Some(true),
+                ..fastest
+            },
+            GopEffort::Balanced => balanced,
+            GopEffort::Thorough => Self {
+                split_floor_k64: 4,
+                good_enough_k64: 3,
+                cdef: Some(false),
+                lr: true,
+                global_motion: true,
+                ..balanced
+            },
+        }
+    }
+}
+
+/// r489 — encode a KEY + P GOP at a chosen search effort: the
+/// practical-speed sibling of [`encode_gop_yuv_with_q`] (which keeps
+/// the exhaustive search — [`GopEffort::Best`] here). Every frame must
+/// carry the same dimensions, bit depth and chroma format.
+///
+/// ## Errors
+///
+/// As [`encode_gop_yuv_with_q`], plus a tile layout outside the
+/// §5.9.15 legal window — [`Error::PartitionWalkOutOfRange`].
+pub fn encode_gop_yuv_with_options(
+    frames: &[YuvFrame],
+    opts: &GopOptions,
+) -> Result<EncodedGopYuv, Error> {
+    let limits = InterLimits::for_effort(opts.effort);
+    let tuning = gop_tuning_for(opts, &limits);
+    if !limits.bounded {
+        return encode_gop_yuv_seg_extras_tuned(
+            frames,
+            opts.base_q_idx,
+            &[],
+            &[],
+            false,
+            None,
+            tuning,
+        )
+        .map(|t| t.gop);
+    }
+    encode_gop_yuv_core_fg(
+        frames,
+        opts.base_q_idx,
+        &[],
+        &[],
+        false,
+        None,
+        tuning,
+        None,
+        None,
+        limits,
+    )
+    .map(|t| t.gop)
+}
+
+/// The frame-level election switches of one [`GopOptions`]: the
+/// exhaustive level keeps every election; the bounded levels keep the
+/// cross-frame carries (primary reference CDFs, high-precision vector
+/// election — both free of a second search) and take the in-loop
+/// filter elections from the level's [`InterLimits`].
+fn gop_tuning_for(opts: &GopOptions, limits: &InterLimits) -> GopTuning {
+    let tiles = (opts.tile_cols_log2, opts.tile_rows_log2);
+    if !limits.bounded {
+        return GopTuning {
+            tiles,
+            ..GopTuning::default()
+        };
+    }
+    GopTuning {
+        tiles,
+        global_motion: limits.global_motion,
+        high_precision_mv: limits.eighth_pel,
+        delta_q: false,
+        qm: false,
+        cdef: limits.cdef.is_some(),
+        cdef_units: limits.cdef.is_some(),
+        lr: limits.lr,
+        ctx_update_elect: false,
+        superres: false,
+        film_grain: false,
+        ..GopTuning::default()
+    }
+}
+
 /// r433 — KEY + P GOP with an explicitly configured §5.9.15
 /// **NON-UNIFORM** tile layout on every frame
 /// (`uniform_tile_spacing_flag = 0`): `widths_sb` / `heights_sb` in
@@ -1281,6 +1582,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
         tuning,
         explicit_tiles,
         None,
+        InterLimits::exhaustive(),
     )?;
     // r441 — §5.9.30 film-grain election gates: lossy twin-model
     // GOPs of at least two frames (the probe needs a
@@ -1325,6 +1627,7 @@ pub fn encode_gop_yuv_seg_extras_tuned_layout(
                 tuning,
                 explicit_tiles,
                 Some(fg),
+                InterLimits::exhaustive(),
             )
         },
         |c: &TunedGopYuv| (c.gop.ivf_bytes.len(), c.gop.recon.as_slice()),
@@ -1642,6 +1945,7 @@ fn encode_gop_yuv_core_fg(
     tuning: GopTuning,
     explicit_tiles: Option<(&[u32], &[u32])>,
     film_grain: Option<&FilmGrainParams>,
+    limits: InterLimits,
 ) -> Result<TunedGopYuv, Error> {
     if let Some(x) = extras {
         let ll = seg_lossless_array(base_q_idx, alt_q);
@@ -1784,6 +2088,13 @@ fn encode_gop_yuv_core_fg(
             collect_donor_cdfs: donor_armed,
             // r456 — the mid-GOP inter election's sequence gate.
             superres_gate: sr_inter_armed,
+            // r489 — the bounded efforts code the KEY frame on the
+            // still-picture production ladders.
+            search: match limits {
+                l if !l.bounded => crate::encoder::key_frame::SearchLimits::default(),
+                l if l.intra_always => crate::encoder::key_frame::SearchLimits::balanced(),
+                _ => crate::encoder::key_frame::SearchLimits::fast(),
+            },
             ..crate::encoder::key_frame::KeyExtras::default()
         },
     )?;
@@ -1919,6 +2230,7 @@ fn encode_gop_yuv_core_fg(
                 tuning.short_ref_signaling,
                 superres,
                 superres.is_some().then_some(input),
+                limits,
             )
         };
         let mut best = encode_arm(input, None)?;
@@ -2358,6 +2670,9 @@ pub(crate) struct InterFrameConfig<'a> {
     /// one. Set by [`encode_inter_frame_generic_gm`]; callers leave
     /// it `None`.
     pub coded_size: Option<(u32, u32)>,
+    /// r489 — search-effort limits on the inter RD ladders (the
+    /// exhaustive shape reproduces the pre-r489 search bit for bit).
+    pub limits: InterLimits,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2440,7 +2755,14 @@ fn build_inter_frame_fh(
         fh.order_hint,
         seq.order_hint_bits,
     );
-    fh.skip_mode_present = Some(skip_allowed && reference_select && seq.enable_order_hint);
+    // r489 — a bounded search that never trials the skip-mode leaf
+    // codes `skip_mode_present = 0` (no per-block §5.11.10 symbol).
+    fh.skip_mode_present = Some(
+        skip_allowed
+            && reference_select
+            && seq.enable_order_hint
+            && !(cfg.limits.bounded && !cfg.limits.skip_mode_trial),
+    );
     // r419: `allow_warped_motion = 1` whenever the sequence gate is
     // open (the f(1) is coded under `!error_resilient_mode &&
     // enable_warped_motion`) — §5.11.27 arm B becomes reachable and
@@ -2463,12 +2785,20 @@ fn build_inter_frame_fh(
         // coded). The per-frame exact-bytes election may flip this
         // back to 0 after the tile is priced.
         allow_high_precision_mv: cfg.high_precision_mv,
-        interpolation_filter: InterpolationFilter::Switchable,
+        // r489 — a bounded search without filter trials codes the
+        // frame filter (`EIGHTTAP`, no per-block §5.11.26 symbols).
+        interpolation_filter: if cfg.limits.bounded && !cfg.limits.filter_trials {
+            InterpolationFilter::Eighttap
+        } else {
+            InterpolationFilter::Switchable
+        },
         // r419: §5.9.2 `is_motion_mode_switchable = 1` — every
         // §5.11.27-eligible leaf codes the `use_obmc` /
         // `motion_mode` S(), and the RD ladder may commit OBMC /
-        // WARPED_CAUSAL winners.
-        is_motion_mode_switchable: true,
+        // WARPED_CAUSAL winners. r489 — the bounded search commits
+        // SIMPLE on every leaf, so its frames code the flag as 0 (no
+        // per-block §5.11.27 symbol).
+        is_motion_mode_switchable: !cfg.limits.bounded,
         // r413: §7.9 temporal MV prediction on every inter frame (the
         // first P-frame's projections are empty — every slot still
         // holds the intra KEY — which both sides derive identically).
@@ -2753,6 +3083,7 @@ fn p_frame_config_primary<'a>(
         superres_source: None,
         ref_dims: Vec::new(),
         coded_size: None,
+        limits: InterLimits::exhaustive(),
     }
 }
 
@@ -2886,6 +3217,7 @@ fn encode_p_frame_yuv(
     short_ref_signaling: bool,
     superres: Option<(u32, u32)>,
     superres_source: Option<&YuvFrame>,
+    limits: InterLimits,
 ) -> Result<
     (
         Vec<u8>,
@@ -2964,6 +3296,7 @@ fn encode_p_frame_yuv(
     cfg.elect_donor = donor_armed && !error_resilient;
     cfg.superres = superres;
     cfg.superres_source = superres_source;
+    cfg.limits = limits;
     let (obus, recon, saved, carry, aux) = encode_inter_frame_generic_gm(
         input,
         seq,
@@ -3414,7 +3747,11 @@ fn encode_inter_frame_aligned(
     // r412: SWITCHABLE frame filter — each inter leaf RD-selects its
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
-    ip.interpolation_filter = SWITCHABLE;
+    ip.interpolation_filter = if cfg.limits.bounded && !cfg.limits.filter_trials {
+        EIGHTTAP
+    } else {
+        SWITCHABLE
+    };
     // r412: per-block single/compound reference choice (§5.9.23) —
     // open exactly when the ladder carries a compound pair (matches
     // the header).
@@ -3440,7 +3777,7 @@ fn encode_inter_frame_aligned(
     // WARPED_CAUSAL) against SIMPLE. `allow_warped_motion` mirrors
     // the header derivation: coded only when the sequence gate is
     // open (the header writer emits the f(1) under the same gate).
-    ip.is_motion_mode_switchable = true;
+    ip.is_motion_mode_switchable = !cfg.limits.bounded;
     // r447: §5.9.2 infers `allow_warped_motion = 0` under error
     // resilience (the SWITCH-frame shape) — mirror the parse-side
     // derivation exactly as the header writer's bit gate does.
@@ -3770,7 +4107,14 @@ fn encode_inter_frame_aligned(
                 // §5.9.20: intra-block-copy is intra-frame-only.
                 allow_intrabc: false,
                 qp: arm_params.quant,
-                search: crate::encoder::key_frame::SearchLimits::default(),
+                // r489 — the bounded search rides the intra arm's
+                // production ladders (the still-picture `Fast` shape)
+                // for its intra candidates.
+                search: if cfg.limits.bounded {
+                    crate::encoder::key_frame::SearchLimits::fast()
+                } else {
+                    crate::encoder::key_frame::SearchLimits::default()
+                },
                 bd: BlockDecodedMirror::new(ssx, ssy, num_planes),
                 dv_hash: Default::default(),
             });
@@ -3794,6 +4138,7 @@ fn encode_inter_frame_aligned(
                 ssy,
                 num_planes,
             )?);
+            ictx.limits = cfg.limits;
             // r426 — arm the §5.9.14 inter-override features (ladder item
             // 8): requires the segmentation carrier (non-empty alt_q), raw
             // RefFrame data within the ladder, and flips SegIdPreSkip.
@@ -3890,17 +4235,30 @@ fn encode_inter_frame_aligned(
                     state.arm_read_deltas();
                     let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
                     twin.arm_read_deltas();
-                    let (tree, _cost) = build_p_search_tree(
-                        sb_r,
-                        sb_c,
-                        BLOCK_64X64,
-                        input,
-                        &mut recon,
-                        &mut ictx,
-                        &mut twin,
-                        arm_params,
-                        model,
-                    )?;
+                    let (tree, _cost) = if cfg.limits.bounded {
+                        build_p_bounded_tree(
+                            sb_r,
+                            sb_c,
+                            BLOCK_64X64,
+                            input,
+                            &mut recon,
+                            &mut ictx,
+                            &mut twin,
+                            arm_params,
+                        )?
+                    } else {
+                        build_p_search_tree(
+                            sb_r,
+                            sb_c,
+                            BLOCK_64X64,
+                            input,
+                            &mut recon,
+                            &mut ictx,
+                            &mut twin,
+                            arm_params,
+                            model,
+                        )?
+                    };
                     write_partition_tree_syntax(
                         &mut writer,
                         &mut cdfs,
@@ -4649,7 +5007,11 @@ fn encode_inter_frame_aligned(
                 num_planes,
                 lambda: crate::encoder::key_frame::lambda_for(&recon.qp),
                 max_bits: if cfg.cdef_units { 3 } else { 0 },
-                fast: None,
+                fast: if cfg.limits.bounded && cfg.limits.cdef == Some(true) {
+                    Some((0, 3))
+                } else {
+                    None
+                },
                 threads: 1,
             })
     {
@@ -5355,6 +5717,18 @@ struct PSearchCtx {
     /// full-superblock skip leaves carry 0 — the §5.11.13
     /// short-circuit arm never codes a delta).
     delta_q_units: i32,
+    /// r489 — search-effort limits (see [`InterLimits`]).
+    limits: InterLimits,
+    /// r489 — per reference plane, per mi cell: the integer-pel
+    /// vector (`[dy, dx]`, luma samples) the bounded motion search
+    /// last settled on for a block covering the cell. Seeds later
+    /// searches (a child block starts from its parent's vector, a
+    /// neighbour from the block beside it). A search aid only.
+    mv_hint: Vec<Vec<[i16; 2]>>,
+    /// r489 — luma SSD of the bare prediction the bounded leaf search
+    /// committed (before the residual): the partition walk's
+    /// intra-trial gate.
+    last_pred_ssd: u64,
 }
 
 impl PSearchCtx {
@@ -5594,6 +5968,9 @@ impl PSearchCtx {
             mirror,
             ip,
             delta_q_units: 0,
+            limits: InterLimits::exhaustive(),
+            mv_hint: vec![vec![[0i16; 2]; (mi_rows as usize) * (mi_cols as usize)]; refs.len()],
+            last_pred_ssd: 0,
         })
     }
 
@@ -6231,6 +6608,40 @@ impl PSearchCtx {
         ii: Option<InterIntraTrial<'_>>,
         motion: MotionSel,
     ) -> Result<(), Error> {
+        self.predict_leaf_planes(
+            mi_row,
+            mi_col,
+            b_size,
+            ref_frame,
+            y_mode,
+            mv,
+            filter,
+            comp,
+            ii,
+            motion,
+            usize::MAX,
+        )
+    }
+
+    /// r489 — [`Self::predict_leaf`] over the first `plane_limit`
+    /// planes only (`1` = a luma-only trial: the bounded search scores
+    /// its candidates on luma and predicts chroma once, for the
+    /// winner). The grid stamps are identical either way.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_leaf_planes(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+        ref_frame: [i8; 2],
+        y_mode: u8,
+        mv: [[i32; 2]; 2],
+        filter: u8,
+        comp: CompoundSel,
+        ii: Option<InterIntraTrial<'_>>,
+        motion: MotionSel,
+        plane_limit: usize,
+    ) -> Result<(), Error> {
         if ii.is_some() && ref_frame[1] != -1 {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -6399,7 +6810,7 @@ impl PSearchCtx {
         // r427 — format scalars (copied out before the field split).
         let bit_depth = self.bit_depth;
         let (ssx, ssy) = (self.subsampling_x, self.subsampling_y);
-        let num_planes = usize::from(self.num_planes);
+        let num_planes = usize::from(self.num_planes).min(plane_limit.max(1));
         let PSearchCtx {
             ref_planes,
             compound_types,
@@ -6766,7 +7177,11 @@ fn encode_inter_leaf_base(
     ictx: &mut PSearchCtx,
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
-    let leaf = encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx, pricing)?;
+    let leaf = if ictx.limits.bounded {
+        encode_inter_leaf_bounded(mi_r, mi_c, b_size, input, recon, ictx, pricing)?
+    } else {
+        encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx, pricing)?
+    };
 
     // r413 — §5.11.10 skip-mode trial: on a skip-mode frame, every
     // >= 8×8 leaf additionally trials the pure-derivation skip-mode
@@ -6777,6 +7192,7 @@ fn encode_inter_leaf_base(
     // residual-coded reconstruction vs the skip-mode leaf's bare
     // prediction, each scored `D + λ·R` over all three planes.
     if !ictx.ip.skip_mode_present
+        || (ictx.limits.bounded && !ictx.limits.skip_mode_trial)
         || crate::cdf::block_width(b_size) < 8
         || crate::cdf::block_height(b_size) < 8
     {
@@ -8299,9 +8715,13 @@ pub(crate) fn residual_tx_search_luma_inter(
     pred: &[u16],
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
+    // r489 — `true` trials `DCT_DCT` only; the AC rounding offset in
+    // 1/64 steps (`QUANT_ROUND_HALF` = the pre-r489 rule).
+    dct_only: bool,
+    round_64: i64,
 ) -> Result<(Vec<i32>, u8), Error> {
     use crate::cdf::{TX_SIZE_SQR_UP, dequantize_step1, is_tx_type_in_set, tx_size_sqr_index};
-    use crate::encoder::forward_quantize::forward_quantize;
+    use crate::encoder::forward_quantize::forward_quantize_rounded;
     use crate::encoder::forward_transform_2d::forward_transform_2d;
     use crate::encoder::key_frame::repack_compact;
     use crate::transform::inverse_transform_2d;
@@ -8332,7 +8752,7 @@ pub(crate) fn residual_tx_search_luma_inter(
     });
     let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
     for t in 0..crate::cdf::TX_TYPES {
-        let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(true, set, t));
+        let admissible = t == DCT_DCT || (!dct_only && set > 0 && is_tx_type_in_set(true, set, t));
         if !admissible {
             continue;
         }
@@ -8341,7 +8761,11 @@ pub(crate) fn residual_tx_search_luma_inter(
         // short-circuit; the QM election arms it on unsegmented lossy
         // frames — the bundle's segment-0 row is the coded one).
         let qm = qp.seg_qm_level[0][0];
-        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, qm, qp), w, h);
+        let quant = repack_compact(
+            forward_quantize_rounded(&coeffs, tx_sz, 0, 0, t, qm, qp, round_64),
+            w,
+            h,
+        );
         let all_zero = quant.iter().all(|&q| q == 0);
         let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, qm, qp);
         let res_back = inverse_transform_2d(&dequant, tx_sz, t, u32::from(qp.bit_depth), false);
@@ -8472,6 +8896,13 @@ fn encode_inter_leaf_residual(
     // CodedLossless and plain-lossy configurations).
     let lossless = ictx.seg_lossless(segment_id);
     let qp = *seg_qp;
+    // r489 — the bounded search's AC rounding offset (round to nearest
+    // on the exhaustive path, bit-identical to the pre-r489 search).
+    let round_64 = if ictx.limits.bounded {
+        ictx.limits.quant_round_64
+    } else {
+        crate::encoder::forward_quantize::QUANT_ROUND_HALF
+    };
     // r424 — the running per-TU fork (lossy arm only: the lossless
     // §5.11.47 guard never codes a tx-type symbol and the TU chain is
     // not searched).
@@ -8571,6 +9002,8 @@ fn encode_inter_leaf_residual(
                     (Some(f), Some(c)) => Some((f, c)),
                     _ => None,
                 },
+                ictx.limits.bounded && !ictx.limits.tx_full_set,
+                round_64,
             )?
         };
         tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
@@ -8663,7 +9096,7 @@ fn encode_inter_leaf_residual(
                 } else {
                     &mut recon.v
                 };
-                let q = residual_tx(
+                let q = crate::encoder::key_frame::residual_tx_avail(
                     crate::encoder::key_frame::SrcPlane::whole(
                         if plane == 1 { &input.u } else { &input.v },
                         cw,
@@ -8678,6 +9111,9 @@ fn encode_inter_leaf_residual(
                     lossless,
                     chroma_tt,
                     &qp,
+                    ctw,
+                    cth,
+                    round_64,
                 );
                 tu_bd_stamp(&mut recon.bd, plane, tc, tr, ctw, cth);
                 residual_quant.push(q);
@@ -9463,6 +9899,875 @@ fn build_p_search_tree(
         *twin = twin_split;
         Ok((SyntaxNode::Split(children), cost_split))
     }
+}
+
+// ---------------------------------------------------------------------
+// r489 — the bounded inter search (every `GopEffort` below `Best`).
+// ---------------------------------------------------------------------
+
+/// Sum of absolute luma differences between the `bw × bh` source block
+/// at `(row0, col0)` and the reference displaced by the integer vector
+/// `(dy, dx)`, reading the reference with the §7.11.3.3 edge clamp.
+/// Gives up (returning a value above `limit`) as soon as the running
+/// sum passes `limit`.
+#[allow(clippy::too_many_arguments)]
+fn block_sad(
+    src: &[u16],
+    ref_y: &[u16],
+    width: usize,
+    height: usize,
+    row0: usize,
+    col0: usize,
+    bw: usize,
+    bh: usize,
+    dy: i32,
+    dx: i32,
+    limit: u64,
+) -> u64 {
+    let (ry, rx) = (row0 as i32 + dy, col0 as i32 + dx);
+    let mut sad = 0u64;
+    if ry >= 0 && rx >= 0 && ry as usize + bh <= height && rx as usize + bw <= width {
+        let (ry, rx) = (ry as usize, rx as usize);
+        for i in 0..bh {
+            let a = &src[(row0 + i) * width + col0..][..bw];
+            let b = &ref_y[(ry + i) * width + rx..][..bw];
+            sad += a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| u64::from(x.abs_diff(y)))
+                .sum::<u64>();
+            if sad > limit {
+                return sad;
+            }
+        }
+        return sad;
+    }
+    for i in 0..bh {
+        let sy = (ry + i as i32).clamp(0, height as i32 - 1) as usize;
+        let a = &src[(row0 + i) * width + col0..][..bw];
+        for (j, &x) in a.iter().enumerate() {
+            let sx = (rx + j as i32).clamp(0, width as i32 - 1) as usize;
+            sad += u64::from(x.abs_diff(ref_y[sy * width + sx]));
+        }
+        if sad > limit {
+            return sad;
+        }
+    }
+    sad
+}
+
+/// Bit length of a vector-difference component (the growth of the
+/// §5.11.32 class + magnitude symbols with the difference).
+fn mv_component_bits(d: i32) -> u64 {
+    u64::from(34 - d.unsigned_abs().leading_zeros())
+}
+
+/// r489 — bounded integer-pel motion search: the best of the `seeds`
+/// (integer `[dy, dx]` vectors — the zero vector, the §7.10.2 stack
+/// predictors, the neighbouring blocks' settled vectors), then a
+/// shrinking four-point pattern (steps 4, 2, 1 — each step walks while
+/// it improves, at most `MAX_WALK` moves) and a final eight-point ring.
+/// The cost is SAD plus `lambda_sad` times the bit-length of the
+/// difference to `seeds[0]`; a start already under `good_sad` is
+/// returned as is. Vectors stay inside `±range` per axis. Returns the
+/// vector and its SAD.
+#[allow(clippy::too_many_arguments)]
+fn motion_search_bounded(
+    src: &[u16],
+    ref_y: &[u16],
+    width: usize,
+    height: usize,
+    row0: usize,
+    col0: usize,
+    bw: usize,
+    bh: usize,
+    seeds: &[[i32; 2]],
+    range: i32,
+    lambda_sad: u64,
+    good_sad: u64,
+) -> ([i32; 2], u64) {
+    const MAX_WALK: usize = 6;
+    let pred = seeds.first().copied().unwrap_or([0, 0]);
+    let mv_cost = |v: [i32; 2]| -> u64 {
+        lambda_sad * (mv_component_bits(v[0] - pred[0]) + mv_component_bits(v[1] - pred[1]))
+    };
+    let eval = |v: [i32; 2], limit: u64| -> (u64, u64) {
+        let mc = mv_cost(v);
+        let sad = block_sad(
+            src,
+            ref_y,
+            width,
+            height,
+            row0,
+            col0,
+            bw,
+            bh,
+            v[0],
+            v[1],
+            limit.saturating_sub(mc),
+        );
+        (sad + mc, sad)
+    };
+    let clampv = |v: [i32; 2]| [v[0].clamp(-range, range), v[1].clamp(-range, range)];
+    let mut best_v = clampv(pred);
+    let (mut best_cost, mut best_sad) = eval(best_v, u64::MAX);
+    for (k, &s) in seeds.iter().enumerate().skip(1) {
+        let v = clampv(s);
+        if v == best_v || seeds[..k].iter().any(|&p| clampv(p) == v) {
+            continue;
+        }
+        let (c, sad) = eval(v, best_cost);
+        if c < best_cost {
+            (best_cost, best_sad, best_v) = (c, sad, v);
+        }
+    }
+    if best_sad <= good_sad {
+        return (best_v, best_sad);
+    }
+    for step in [4i32, 2, 1] {
+        for _ in 0..MAX_WALK {
+            let center = best_v;
+            for (oy, ox) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
+                let v = [center[0] + oy, center[1] + ox];
+                if v != clampv(v) {
+                    continue;
+                }
+                let (c, sad) = eval(v, best_cost);
+                if c < best_cost {
+                    (best_cost, best_sad, best_v) = (c, sad, v);
+                }
+            }
+            if best_v == center {
+                break;
+            }
+        }
+    }
+    let center = best_v;
+    for (oy, ox) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+        let v = [center[0] + oy, center[1] + ox];
+        if v != clampv(v) {
+            continue;
+        }
+        let (c, sad) = eval(v, best_cost);
+        if c < best_cost {
+            (best_cost, best_sad, best_v) = (c, sad, v);
+        }
+    }
+    (best_v, best_sad)
+}
+
+/// Luma SSD between the source block and the prediction scratch.
+fn scratch_luma_ssd(
+    input: &YuvFrame,
+    ictx: &PSearchCtx,
+    row0: usize,
+    col0: usize,
+    bw: usize,
+    bh: usize,
+    width: usize,
+) -> u64 {
+    let mut ssd = 0u64;
+    for i in 0..bh {
+        let a = &input.y[(row0 + i) * width + col0..][..bw];
+        let b = &ictx.scratch[0][(row0 + i) * width + col0..][..bw];
+        ssd += a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = u64::from(x.abs_diff(y));
+                d * d
+            })
+            .sum::<u64>();
+    }
+    ssd
+}
+
+/// r489 — the bounded twin of [`encode_inter_leaf_modes`]: one
+/// predictor-seeded integer search per reference with sub-pel
+/// refinement around its winner, luma-only candidate scoring through
+/// the decoder's own §7.11.3 kernel, reference / compound pruning once
+/// a candidate predicts the block to within the quantiser's noise, and
+/// one residual pass. The committed leaf is predicted over every plane
+/// through the same kernel, so the reconstruction is the decoder's by
+/// construction.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_leaf_bounded(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &YuvFrame,
+    recon: &mut ReconState,
+    ictx: &mut PSearchCtx,
+    pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
+) -> Result<SyntaxBlock, Error> {
+    let lim = ictx.limits;
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
+    let (bw, bh) = (bw4 * 4, bh4 * 4);
+    let row0 = (mi_r as usize) * 4;
+    let col0 = (mi_c as usize) * 4;
+    let width = recon.width;
+    let height = recon.height;
+    let lambda = lambda_for(&recon.qp);
+    let lambda_sad = lambda.isqrt().max(1);
+    // Prediction error at which the quantiser's own noise dominates:
+    // `step² · k / 65536` per sample (the luma AC step is in 1/8
+    // sample units, so `k = 85` is the uniform-quantiser noise power
+    // `Δ² / 12`).
+    let step = u64::from(crate::cdf::get_ac_quant(&recon.qp, 0, 0).unsigned_abs());
+    let samples = (bw * bh) as u64;
+    let good_ssd = samples * step * step * u64::from(lim.good_enough_k64) / 65536;
+    let good_sad = samples * step * u64::from(lim.good_enough_k64).isqrt() / 256;
+    let filter = if ictx.ip.interpolation_filter != SWITCHABLE {
+        ictx.ip.interpolation_filter
+    } else {
+        EIGHTTAP
+    };
+    let in_bounds =
+        |m: [i32; 2]| m[0].unsigned_abs() < (1 << 14) && m[1].unsigned_abs() < (1 << 14);
+
+    #[derive(Clone, Copy)]
+    struct Cand {
+        ref_frame: [i8; 2],
+        y_mode: u8,
+        mv: [[i32; 2]; 2],
+        ref_mv_idx: u32,
+        rate: u64,
+    }
+    let mut best: Option<(u64, u64, Cand)> = None;
+    // Score one candidate on luma; keeps the running best.
+    let trial = |ictx: &mut PSearchCtx,
+                 best: &mut Option<(u64, u64, Cand)>,
+                 cand: Cand|
+     -> Result<u64, Error> {
+        ictx.predict_leaf_planes(
+            mi_r,
+            mi_c,
+            b_size,
+            cand.ref_frame,
+            cand.y_mode,
+            cand.mv,
+            filter,
+            CompoundSel::AVERAGE,
+            None,
+            MotionSel::Simple,
+            1,
+        )?;
+        let ssd = scratch_luma_ssd(input, ictx, row0, col0, bw, bh, width);
+        let score = ssd + lambda * cand.rate;
+        if best.is_none_or(|(s, _, _)| score < s) {
+            *best = Some((score, ssd, cand));
+        }
+        Ok(ssd)
+    };
+
+    let single_refs = ictx.single_refs.clone();
+    let mut searched: [Option<[i32; 2]>; 8] = [None; 8];
+    for (ref_ord, &rf) in single_refs.iter().enumerate() {
+        // Reference pruning: a later reference is only searched while
+        // no earlier candidate reaches the noise floor.
+        if ref_ord > 0 && (ref_ord >= lim.max_refs || best.is_some_and(|(_, d, _)| d <= good_ssd)) {
+            break;
+        }
+        let ref_bias = ref_ord as u64;
+        let stack = ictx.find_stack(mi_r, mi_c, b_size, [rf, -1])?;
+        let nfound = stack.num_mv_found;
+        let nearest = stack.ref_stack_mv[0][0];
+        let mut seen: [[i32; 2]; 4] = [[i32::MAX; 2]; 4];
+        let mut n_seen = 0usize;
+        if in_bounds(nearest) {
+            trial(
+                ictx,
+                &mut best,
+                Cand {
+                    ref_frame: [rf, -1],
+                    y_mode: MODE_NEARESTMV,
+                    mv: [nearest, [0, 0]],
+                    ref_mv_idx: 0,
+                    rate: 3 + ref_bias,
+                },
+            )?;
+            seen[n_seen] = nearest;
+            n_seen += 1;
+        }
+        let global = stack.global_mvs[0];
+        if in_bounds(global) && !seen[..n_seen].contains(&global) {
+            trial(
+                ictx,
+                &mut best,
+                Cand {
+                    ref_frame: [rf, -1],
+                    y_mode: MODE_GLOBALMV,
+                    mv: [global, [0, 0]],
+                    ref_mv_idx: 0,
+                    rate: 4 + ref_bias,
+                },
+            )?;
+            seen[n_seen] = global;
+            n_seen += 1;
+        }
+        if nfound >= 2 {
+            let near = stack.ref_stack_mv[1][0];
+            if in_bounds(near) && !seen[..n_seen].contains(&near) {
+                trial(
+                    ictx,
+                    &mut best,
+                    Cand {
+                        ref_frame: [rf, -1],
+                        y_mode: MODE_NEARMV,
+                        mv: [near, [0, 0]],
+                        ref_mv_idx: 1,
+                        rate: 4 + ref_bias,
+                    },
+                )?;
+                seen[n_seen] = near;
+                n_seen += 1;
+            }
+        }
+        // Early termination: a derived vector already predicts the
+        // block to within the quantiser's noise.
+        if best.is_some_and(|(_, d, _)| d <= good_ssd) {
+            continue;
+        }
+
+        // Integer search seeded by the stack predictor and the
+        // neighbouring blocks' settled vectors.
+        let ref_plane = ictx.plane_of_ref(rf);
+        let cell = (mi_r * ictx.mi_cols + mi_c) as usize;
+        let to_int = |m: [i32; 2]| [(m[0] + 4) >> 3, (m[1] + 4) >> 3];
+        let hint = |c: usize| -> [i32; 2] {
+            let h = ictx.mv_hint[ref_plane][c];
+            [i32::from(h[0]), i32::from(h[1])]
+        };
+        let mut seeds: [[i32; 2]; 6] = [[0, 0]; 6];
+        let mut n_seeds = 0usize;
+        let mut push = |v: [i32; 2]| {
+            seeds[n_seeds] = v;
+            n_seeds += 1;
+        };
+        push(to_int(nearest));
+        push([0, 0]);
+        push(hint(cell));
+        if mi_c > 0 {
+            push(hint(cell - 1));
+        }
+        if mi_r > 0 {
+            push(hint(cell - ictx.mi_cols as usize));
+        }
+        if nfound >= 2 {
+            push(to_int(stack.ref_stack_mv[1][0]));
+        }
+        let (mv_int, _) = motion_search_bounded(
+            &input.y,
+            ictx.search_luma(ref_plane),
+            width,
+            height,
+            row0,
+            col0,
+            bw,
+            bh,
+            &seeds[..n_seeds],
+            lim.search_range,
+            lambda_sad,
+            good_sad,
+        );
+        for dr in 0..bh4 as u32 {
+            for dc in 0..bw4 as u32 {
+                let (rr, cc) = (mi_r + dr, mi_c + dc);
+                if rr < ictx.mi_rows && cc < ictx.mi_cols {
+                    ictx.mv_hint[ref_plane][(rr * ictx.mi_cols + cc) as usize] =
+                        [mv_int[0] as i16, mv_int[1] as i16];
+                }
+            }
+        }
+
+        // Sub-pel refinement around the integer winner only, each
+        // candidate through the real §7.11.3.4 kernel (luma).
+        let window: u32 = match nfound {
+            0 | 1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let new_rate = |mv: [i32; 2]| -> Result<(u64, u32), Error> {
+            let mut out: Option<(u64, u32)> = None;
+            for idx in 0..=window {
+                let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, idx)?;
+                let rate = 5
+                    + ref_bias
+                    + u64::from(idx)
+                    + mv_component_bits(mv[0] - pred[0])
+                    + mv_component_bits(mv[1] - pred[1]);
+                if out.is_none_or(|(r, _)| rate < r) {
+                    out = Some((rate, idx));
+                }
+            }
+            Ok(out.expect("slot 0 is always reachable"))
+        };
+        let score_new = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
+            ictx.predict_leaf_planes(
+                mi_r,
+                mi_c,
+                b_size,
+                [rf, -1],
+                MODE_NEWMV,
+                [mv, [0, 0]],
+                filter,
+                CompoundSel::AVERAGE,
+                None,
+                MotionSel::Simple,
+                1,
+            )?;
+            let ssd = scratch_luma_ssd(input, ictx, row0, col0, bw, bh, width);
+            Ok(ssd + lambda * new_rate(mv)?.0)
+        };
+        let mut mv_new = [mv_int[0] * 8, mv_int[1] * 8];
+        let mut new_score = score_new(ictx, mv_new)?;
+        let steps: &[i32] = if ictx.ip.allow_high_precision_mv && lim.eighth_pel {
+            &[4, 2, 1]
+        } else {
+            &[4, 2]
+        };
+        for &st in steps {
+            let center = mv_new;
+            let ring: &[(i32, i32)] = if lim.subpel_ring8 {
+                &[
+                    (-1, 0),
+                    (1, 0),
+                    (0, -1),
+                    (0, 1),
+                    (-1, -1),
+                    (-1, 1),
+                    (1, -1),
+                    (1, 1),
+                ]
+            } else {
+                &[(-1, 0), (1, 0), (0, -1), (0, 1)]
+            };
+            for &(oy, ox) in ring {
+                let cand = [center[0] + oy * st, center[1] + ox * st];
+                if !in_bounds(cand) {
+                    continue;
+                }
+                let sc = score_new(ictx, cand)?;
+                if sc < new_score {
+                    new_score = sc;
+                    mv_new = cand;
+                }
+            }
+        }
+        searched[rf as usize] = Some(mv_new);
+        // A searched vector equal to a derived one is the derived
+        // candidate at a higher rate — not offered.
+        if in_bounds(mv_new) && !seen[..n_seen].contains(&mv_new) {
+            let (rate, idx) = new_rate(mv_new)?;
+            trial(
+                ictx,
+                &mut best,
+                Cand {
+                    ref_frame: [rf, -1],
+                    y_mode: MODE_NEWMV,
+                    mv: [mv_new, [0, 0]],
+                    ref_mv_idx: idx,
+                    rate,
+                },
+            )?;
+        }
+    }
+
+    // COMPOUND_AVERAGE trials over the ladder pairs, only while the
+    // single-reference winner sits above the noise floor (§5.11.25:
+    // `Min( bw4, bh4 ) >= 2` and `reference_select`).
+    if lim.compound
+        && bw4.min(bh4) >= 2
+        && ictx.ip.reference_select
+        && best.is_some_and(|(_, d, _)| d > good_ssd)
+    {
+        for crf in ictx.compound_pairs.clone() {
+            let stack = ictx.find_stack(mi_r, mi_c, b_size, crf)?;
+            let nn = [stack.ref_stack_mv[0][0], stack.ref_stack_mv[0][1]];
+            if in_bounds(nn[0]) && in_bounds(nn[1]) {
+                trial(
+                    ictx,
+                    &mut best,
+                    Cand {
+                        ref_frame: crf,
+                        y_mode: MODE_NEAREST_NEARESTMV,
+                        mv: nn,
+                        ref_mv_idx: 0,
+                        rate: 6,
+                    },
+                )?;
+            }
+            if let (Some(a), Some(b)) = (searched[crf[0] as usize], searched[crf[1] as usize])
+                && [a, b] != nn
+            {
+                let window: u32 = match stack.num_mv_found {
+                    0 | 1 => 0,
+                    2 => 1,
+                    _ => 2,
+                };
+                let mut pick: Option<(u64, u32)> = None;
+                for idx in 0..=window {
+                    let p0 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 0, idx)?;
+                    let p1 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 1, idx)?;
+                    let rate = 8
+                        + u64::from(idx)
+                        + mv_component_bits(a[0] - p0[0])
+                        + mv_component_bits(a[1] - p0[1])
+                        + mv_component_bits(b[0] - p1[0])
+                        + mv_component_bits(b[1] - p1[1]);
+                    if pick.is_none_or(|(r, _)| rate < r) {
+                        pick = Some((rate, idx));
+                    }
+                }
+                let (rate, idx) = pick.expect("slot 0 is always reachable");
+                trial(
+                    ictx,
+                    &mut best,
+                    Cand {
+                        ref_frame: crf,
+                        y_mode: MODE_NEW_NEWMV,
+                        mv: [a, b],
+                        ref_mv_idx: idx,
+                        rate,
+                    },
+                )?;
+            }
+        }
+    }
+
+    let (_, mut pred_ssd, cand) = best.ok_or(Error::PartitionWalkOutOfRange)?;
+    let Cand {
+        ref_frame,
+        y_mode,
+        mv,
+        ref_mv_idx,
+        ..
+    } = cand;
+
+    // §5.11.26 interpolation-filter trial on the winner (the two other
+    // codable filters, luma distortion deciding), where the frame
+    // header keeps the filter switchable and the effort asks for it.
+    let mut filter = filter;
+    if lim.filter_trials
+        && ictx.ip.interpolation_filter == SWITCHABLE
+        && y_mode != MODE_GLOBALMV
+        && y_mode != MODE_GLOBAL_GLOBALMV
+    {
+        use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
+        for f in [EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
+            ictx.predict_leaf_planes(
+                mi_r,
+                mi_c,
+                b_size,
+                ref_frame,
+                y_mode,
+                mv,
+                f,
+                CompoundSel::AVERAGE,
+                None,
+                MotionSel::Simple,
+                1,
+            )?;
+            let ssd = scratch_luma_ssd(input, ictx, row0, col0, bw, bh, width);
+            if ssd < pred_ssd {
+                pred_ssd = ssd;
+                filter = f;
+            }
+        }
+    } else if ictx.ip.interpolation_filter == SWITCHABLE
+        && (y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV)
+    {
+        // `needs_interp_filter( ) == 0`: the reader derives EIGHTTAP.
+        filter = EIGHTTAP;
+    }
+
+    // The committed prediction, every plane.
+    ictx.predict_leaf(
+        mi_r,
+        mi_c,
+        b_size,
+        ref_frame,
+        y_mode,
+        mv,
+        filter,
+        CompoundSel::AVERAGE,
+        None,
+        MotionSel::Simple,
+    )?;
+    ictx.last_pred_ssd = scratch_luma_ssd(input, ictx, row0, col0, bw, bh, width);
+
+    let segment_id = ictx.segment_for_block(input, mi_r, mi_c, b_size);
+    let seg_qp = ictx.seg_qp(&recon.qp, segment_id);
+    let lossless = ictx.seg_lossless(segment_id);
+    let residual = |recon: &mut ReconState, ictx: &PSearchCtx, depth: u32| {
+        encode_inter_leaf_residual(
+            mi_r,
+            mi_c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            filter,
+            CompoundSel::AVERAGE,
+            None,
+            MOTION_MODE_SIMPLE,
+            depth,
+            segment_id,
+            &seg_qp,
+            // The per-TU chain keeps the magnitude proxy; the leaf as
+            // a whole is priced exactly below.
+            None,
+        )
+    };
+    let mut leaf = residual(recon, ictx, 0)?;
+    if lossless || leaf.skip == 1 {
+        return Ok(leaf);
+    }
+    let src = crate::encoder::key_frame::SourceView::whole(input);
+    let rate_of = |blk: &SyntaxBlock, extra: u64| -> Result<u64, Error> {
+        match pricing {
+            Some((twin, params)) => twin.price_block(blk, mi_r, mi_c, b_size, params),
+            None => Ok((p_leaf_rate(blk) + extra) * 256),
+        }
+    };
+    let score = score256(
+        region_distortion_wh(recon, &src, mi_r, mi_c, bw4, bh4),
+        lambda,
+        rate_of(&leaf, 0)?,
+    );
+    // One §5.11.17 split level, where the effort asks for it.
+    if lim.tx_depth_max > 0 && MAX_TX_SIZE_RECT[b_size] != TX_4X4 {
+        let after0 = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+        let leaf1 = residual(recon, ictx, 1)?;
+        let s1 = score256(
+            region_distortion_wh(recon, &src, mi_r, mi_c, bw4, bh4),
+            lambda,
+            rate_of(&leaf1, 2)?,
+        );
+        if s1 < score && leaf1.skip == 0 {
+            leaf = leaf1;
+        } else {
+            restore_region(recon, mi_r, mi_c, &after0);
+        }
+    }
+    Ok(leaf)
+}
+
+/// r489 — the bounded twin of [`build_p_search_tree`]: a top-down
+/// §5.11.4 walk that codes each fully-inside square node as one inter
+/// leaf first and only then decides, by cost, whether anything else is
+/// worth trying:
+///
+/// * a residual-free leaf, or one whose distortion is already at the
+///   quantiser's noise floor, ends the descent;
+/// * the §5.11.22 intra arm is trialled only where the inter
+///   prediction explains less of the block than its own variance;
+/// * `PARTITION_SPLIT` recurses with the leaf's score as a budget —
+///   the walk abandons the split as soon as the children coded so far
+///   cost more than the leaf.
+///
+/// The rate twin is threaded exactly as the exhaustive walk threads
+/// it (every committed shape is priced by its real symbol sequence),
+/// so the node-level decisions carry exact bits.
+#[allow(clippy::too_many_arguments)]
+fn build_p_bounded_tree(
+    r: u32,
+    c: u32,
+    b_size: usize,
+    input: &YuvFrame,
+    recon: &mut ReconState,
+    ictx: &mut PSearchCtx,
+    twin: &mut RateTwin,
+    params: &SyntaxFrameParams,
+) -> Result<(SyntaxNode, u64), Error> {
+    if r >= recon.mi_rows || c >= recon.mi_cols {
+        return Ok((SyntaxNode::dummy_oob(), 0));
+    }
+    let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let half = n4 >> 1;
+    let sub = crate::cdf::partition_subsize(crate::cdf::PARTITION_SPLIT, b_size)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let fully_inside = r + n4 <= recon.mi_rows && c + n4 <= recon.mi_cols;
+    let quads = [(r, c), (r, c + half), (r + half, c), (r + half, c + half)];
+    if !fully_inside {
+        // §5.11.4 forced split (dims are multiples of 8, so the
+        // recursion ends at fully-inside BLOCK_8X8 nodes).
+        let mut cost = twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let mut kids: Vec<Box<SyntaxNode>> = Vec::with_capacity(4);
+        for (qr, qc) in quads {
+            let (node, cq) = build_p_bounded_tree(qr, qc, sub, input, recon, ictx, twin, params)?;
+            cost += cq;
+            kids.push(Box::new(node));
+        }
+        let children: [Box<SyntaxNode>; 4] = kids
+            .try_into()
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        return Ok((SyntaxNode::Split(children), cost));
+    }
+
+    let lim = ictx.limits;
+    let lambda = lambda_for(&recon.qp);
+    let src = crate::encoder::key_frame::SourceView::whole(input);
+    let can_split = b_size > lim.min_leaf;
+    // Rollback state is only captured where a second candidate can
+    // follow the inter leaf.
+    let before = save_region(recon, r, c, n4 as usize);
+    let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
+    let g_before = ictx.snapshot_grids_rect(r, c, n4);
+    let origin = twin.scope(r, c, b_size, params);
+
+    // Candidate A: one inter leaf.
+    let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx, Some((&*twin, params)))?;
+    let pred_ssd = ictx.last_pred_ssd;
+    // Only a leaf whose residual QUANTISED to nothing counts as
+    // settled; a skip-mode election is a rate decision the finer
+    // shapes may still beat.
+    let leaf_skip = inter_leaf.skip == 1
+        && inter_leaf
+            .inter
+            .as_ref()
+            .is_some_and(|ib| ib.skip_mode == 0);
+    ictx.stamp_leaf(
+        &inter_leaf,
+        r,
+        c,
+        b_size,
+        ictx.seg_lossless(inter_leaf.segment_id),
+    );
+    let d_inter = region_distortion(recon, &src, r, c, n4 as usize);
+    let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
+    let cost_inter = twin.commit_subtree(&node_inter, r, c, b_size, params)?;
+    let score_inter = score256(d_inter, lambda, cost_inter);
+
+    let n = u64::from(n4) * 4;
+    let luma_samples = n * n;
+    let samples = luma_samples
+        + if recon.num_planes > 1 {
+            2 * (n >> recon.subsampling_x) * (n >> recon.subsampling_y)
+        } else {
+            0
+        };
+    let step = u64::from(crate::cdf::get_ac_quant(&recon.qp, 0, 0).unsigned_abs());
+    let floor = samples * step * step * u64::from(lim.split_floor_k64) / 65536;
+    let try_split = can_split && !leaf_skip && d_inter > floor;
+    // Intra gate: the inter prediction leaves more energy than the
+    // block's own deviation from its mean would (a flat intra
+    // prediction would do at least as well), and that energy is above
+    // the noise floor.
+    let try_intra = !leaf_skip
+        && d_inter > floor
+        && (lim.intra_always || {
+            let luma_floor = luma_samples * step * step * u64::from(lim.split_floor_k64) / 65536;
+            pred_ssd > luma_floor && {
+                let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+                let nn = n as usize;
+                let (mut sum, mut sq) = (0u64, 0u64);
+                for i in 0..nn {
+                    for &v in &input.y[(row0 + i) * recon.width + col0..][..nn] {
+                        sum += u64::from(v);
+                        sq += u64::from(v) * u64::from(v);
+                    }
+                }
+                let dev = sq - sum * sum / luma_samples;
+                pred_ssd > dev / 2
+            }
+        });
+    if !try_split && !try_intra {
+        return Ok((node_inter, cost_inter));
+    }
+
+    type Kept = (
+        SyntaxNode,
+        RegionSnapshot,
+        crate::cdf::EncoderStampSnapshot,
+        DriverGridSnapshot,
+        crate::encoder::rate_twin::TwinScope,
+        u64,
+        u64,
+    );
+    let mut best: Kept = (
+        node_inter,
+        save_region(recon, r, c, n4 as usize),
+        ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4),
+        ictx.snapshot_grids_rect(r, c, n4),
+        twin.scope(r, c, b_size, params),
+        score_inter,
+        cost_inter,
+    );
+    restore_region(recon, r, c, &before);
+    ictx.mirror.restore_encoder_stamp_rect(&m_before);
+    ictx.restore_grids_rect(&g_before);
+    twin.restore(&origin);
+
+    if try_intra {
+        // Candidate B: the §5.11.22 intra leaf.
+        let intra_leaf =
+            encode_intra_candidate(r, c, b_size, input, recon, ictx, Some((&*twin, params)))?;
+        ictx.stamp_leaf(
+            &intra_leaf,
+            r,
+            c,
+            b_size,
+            ictx.seg_lossless(intra_leaf.segment_id),
+        );
+        ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
+        let d_intra = region_distortion(recon, &src, r, c, n4 as usize);
+        let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
+        let cost_intra = twin.commit_subtree(&node_intra, r, c, b_size, params)?;
+        let score_intra = score256(d_intra, lambda, cost_intra);
+        if score_intra < best.5 {
+            best = (
+                node_intra,
+                save_region(recon, r, c, n4 as usize),
+                ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4),
+                ictx.snapshot_grids_rect(r, c, n4),
+                twin.scope(r, c, b_size, params),
+                score_intra,
+                cost_intra,
+            );
+        }
+        restore_region(recon, r, c, &before);
+        ictx.mirror.restore_encoder_stamp_rect(&m_before);
+        ictx.restore_grids_rect(&g_before);
+        twin.restore(&origin);
+    }
+
+    if try_split {
+        // Candidate C: PARTITION_SPLIT, abandoned once the children
+        // coded so far already cost more than the best leaf.
+        let mut cost_split =
+            twin.commit_partition_symbol(crate::cdf::PARTITION_SPLIT, r, c, b_size)?;
+        let mut kids: Vec<Box<SyntaxNode>> = Vec::with_capacity(4);
+        let mut d_part = 0u64;
+        let mut abandoned = false;
+        for (qi, (qr, qc)) in quads.into_iter().enumerate() {
+            let (node, cq) = build_p_bounded_tree(qr, qc, sub, input, recon, ictx, twin, params)?;
+            cost_split += cq;
+            kids.push(Box::new(node));
+            d_part += region_distortion(recon, &src, qr, qc, half as usize);
+            if qi < 3 && score256(d_part, lambda, cost_split) >= best.5 {
+                abandoned = true;
+                break;
+            }
+        }
+        if !abandoned && score256(d_part, lambda, cost_split) < best.5 {
+            let children: [Box<SyntaxNode>; 4] = kids
+                .try_into()
+                .map_err(|_| Error::PartitionWalkOutOfRange)?;
+            return Ok((SyntaxNode::Split(children), cost_split));
+        }
+    }
+    let (node, after, m_after, g_after, t_after, _, cost) = best;
+    restore_region(recon, r, c, &after);
+    ictx.mirror.restore_encoder_stamp_rect(&m_after);
+    ictx.restore_grids_rect(&g_after);
+    twin.restore(&t_after);
+    Ok((node, cost))
 }
 
 #[cfg(test)]
@@ -10680,6 +11985,7 @@ mod tests {
             false,
             None,
             None,
+            InterLimits::exhaustive(),
         )
         .unwrap();
         assert!(!saved1.frame_is_intra);

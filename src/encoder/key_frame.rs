@@ -5933,6 +5933,8 @@ fn encode_intrabc_leaf(
                         (Some(f), Some(c)) => Some((f, c)),
                         _ => None,
                     },
+                    false,
+                    crate::encoder::forward_quantize::QUANT_ROUND_HALF,
                 )?
             };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);

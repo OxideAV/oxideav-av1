@@ -4,6 +4,16 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Encoder: `encode_gop_yuv_with_options` with `GopOptions` (`base_q_idx`, `effort`, the §5.9.15 uniform tile layout) and the `GopEffort` ladder (`Fastest` / `Fast` / `Balanced` — the default — / `Thorough` / `Best`). `Best` is the exhaustive search `encode_gop_yuv_with_q` has always run (byte-identical); the four bounded levels are a new inter search:
+  - Partition walk: top-down from 64×64 to 8×8, each node coded as one inter leaf first; a leaf whose residual quantises to nothing, or whose distortion is at the quantiser's noise floor, ends the descent; the intra arm is trialled only on unsettled nodes (at `Fastest` / `Fast` only where the inter prediction explains less than the block's own variance); `PARTITION_SPLIT` is abandoned as soon as the children coded so far cost more than the leaf. Node decisions are priced by the real symbol sequence (the rate twin, moved by block-scope snapshots instead of whole-state clones).
+  - Motion search: the §7.10.2 stack predictors are scored first and end the leaf's search when one predicts to within the noise floor; otherwise one integer search per reference seeded by the stack and by the vectors already settled for the parent and neighbouring blocks (a shrinking four-point pattern on SAD with an early exit by row, not a window scan), then sub-pel refinement around its winner only. The second reference and the compound-average pair are searched only while the block is still above the floor.
+  - Candidates are scored on a luma-only prediction through the decoder's own §7.11.3 kernel; chroma is predicted once, for the winner. One residual pass per leaf (`DCT_DCT` at the largest transform at `Fastest` / `Fast`; the §5.11.48 inter set plus one §5.11.17 split level from `Balanced`), dead-zone quantiser rounding.
+  - Frames of the bounded levels code a fixed `EIGHTTAP` filter, `is_motion_mode_switchable = 0` and `skip_mode_present = 0` (no per-block symbols for tools the search does not trial) and run exactly one frame search (no delta-q / quantiser-matrix / superres / film-grain election); the KEY frame rides the still-picture `Fast` (`Thorough`: `Balanced`) ladders.
+  - Measured, 8 frames of 320×240 `testsrc2`, `base_q_idx` 120, one thread, medians: exhaustive 99.9 s / 4 972 B / 39.55 dB → `Balanced` 0.4–1.2 s / 10 523 B / 44.42 dB (`Fastest` 0.2–0.3 s, `Thorough` 2–2.4 s); all-intra (`StillSpeed::Fast`) 0.6 s / 16 549 B / 45.55 dB. Every stream decodes to the encoder's reconstruction in this crate's decoder and in a black-box decoder process.
+- `examples/gop_bench.rs`: times a raw 4:2:0 sequence through any effort level (or all-intra), reports bytes / luma PSNR and checks the decode against the encoder's reconstruction.
+
 ### Changed
 
 - Decoder memory, output unchanged (every still / video digest and every coded byte equal to 0.1.24):

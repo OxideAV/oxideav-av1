@@ -240,6 +240,7 @@ pub fn encode_camera_frame_yuv420_tiles_qm(
         superres_source: None,
         ref_dims: Vec::new(),
         coded_size: None,
+        limits: crate::encoder::inter_frame::InterLimits::exhaustive(),
     };
     let (obus, recon, _saved, _carry, _aux) = encode_inter_frame_generic(
         &wide,

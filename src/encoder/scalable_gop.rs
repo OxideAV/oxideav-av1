@@ -368,6 +368,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             superres_source: None,
             ref_dims: Vec::new(),
             coded_size: None,
+            limits: crate::encoder::inter_frame::InterLimits::exhaustive(),
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -1102,6 +1103,7 @@ fn encode_spatial_layered_core(
                 superres_source: None,
                 ref_dims: il_ref_dims,
                 coded_size: None,
+                limits: crate::encoder::inter_frame::InterLimits::exhaustive(),
             };
             // r456 — per-temporal-layer quantiser offset (anchors
             // finest, leaves coarsest; inert on the pure spatial

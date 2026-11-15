@@ -370,6 +370,7 @@ pub use inter_frame::{
     encode_gop_yuv420_with_q_seg,
 };
 pub use inter_frame::{EncodedGopYuv, GopFrameReconYuv, encode_gop_yuv, encode_gop_yuv_with_q};
+pub use inter_frame::{GopEffort, GopOptions, encode_gop_yuv_with_options};
 #[doc(hidden)]
 pub use inter_frame::{
     GopTuning, SegExtras, TunedGop, encode_gop_yuv420_with_q_seg_extras_tuned,

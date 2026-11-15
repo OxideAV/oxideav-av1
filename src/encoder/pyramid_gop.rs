@@ -840,6 +840,7 @@ impl PyramidSession {
                         superres_source: None,
                         ref_dims: Vec::new(),
                         coded_size: None,
+                        limits: crate::encoder::inter_frame::InterLimits::exhaustive(),
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
