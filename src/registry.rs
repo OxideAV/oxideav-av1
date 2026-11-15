@@ -115,13 +115,37 @@ pub fn register(ctx: &mut RuntimeContext) {
 /// `params.codec_id` is threaded through so [`Decoder::codec_id`]
 /// reports the resolved id.
 ///
+/// ## Options
+///
+/// | key | values | default |
+/// |---|---|---|
+/// | `film_grain` | `true` / `false` — synthesise §7.18.3 film grain on the output frames; `false` outputs the pre-grain reconstruction and skips the synthesis | `true` (the conformant output) |
+///
 /// ## Errors
 ///
-/// Construction fails only when the extradata's configuration OBUs
-/// are malformed (`Error::invalid`); an empty / unconfigured stream is
-/// represented by an idle decoder that returns `NeedMore` until fed.
+/// Construction fails when the extradata's configuration OBUs are
+/// malformed or `film_grain` carries an unknown value
+/// (`Error::invalid`); an empty / unconfigured stream is represented by
+/// an idle decoder that returns `NeedMore` until fed.
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     let mut session = SpecDecodeSession::new();
+    // r489 — the one decoder option: `film_grain` (`true` — the
+    // default, conformant output — or `false`: frames are output
+    // without §7.18.3 grain synthesis; see
+    // [`SpecDecodeSession::set_film_grain`]).
+    for (k, v) in params.options.iter() {
+        if k == "film_grain" {
+            match v {
+                "true" | "1" | "on" => session.set_film_grain(true),
+                "false" | "0" | "off" => session.set_film_grain(false),
+                _ => {
+                    return Err(CoreError::invalid(format!(
+                        "oxideav-av1: option film_grain={v:?}"
+                    )));
+                }
+            }
+        }
+    }
     let config_obus = codec_config_obus(&params.extradata);
     if !config_obus.is_empty() {
         session

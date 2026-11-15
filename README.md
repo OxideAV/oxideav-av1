@@ -2531,6 +2531,141 @@ before filtering, the encoder's per-candidate CDF-context copy and
 per-mode prediction buffers, and the frame-parallel residue of the
 2×2-tile clip (8 → 16 workers gains 8 %).
 
+#### Inter encode effort, single-parse frame-parallel decode, tile-parallel inter decode (r489)
+
+**Encoder — `encode_gop_yuv_with_options` / `GopEffort`.** The KEY + P
+GOP encoder had one speed: exhaustive. A sample of it on 8 frames of
+320×240 (`testsrc2`, `base_q_idx` 120, 99.9 s) shows where the time
+went. By structure: every square node from 64×64 down to 4×4 codes an
+inter leaf, an intra leaf, eight rectangular / T / strip shapes and
+the recursive split; every inter leaf scans a 9×9 step-4 grid over ±16
+plus a 7×7 refinement per reference (about 130 block SSDs, each sample
+edge-clamped), refines 16–24 sub-pel positions and scores some 18 mode candidates, 34
+masked-compound, 20 inter-intra, three filter and the OBMC / warp arms
+— each a full three-plane prediction through the decoder's leaf driver
+— then runs a transform-depth ladder with up to 16 transform types per
+unit under exact bit pricing; and the frame is searched two to four
+times over (quantiser-matrix ladder, delta-q arm), the GOP again for
+each film-grain candidate. By self time: 16 % copying (rate-twin
+writer-state clones and per-unit price forks), 14 % the sub-pel
+convolution, 10 % the leaf mode loop, 7 % the allocator, 6 % mask
+blends, 5 % transforms.
+
+`GopEffort::Best` keeps that search (byte-identical to
+`encode_gop_yuv_with_q`). The four bounded levels restructure it:
+
+- **Partition walk** top-down to 8×8. Each node is coded as one inter
+  leaf first; a leaf whose residual quantises to nothing, or whose
+  distortion is at the quantiser's noise floor, ends the descent; the
+  intra arm runs only on unsettled nodes; `PARTITION_SPLIT` is
+  abandoned as soon as the children coded so far cost more than the
+  leaf. Node decisions are priced by the real symbol sequence, the
+  rate twin moving by block-scope snapshots instead of whole-state
+  clones.
+- **Motion search.** The §7.10.2 stack predictors are scored first and
+  end the leaf's search when one predicts to within the noise floor.
+  Otherwise one integer search per reference, seeded by the stack and
+  by the vectors already settled for the parent and neighbouring
+  blocks — a shrinking four-point pattern on SAD with a row-wise early
+  exit — then sub-pel refinement around its winner only. The second
+  reference and the compound pair are searched only while the block is
+  still above the floor.
+- **Candidates** are scored on a luma-only prediction (the decoder's
+  own §7.11.3 kernel); chroma is predicted once, for the winner. One
+  residual pass per leaf with dead-zone rounding.
+- **Frames** code a fixed `EIGHTTAP` filter and no motion-mode /
+  skip-mode symbols, and are searched once.
+
+Apple M-series, release build, one thread, medians (the machine was
+shared with other builds — the bounded levels moved between 0.3 s and
+1.2 s run to run); `cargo run --release --example gop_bench -- --raw
+<clip>.yuv --size WxH --frames 8 --q Q --effort E`; clips from `ffmpeg
+-f lavfi -i testsrc2=…` / `mandelbrot=…` / `testsrc2,noise=alls=6`.
+Every stream decodes to the encoder's reconstruction in this crate's
+decoder and in a black-box decoder process.
+
+| 8 frames | effort | time | bytes | luma PSNR |
+|---|---|---|---|---|
+| `testsrc2` 320×240, q 120 | all-intra (`StillSpeed::Fast`) | 0.62 s | 16 549 | 45.55 dB |
+| | `Fastest` | 0.33 s | 12 315 | 44.19 dB |
+| | `Fast` | 0.41 s | 11 609 | 45.26 dB |
+| | `Balanced` (default) | 1.17 s | 10 523 | 44.42 dB |
+| | `Thorough` | 2.44 s | 10 372 | 44.63 dB |
+| | `Best` (the pre-r489 encoder) | 99.9 s | 4 972 | 39.55 dB |
+| `mandelbrot` zoom 320×240, q 90 | all-intra | 0.62 s | 93 963 | 41.69 dB |
+| | `Fastest` / `Fast` | 0.23 s / 0.48 s | 33 041 / 31 359 | 41.03 / 41.80 dB |
+| | `Balanced` / `Thorough` | 1.1 s / 2.1 s | 27 415 / 27 475 | 41.52 / 41.61 dB |
+| noisy `testsrc2` 352×288, q 90 | all-intra | 0.84 s | 68 084 | 38.32 dB |
+| | `Fastest` / `Fast` | 0.71 s / 1.06 s | 50 245 / 43 039 | 37.90 / 38.27 dB |
+| | `Balanced` / `Thorough` | 2.1 s / 3.4 s | 33 159 / 32 851 | 38.12 / 38.14 dB |
+
+The exhaustive encoder lands on a different operating point at the
+same `base_q_idx` (its exact-priced skip-mode and residual elections
+trade about 5 dB for half the bytes), so compare by rate at matched
+quality: on the `testsrc2` clip `Balanced` reaches 38.43 dB in 5 455 B
+(q 160) and 51.45 dB in 15 649 B (q 60); all-intra needs 11 339 B for
+40.12 dB and 23 078 B for 51.78 dB; `Best` codes 39.55 dB in 4 972 B
+and 46.20 dB in 12 442 B (q 60, 111 s). Interpolated at 39.55 dB the
+default costs about 6.4 kB — some 40 % under all-intra and some 30 %
+over the exhaustive search, at about 1 % of its time. Not in the
+bounded search: rectangular and 4×4 partitions, masked / inter-intra
+compounds, OBMC and warped motion, switchable filters, the skip-mode
+leaf (its election at this encoder's λ costs more than it saves once
+it stops the partition descent — measured), a tile-threaded search.
+
+**Decoder — one parse per frame.** Under a worker budget a referenced
+frame walks its syntax first (so the next frame's walk can start from
+its end CDFs, motion field and segment map) and then walks again to
+reconstruct. The second walk decoded every symbol a second time. The
+syntax walk now records the value of every symbol and bool it reads —
+one byte each — and the reconstruction walk replays that tape: no
+arithmetic decoding and no CDF adaptation the second time round.
+
+**Decoder — tile-parallel inter frames.** Intra tiles already decoded
+on tile-sized walkers in parallel; inter tiles did not, because the
+inter arms read frame-level state at frame positions. Each worker now
+owns one frame-scope walker, walks the tiles it draws on it (tiles
+write disjoint rectangles), and the frame walker imports each finished
+rectangle (mode-info grids, samples, restoration units); the in-loop
+filters advance, and the §7.20 rows publish, as each tile row
+completes. Output is identical at every budget (`tests/
+decode_inter_tiles.rs`: 2×2 / 4×2 layouts, 4:2:0 / 4:4:4, with CDEF
+and loop restoration, 1 / 2 / 3 / 4 / 8 workers through the registry
+decoder and a direct session). The same work fixed a latent
+frame-parallel fault: a leaf whose vector reaches above the frame
+clamps every read to the top rows but waited for none of them, so the
+first such leaf of a frame could read a reference before its first
+rows were published (decode error, never wrong pixels).
+
+1080p, 120 frames, a black-box encoder at its preset 8 (`testsrc2`),
+one temporal unit per packet through the registry decoder
+(`examples/decode_bench <clip> threads=N stream=1 mode=registry`),
+frames per second, median of five runs each on a machine shared with
+other builds; the digests of all planes agree before / after and
+across budgets. One worker takes neither path (no syntax-only walk, no
+tile threads) and is unchanged.
+
+| Clip | 2 workers | 4 | 8 |
+|---|---|---|---|
+| random-access GOP, one tile | 133.7 → 138.4 | 232.3 → 244.4 | 358.3 → 386.9 |
+| random-access GOP, 2×2 tiles | 139.6 → 147.1 | 239.8 → 302.1 | 359.1 → 381.4 |
+| low-delay GOP, 4×2 tiles | 113.8 → 135.1 | 162.0 → 196.8 | 162.9 → 213.9 |
+
+The trade is memory: a frame-scope walker per tile worker per frame in
+flight. On the low-delay 4×2 clip at 8 workers the peak of live
+allocations rises from 235 MiB to 896 MiB (the sample planes of those
+walkers are allocated at frame extent and touched only inside their
+tiles, so the resident growth is smaller than the allocated one). A
+tile-origin offset for the inter arms would let inter tiles walk on
+tile-sized state, as intra tiles do.
+
+**Decoder — film-grain opt-out.** `SpecDecodeSession::set_film_grain(
+false)` (registry decoder option `film_grain=false`) outputs frames
+without §7.18.3 synthesis — the pre-grain reconstruction, exactly the
+samples the reference store holds, and what a black-box decoder
+outputs with its own grain switch off (`tests/film_grain_opt_out.rs`).
+The default is the conformant, grained output.
+
 ## WebAssembly
 
 The decoder and encoder run on `wasm32-unknown-unknown` (no clock, no

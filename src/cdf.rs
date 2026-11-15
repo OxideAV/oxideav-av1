@@ -17524,6 +17524,52 @@ impl PartitionWalker {
         }
     }
 
+    /// r489 — copy the `CurrFrame[ plane ]` samples of the mi rect
+    /// `[ row0, row1 ) × [ col0, col1 )` from a FRAME-SIZED walker
+    /// (same mi extent as this one) at the same position: the stitch
+    /// of an inter tile reconstructed on a worker's own frame-scope
+    /// walker (the inter arms read frame-level state at frame
+    /// positions, so their tiles cannot walk at a tile-local origin).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_curr_frame_same_rect_from(
+        &mut self,
+        src: &Self,
+        row0: u32,
+        row1: u32,
+        col0: u32,
+        col1: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) {
+        for plane in 0..3usize {
+            let Some(sp) = src.curr_frame[plane].as_ref() else {
+                continue;
+            };
+            let (ssx, ssy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> ssy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> ssx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+            let Some(dp) = self.curr_frame[plane].as_mut() else {
+                continue;
+            };
+            if sp.cols != dp.cols || sp.rows != dp.rows {
+                continue;
+            }
+            let stride = dp.cols as usize;
+            let y0 = ((row0 * (MI_SIZE as u32)) >> ssy) as usize;
+            let y1 = (((row1 * (MI_SIZE as u32)) >> ssy) as usize).min(dp.rows as usize);
+            let x0 = ((col0 * (MI_SIZE as u32)) >> ssx) as usize;
+            let x1 = (((col1 * (MI_SIZE as u32)) >> ssx) as usize).min(stride);
+            if x0 >= x1 {
+                continue;
+            }
+            for y in y0..y1 {
+                dp.samples[y * stride + x0..y * stride + x1]
+                    .copy_from_slice(&sp.samples[y * stride + x0..y * stride + x1]);
+            }
+        }
+    }
+
     /// r475 — import the §5.11.58 restoration units a tile-sized
     /// walker decoded for the frame mi rect `[ mi_row0, mi_row1 ) ×
     /// [ mi_col0, mi_col1 )`: the unit ranges the §5.11.57 window
@@ -21892,7 +21938,10 @@ impl PartitionWalker {
                     } else {
                         let mv_row =
                             i64::from(self.mvs.get((cell * 2 + list) * 2).copied().unwrap_or(0));
-                        (bottom + (mv_row >> 3) + 16).clamp(0, i64::from(u32::MAX)) as u32
+                        // At least the margin itself: a vector reaching
+                        // above the frame clamps every read to the top
+                        // rows, which must be published all the same.
+                        (bottom + (mv_row >> 3) + 16).clamp(16, i64::from(u32::MAX)) as u32
                     };
                     let n = &mut needs[(slot as usize) & 7];
                     *n = (*n).max(need);

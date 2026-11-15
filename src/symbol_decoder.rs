@@ -106,7 +106,24 @@ pub struct SymbolDecoder<'a> {
     /// frame-header `disable_cdf_update` flag). The §8.2.6 decode step
     /// itself is unaffected.
     disable_cdf_update: bool,
+    /// r489 — symbol tape (see [`Self::record_tape`] /
+    /// [`Self::replay`]): [`TAPE_OFF`], [`TAPE_RECORD`] or
+    /// [`TAPE_REPLAY`].
+    tape_mode: u8,
+    /// The tape being recorded (one byte per decoded symbol / bool).
+    tape_rec: Vec<u8>,
+    /// The tape being replayed and the next entry to hand out.
+    tape_src: &'a [u8],
+    tape_pos: usize,
 }
+
+/// No tape: the decoder reads the partition.
+const TAPE_OFF: u8 = 0;
+/// Every decoded symbol / bool is appended to the tape.
+const TAPE_RECORD: u8 = 1;
+/// Every read returns the next tape entry; the partition is not read
+/// and no CDF is adapted.
+const TAPE_REPLAY: u8 = 2;
 
 impl<'a> SymbolDecoder<'a> {
     /// `init_symbol( sz )` — §8.2.2.
@@ -154,9 +171,65 @@ impl<'a> SymbolDecoder<'a> {
             range,
             max_bits,
             disable_cdf_update,
+            tape_mode: TAPE_OFF,
+            tape_rec: Vec::new(),
+            tape_src: &[],
+            tape_pos: 0,
         };
         d.refill();
         Ok(d)
+    }
+
+    /// r489 — start recording every value this decoder hands out
+    /// (symbols and bools, in read order) onto a tape; one byte each.
+    /// A syntax walk is a deterministic function of those values, so a
+    /// second walk of the same partition can run from the tape
+    /// ([`Self::replay`]) without decoding or adapting anything.
+    pub(crate) fn record_tape(&mut self, capacity: usize) {
+        self.tape_mode = TAPE_RECORD;
+        self.tape_rec = Vec::with_capacity(capacity);
+    }
+
+    /// The tape recorded since [`Self::record_tape`].
+    pub(crate) fn take_tape(&mut self) -> Vec<u8> {
+        self.tape_mode = TAPE_OFF;
+        std::mem::take(&mut self.tape_rec)
+    }
+
+    /// r489 — a decoder that replays `tape` (recorded by
+    /// [`Self::record_tape`] over the same partition and the same
+    /// syntax walk): every read returns the next recorded value. The
+    /// CDF arrays passed to the reads are left untouched, so the
+    /// caller's CDF state is NOT the adapted state after a replay.
+    /// Reading past the tape is [`Error::UnexpectedEnd`].
+    pub(crate) fn replay(tape: &'a [u8]) -> Self {
+        Self {
+            bytes: &[],
+            sz: 0,
+            value_reg: 0,
+            reserve_bits: 0,
+            next_byte: 0,
+            short: false,
+            range: 1 << 15,
+            max_bits: 0,
+            disable_cdf_update: true,
+            tape_mode: TAPE_REPLAY,
+            tape_rec: Vec::new(),
+            tape_src: tape,
+            tape_pos: 0,
+        }
+    }
+
+    /// The next tape entry of a replaying decoder.
+    #[inline]
+    fn tape_next(&mut self) -> Result<u32, Error> {
+        match self.tape_src.get(self.tape_pos) {
+            Some(&v) => {
+                self.tape_pos += 1;
+                Ok(u32::from(v))
+            }
+            None => Err(Error::UnexpectedEnd),
+        }
     }
 
     /// Load partition bytes (inverted; `0xFF` past the partition)
@@ -267,6 +340,9 @@ impl<'a> SymbolDecoder<'a> {
         &mut self,
         cdf: &mut [u16; L],
     ) -> Result<u32, Error> {
+        if self.tape_mode == TAPE_REPLAY {
+            return self.tape_next();
+        }
         let n = (L - 1) as u32;
         let value = self.value();
         let r8 = self.range >> 8;
@@ -297,11 +373,17 @@ impl<'a> SymbolDecoder<'a> {
         if !self.disable_cdf_update {
             adapt_cdf(cdf, symbol, n);
         }
+        if self.tape_mode == TAPE_RECORD {
+            self.tape_rec.push(symbol as u8);
+        }
         Ok(symbol)
     }
 
     /// [`Self::read_symbol`] at a run-time alphabet size.
     fn read_symbol_any(&mut self, cdf: &mut [u16]) -> Result<u32, Error> {
+        if self.tape_mode == TAPE_REPLAY {
+            return self.tape_next();
+        }
         // N = number of possible symbol values = cdf.len() - 1.
         let n = cdf.len() as u32 - 1;
         debug_assert!(n >= 1, "§8.2.6: N must be greater than 1");
@@ -343,6 +425,9 @@ impl<'a> SymbolDecoder<'a> {
         // §8.3 CDF update.
         if !self.disable_cdf_update {
             update_cdf(cdf, symbol, n);
+        }
+        if self.tape_mode == TAPE_RECORD {
+            self.tape_rec.push(symbol as u8);
         }
 
         Ok(symbol)
@@ -442,6 +527,9 @@ impl<'a> SymbolDecoder<'a> {
         // `cur( 0 ) = ( ( SymbolRange >> 8 ) * ( ( 1 << 14 ) >> 6 ) >> 1 )
         // + EC_MIN_PROB`, `cur( 1 ) = 0`; the CDF update is moot (the
         // array is discarded).
+        if self.tape_mode == TAPE_REPLAY {
+            return self.tape_next();
+        }
         let cur0 = (((self.range >> 8) * ((1u32 << 14) >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
             + EC_MIN_PROB;
         let symbol = if self.value() >= cur0 {
@@ -453,6 +541,9 @@ impl<'a> SymbolDecoder<'a> {
             1
         };
         self.renormalize()?;
+        if self.tape_mode == TAPE_RECORD {
+            self.tape_rec.push(symbol as u8);
+        }
         Ok(symbol)
     }
 
@@ -828,6 +919,61 @@ mod tests {
 
     /// `read_literal(n)` builds an n-bit value MSB first from n bool
     /// decodes. We assert it equals the documented composition.
+    /// r489 — a replayed tape hands out exactly the values the
+    /// recording decoder produced, leaves the CDFs alone, and ends
+    /// with `UnexpectedEnd`.
+    #[test]
+    fn tape_replay_reproduces_the_recorded_reads() {
+        let bytes: Vec<u8> = (0..96u32)
+            .map(|i| (i.wrapping_mul(151) ^ (i >> 2) ^ 0x5a) as u8)
+            .collect();
+        let fresh = || -> ([u16; 3], [u16; 5], [u16; 9]) {
+            (
+                [1 << 14, 1 << 15, 0],
+                [8000, 16000, 24000, 1 << 15, 0],
+                [4000, 8000, 12000, 16000, 20000, 24000, 28000, 1 << 15, 0],
+            )
+        };
+        let walk = |dec: &mut SymbolDecoder<'_>| -> Result<Vec<u32>, Error> {
+            let (mut c2, mut c4, mut c8) = fresh();
+            let mut out = Vec::new();
+            for round in 0..40u32 {
+                out.push(dec.read_symbol(&mut c2)?);
+                out.push(dec.read_symbol(&mut c4)?);
+                out.push(dec.read_symbol(&mut c8)?);
+                out.push(dec.read_bool()?);
+                out.push(dec.read_literal(1 + round % 5)?);
+                out.push(dec.read_ns(3 + round % 7)?);
+            }
+            Ok(out)
+        };
+        let mut rec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        rec.record_tape(0);
+        let want = walk(&mut rec).unwrap();
+        let tape = rec.take_tape();
+        assert!(!tape.is_empty());
+
+        // The plain decode of the same partition (no tape) agrees.
+        let mut plain = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        assert_eq!(walk(&mut plain).unwrap(), want);
+
+        let mut rep = SymbolDecoder::replay(&tape);
+        assert_eq!(walk(&mut rep).unwrap(), want);
+        // The tape is spent: one more read of any kind fails.
+        assert_eq!(rep.read_bool(), Err(Error::UnexpectedEnd));
+        let (mut c2, _, mut c8) = fresh();
+        assert_eq!(rep.read_symbol(&mut c2), Err(Error::UnexpectedEnd));
+        assert_eq!(rep.read_symbol(&mut c8), Err(Error::UnexpectedEnd));
+
+        // A replay adapts nothing.
+        let mut rep = SymbolDecoder::replay(&tape);
+        let (mut c2, mut c4, mut c8) = fresh();
+        rep.read_symbol(&mut c2).unwrap();
+        rep.read_symbol(&mut c4).unwrap();
+        rep.read_symbol(&mut c8).unwrap();
+        assert_eq!((c2, c4, c8), fresh());
+    }
+
     #[test]
     fn read_literal_composes_bits_msb_first() {
         // Use a window that decodes to a known multi-bit literal. We

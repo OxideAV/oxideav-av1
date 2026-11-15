@@ -194,6 +194,9 @@ struct SpecRefSlot {
 #[derive(Debug, Clone)]
 struct SpecRefState {
     info: RefInfo,
+    /// r489 — the session's film-grain opt-out (see
+    /// [`SpecDecodeSession::set_film_grain`]).
+    skip_grain: bool,
     /// r453 — `Arc`-shared: §7.20 stores the SAME immutable payload
     /// into every slot `refresh_frame_flags` selects (and the §7.21
     /// show-existing re-store copies a stored one wholesale), so an
@@ -275,6 +278,9 @@ impl SlotCell {
 struct SessionRefs {
     info: RefInfo,
     slots: [Option<Arc<SlotCell>>; NUM_REF_FRAMES as usize],
+    /// r489 — output frames WITHOUT §7.18.3 film-grain synthesis (the
+    /// session's opt-out; `false` is the conformant output).
+    skip_grain: bool,
 }
 
 impl SessionRefs {
@@ -282,6 +288,7 @@ impl SessionRefs {
         Self {
             info: RefInfo::default(),
             slots: Default::default(),
+            skip_grain: false,
         }
     }
 
@@ -297,6 +304,7 @@ impl SessionRefs {
         Ok(SpecRefState {
             info: self.info.clone(),
             slots,
+            skip_grain: self.skip_grain,
         })
     }
 }
@@ -454,8 +462,9 @@ pub struct PendingSpecFrame(PendingState);
 enum PendingState {
     Done(Result<SpecFrame, Error>),
     Running(std::thread::JoinHandle<Result<SpecFrame, Error>>),
-    /// A §7.21 `show_existing_frame` output of a slot still decoding.
-    Existing(Arc<SlotCell>, Box<SequenceHeader>),
+    /// A §7.21 `show_existing_frame` output of a slot still decoding
+    /// (the flag is the session's film-grain opt-out).
+    Existing(Arc<SlotCell>, Box<SequenceHeader>, bool),
 }
 
 impl PendingSpecFrame {
@@ -469,7 +478,7 @@ impl PendingSpecFrame {
         match &self.0 {
             PendingState::Done(_) => true,
             PendingState::Running(h) => h.is_finished(),
-            PendingState::Existing(cell, _) => cell.is_complete(),
+            PendingState::Existing(cell, _, _) => cell.is_complete(),
         }
     }
 
@@ -483,9 +492,9 @@ impl PendingSpecFrame {
                 Ok(r) => r,
                 Err(panic) => std::panic::resume_unwind(panic),
             },
-            PendingState::Existing(cell, seq) => cell
+            PendingState::Existing(cell, seq, skip_grain) => cell
                 .wait()
-                .and_then(|slot| output_existing_frame(&slot, &seq)),
+                .and_then(|slot| output_existing_frame(&slot, &seq, skip_grain)),
         });
     }
 
@@ -526,6 +535,7 @@ fn decode_or_defer(
         let mut reads = SessionRefs {
             info: refs.info.clone(),
             slots: Default::default(),
+            skip_grain: refs.skip_grain,
         };
         for (i, (dst, src)) in reads.slots.iter_mut().zip(refs.slots.iter()).enumerate() {
             if (mask >> i) & 1 != 0 {
@@ -586,6 +596,7 @@ fn decode_or_defer(
                             writer,
                             on_meta: Some(&mut publish),
                             mfmvs: None,
+                            tapes: None,
                         },
                     )
                 } else {
@@ -620,6 +631,7 @@ fn decode_or_defer(
                             writer,
                             on_meta: None,
                             mfmvs: parsed.mfmvs,
+                            tapes: parsed.tapes,
                         },
                     )
                 }
@@ -723,6 +735,9 @@ struct DecodedFrameInternal {
     /// r481 — a syntax-only walk's §7.9 motion field (projected once:
     /// the full walk of the same frame reuses it).
     mfmvs: Option<MotionFieldMvs>,
+    /// r489 — a syntax-only walk's symbol tapes, one per tile (the
+    /// full walk of the same frame replays them).
+    tapes: Option<Vec<Vec<u8>>>,
 }
 
 /// How [`decode_frame_spec_tiles`] runs one frame.
@@ -739,6 +754,10 @@ enum FrameMode<'m> {
         on_meta: Option<&'m mut dyn FnMut(FrameMeta)>,
         /// The §7.9 motion field the frame's syntax-only walk projected.
         mfmvs: Option<MotionFieldMvs>,
+        /// r489 — the symbol tapes the frame's syntax-only walk
+        /// recorded, one per tile: the walk replays them instead of
+        /// decoding the tiles a second time.
+        tapes: Option<Vec<Vec<u8>>>,
     },
 }
 
@@ -888,14 +907,20 @@ fn decode_frame_spec_tiles(
     mode: FrameMode<'_>,
 ) -> Result<DecodedFrameInternal, Error> {
     let parse_only = matches!(mode, FrameMode::ParseOnly);
-    let (mut writer, mut on_meta, projected_mfmvs) = match mode {
+    let (mut writer, mut on_meta, projected_mfmvs, tapes) = match mode {
         FrameMode::Recon {
             writer,
             on_meta,
             mfmvs,
-        } => (Some(writer), on_meta, mfmvs),
-        _ => (None, None, None),
+            tapes,
+        } => (Some(writer), on_meta, mfmvs, tapes),
+        _ => (None, None, None, None),
     };
+    // A tape set that does not cover the frame's tiles is ignored (the
+    // tiles are decoded again).
+    let tapes = tapes.filter(|t| t.len() == tiles.len());
+    // r489 — the tapes a syntax-only walk records, by tile.
+    let mut recorded: Vec<Vec<u8>> = Vec::new();
     if fh.show_existing_frame {
         // §7.21 output-existing path is the caller's (no tile group).
         return Err(Error::PartitionWalkOutOfRange);
@@ -1330,8 +1355,9 @@ fn decode_frame_spec_tiles(
 
     walker.set_parse_only(parse_only);
     walker.set_keep_residual_readouts(false);
-    if any_pending {
-        walker.set_ref_rows(Some(Arc::new(row_sources)));
+    let row_sources: Option<Arc<RefRowSources>> = any_pending.then(|| Arc::new(row_sources));
+    if let Some(rs) = &row_sources {
+        walker.set_ref_rows(Some(Arc::clone(rs)));
     }
 
     // §8.3.1 frame-start CDF state: `load_cdfs( ref_frame_idx[
@@ -1460,6 +1486,7 @@ fn decode_frame_spec_tiles(
             mf_mvs: Vec<i16>,
             segment_ids: Vec<i32>,
             cdfs: Box<TileCdfContext>,
+            tape: Vec<u8>,
         }
         let next = AtomicUsize::new(0);
         let parse_one = |t: usize| -> Result<TileMeta, Error> {
@@ -1489,6 +1516,7 @@ fn decode_frame_spec_tiles(
             let tile = &tiles[t];
             let mut decoder =
                 SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
+            decoder.record_tape(tile.bytes.len() * 2);
             let mut cdfs = frame_start_cdfs.as_ref().clone();
             local.decode_tile_syntax_with_lr(
                 &mut decoder,
@@ -1499,6 +1527,7 @@ fn decode_frame_spec_tiles(
                 &quant,
                 dq.delta_q_present,
             )?;
+            let tape = decoder.take_tape();
             let (r0, r1, c0, c1) = (
                 geom.mi_row_start,
                 geom.mi_row_end,
@@ -1512,6 +1541,7 @@ fn decode_frame_spec_tiles(
                 mf_mvs: Vec::with_capacity(n * 2),
                 segment_ids: Vec::with_capacity(n),
                 cdfs: Box::new(cdfs),
+                tape,
             };
             let (raw_refs, raw_mvs, segs) = (local.ref_frames(), local.mvs(), local.segment_ids());
             for r in r0..r1 {
@@ -1557,7 +1587,8 @@ fn decode_frame_spec_tiles(
         let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
         results.sort_by_key(|(t, _)| *t);
         for (t, out) in results {
-            let m = out?;
+            let mut m = out?;
+            recorded.push(std::mem::take(&mut m.tape));
             let (r0, r1, c0, c1) = m.rect;
             let w = (c1 - c0) as usize;
             for (k, r) in (r0..r1).enumerate() {
@@ -1592,6 +1623,7 @@ fn decode_frame_spec_tiles(
                 grain_params: effective_grain,
             }),
             mfmvs: Some(mfmvs),
+            tapes: Some(recorded),
         });
     }
 
@@ -1602,8 +1634,9 @@ fn decode_frame_spec_tiles(
         let worker_count = threads.min(tiles.len());
         let next = AtomicUsize::new(0);
         let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
+        let tapes_ref = tapes.as_ref();
         let decode_one =
-            |tile_num: usize| -> Result<(PartitionWalker, Box<TileCdfContext>), Error> {
+            |tile_num: usize| -> Result<(PartitionWalker, Box<TileCdfContext>, Vec<u8>), Error> {
                 let tile = &tiles[tile_num];
                 let tile_row = (tile_num as u32) / ti.tile_cols;
                 let tile_col = (tile_num as u32) % ti.tile_cols;
@@ -1637,11 +1670,17 @@ fn decode_frame_spec_tiles(
                     mi_col_end: w4,
                 });
                 local.set_current_q_index(i32::from(qp.base_q_idx));
-                let mut decoder = SymbolDecoder::init_symbol(
-                    &tile.bytes,
-                    tile.bytes.len(),
-                    fh.disable_cdf_update,
-                )?;
+                let mut decoder = match tapes_ref {
+                    Some(t) => SymbolDecoder::replay(&t[tile_num]),
+                    None => SymbolDecoder::init_symbol(
+                        &tile.bytes,
+                        tile.bytes.len(),
+                        fh.disable_cdf_update,
+                    )?,
+                };
+                if parse_only {
+                    decoder.record_tape(tile.bytes.len() * 2);
+                }
                 let mut cdfs = frame_start_cdfs.as_ref().clone();
                 local.decode_tile_syntax_with_lr(
                     &mut decoder,
@@ -1652,7 +1691,7 @@ fn decode_frame_spec_tiles(
                     &quant,
                     dq.delta_q_present,
                 )?;
-                Ok((local, Box::new(cdfs)))
+                Ok((local, Box::new(cdfs), decoder.take_tape()))
             };
         let mut first_err: Option<Error> = None;
         std::thread::scope(|scope| {
@@ -1675,9 +1714,15 @@ fn decode_frame_spec_tiles(
                 });
             }
             drop(tx);
+            if parse_only {
+                recorded.resize(tiles.len(), Vec::new());
+            }
             for (t, out) in rx {
                 match out {
-                    Ok((local, cdfs)) => {
+                    Ok((local, cdfs, tape)) => {
+                        if parse_only {
+                            recorded[t] = tape;
+                        }
                         let tile_row = (t as u32) / ti.tile_cols;
                         let tile_col = (t as u32) % ti.tile_cols;
                         let (r0, r1) = (
@@ -1725,8 +1770,206 @@ fn decode_frame_spec_tiles(
             p.advance(&mut walker, mi_rows)?;
         }
     }
+    // r489 — tile-parallel reconstruction of an INTER frame. The inter
+    // arms read frame-level state at frame positions (the §7.9 motion
+    // field, the previous segment map, the reference planes, the
+    // §7.11.3.2 clamps), so a tile cannot walk at a tile-local origin
+    // the way an intra tile does: each worker owns ONE frame-scope
+    // walker, walks the tiles it draws on it (tiles write disjoint
+    // rectangles; every §5.11 context is re-armed per tile), and the
+    // frame walker imports each finished rectangle — the mode-info
+    // grids, the samples, the restoration units. The in-loop filters
+    // advance (and the §7.20 rows publish) each time a whole tile row
+    // is in. Only what a tile reads from OUTSIDE its own rectangle
+    // matters for equality with the serial walk, and that is all
+    // frame-start state, so the frame is bit-identical at any budget.
+    let inter_tile_parallel = threads > 1 && tiles.len() > 1 && is_inter_frame && !parse_only;
+    if inter_tile_parallel {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let worker_count = threads.min(tiles.len());
+        let next = AtomicUsize::new(0);
+        let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
+        let tapes_ref = tapes.as_ref();
+        let row_sources_ref = row_sources.as_ref();
+        let ictx_ref = ictx.as_ref();
+        let plane_count = cc.num_planes as usize;
+        let tile_geom = |t: usize| -> TileGeometry {
+            let tile_row = (t as u32) / ti.tile_cols;
+            let tile_col = (t as u32) % ti.tile_cols;
+            TileGeometry {
+                mi_row_start: ti.mi_row_starts[tile_row as usize],
+                mi_row_end: ti.mi_row_starts[tile_row as usize + 1],
+                mi_col_start: ti.mi_col_starts[tile_col as usize],
+                mi_col_end: ti.mi_col_starts[tile_col as usize + 1],
+            }
+        };
+        let new_local = || -> Result<PartitionWalker, Error> {
+            let mut local = PartitionWalker::new(
+                mi_rows,
+                mi_cols,
+                TileGeometry {
+                    mi_row_start: 0,
+                    mi_row_end: mi_rows,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols,
+                },
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            local.set_keep_residual_readouts(false);
+            if let Some(rs) = row_sources_ref {
+                local.set_ref_rows(Some(Arc::clone(rs)));
+            }
+            local.ensure_curr_frame_planes(plane_count, sub_x_u8, sub_y_u8);
+            Ok(local)
+        };
+        let walk_one =
+            |local: &mut PartitionWalker, tile_num: usize| -> Result<Box<TileCdfContext>, Error> {
+                let tile = &tiles[tile_num];
+                local.begin_tile(tile_geom(tile_num));
+                local.set_current_q_index(i32::from(qp.base_q_idx));
+                let mut decoder = match tapes_ref {
+                    Some(t) => SymbolDecoder::replay(&t[tile_num]),
+                    None => SymbolDecoder::init_symbol(
+                        &tile.bytes,
+                        tile.bytes.len(),
+                        fh.disable_cdf_update,
+                    )?,
+                };
+                let mut cdfs = frame_start_cdfs.as_ref().clone();
+                local.decode_tile_syntax_with_lr(
+                    &mut decoder,
+                    &mut cdfs,
+                    &params,
+                    lr_walk_ref,
+                    ictx_ref,
+                    &quant,
+                    dq.delta_q_present,
+                )?;
+                Ok(Box::new(cdfs))
+            };
+        // A worker's walker travels to the stitching thread with each
+        // finished tile and comes back for the next one, so a tile's
+        // rectangle is imported before its walker is written again.
+        type TileDone = (
+            usize,
+            usize,
+            Result<Box<TileCdfContext>, Error>,
+            PartitionWalker,
+        );
+        let mut first_err: Option<Error> = None;
+        let mut pipeline_err: Option<Error> = None;
+        let mut done = vec![false; tiles.len()];
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<TileDone>();
+            let mut returns: Vec<std::sync::mpsc::Sender<PartitionWalker>> = Vec::new();
+            for worker in 0..worker_count {
+                let tx = tx.clone();
+                let (back_tx, back_rx) = std::sync::mpsc::channel::<PartitionWalker>();
+                returns.push(back_tx);
+                let next = &next;
+                let walk_one = &walk_one;
+                let new_local = &new_local;
+                scope.spawn(move || {
+                    let mut local = match new_local() {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    };
+                    loop {
+                        let t = next.fetch_add(1, Ordering::SeqCst);
+                        if t >= tiles.len() {
+                            break;
+                        }
+                        let out = walk_one(&mut local, t);
+                        if tx.send((t, worker, out, local)).is_err() {
+                            break;
+                        }
+                        local = match back_rx.recv() {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        };
+                    }
+                });
+            }
+            drop(tx);
+            let mut rows_in = 0u32;
+            for (t, worker, out, local) in rx {
+                match out {
+                    Ok(cdfs) => {
+                        let g = tile_geom(t);
+                        walker.import_rect_from(
+                            &local,
+                            g.mi_row_start,
+                            g.mi_col_start,
+                            g.mi_row_start,
+                            g.mi_col_start,
+                            g.mi_row_end - g.mi_row_start,
+                            g.mi_col_end - g.mi_col_start,
+                            sub_x_u8,
+                            sub_y_u8,
+                        );
+                        walker.import_curr_frame_same_rect_from(
+                            &local,
+                            g.mi_row_start,
+                            g.mi_row_end,
+                            g.mi_col_start,
+                            g.mi_col_end,
+                            sub_x_u8,
+                            sub_y_u8,
+                        );
+                        if lr.uses_lr {
+                            walker.import_lr_units_from(
+                                &local,
+                                g.mi_row_start,
+                                g.mi_row_end,
+                                g.mi_col_start,
+                                g.mi_col_end,
+                                &lr_walk,
+                            );
+                        }
+                        if !fh.disable_frame_end_update_cdf && t as u32 == ti.context_update_tile_id
+                        {
+                            end_cdfs = Some(cdfs);
+                        }
+                        done[t] = true;
+                        // Advance the in-loop filters over every tile
+                        // row that is now complete across the frame.
+                        let cols = ti.tile_cols as usize;
+                        while (rows_in as usize) < ti.tile_rows as usize
+                            && done[rows_in as usize * cols..(rows_in as usize + 1) * cols]
+                                .iter()
+                                .all(|&d| d)
+                        {
+                            rows_in += 1;
+                            if let Some(p) = pipeline.as_mut()
+                                && pipeline_err.is_none()
+                                && first_err.is_none()
+                                && let Err(e) =
+                                    p.advance(&mut walker, ti.mi_row_starts[rows_in as usize])
+                            {
+                                pipeline_err = Some(e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+                // Hand the walker back (the worker may have left).
+                let _ = returns[worker].send(local);
+            }
+        });
+        if let Some(e) = first_err.or(pipeline_err) {
+            return Err(e);
+        }
+        if done.iter().any(|&d| !d) {
+            // A worker could not set up its walker.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
     for (tile_num, tile) in tiles.iter().enumerate() {
-        if tile_parallel {
+        if tile_parallel || inter_tile_parallel {
             break;
         }
         let tile_row = (tile_num as u32) / ti.tile_cols;
@@ -1744,8 +1987,15 @@ fn decode_frame_spec_tiles(
         // `delta_q_present` stream dequantised against a garbage
         // base).
         walker.set_current_q_index(i32::from(qp.base_q_idx));
-        let mut decoder =
-            SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
+        let mut decoder = match tapes.as_ref() {
+            Some(t) => SymbolDecoder::replay(&t[tile_num]),
+            None => {
+                SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?
+            }
+        };
+        if parse_only {
+            decoder.record_tape(tile.bytes.len() * 2);
+        }
         let mut cdfs = frame_start_cdfs.as_ref().clone();
         // The rows of a tile row are complete across the frame once its
         // last tile column has walked them.
@@ -1763,6 +2013,9 @@ fn decode_frame_spec_tiles(
                 _ => Ok(()),
             },
         )?;
+        if parse_only {
+            recorded.push(decoder.take_tape());
+        }
         if !fh.disable_frame_end_update_cdf && tile_num as u32 == ti.context_update_tile_id {
             end_cdfs = Some(Box::new(cdfs));
         }
@@ -1828,6 +2081,7 @@ fn decode_frame_spec_tiles(
             ref_planes: None,
             meta: Some(meta),
             mfmvs: Some(mfmvs),
+            tapes: Some(recorded),
         });
     }
     // r481 — the frame-parallel decode stores the slot now: a later
@@ -1838,6 +2092,12 @@ fn decode_frame_spec_tiles(
         && let Some(m) = meta.take()
     {
         cb(m);
+    }
+    // r489 — a replayed walk adapted no CDF: its frame-end state is
+    // not the §8.4 payload (the syntax-only walk that recorded the
+    // tapes already published the real one).
+    if tapes.is_some() {
+        meta = None;
     }
     let mut pipelined_planes: Option<Arc<RefPlanes>> = None;
     if let Some(p) = pipeline.take() {
@@ -2278,8 +2538,12 @@ fn decode_frame_spec_tiles(
         }
     };
 
+    // r489 — the session's opt-out: the frame is output as stored
+    // (the §7.20 store and the saved grain state are unaffected, so the
+    // decode of every later frame is the same either way).
+    let skip_grain = refs.is_some_and(|r| r.skip_grain);
     let planes: Vec<Vec<u8>> = match effective_grain.as_ref() {
-        Some(fg) if fg.apply_grain => {
+        Some(fg) if fg.apply_grain && !skip_grain => {
             // Grain needs every plane at once (chroma scaling reads
             // luma): store first, synthesise, then narrow.
             for (plane, b) in plane_bufs.iter().enumerate() {
@@ -2351,6 +2615,7 @@ fn decode_frame_spec_tiles(
         ref_planes,
         meta,
         mfmvs: None,
+        tapes: None,
     })
 }
 
@@ -2595,6 +2860,26 @@ impl SpecDecodeSession {
         }
     }
 
+    /// r489 — film-grain synthesis on the output frames. `true` (the
+    /// default) is the conformant output: §7.18.3 runs on every shown
+    /// frame whose header (or §7.21 slot) carries `apply_grain = 1`.
+    /// `false` outputs those frames as stored — the pre-grain
+    /// reconstruction, exactly the samples the §7.20 reference store
+    /// holds — and skips the synthesis work. Grain is applied to the
+    /// output copy only, so the reference chain, and with it every
+    /// other decoded sample, is the same under both settings. Takes
+    /// effect from the next temporal unit.
+    pub fn set_film_grain(&mut self, apply: bool) {
+        self.refs.skip_grain = !apply;
+    }
+
+    /// Whether output frames carry §7.18.3 film grain (see
+    /// [`Self::set_film_grain`]).
+    #[must_use]
+    pub fn film_grain(&self) -> bool {
+        !self.refs.skip_grain
+    }
+
     /// r475 — grant the session a worker budget: a multi-tile frame
     /// decodes its tiles `threads`-wide (the post-filters by row
     /// band), byte-identical to the serial decode for any budget.
@@ -2774,7 +3059,9 @@ impl SpecDecodeSession {
     /// must start a new coded video sequence (a KEY frame), which
     /// rebuilds every slot before anything can reference it.
     pub fn reset_references(&mut self) {
+        let skip_grain = self.refs.skip_grain;
         self.refs = SessionRefs::new();
+        self.refs.skip_grain = skip_grain;
     }
 
     /// The §5.5 sequence header the session currently holds (the most
@@ -2931,7 +3218,11 @@ fn slot_payload(
 /// runs `load_grain_params( frame_to_show_map_idx )` when
 /// `film_grain_params_present == 1`; the stored planes themselves stay
 /// grain-free).
-fn output_existing_frame(slot: &SpecRefSlot, seq: &SequenceHeader) -> Result<SpecFrame, Error> {
+fn output_existing_frame(
+    slot: &SpecRefSlot,
+    seq: &SequenceHeader,
+    skip_grain: bool,
+) -> Result<SpecFrame, Error> {
     slot.planes.wait_complete()?;
     let dims = slot.planes.dims();
     let stored: Vec<&[u16]> = (0..dims.len())
@@ -2940,6 +3231,7 @@ fn output_existing_frame(slot: &SpecRefSlot, seq: &SequenceHeader) -> Result<Spe
     // §7.18.3 on the OUTPUT copy only.
     let mut grain_bufs: Option<Vec<Vec<u16>>> = None;
     if seq.film_grain_params_present
+        && !skip_grain
         && let Some(fg) = slot.grain_params.as_ref()
         && fg.apply_grain
     {
@@ -3112,11 +3404,13 @@ fn decode_temporal_unit_spec(
                         out.push(PendingSpecFrame(PendingState::Existing(
                             Arc::clone(&cell),
                             Box::new(s.clone()),
+                            refs.skip_grain,
                         )));
                     } else {
                         out.push(PendingSpecFrame::ready(output_existing_frame(
                             &*cell.wait()?,
                             s,
+                            refs.skip_grain,
                         )?));
                     }
                     // §7.4 / §7.21: a shown KEY frame re-loads the
