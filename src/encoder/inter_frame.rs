@@ -4252,6 +4252,7 @@ fn encode_inter_frame_aligned(
                 // §5.11.1 per-tile prologue: `CurrentQIndex = base_q_idx`
                 // at every tile entry.
                 recon.qp.current_q_index = base_q_idx;
+                let mut tile_twin: Option<RateTwin> = None;
                 for &(sb_r, sb_c) in origins {
                     recon.bd.clear_for_sb(sb_r, sb_c, mi_rows, mi_cols);
                     // r428 — §5.11.13 `CurrentQIndex` walk: apply the plan
@@ -4277,7 +4278,24 @@ fn encode_inter_frame_aligned(
                     // state AND the rate twin's fork, so both enter the
                     // superblock identically.
                     state.arm_read_deltas();
-                    let mut twin = RateTwin::snapshot(&cdfs, &state, &writer);
+                    // r489 — the bounded search keeps ONE twin per tile:
+                    // its syntax mirror is committed to exactly the
+                    // trees the writer emits, so after each superblock
+                    // it equals the live state (asserted below) and
+                    // only the coder side is re-seated. A per-superblock
+                    // snapshot clones the whole-frame mirror once per
+                    // superblock — quadratic in the picture area.
+                    let mut fresh_twin: Option<RateTwin> = None;
+                    let twin: &mut RateTwin = match tile_twin.as_mut() {
+                        Some(t) if cfg.limits.bounded => {
+                            t.resync_coder(&cdfs, &writer);
+                            t
+                        }
+                        _ if cfg.limits.bounded => {
+                            tile_twin.insert(RateTwin::snapshot(&cdfs, &state, &writer))
+                        }
+                        _ => fresh_twin.insert(RateTwin::snapshot(&cdfs, &state, &writer)),
+                    };
                     twin.arm_read_deltas();
                     let (tree, _cost) = if cfg.limits.bounded {
                         build_p_bounded_tree(
@@ -4287,7 +4305,7 @@ fn encode_inter_frame_aligned(
                             input,
                             &mut recon,
                             &mut ictx,
-                            &mut twin,
+                            twin,
                             arm_params,
                         )?
                     } else {
@@ -4298,7 +4316,7 @@ fn encode_inter_frame_aligned(
                             input,
                             &mut recon,
                             &mut ictx,
-                            &mut twin,
+                            twin,
                             arm_params,
                             model,
                         )?
@@ -4318,6 +4336,14 @@ fn encode_inter_frame_aligned(
                     debug_assert!(
                         twin.matches(&cdfs, &writer),
                         "rate twin desynced from the writer after superblock ({sb_r},{sb_c})"
+                    );
+                    // r489 — the per-tile twin's syntax mirror must
+                    // equal the live state too (it is carried into the
+                    // next superblock).
+                    debug_assert!(
+                        !cfg.limits.bounded || twin.matches_state(&cdfs, &state, &writer),
+                        "tile twin desynced from the write state after superblock ({sb_r},{sb_c}): {:?}",
+                        twin.differing_state_fields(&state)
                     );
                     // r428 — realized `CurrentQIndex`: a full-superblock
                     // skip leaf takes the §5.11.13 short-circuit arm (no

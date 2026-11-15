@@ -2559,9 +2559,10 @@ blends, 5 % transforms.
   distortion is at the quantiser's noise floor, ends the descent; the
   intra arm runs only on unsettled nodes; `PARTITION_SPLIT` is
   abandoned as soon as the children coded so far cost more than the
-  leaf. Node decisions are priced by the real symbol sequence, the
-  rate twin moving by block-scope snapshots instead of whole-state
-  clones.
+  leaf. Node decisions are priced by the real symbol sequence, on one
+  rate twin per tile that moves by block-scope snapshots (the
+  exhaustive walk clones the whole-frame write state per superblock
+  and per candidate).
 - **Motion search.** The §7.10.2 stack predictors are scored first and
   end the leaf's search when one predicts to within the noise floor.
   Otherwise one integer search per reference, seeded by the stack and
@@ -2576,9 +2577,10 @@ blends, 5 % transforms.
 - **Frames** code a fixed `EIGHTTAP` filter and no motion-mode /
   skip-mode symbols, and are searched once.
 
-Apple M-series, release build, one thread, medians (the machine was
-shared with other builds — the bounded levels moved between 0.3 s and
-1.2 s run to run); `cargo run --release --example gop_bench -- --raw
+Apple M-series, release build, one thread, medians of five (the
+machine was shared with other builds: across the round the default
+level measured between 0.6 s and 1.2 s on the first clip, the table
+is the quietest reading); `cargo run --release --example gop_bench -- --raw
 <clip>.yuv --size WxH --frames 8 --q Q --effort E`; clips from `ffmpeg
 -f lavfi -i testsrc2=…` / `mandelbrot=…` / `testsrc2,noise=alls=6`.
 Every stream decodes to the encoder's reconstruction in this crate's
@@ -2586,18 +2588,18 @@ decoder and in a black-box decoder process.
 
 | 8 frames | effort | time | bytes | luma PSNR |
 |---|---|---|---|---|
-| `testsrc2` 320×240, q 120 | all-intra (`StillSpeed::Fast`) | 0.62 s | 16 549 | 45.55 dB |
-| | `Fastest` | 0.33 s | 12 315 | 44.19 dB |
-| | `Fast` | 0.41 s | 11 609 | 45.26 dB |
-| | `Balanced` (default) | 1.17 s | 10 523 | 44.42 dB |
-| | `Thorough` | 2.44 s | 10 372 | 44.63 dB |
+| `testsrc2` 320×240, q 120 | all-intra (`StillSpeed::Fast`) | 0.42 s | 16 549 | 45.55 dB |
+| | `Fastest` | 0.15 s | 12 315 | 44.19 dB |
+| | `Fast` | 0.20 s | 11 609 | 45.26 dB |
+| | `Balanced` (default) | 0.61 s | 10 523 | 44.42 dB |
+| | `Thorough` | 1.48 s | 10 372 | 44.63 dB |
 | | `Best` (the pre-r489 encoder) | 99.9 s | 4 972 | 39.55 dB |
-| `mandelbrot` zoom 320×240, q 90 | all-intra | 0.62 s | 93 963 | 41.69 dB |
-| | `Fastest` / `Fast` | 0.23 s / 0.48 s | 33 041 / 31 359 | 41.03 / 41.80 dB |
-| | `Balanced` / `Thorough` | 1.1 s / 2.1 s | 27 415 / 27 475 | 41.52 / 41.61 dB |
-| noisy `testsrc2` 352×288, q 90 | all-intra | 0.84 s | 68 084 | 38.32 dB |
-| | `Fastest` / `Fast` | 0.71 s / 1.06 s | 50 245 / 43 039 | 37.90 / 38.27 dB |
-| | `Balanced` / `Thorough` | 2.1 s / 3.4 s | 33 159 / 32 851 | 38.12 / 38.14 dB |
+| `mandelbrot` zoom 320×240, q 90 | all-intra | 0.46 s | 93 963 | 41.69 dB |
+| | `Fastest` / `Fast` | 0.15 s / 0.32 s | 33 041 / 31 359 | 41.03 / 41.80 dB |
+| | `Balanced` / `Thorough` | 0.76 s / 1.60 s | 27 415 / 27 475 | 41.52 / 41.61 dB |
+| noisy `testsrc2` 352×288, q 90 | all-intra | 0.58 s | 68 084 | 38.32 dB |
+| | `Fastest` / `Fast` | 0.52 s / 0.76 s | 50 245 / 43 039 | 37.90 / 38.27 dB |
+| | `Balanced` / `Thorough` | 1.58 s / 2.65 s | 33 159 / 32 851 | 38.12 / 38.14 dB |
 
 The exhaustive encoder lands on a different operating point at the
 same `base_q_idx` (its exact-priced skip-mode and residual elections
@@ -2607,7 +2609,7 @@ quality: on the `testsrc2` clip `Balanced` reaches 38.43 dB in 5 455 B
 40.12 dB and 23 078 B for 51.78 dB; `Best` codes 39.55 dB in 4 972 B
 and 46.20 dB in 12 442 B (q 60, 111 s). Interpolated at 39.55 dB the
 default costs about 6.4 kB — some 40 % under all-intra and some 30 %
-over the exhaustive search, at about 1 % of its time. Not in the
+over the exhaustive search, at well under 1 % of its time. Not in the
 bounded search: rectangular and 4×4 partitions, masked / inter-intra
 compounds, OBMC and warped motion, switchable filters, the skip-mode
 leaf (its election at this encoder's λ costs more than it saves once
@@ -2623,8 +2625,8 @@ state rebuilt by the one write pass that produces the bytes). The KEY
 frame's tile search and the CDEF election ride the same budget. The
 stream is identical at every budget (`tests/gop_effort.rs`). 8 frames
 of 1280×720 `testsrc2`, `Balanced`, q 120, 4×2 tiles (`gop_bench …
---tiles 2x1 --threads N`), medians of five: 4.5 s at 1 thread, 2.6 s
-at 2, 2.0 s at 4, 1.4 s at 8 (85 646 B, 43.04 dB at each). What still
+--tiles 2x1 --threads N`), medians of five: 2.8 s at 1 thread, 1.8 s
+at 2, 1.4 s at 4, 1.0 s at 8 (85 646 B, 43.04 dB at each). What still
 runs serial per frame: the stitch's write pass, the CDEF
 application, and the frame chain itself.
 
