@@ -120,30 +120,37 @@ pub fn register(ctx: &mut RuntimeContext) {
 /// | key | values | default |
 /// |---|---|---|
 /// | `film_grain` | `true` / `false` — synthesise §7.18.3 film grain on the output frames; `false` outputs the pre-grain reconstruction and skips the synthesis | `true` (the conformant output) |
+/// | `inter_tile_parallel` | `true` / `false` — reconstruct the tiles of an inter frame on workers under the thread budget; `false` walks them one after the other for a smaller footprint (same samples) | `true` |
 ///
 /// ## Errors
 ///
 /// Construction fails when the extradata's configuration OBUs are
-/// malformed or `film_grain` carries an unknown value
+/// malformed or one of the options carries an unknown value
 /// (`Error::invalid`); an empty / unconfigured stream is represented by
 /// an idle decoder that returns `NeedMore` until fed.
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     let mut session = SpecDecodeSession::new();
-    // r489 — the one decoder option: `film_grain` (`true` — the
-    // default, conformant output — or `false`: frames are output
-    // without §7.18.3 grain synthesis; see
-    // [`SpecDecodeSession::set_film_grain`]).
+    // r489 — the decoder options: `film_grain` (`true` — the default,
+    // conformant output — or `false`: frames are output without
+    // §7.18.3 grain synthesis) and `inter_tile_parallel` (`true` — the
+    // default — or `false`: the memory-lean serial tile walk of inter
+    // frames). See [`SpecDecodeSession::set_film_grain`] /
+    // [`SpecDecodeSession::set_inter_tile_parallel`].
     for (k, v) in params.options.iter() {
-        if k == "film_grain" {
-            match v {
-                "true" | "1" | "on" => session.set_film_grain(true),
-                "false" | "0" | "off" => session.set_film_grain(false),
-                _ => {
-                    return Err(CoreError::invalid(format!(
-                        "oxideav-av1: option film_grain={v:?}"
-                    )));
-                }
+        if k != "film_grain" && k != "inter_tile_parallel" {
+            continue;
+        }
+        let on = match v {
+            "true" | "1" | "on" => true,
+            "false" | "0" | "off" => false,
+            _ => {
+                return Err(CoreError::invalid(format!("oxideav-av1: option {k}={v:?}")));
             }
+        };
+        if k == "film_grain" {
+            session.set_film_grain(on);
+        } else {
+            session.set_inter_tile_parallel(on);
         }
     }
     let config_obus = codec_config_obus(&params.extradata);

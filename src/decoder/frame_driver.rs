@@ -197,6 +197,9 @@ struct SpecRefState {
     /// r489 — the session's film-grain opt-out (see
     /// [`SpecDecodeSession::set_film_grain`]).
     skip_grain: bool,
+    /// r489 — the session's inter tile-parallel opt-out (see
+    /// [`SpecDecodeSession::set_inter_tile_parallel`]).
+    serial_inter_tiles: bool,
     /// r453 — `Arc`-shared: §7.20 stores the SAME immutable payload
     /// into every slot `refresh_frame_flags` selects (and the §7.21
     /// show-existing re-store copies a stored one wholesale), so an
@@ -281,6 +284,9 @@ struct SessionRefs {
     /// r489 — output frames WITHOUT §7.18.3 film-grain synthesis (the
     /// session's opt-out; `false` is the conformant output).
     skip_grain: bool,
+    /// r489 — reconstruct the tiles of an inter frame one after the
+    /// other even under a worker budget (the memory-lean setting).
+    serial_inter_tiles: bool,
 }
 
 impl SessionRefs {
@@ -289,6 +295,7 @@ impl SessionRefs {
             info: RefInfo::default(),
             slots: Default::default(),
             skip_grain: false,
+            serial_inter_tiles: false,
         }
     }
 
@@ -305,6 +312,7 @@ impl SessionRefs {
             info: self.info.clone(),
             slots,
             skip_grain: self.skip_grain,
+            serial_inter_tiles: self.serial_inter_tiles,
         })
     }
 }
@@ -536,6 +544,7 @@ fn decode_or_defer(
             info: refs.info.clone(),
             slots: Default::default(),
             skip_grain: refs.skip_grain,
+            serial_inter_tiles: refs.serial_inter_tiles,
         };
         for (i, (dst, src)) in reads.slots.iter_mut().zip(refs.slots.iter()).enumerate() {
             if (mask >> i) & 1 != 0 {
@@ -1783,7 +1792,11 @@ fn decode_frame_spec_tiles(
     // is in. Only what a tile reads from OUTSIDE its own rectangle
     // matters for equality with the serial walk, and that is all
     // frame-start state, so the frame is bit-identical at any budget.
-    let inter_tile_parallel = threads > 1 && tiles.len() > 1 && is_inter_frame && !parse_only;
+    let inter_tile_parallel = threads > 1
+        && tiles.len() > 1
+        && is_inter_frame
+        && !parse_only
+        && !refs.is_some_and(|r| r.serial_inter_tiles);
     if inter_tile_parallel {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let worker_count = threads.min(tiles.len());
@@ -2880,6 +2893,26 @@ impl SpecDecodeSession {
         !self.refs.skip_grain
     }
 
+    /// r489 — tile-parallel reconstruction of INTER frames under the
+    /// worker budget. `true` (the default) is the faster setting: each
+    /// tile worker of a frame owns a frame-scope walk state, so a
+    /// multi-tile inter stream holds up to `threads` of them per frame
+    /// in flight (at 1080p with eight tiles and eight workers the
+    /// resident set roughly triples). `false` reconstructs the tiles
+    /// of an inter frame one after the other — the frame-level and
+    /// in-loop-filter parallelism stay — for the smaller footprint.
+    /// The decoded samples are identical either way.
+    pub fn set_inter_tile_parallel(&mut self, parallel: bool) {
+        self.refs.serial_inter_tiles = !parallel;
+    }
+
+    /// Whether inter frames reconstruct their tiles on workers (see
+    /// [`Self::set_inter_tile_parallel`]).
+    #[must_use]
+    pub fn inter_tile_parallel(&self) -> bool {
+        !self.refs.serial_inter_tiles
+    }
+
     /// r475 — grant the session a worker budget: a multi-tile frame
     /// decodes its tiles `threads`-wide (the post-filters by row
     /// band), byte-identical to the serial decode for any budget.
@@ -3059,9 +3092,10 @@ impl SpecDecodeSession {
     /// must start a new coded video sequence (a KEY frame), which
     /// rebuilds every slot before anything can reference it.
     pub fn reset_references(&mut self) {
-        let skip_grain = self.refs.skip_grain;
+        let (skip_grain, serial_inter_tiles) = (self.refs.skip_grain, self.refs.serial_inter_tiles);
         self.refs = SessionRefs::new();
         self.refs.skip_grain = skip_grain;
+        self.refs.serial_inter_tiles = serial_inter_tiles;
     }
 
     /// The §5.5 sequence header the session currently holds (the most

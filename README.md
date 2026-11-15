@@ -2652,12 +2652,14 @@ tile threads) and is unchanged.
 | low-delay GOP, 4×2 tiles | 113.8 → 135.1 | 162.0 → 196.8 | 162.9 → 213.9 |
 
 The trade is memory: a frame-scope walker per tile worker per frame in
-flight. On the low-delay 4×2 clip at 8 workers the peak of live
-allocations rises from 235 MiB to 896 MiB (the sample planes of those
-walkers are allocated at frame extent and touched only inside their
-tiles, so the resident growth is smaller than the allocated one). A
-tile-origin offset for the inter arms would let inter tiles walk on
-tile-sized state, as intra tiles do.
+flight. On the low-delay 4×2 clip the peak resident set goes from 252
+to 506 MiB at 4 workers and from 426 to 1 227 MiB at 8 (live
+allocations 156 → 334 MiB and 227 → 886 MiB). The faster behaviour is
+the default; `SpecDecodeSession::set_inter_tile_parallel(false)`
+(registry decoder option `inter_tile_parallel=false`) keeps the serial
+tile walk of inter frames — and the earlier footprint — with the same
+samples. A tile-origin offset for the inter arms would let inter tiles
+walk on tile-sized state, as intra tiles do, and remove the trade.
 
 **Decoder — film-grain opt-out.** `SpecDecodeSession::set_film_grain(
 false)` (registry decoder option `film_grain=false`) outputs frames

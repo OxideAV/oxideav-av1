@@ -123,6 +123,50 @@ fn assert_every_budget(tag: &str, units: &[Vec<u8>], ivf: &[u8], reference: &[Pl
 }
 
 #[test]
+fn the_serial_tile_walk_opt_out_decodes_the_same_frames() {
+    let (units, ivf, reference) =
+        stream(256, 192, ChromaFormat::Yuv420, 5, GopEffort::Fast, (1, 1));
+    for threads in [2usize, 4, 8] {
+        let mut session = SpecDecodeSession::new();
+        assert!(
+            session.inter_tile_parallel(),
+            "tile-parallel is the default"
+        );
+        session.set_inter_tile_parallel(false);
+        assert!(!session.inter_tile_parallel());
+        session.set_threads(threads);
+        let out: Vec<Planes> = session
+            .decode_ivf(&ivf)
+            .expect("session decode")
+            .into_iter()
+            .map(|f| f.planes)
+            .collect();
+        assert!(out == reference, "serial tile walk differs at {threads}");
+
+        let mut params = CodecParameters::video("av1".into());
+        params.options.insert("inter_tile_parallel", "false");
+        let mut dec = make_decoder(&params).expect("make_decoder");
+        dec.set_execution_context(&ExecutionContext::with_threads(threads));
+        let mut got: Vec<Planes> = Vec::new();
+        for (i, tu) in units.iter().enumerate() {
+            let pkt = Packet::new(0, TimeBase::new(1, 25), tu.clone()).with_pts(i as i64);
+            dec.send_packet(&pkt).expect("send_packet");
+            while let Ok(Frame::Video(v)) = dec.receive_frame() {
+                got.push(v.planes.into_iter().map(|p| p.data).collect());
+            }
+        }
+        dec.flush().expect("flush");
+        while let Ok(Frame::Video(v)) = dec.receive_frame() {
+            got.push(v.planes.into_iter().map(|p| p.data).collect());
+        }
+        assert!(got == reference, "registry opt-out differs at {threads}");
+    }
+    let mut params = CodecParameters::video("av1".into());
+    params.options.insert("inter_tile_parallel", "sometimes");
+    assert!(make_decoder(&params).is_err());
+}
+
+#[test]
 fn four_tile_p_gop_decodes_identically_for_every_worker_budget() {
     let (units, ivf, reference) = stream(
         256,
